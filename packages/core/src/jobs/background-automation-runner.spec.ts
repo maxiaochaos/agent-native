@@ -116,6 +116,7 @@ vi.mock("../secrets/storage.js", async (importOriginal) => ({
 const {
   BACKGROUND_RUN_HARD_TIMEOUT_MS,
   backgroundRunTerminalError,
+  resolveBackgroundAutomationIdentity,
   runBackgroundAutomation,
 } = await import("./background-automation-runner.js");
 
@@ -138,6 +139,29 @@ const testEngine = {
   defaultModel: "test-model",
   supportedModels: ["test-model"],
 } as any;
+
+describe("background automation identity scope", () => {
+  it("uses deployment defaults for a no-org shared job without reading personal defaults", async () => {
+    const result = await resolveBackgroundAutomationIdentity({
+      resource: {
+        owner: "__shared__",
+        path: "jobs/daily-digest.md",
+      },
+      meta: {
+        createdBy: "owner@example.test",
+        runAs: "creator",
+      },
+    } as any);
+
+    expect(result).toMatchObject({
+      ok: true,
+      identity: {
+        userEmail: "owner@example.test",
+        defaultAgentEngineScope: "deployment",
+      },
+    });
+  });
+});
 
 describe("automation history ownership", () => {
   it.each([
@@ -808,7 +832,10 @@ describe("default selection reaches new chats and background runs", () => {
       await import("../server/request-context.js");
     const { runAgentLoopDirectWithSoftTimeout } =
       await import("../agent/run-loop-with-resume.js");
-    const ctx = { userEmail: "default-model@example.test" };
+    const ctx = {
+      userEmail: "default-model@example.test",
+      orgScope: "personal" as const,
+    };
     const fakeEngine = {
       ...testEngine,
       name: "default-model-fixture",
@@ -886,6 +913,7 @@ describe("default selection reaches new chats and background runs", () => {
               } as any,
             },
             ownerEmail: ctx.userEmail,
+            requestContext: { orgScope: ctx.orgScope },
             prompt: "Return a short status.",
             threadTitle: "Job: model precedence",
             runIdPrefix: `job-model-${pinned}`,
@@ -1846,11 +1874,14 @@ describe("runBackgroundAutomation — preconditions fail before any thread or ru
 
   async function seedOrg(members: Array<[email: string, role: string]>) {
     await pglite.exec(`
-      CREATE TABLE IF NOT EXISTS "user" (id TEXT PRIMARY KEY, email TEXT UNIQUE);
-      INSERT INTO "user" (id, email) VALUES ('u-alice', 'alice@agent-native.test')
+      CREATE TABLE IF NOT EXISTS "user" (
+      id TEXT PRIMARY KEY, name TEXT, email TEXT UNIQUE,
+      created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+    );
+      INSERT INTO "user" (id, name, email, created_at, updated_at) VALUES ('u-alice', 'u-alice', 'alice@agent-native.test', now(), now())
         ON CONFLICT DO NOTHING;
       CREATE TABLE IF NOT EXISTS org_members (
-        org_id TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL,
+        id TEXT, joined_at BIGINT, org_id TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL,
         federation_removal_pending_at BIGINT
       );
       DELETE FROM org_members;
@@ -1858,9 +1889,9 @@ describe("runBackgroundAutomation — preconditions fail before any thread or ru
     for (const [email, role] of members) {
       await pglite
         .prepare(
-          `INSERT INTO org_members (org_id, email, role) VALUES ('acme', ?, ?)`,
+          `INSERT INTO org_members (id, org_id, email, role, joined_at) VALUES (?, 'acme', ?, ?, 0)`,
         )
-        .run(email, role);
+        .run(`acme:${email}`, email, role);
     }
   }
 

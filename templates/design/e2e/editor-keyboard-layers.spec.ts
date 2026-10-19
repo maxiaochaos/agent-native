@@ -82,21 +82,38 @@ function layerTree(page: Page) {
   return page.getByRole("tree", { name: "Layers" });
 }
 
-function layerRowButton(page: Page, name: string) {
+function layerRowButtons(page: Page, name: string) {
   return layerTree(page)
-    .locator("[data-layer-row-button][data-layer-node-id]")
-    .filter({ has: page.locator(`span[title="${name}"]`) })
-    .first();
+    .locator(`span[title="${name}"]`)
+    .locator("xpath=ancestor::button[@data-layer-row-button]");
+}
+
+function layerRowButton(page: Page, name: string) {
+  return layerRowButtons(page, name).first();
 }
 
 function selectedRows(page: Page) {
   return layerTree(page).locator('[role="treeitem"][aria-selected="true"]');
 }
 
+function selectedLayerRowButtons(page: Page) {
+  return selectedRows(page).locator(
+    "[data-layer-row-button][data-layer-node-id]",
+  );
+}
+
 async function selectLayer(page: Page, name: string) {
   await expandAllLayers(page);
-  await layerRowButton(page, name).click();
+  const target = layerRowButton(page, name);
+  const nodeId = await target.getAttribute("data-layer-node-id");
+  expect(nodeId).toBeTruthy();
+  await target.click();
   await expect(selectedRows(page)).toHaveCount(1);
+  await expect(selectedLayerRowButtons(page)).toContainText(name);
+  await expect(selectedLayerRowButtons(page)).toHaveAttribute(
+    "data-layer-node-id",
+    nodeId!,
+  );
 }
 
 /** A Screens-list row selects that Screen on the overview canvas, so a paste lands in it. */
@@ -124,6 +141,22 @@ function idsNamed(nodes: Map<string, SavedNode>, name: string) {
 
 function count(value: string, needle: string): number {
   return value.split(needle).length - 1;
+}
+
+async function savedHtmlWithCardCount(
+  app: App,
+  designId: string,
+  expectedCards: number,
+  filename = "index.html",
+) {
+  let html = "";
+  await expect
+    .poll(async () => {
+      html = await app.savedHtml(designId, filename);
+      return count(html, 'data-agent-native-layer-name="Copy Card"');
+    })
+    .toBe(expectedCards);
+  return html;
 }
 
 /** The pasted cards keep the source's rules, font and image, and none of the peer's rules leak in. */
@@ -170,8 +203,7 @@ async function previewCount(app: App, name: string) {
 test.use({ viewport: { width: 1600, height: 1000 } });
 
 test.describe("editor keyboard layer clipboard", () => {
-  // fixme: product bug: (1) The card pastes at left 599px / top 455px (the target screen's centre) instead of its copied 40,60. (2) The second consecutive paste
-  test.fixme("round-trips a styled nested layer across independent designs, route remounts, and browser tabs as one undo step", async ({
+  test("round-trips a styled nested layer across independent designs, route remounts, and browser tabs as one undo step", async ({
     app,
     context,
   }) => {
@@ -193,7 +225,7 @@ test.describe("editor keyboard layer clipboard", () => {
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
 
-    const pastedHtml = await app.savedHtml(targetId);
+    const pastedHtml = await savedHtmlWithCardCount(app, targetId, 1);
     expectStyledCards(pastedHtml, 1);
     const pasted = savedNodeMap(pastedHtml);
     const [card] = idsNamed(pasted, "Copy Card");
@@ -206,7 +238,7 @@ test.describe("editor keyboard layer clipboard", () => {
       position: "absolute",
       width: "260px",
       "border-radius": "16px",
-      transform: "matrix(0.999391, 0.0348995, -0.0348995, 0.999391, 0, 0)",
+      transform: "rotate(2deg)",
     });
     expect
       .soft(
@@ -218,7 +250,7 @@ test.describe("editor keyboard layer clipboard", () => {
     await page.keyboard.press(`${PRIMARY}+z`);
     await app.settled();
     expect(
-      await app.savedHtml(targetId),
+      await savedHtmlWithCardCount(app, targetId, 0),
       "one undo removes the whole paste",
     ).toBe(seededTarget);
 
@@ -230,12 +262,14 @@ test.describe("editor keyboard layer clipboard", () => {
     await page.bringToFront();
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
-    expectStyledCards(await app.savedHtml(targetId), 1);
+    const onePastedHtml = await savedHtmlWithCardCount(app, targetId, 1);
+    expectStyledCards(onePastedHtml, 1);
 
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
-    expectStyledCards(await app.savedHtml(targetId), 2);
-    const twice = await app.savedNodes(targetId);
+    const twoPastedHtml = await savedHtmlWithCardCount(app, targetId, 2);
+    expectStyledCards(twoPastedHtml, 2);
+    const twice = savedNodeMap(twoPastedHtml);
     expect
       .soft(
         idsNamed(twice, "Copy Card").map((id) => twice.get(id)?.parent),
@@ -245,14 +279,14 @@ test.describe("editor keyboard layer clipboard", () => {
 
     await page.keyboard.press(`${PRIMARY}+z`);
     await app.settled();
-    expectStyledCards(await app.savedHtml(targetId), 1);
+    const onceAfterUndoHtml = await savedHtmlWithCardCount(app, targetId, 1);
+    expectStyledCards(onceAfterUndoHtml, 1);
     await page.keyboard.press(`${PRIMARY}+z`);
     await app.settled();
-    expect(await app.savedHtml(targetId)).toBe(seededTarget);
+    expect(await savedHtmlWithCardCount(app, targetId, 0)).toBe(seededTarget);
   });
 
-  // fixme: product bug: The second paste is saved inside the first pasted card (its parent is the first copy's id) instead of as a sibling under target-body. The
-  test.fixme("keeps two responsive pastes distinct across settled undo and redo", async ({
+  test("keeps two responsive pastes distinct across settled undo and redo", async ({
     app,
   }) => {
     const page = app.page;
@@ -264,11 +298,11 @@ test.describe("editor keyboard layer clipboard", () => {
 
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
-    const oneHtml = await app.savedHtml(id, "target.html");
+    const oneHtml = await savedHtmlWithCardCount(app, id, 1, "target.html");
     expectStyledCards(oneHtml, 1);
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
-    const twoHtml = await app.savedHtml(id, "target.html");
+    const twoHtml = await savedHtmlWithCardCount(app, id, 2, "target.html");
     expectStyledCards(twoHtml, 2);
     const two = savedNodeMap(twoHtml);
     expect
@@ -277,24 +311,37 @@ test.describe("editor keyboard layer clipboard", () => {
         "repeated pastes stack as siblings, not one inside the other",
       )
       .toEqual(["target-body", "target-body"]);
+    expect(
+      idsNamed(two, "Copy Card").map((card) => placement(two.get(card))),
+    ).toEqual([
+      { left: "40px", top: "60px" },
+      { left: "56px", top: "76px" },
+    ]);
 
     await page.keyboard.press(`${PRIMARY}+z`);
     await app.settled();
-    expect(await app.savedHtml(id, "target.html")).toBe(oneHtml);
+    expect(await savedHtmlWithCardCount(app, id, 1, "target.html")).toBe(
+      oneHtml,
+    );
     await page.keyboard.press(`${PRIMARY}+z`);
     await app.settled();
-    expect(await app.savedHtml(id, "target.html")).toBe(seededTarget);
+    expect(await savedHtmlWithCardCount(app, id, 0, "target.html")).toBe(
+      seededTarget,
+    );
 
     await page.keyboard.press(`${PRIMARY}+Shift+z`);
     await app.settled();
-    expect(await app.savedHtml(id, "target.html")).toBe(oneHtml);
+    expect(await savedHtmlWithCardCount(app, id, 1, "target.html")).toBe(
+      oneHtml,
+    );
     await page.keyboard.press(`${PRIMARY}+Shift+z`);
     await app.settled();
-    expect(await app.savedHtml(id, "target.html")).toBe(twoHtml);
+    expect(await savedHtmlWithCardCount(app, id, 2, "target.html")).toBe(
+      twoHtml,
+    );
   });
 
-  // fixme: product bug: The same-screen copy is saved nested inside the source card (Source Root keeps [source-card, source-peer]) with no left/top, instead of
-  test.fixme("pastes a nested selected layer on the same screen and another screen with fresh ids after reload", async ({
+  test("pastes a nested selected layer on the same screen and another screen with fresh ids after reload", async ({
     app,
   }) => {
     const page = app.page;
@@ -306,7 +353,7 @@ test.describe("editor keyboard layer clipboard", () => {
 
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
-    const source = await app.savedNodes(id);
+    const source = savedNodeMap(await savedHtmlWithCardCount(app, id, 2));
     const sourceCopy = addedIds(sourceBefore, source);
     const [sourceCard] = sourceCopy.filter(
       (node) =>
@@ -337,7 +384,9 @@ test.describe("editor keyboard layer clipboard", () => {
     await selectScreen(page, "Target");
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
-    const target = await app.savedNodes(id, "target.html");
+    const target = savedNodeMap(
+      await savedHtmlWithCardCount(app, id, 1, "target.html"),
+    );
     const targetCopy = addedIds(targetBefore, target);
     expect(targetCopy.filter((node) => sourceBefore.has(node))).toEqual([]);
     const [targetCard] = idsNamed(target, "Copy Card");
@@ -357,8 +406,7 @@ test.describe("editor keyboard layer clipboard", () => {
     await expect(app.node(targetCta, "target.html")).toHaveText("Nested CTA");
   });
 
-  // fixme: product bug: The pair is re-laid out as a cascade: the peer sits 16,16 from the card (599,455 and 615,471) instead of 300,20 apart, overlapping the
-  test.fixme("pastes a multi-selection across screens with each layer and child id regenerated", async ({
+  test("pastes a multi-selection across screens with each layer and child id regenerated", async ({
     app,
   }) => {
     const page = app.page;
@@ -374,7 +422,9 @@ test.describe("editor keyboard layer clipboard", () => {
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
 
-    const target = await app.savedNodes(id, "target.html");
+    const target = savedNodeMap(
+      await savedHtmlWithCardCount(app, id, 1, "target.html"),
+    );
     const pasted = addedIds(targetBefore, target);
     expect(pasted.filter((node) => sourceBefore.has(node))).toEqual([]);
     const [card] = idsNamed(target, "Copy Card");
@@ -405,14 +455,15 @@ test.describe("editor keyboard layer clipboard", () => {
     expectOnlyChanged(sourceBefore, await app.savedNodes(id), []);
   });
 
-  // fixme: product bug: The cut card pastes at 599,455 (the target screen's centre) instead of its copied 40,60. Duplicate, delete, undo, redo and cut pass.
-  test.fixme("duplicates, deletes, cuts, undoes, and redoes selected layers from the keyboard", async ({
+  test("duplicates, deletes, cuts, undoes, and redoes selected layers from the keyboard", async ({
     app,
   }) => {
     const page = app.page;
     const id = await seedKeyboardDesign(app);
     const seeded = await app.savedNodes(id);
     await selectLayer(page, "Source Peer");
+    const originalPeerRowId =
+      await selectedLayerRowButtons(page).getAttribute("data-layer-node-id");
 
     await page.keyboard.press(`${PRIMARY}+d`);
     await app.settled();
@@ -429,6 +480,41 @@ test.describe("editor keyboard layer clipboard", () => {
     ]);
     expectOnlyChanged(seeded, duplicated, copy);
     await expect.poll(() => previewCount(app, "Source Peer")).toBe(2);
+    await expect(selectedLayerRowButtons(page)).toContainText("Source Peer");
+    const peerCopyRowId =
+      await selectedLayerRowButtons(page).getAttribute("data-layer-node-id");
+    expect(peerCopyRowId).not.toBe(originalPeerRowId);
+    await expect(selectedLayerRowButtons(page)).toHaveAttribute(
+      "data-layer-node-id",
+      peerCopyRowId!,
+    );
+
+    await page.keyboard.press(`${PRIMARY}+z`);
+    await app.settled();
+    const withoutCopy = await app.savedNodes(id);
+    expect(idsNamed(withoutCopy, "Source Peer")).toStrictEqual(["source-peer"]);
+    await expect.poll(() => previewCount(app, "Source Peer")).toBe(1);
+    await expect(selectedLayerRowButtons(page)).toHaveAttribute(
+      "data-layer-node-id",
+      originalPeerRowId!,
+    );
+
+    await page.keyboard.press(`${PRIMARY}+Shift+z`);
+    await app.settled();
+    const redone = await app.savedNodes(id);
+    const redoneCopy = idsNamed(redone, "Source Peer").find(
+      (nodeId) => nodeId !== "source-peer",
+    );
+    expect(redoneCopy).toBeDefined();
+    await expect.poll(() => previewCount(app, "Source Peer")).toBe(2);
+    await expect(selectedLayerRowButtons(page)).toContainText("Source Peer");
+    const redoneCopyRowId =
+      await selectedLayerRowButtons(page).getAttribute("data-layer-node-id");
+    expect(redoneCopyRowId).not.toBe(originalPeerRowId);
+    await expect(selectedLayerRowButtons(page)).toHaveAttribute(
+      "data-layer-node-id",
+      redoneCopyRowId!,
+    );
 
     await page.keyboard.press("Delete");
     await app.settled();
@@ -452,14 +538,14 @@ test.describe("editor keyboard layer clipboard", () => {
     await selectLayer(page, "Copy Card");
     await page.keyboard.press(`${PRIMARY}+x`);
     await app.settled();
-    const cut = await app.savedNodes(id);
+    const cut = savedNodeMap(await savedHtmlWithCardCount(app, id, 0));
     expect(idsNamed(cut, "Copy Card")).toStrictEqual([]);
     expect(childrenOf(cut, "source-root")).toStrictEqual(["source-peer"]);
 
     await selectScreen(page, "Target");
     await page.keyboard.press(`${PRIMARY}+v`);
     await app.settled();
-    const targetHtml = await app.savedHtml(id, "target.html");
+    const targetHtml = await savedHtmlWithCardCount(app, id, 1, "target.html");
     expectStyledCards(targetHtml, 1);
     const target = savedNodeMap(targetHtml);
     expect(childrenOf(target, "target-body")).toStrictEqual([
