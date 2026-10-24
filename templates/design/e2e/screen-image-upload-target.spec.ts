@@ -122,9 +122,7 @@ async function waitForGate(gate: Promise<void>, label: string) {
   }
 }
 
-// oracle: none — an upload race in app code with no native Figma counterpart; only the Choose image… button's name changed here.
-// fixme: product bug: The saved inline style is background-image:url(&quot;/api/qa-import-assets/...png&quot;) and the editor requests GET
-test.fixme("delayed Screen-root image upload stays with its original Screen", async ({
+test("delayed Screen-root image upload stays with its original Screen", async ({
   app,
   page,
 }) => {
@@ -140,6 +138,7 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
   );
   const uploadTimeline: Array<Record<string, unknown>> = [];
   const timelineStart = Date.now();
+  let observedRequestSequence = 0;
   page.on("request", (request) => {
     const url = request.url();
     if (!url.includes("/_agent-native/actions/")) return;
@@ -147,6 +146,7 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
     if (action === "get-design") {
       uploadTimeline.push({
         ms: Date.now() - timelineStart,
+        sequence: observedRequestSequence++,
         event: "browser-get-design-request",
       });
       return;
@@ -162,6 +162,7 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
     const content = typeof body.content === "string" ? body.content : "";
     uploadTimeline.push({
       ms: Date.now() - timelineStart,
+      sequence: observedRequestSequence++,
       event: "browser-update-file-request",
       fileId: body.id,
       expectedVersionHash: body.expectedVersionHash ?? null,
@@ -200,6 +201,7 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
       return;
     }
     if (!url.includes("/_agent-native/actions/get-design")) return;
+    const sequence = observedRequestSequence++;
     void response
       .json()
       .then((body: DesignRecord) => {
@@ -207,6 +209,7 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
         if (!file) return;
         uploadTimeline.push({
           ms: Date.now() - timelineStart,
+          sequence,
           event: "browser-get-design-response",
           screenAHasConcurrentMarker: file.content.includes(
             "Screen A source updated during upload",
@@ -218,12 +221,26 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
       .catch(() => {});
   });
   let releaseUpload!: () => void;
+  let releaseScreenACollabPoll!: () => void;
   let releaseBrowserDesignReads!: () => void;
   let markUploadStarted!: () => void;
   let markUploadCompleted!: () => void;
+  let markScreenACollabPollObserved!: () => void;
+  let markScreenACollabPollCompleted!: () => void;
+  let holdNextScreenACollabPoll = false;
+  let screenACollabPollHeld = false;
   let holdBrowserDesignReads = false;
   const uploadGate = new Promise<void>((resolve) => {
     releaseUpload = resolve;
+  });
+  const screenACollabPollReleaseGate = new Promise<void>((resolve) => {
+    releaseScreenACollabPoll = resolve;
+  });
+  const screenACollabPollObserved = new Promise<void>((resolve) => {
+    markScreenACollabPollObserved = resolve;
+  });
+  const screenACollabPollCompleted = new Promise<void>((resolve) => {
+    markScreenACollabPollCompleted = resolve;
   });
   const browserDesignReadGate = new Promise<void>((resolve) => {
     releaseBrowserDesignReads = resolve;
@@ -238,9 +255,51 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
   let uploadBody: string | undefined;
   let uploadRouteError: string | undefined;
   const uploadRoute = "**/_agent-native/actions/upload-image";
+  const pollRoute = "**/_agent-native/poll?*";
+  const eventsRoute = "**/_agent-native/events*";
   const designReadRoute = "**/_agent-native/actions/get-design*";
+  // The client also reads get-design inside batches; an unheld batch leaks the concurrent edit.
+  const batchedReadRoute = "**/_agent-native/actions/get-actions-batch*";
 
   try {
+    await page.route(eventsRoute, async (route) => {
+      await route.fulfill({ status: 204, body: "" });
+    });
+    await page.route(pollRoute, async (route) => {
+      const response = await route.fetch();
+      const body = await response.text();
+      const payload = JSON.parse(body) as {
+        events?: Array<{ source?: string; docId?: string }>;
+      };
+      const events = payload.events ?? [];
+      const hasScreenACollabEvent = events.some(
+        (event) => event.source === "collab" && event.docId === screenAId,
+      );
+      if (holdNextScreenACollabPoll && hasScreenACollabEvent) {
+        holdNextScreenACollabPoll = false;
+        screenACollabPollHeld = true;
+        markScreenACollabPollObserved();
+        uploadTimeline.push({
+          ms: Date.now() - timelineStart,
+          event: "screen-a-collab-poll-held",
+        });
+        try {
+          await waitForGate(
+            screenACollabPollReleaseGate,
+            "Screen A collaboration poll release",
+          );
+          await route.fulfill({ response, body });
+          uploadTimeline.push({
+            ms: Date.now() - timelineStart,
+            event: "screen-a-collab-poll-released",
+          });
+        } finally {
+          markScreenACollabPollCompleted();
+        }
+        return;
+      }
+      await route.fulfill({ response, body });
+    });
     await app.open(designId);
     await page.route(designReadRoute, async (route) => {
       if (!holdBrowserDesignReads) {
@@ -266,6 +325,18 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
       });
       await waitForGate(browserDesignReadGate, "browser get-design release");
       await route.fulfill({ response, body });
+    });
+    await page.route(batchedReadRoute, async (route) => {
+      const readsDesign = (route.request().postData() ?? "").includes(
+        '"action":"get-design"',
+      );
+      if (holdBrowserDesignReads && readsDesign) {
+        await waitForGate(
+          browserDesignReadGate,
+          "browser batched get-design release",
+        );
+      }
+      await route.continue();
     });
     const layers = page.getByRole("tree", { name: "Layers" });
     const screens = layers.locator('[role="treeitem"][aria-level="1"]');
@@ -356,6 +427,7 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
       .replace("background-color:#253b50", "background-color:#2e4a62");
     expect(screenAHtmlWithConcurrentEdit).not.toBe(screenAHtmlBeforeEdit);
     expect(screenAHtmlWithConcurrentEdit).toContain("#2e4a62");
+    holdNextScreenACollabPoll = true;
     holdBrowserDesignReads = true;
     const externalUpdateResult = await postAction(page, "update-file", {
       id: screenAId,
@@ -370,6 +442,8 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
     await expect
       .poll(() => readScreenHtml(page, designId, screenAId))
       .toContain("Screen A source updated during upload");
+    await waitForGate(screenACollabPollObserved, "Screen A collaboration poll");
+    expect(screenACollabPollHeld).toBe(true);
     expect(await readBodyFill(page, screenBHtmlBefore)).toMatchObject({
       backgroundColor: "rgb(128, 85, 0)",
       backgroundImage: "",
@@ -379,6 +453,7 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
     uploadTimeline.push({
       ms: Date.now() - timelineStart,
       event: "upload-response-released",
+      screenACollabPollHeld: screenACollabPollHeld,
       browserHadObservedConcurrentMarker: uploadTimeline.some(
         (event) =>
           event.event === "browser-get-design-response" &&
@@ -432,11 +507,25 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
         { exact: true },
       ),
     ).toBeVisible();
+    const staleUploadSave = uploadTimeline.find(
+      (event) =>
+        event.event === "browser-update-file-request" &&
+        event.fileId === screenAId &&
+        event.hasUploadUrl === true,
+    );
+    expect(staleUploadSave).toBeDefined();
+    expect(staleUploadSave?.hasConcurrentMarker).toBe(false);
+    expect(typeof staleUploadSave?.expectedVersionHash).toBe("string");
+    const staleUploadSaveSequence = staleUploadSave?.sequence;
+    expect(typeof staleUploadSaveSequence).toBe("number");
     expect(
       uploadTimeline.some(
         (event) =>
           event.event === "browser-get-design-response" &&
-          event.screenAHasConcurrentMarker === true,
+          event.screenAHasConcurrentMarker === true &&
+          typeof event.sequence === "number" &&
+          typeof staleUploadSaveSequence === "number" &&
+          event.sequence < staleUploadSaveSequence,
       ),
     ).toBe(false);
     expect(
@@ -450,6 +539,8 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
     ).toBe(true);
     releaseBrowserDesignReads();
     holdBrowserDesignReads = false;
+    releaseScreenACollabPoll();
+    await screenACollabPollCompleted;
     await expect
       .poll(() => designFrame(page, screenAId).locator("body").textContent())
       .toContain("Screen A source updated during upload");
@@ -578,19 +669,26 @@ test.fixme("delayed Screen-root image upload stays with its original Screen", as
     );
   } finally {
     releaseUpload?.();
+    releaseScreenACollabPoll?.();
     releaseBrowserDesignReads?.();
     await Promise.race([
       uploadCompleted,
       new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
     ]);
+    if (screenACollabPollHeld) {
+      await Promise.race([
+        screenACollabPollCompleted,
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+    }
     await page.unroute(uploadRoute).catch(() => {});
+    await page.unroute(pollRoute).catch(() => {});
+    await page.unroute(eventsRoute).catch(() => {});
     await page.unroute(designReadRoute).catch(() => {});
+    await page.unroute(batchedReadRoute).catch(() => {});
   }
 });
-
-// oracle: none — an upload race in app code with no native Figma counterpart; only the Choose image… button's name and how Interact is left and its frame swapped changed here.
-// fixme: product bug: After reload the client re-sends the rejected stale upload save (old #253b50 content + image URL) three times; the server answers 200
-test.fixme("active Screen upload conflict preserves SQL and live-collaboration source", async ({
+test("active Screen upload conflict preserves SQL and live-collaboration source", async ({
   app,
   page,
 }) => {
@@ -1074,9 +1172,7 @@ test.fixme("active Screen upload conflict preserves SQL and live-collaboration s
   }
 });
 
-// oracle: none — an upload race in app code with no native Figma counterpart; only the Choose image… button's name changed here.
-// fixme: fails in CI on current main: app reported console.error: Failed to load resource: the server responded with a status of 404 (Not Found)
-test.fixme("accepted Screen-root image upload persists and renders its source", async ({
+test("accepted Screen-root image upload persists and renders its source", async ({
   app,
   page,
 }) => {

@@ -12,7 +12,7 @@ import {
   AppSidebarFooter,
   AppSidebarHeader,
 } from "@agent-native/toolkit/app/shared";
-import { CLIPS_MEETINGS, CLIPS_WISPRFLOW } from "@shared/labs";
+import { CLIPS_MEETINGS, CLIPS_VOICE_DICTATION } from "@shared/labs";
 import {
   IconInbox,
   IconPhoto,
@@ -195,7 +195,7 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
   const t = useT();
   const isRecordingRoute = location.pathname.startsWith("/r/");
   const meetingsLabEnabled = useLab(CLIPS_MEETINGS);
-  const wisprFlowLabEnabled = useLab(CLIPS_WISPRFLOW);
+  const voiceDictationLabEnabled = useLab(CLIPS_VOICE_DICTATION);
   const recordingScope = useMemo(() => {
     const match = location.pathname.match(/^\/(?:r|share)\/([^/]+)/);
     const recordingId = match?.[1];
@@ -244,6 +244,8 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
     kind: "image",
   });
   const { data: sharedCount } = useRecordingsCount({ view: "shared" });
+  const { data: archiveCount } = useRecordingsCount({ view: "archive" });
+  const { data: trashCount } = useRecordingsCount({ view: "trash" });
   const suggestionCountArgs = useMemo(() => {
     if (recordingScope) return null;
     if (location.pathname === "/library") {
@@ -515,7 +517,7 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
           },
         ]
       : []),
-    ...(wisprFlowLabEnabled
+    ...(voiceDictationLabEnabled
       ? [
           {
             to: "/dictate",
@@ -530,6 +532,7 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
       label: t("navigation.archive"),
       icon: IconArchive,
       match: (p) => p.startsWith("/archive"),
+      count: archiveCount,
     },
     {
       to: "/trash",
@@ -538,6 +541,7 @@ export function LibraryLayout({ children }: LibraryLayoutProps) {
       match: (p) =>
         p.startsWith("/trash") ||
         (p.startsWith("/r/") && recordingSection === "trash"),
+      count: trashCount,
     },
   ];
 

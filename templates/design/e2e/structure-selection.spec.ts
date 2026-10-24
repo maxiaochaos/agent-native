@@ -632,8 +632,7 @@ test.describe("groups", () => {
       .screenshot({ path: testInfo.outputPath("group-inline-svg.png") });
   });
 
-  // fixme: product bug: Fill Text gains a wrapper child (textChildren 1) and keeps rgba(249,115,22,0.5) on its owner after the opacity returns to 100%.
-  test.fixme("Group Fill commits direct opacity changes from 50% back to 100%", async ({
+  test("Group Fill commits direct opacity changes from 50% back to 100%", async ({
     app,
     page,
   }) => {
@@ -1291,8 +1290,7 @@ test.describe("groups", () => {
     ).toBeVisible();
   });
 
-  // fixme: fails on current main after the merge: Error: expect(received).toMatchObject(expected)
-  test.fixme("Selection Colors keeps an opacity-zero preview attached until gesture release", async ({
+  test("Selection Colors keeps an opacity-zero preview attached until gesture release", async ({
     app,
     page,
   }) => {
@@ -1669,8 +1667,7 @@ test.describe("groups", () => {
       .toContain('data-agent-native-group="true"');
   });
 
-  // fixme: fails on current main after the merge: TimeoutError: locator.waitFor: Timeout 15000ms exceeded.
-  test.fixme("Group Fill recolors child fills and text, keeps strokes and gaps, and undoes once", async ({
+  test("Group Fill recolors child fills and text, keeps strokes and gaps, and undoes once", async ({
     app,
     page,
   }, testInfo) => {
@@ -1918,8 +1915,7 @@ test.describe("groups", () => {
     ).toEqual([]);
   });
 
-  // fixme: fails on current main after the merge: TimeoutError: locator.waitFor: Timeout 15000ms exceeded.
-  test.fixme("Group Fill stacks, hides, restores, removes, and replaces shared paints", async ({
+  test("Group Fill stacks, hides, restores, removes, and replaces shared paints", async ({
     app,
     page,
   }) => {
@@ -2088,8 +2084,7 @@ test.describe("groups", () => {
     expect(viteUpdates).toEqual([]);
   });
 
-  // fixme: product bug: After Cmd+Shift+G the selection shows a '120 × 80' badge (one item) instead of '270 × 80' for the two selected layers. Saved state is
-  test.fixme("Cmd+Shift+G ungroups: the children return to the page at their original positions and stay selected together", async ({
+  test("Cmd+Shift+G ungroups: the children return to the page at their original positions and stay selected together", async ({
     app,
   }) => {
     const id = await openSeeded(app);
@@ -2145,8 +2140,7 @@ test.describe("groups", () => {
     ).toHaveText("270 × 80");
   });
 
-  // fixme: fails on current main after the merge: Error: expect(locator).toBeVisible() failed
-  test.fixme("nudging a group moves the group, not each child, and both children follow", async ({
+  test("nudging a group moves the group, not each child, and both children follow", async ({
     app,
   }) => {
     const id = await openSeeded(app);

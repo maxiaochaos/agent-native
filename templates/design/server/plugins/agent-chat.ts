@@ -45,6 +45,7 @@ const EXTERNAL_CONNECTOR_TOOL_NAMES = [
   "list-files",
   "create-file",
   "update-file",
+  "delete-file",
   "rename-screen",
   "export-png",
 ];
@@ -239,7 +240,6 @@ async function hasDesignEdit(
     if (
       record?.type !== "tool_done" ||
       record.completedSideEffect !== true ||
-      record.isError === true ||
       typeof record.tool !== "string" ||
       !DESIGN_EDIT_TOOLS.has(record.tool)
     ) {

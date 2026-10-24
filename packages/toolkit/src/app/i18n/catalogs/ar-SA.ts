@@ -171,6 +171,16 @@ const messages: ToolkitAgentChatTranslation = {
   "onboarding.builderPrivacy": "سياسة الخصوصية",
   "onboarding.builderConsentAnd": "و",
   "onboarding.builderExistingAccount": "لديّ حساب Builder.io",
+  "onboarding.creditsTitle": "جرّبه مع 60 من أرصدة Agent المجانية شهريًا",
+  "onboarding.creditsTitleClips":
+    "جرّبه مع تخزين فيديو مجاني و60 من أرصدة Agent شهريًا",
+  "onboarding.creditsActivate": "تفعيل الأرصدة المجانية",
+  "onboarding.creditsFinePrint":
+    "سيؤدي هذا إلى إنشاء حساب Builder.io مجاني. بالمتابعة، فأنت توافق على",
+  "onboarding.creditsConnectExisting": "الاتصال بحساب Builder.io موجود",
+  "onboarding.creditsMoreInfo": "المزيد من المعلومات",
+  "onboarding.creditsSkipBody":
+    "إذا تخطيت، ستحتاج إلى توصيل مفاتيحك الخاصة لاستخدام الذكاء الاصطناعي والتخزين.",
   "onboarding.builderConnect": "الاتصال بـ Builder.io",
   "onboarding.builderActivating": "جارٍ تفعيل أرصدة Builder.io المجانية",
   "onboarding.builderConnecting": "جارٍ إعداد أرصدة Builder.io المجانية",
@@ -206,6 +216,10 @@ const messages: ToolkitAgentChatTranslation = {
   "onboarding.capability.embeddings.keySummary": "التضمينات",
   "onboarding.capability.embeddings.why":
     "تُحسّن التضمينات البحث الدلالي. يظل البحث بالكلمات المفتاحية يعمل من دونها.",
+  "onboarding.capability.webSearch.label": "البحث على الويب",
+  "onboarding.capability.webSearch.keySummary": "بحث على الويب مُدار من Builder",
+  "onboarding.capability.webSearch.why":
+    "ابحث في المصادر العامة الحديثة على الويب. يستخدم البحث المُدار من Builder أرصدة Builder AI المضمنة، لذلك لا تحتاج إلى مفتاح بحث منفصل.",
   "onboarding.capability.systemOne.why":
     "Jev نموذج قرار اختياري يساعد في اختيار الأدوات والمهارات المناسبة قبل أول طلب للنموذج من الوكيل.",
   "onboarding.capability.assetsImageGeneration.label": "إنشاء الصور",
@@ -671,6 +685,10 @@ const messages: ToolkitAgentChatTranslation = {
     "رفض مزوّد النموذج هذا الطلب لأنه غير صالح، لذلك لم تُعد المحاولة. أعد المحاولة، أو ابدأ محادثة جديدة إذا استمر الأمر.",
   "errorMessages.requestTooLarge":
     "تجاوز هذا الطلب حد الحجم على الخادم (HTTP 413). ابدأ دردشة جديدة أو أزل المرفقات أو المراجع الكبيرة، ثم حاول مرة أخرى.",
+  "errorMessages.capabilityUnavailable":
+    "تعذّر إرسال رسالتك الآن. يُرجى المحاولة مرة أخرى بعد قليل.",
+  "errorMessages.capabilityUnsupported":
+    "لا يمكن لهذا التطبيق إعادة محاولة المطالبة المحفوظة بأمان بعد. حدّث التطبيق ثم حاول مرة أخرى.",
   "errorMessages.runInterrupted": "توقف الوكيل قبل أن يُكمل.",
   "errorMessages.runFailed": "فشل تشغيل الوكيل.",
   "errorMessages.runUnverified":
@@ -2769,6 +2787,7 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsShell.search.appDefaultModel": "النموذج الافتراضي للتطبيق",
   "settingsShell.search.backgroundAgents": "الوكلاء في الخلفية",
   "settingsShell.search.browserAutomation": "أتمتة المتصفح",
+  "settingsShell.search.webSearch": "البحث على الويب",
   "settingsShell.search.connectedAgents": "الوكلاء المتصلون",
   "settingsShell.search.database": "قاعدة البيانات",
   "settingsShell.search.defaultModel": "النموذج الافتراضي",
@@ -2897,6 +2916,7 @@ const messages: ToolkitAgentChatTranslation = {
     "يُبقي الشرائح والتصاميم المُنشأة متوافقة مع علامتك التجارية.",
   "settingsInfra.whyBackground": "يُجري تغييرات في الكود من بيئة الإنتاج.",
   "settingsInfra.whyBrowser": "يتيح للوكيل استخدام متصفح في بيئة الإنتاج.",
+  "settingsInfra.whyWebSearch": "يعثر على معلومات عامة حديثة ووثائق رسمية.",
   "settingsInfra.provider": "المزوّد",
   "settingsInfra.keyOrg": "يستخدم مفتاح {{provider}} الخاص بالمؤسسة.",
   "settingsInfra.manageKey": "إدارة المفتاح",
@@ -3239,6 +3259,26 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsSubAgents.close": "إغلاق",
   "observability.insights.rawTrace":
     "التتبع الخام (كل الخطوات مع المدخلات والمخرجات)",
+  "reportProblem.menuItem": "الإبلاغ عن مشكلة",
+  "reportProblem.title_zero":
+    "هل تريد إرفاق ما فعله التطبيق خلال آخر {{count}} ثانية؟",
+  "reportProblem.title_one":
+    "هل تريد إرفاق ما فعله التطبيق خلال آخر {{count}} ثانية؟",
+  "reportProblem.title_two":
+    "هل تريد إرفاق ما فعله التطبيق خلال آخر {{count}} ثانيتين؟",
+  "reportProblem.title_few":
+    "هل تريد إرفاق ما فعله التطبيق خلال آخر {{count}} ثوانٍ؟",
+  "reportProblem.title_many":
+    "هل تريد إرفاق ما فعله التطبيق خلال آخر {{count}} ثانيةً؟",
+  "reportProblem.title_other":
+    "هل تريد إرفاق ما فعله التطبيق خلال آخر {{count}} ثانية؟",
+  "reportProblem.noEvents": "لم يُسجَّل شيء بعد.",
+  "reportProblem.send": "إرسال إلى الوكيل",
+  "reportProblem.copy": "نسخ تقرير المشكلة",
+  "reportProblem.attaching": "جارٍ الإرفاق…",
+  "reportProblem.notAttached": "لم يتم إرفاق التقرير.",
+  "reportProblem.agentMessage":
+    "حدث خطأ ما في التطبيق. استخدم تقرير المشكلة المرفق لشرح ما حدث.",
 };
 
 export default messages;

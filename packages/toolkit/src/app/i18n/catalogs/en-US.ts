@@ -174,6 +174,16 @@ const messages = {
   "onboarding.builderPrivacy": "Privacy Policy",
   "onboarding.builderConsentAnd": "and",
   "onboarding.builderExistingAccount": "I have a Builder.io account",
+  "onboarding.creditsTitle": "Try it with 60 free Agent Credits a month",
+  "onboarding.creditsTitleClips":
+    "Try it with free video storage and 60 Agent Credits a month",
+  "onboarding.creditsActivate": "Activate free credits",
+  "onboarding.creditsFinePrint":
+    "This will create a free Builder.io account. By continuing, you agree to our",
+  "onboarding.creditsConnectExisting": "Connect an existing Builder.io account",
+  "onboarding.creditsMoreInfo": "More info",
+  "onboarding.creditsSkipBody":
+    "If you skip, you'll need to connect your own keys to use AI and storage.",
   "onboarding.builderActivating": "Activating Builder.io free credits",
   "onboarding.builderConnecting": "Setting up Builder.io credits",
   "onboarding.builderProvisioningDescription":
@@ -208,6 +218,10 @@ const messages = {
   "onboarding.capability.embeddings.keySummary": "Embeddings",
   "onboarding.capability.embeddings.why":
     "Embeddings improve semantic search. Keyword search still works without them.",
+  "onboarding.capability.webSearch.label": "Web search",
+  "onboarding.capability.webSearch.keySummary": "Builder-managed web search",
+  "onboarding.capability.webSearch.why":
+    "Search current public web sources. Builder-managed search uses included Builder AI credits, so no separate search API key is needed.",
   "onboarding.capability.systemOne.why":
     "Jev is an optional decision model that helps choose relevant tools and skills before the agent's first model request.",
   "onboarding.capability.assetsImageGeneration.label": "Image generation",
@@ -674,6 +688,10 @@ const messages = {
     "The model provider rejected this request as malformed, so it was not retried. Retry, or start a new chat if it keeps happening.",
   "errorMessages.requestTooLarge":
     "This request exceeded the server's size limit (HTTP 413). Start a new chat or remove large attachments or references, then retry.",
+  "errorMessages.capabilityUnavailable":
+    "We couldn't send your message right now. Please try again shortly.",
+  "errorMessages.capabilityUnsupported":
+    "This app can't safely retry your saved prompt yet. Update the app, then try again.",
   "errorMessages.runInterrupted": "The agent stopped before finishing.",
   "errorMessages.runFailed": "The agent run failed.",
   "errorMessages.runUnverified":
@@ -2647,6 +2665,7 @@ const messages = {
   "settingsShell.search.appDefaultModel": "App default model",
   "settingsShell.search.backgroundAgents": "Background agents",
   "settingsShell.search.browserAutomation": "Browser automation",
+  "settingsShell.search.webSearch": "Web search",
   "settingsShell.search.connectedAgents": "Connected agents",
   "settingsShell.search.database": "Database",
   "settingsShell.search.defaultModel": "Default model",
@@ -2780,6 +2799,8 @@ const messages = {
     "Keeps generated slides and designs on brand.",
   "settingsInfra.whyBackground": "Makes code changes from production.",
   "settingsInfra.whyBrowser": "Lets the agent use a browser in production.",
+  "settingsInfra.whyWebSearch":
+    "Finds current public information and official documentation.",
   "settingsInfra.provider": "Provider",
   "settingsInfra.keyOrg": "Uses the organization {{provider}} key.",
   "settingsInfra.manageKey": "Manage key",
@@ -3109,6 +3130,18 @@ const messages = {
   "settingsSubAgents.close": "Close",
   "observability.insights.rawTrace":
     "Raw trace (every span, with inputs and outputs)",
+  "reportProblem.menuItem": "Report a problem",
+  "reportProblem.title_one":
+    "Attach what the app did in the last {{count}} second?",
+  "reportProblem.title_other":
+    "Attach what the app did in the last {{count}} seconds?",
+  "reportProblem.noEvents": "Nothing recorded yet.",
+  "reportProblem.send": "Send to agent",
+  "reportProblem.copy": "Copy problem report",
+  "reportProblem.attaching": "Attaching…",
+  "reportProblem.notAttached": "The report was not attached.",
+  "reportProblem.agentMessage":
+    "Something went wrong in the app. Use the attached problem report to explain what happened.",
 } as const;
 
 export default messages;

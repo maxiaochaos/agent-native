@@ -701,7 +701,7 @@ const FEEDBACK_EYES_REGEX_CASES = [
 ];
 
 const FEEDBACK_STATUS_REACTIONS_RE =
-  /(?=.*(?:\beyes?\b|👀))(?=.*(?:checkmark|check mark|✅))(?=.*(?:ticket(?: emoji)?|🎫))(?=.*(?:not fixed|don['’]?t fix|didn['’]?t fix|we didn['’]?t|unfixed|not addressed|opposite of (?:a )?checkmark))/is;
+  /(?=.*(?:\beyes?\b|\beyeballs?\b|👀))(?=.*(?:checkmark|check mark|checks? off|check off|✅))(?=.*(?:ticket(?: emoji)?|🎫|repl(?:y|ies)))((?=.*(?:not fixed|don['’]?t fix|didn['’]?t fix|we didn['’]?t|unfixed|not addressed|opposite of (?:a )?checkmark))|(?=.*(?:\bno\b|\bnot\b|\bmissing\b|\bwhy\b)))/is;
 const FEEDBACK_STATUS_REACTIONS_REGEX_CASES = [
   [true, "Keep 👀; use ✅ when fixed and 🎫 when not fixed."],
   [
@@ -711,6 +711,10 @@ const FEEDBACK_STATUS_REACTIONS_REGEX_CASES = [
   [
     true,
     "Keep 👀. Some things we fixed and some things we didn't; add ✅ and 🎫.",
+  ],
+  [
+    true,
+    "I see a lot of eyeballs but not a lot of checkmarks; why no checks, replies, or ticket emojis?",
   ],
   [false, "Keep 👀 and ✅ on fixed reports; ask about anything unfixed."],
   [false, "A ticket emoji is already on the issue."],
@@ -3233,6 +3237,28 @@ const FEEDBACK_OPEN_WITHOUT_QUESTION_REGEX_CASES = [
   [false, "I asked which Figma file link to use."],
 ];
 
+const FEEDBACK_CHANNEL_COVERAGE_RE =
+  /\b(?:also|add|include|check|scan|review)\b[^.!?\n]{0,120}\b(?:the\s+)?#?[\w-]*feedback(?:[-\s]+channel)?\b|\b(?:missed|skipped|ignored|excluded)\b[^.!?\n]{0,100}\b#?[\w-]*feedback\b|\b(?:missed|skipped|ignored|excluded)\b[^.!?\n]{0,140}\b(?:reports?|parent(?:\s+messages?)?|messages?)\b[^.!?\n]{0,100}\b(?:in|from|within)\s+(?:the\s+)?#?[\w-]+/i;
+const FEEDBACK_CHANNEL_COVERAGE_REGEX_CASES = [
+  [true, "you missed TONS of reports in #qa-agent-native"],
+  [
+    true,
+    "The scan skipped parent messages within #product-agent-native-feedback.",
+  ],
+  [true, "Please also include #dev-agent-native-feedback."],
+  [false, "The report artifact lists seven failed CI shards."],
+  [false, "All channel pages were exhausted and every parent was inventoried."],
+];
+const FEEDBACK_ATTACHMENT_COVERAGE_RE =
+  /\b(?:missed|skipped|ignored|overlooked|dropped|didn['’]?t\s+read|did\s+not\s+read)\b[^.!?\n]{0,100}\b(?:attachments?|screenshots?|images?|files?)\b|\b(?:attachment|file)[- ]only\s+(?:reply|message)\b[^.!?\n]{0,100}\b(?:treated|recorded|coerced|counted|handled|seen)\b[^.!?\n]{0,60}\b(?:empty|missing|absent|no|nothing)\b/i;
+const FEEDBACK_ATTACHMENT_COVERAGE_REGEX_CASES = [
+  [true, "The checker ignored the attachment-only reply and called it empty."],
+  [true, "You missed the screenshots in the thread."],
+  [true, "The file-only message was treated as missing evidence."],
+  [false, "I attached a screenshot to the report."],
+  [false, "Please inspect the image before reproducing the bug."],
+];
+
 if (process.argv.includes("--self-test")) {
   const failures = FEEDBACK_REGEX_CASES.filter(
     ([expected, message]) =>
@@ -3253,6 +3279,18 @@ if (process.argv.includes("--self-test")) {
     ...FEEDBACK_OPEN_WITHOUT_QUESTION_REGEX_CASES.filter(
       ([expected, message]) =>
         FEEDBACK_OPEN_WITHOUT_QUESTION_RE.test(message) !== expected,
+    ),
+  );
+  failures.push(
+    ...FEEDBACK_CHANNEL_COVERAGE_REGEX_CASES.filter(
+      ([expected, message]) =>
+        FEEDBACK_CHANNEL_COVERAGE_RE.test(message) !== expected,
+    ),
+  );
+  failures.push(
+    ...FEEDBACK_ATTACHMENT_COVERAGE_REGEX_CASES.filter(
+      ([expected, message]) =>
+        FEEDBACK_ATTACHMENT_COVERAGE_RE.test(message) !== expected,
     ),
   );
   const stressMessage = "reply and but ".repeat(7_000);
@@ -3544,7 +3582,7 @@ if (process.argv.includes("--self-test")) {
     process.exitCode = 1;
   } else {
     console.log(
-      `Friction regex self-test passed (${FEEDBACK_REGEX_CASES.length + RESOURCE_CLEANUP_REGEX_CASES.length + AUTH_PAGE_BACKGROUND_REGRESSION_CASES.length + SHIPPING_CHURN_REGEX_CASES.length + UNAUTHORIZED_PR_PUSH_REGEX_CASES.length + OWN_PR_COMMENT_AUTHORIZATION_REGEX_CASES.length + BETA_PUBLISHER_RUN_INTERFERENCE_REGEX_CASES.length + BETA_OVERVERIFICATION_REGEX_CASES.length + BABYSIT_LEASE_BLOCKS_WORK_REGEX_CASES.length + STALE_PR_WATCHER_REGEX_CASES.length + SHIP_STOPPED_BEFORE_MERGE_REGEX_CASES.length + CREDENTIAL_REGEX_CASES.length + DESIGN_FEEDBACK_REGEX_CASES.length + FEEDBACK_EYES_REGEX_CASES.length + FEEDBACK_STATUS_REACTIONS_REGEX_CASES.length + POST_MERGE_FEEDBACK_FOLLOWUP_REGEX_CASES.length + PR_REVIEW_HANDOFF_REGEX_CASES.length + WORKTREE_BRANCH_PERMISSION_REGEX_CASES.length + BRANCH_WORKTREE_ASK_REGEX_CASES.length + BRANCH_CLASSIFICATION_REGEX_CASES.length + SLOW_EDITOR_RUNTIME_REGEX_CASES.length + FEEDBACK_RELEASE_COVERAGE_REGEX_CASES.length + FEEDBACK_NO_LOCAL_REPRO_REGEX_CASES.length + E2E_ISSUE_FANOUT_REGEX_CASES.length + E2E_ISSUE_FANOUT_NORMALIZATION_CASES.length + LEGACY_LINE_NORMALIZATION_CASES.length + FEEDBACK_REPLY_DETAIL_REGEX_CASES.length + FEEDBACK_OPEN_WITHOUT_QUESTION_REGEX_CASES.length + 1} cases).`,
+      `Friction regex self-test passed (${FEEDBACK_REGEX_CASES.length + RESOURCE_CLEANUP_REGEX_CASES.length + AUTH_PAGE_BACKGROUND_REGRESSION_CASES.length + SHIPPING_CHURN_REGEX_CASES.length + UNAUTHORIZED_PR_PUSH_REGEX_CASES.length + OWN_PR_COMMENT_AUTHORIZATION_REGEX_CASES.length + BETA_PUBLISHER_RUN_INTERFERENCE_REGEX_CASES.length + BETA_OVERVERIFICATION_REGEX_CASES.length + BABYSIT_LEASE_BLOCKS_WORK_REGEX_CASES.length + STALE_PR_WATCHER_REGEX_CASES.length + SHIP_STOPPED_BEFORE_MERGE_REGEX_CASES.length + CREDENTIAL_REGEX_CASES.length + DESIGN_FEEDBACK_REGEX_CASES.length + FEEDBACK_EYES_REGEX_CASES.length + FEEDBACK_STATUS_REACTIONS_REGEX_CASES.length + POST_MERGE_FEEDBACK_FOLLOWUP_REGEX_CASES.length + PR_REVIEW_HANDOFF_REGEX_CASES.length + WORKTREE_BRANCH_PERMISSION_REGEX_CASES.length + BRANCH_WORKTREE_ASK_REGEX_CASES.length + BRANCH_CLASSIFICATION_REGEX_CASES.length + SLOW_EDITOR_RUNTIME_REGEX_CASES.length + FEEDBACK_RELEASE_COVERAGE_REGEX_CASES.length + FEEDBACK_NO_LOCAL_REPRO_REGEX_CASES.length + E2E_ISSUE_FANOUT_REGEX_CASES.length + E2E_ISSUE_FANOUT_NORMALIZATION_CASES.length + LEGACY_LINE_NORMALIZATION_CASES.length + FEEDBACK_REPLY_DETAIL_REGEX_CASES.length + FEEDBACK_OPEN_WITHOUT_QUESTION_REGEX_CASES.length + FEEDBACK_CHANNEL_COVERAGE_REGEX_CASES.length + 1} cases).`,
     );
   }
   process.exit(failures.length > 0 ? 1 : 0);
@@ -3647,6 +3685,14 @@ const PATTERNS = [
     fixedBy:
       "guard:ssr-cache-artifact + performance skill cache artifact contract (2026-08-20)",
     re: /\b(?:cache|caching|cache-control|stale-while-revalidate|SWR|CDN)\b[^.!?]{0,140}\b(?:wrong|broken|slow|again|regression|revert|reverted|no-cache|no-store|max-age=0|must-revalidate|fire|every few weeks)\b/i,
+  },
+  {
+    key: "request-path-schema",
+    label:
+      "Reported schema work on the request path, a missing framework table, or migration drift",
+    fixedBy:
+      "defineStore registry + store-migrations.lock.json in guard:release-schema-complete + framework-stores skill (2026-10-15)",
+    re: /\b(?:migrations?|ensure\w*Table|schema|ddl|CREATE TABLE)\b[^.!?]{0,80}\b(?:every (?:cold start|request|boot)|on cold start|hundreds of|not migrated|SchemaNotMigrated|relation [^ ]+ does not exist|missing (?:table|column)|drift(?:ed)?)\b|\b(?:hundreds of|every cold start|each cold start)\b[^.!?]{0,40}\b(?:migrations?|schema checks?|ddl)\b/i,
   },
   {
     key: "slow-list-query",
@@ -3810,14 +3856,15 @@ const PATTERNS = [
     key: "feedback-eyes-missed",
     label: "Had to demand correct 👀 ownership and release",
     fixedBy:
-      ".agents/skills/review-latest-feedback + address-feedback-with-replies (active ownership lifecycle, 2026-09-23)",
+      ".agents/skills/review-latest-feedback + feedback:inventory-check exact-root and owned-mark reconciliation (2026-10-16)",
     re: FEEDBACK_EYES_RE,
   },
   {
     key: "feedback-status-reactions",
     label:
       "Had to ask for checkmark/ticket reactions matching feedback outcomes",
-    fixedBy: ".agents/skills/review-latest-feedback (2026-09-30)",
+    fixedBy:
+      ".agents/skills/review-latest-feedback + feedback:inventory-check per-scope ✅, owned-mark, completed-handoff, and exact status checks (2026-10-16)",
     re: FEEDBACK_STATUS_REACTIONS_RE,
   },
   {
@@ -3850,10 +3897,17 @@ const PATTERNS = [
   },
   {
     key: "feedback-channel-coverage",
-    label: "Had to ask for another feedback channel to be scanned",
+    label: "Had to ask for feedback-channel or parent-report coverage",
     fixedBy:
-      ".agents/skills/review-latest-feedback (default channel coverage, 2026-10-05)",
-    re: /\b(?:also|add|include|check|scan|review)\b[^.!?\n]{0,120}\b(?:the\s+)?#?[\w-]*feedback(?:[-\s]+channel)?\b|\b(?:missed|skipped|ignored|excluded)\b[^.!?\n]{0,100}\b#?[\w-]*feedback\b/i,
+      "feedback:inventory-check required independent source-receipt parity + review-latest-feedback channel-inventory procedure (2026-10-17)",
+    re: FEEDBACK_CHANNEL_COVERAGE_RE,
+  },
+  {
+    key: "feedback-attachment-coverage",
+    label: "Had to ask the feedback sweep to preserve attachment-only evidence",
+    fixedBy:
+      "feedback:inventory-check thread attachment metadata + review-latest-feedback attachment inspection guidance (2026-10-16)",
+    re: FEEDBACK_ATTACHMENT_COVERAGE_RE,
   },
   {
     key: "feedback-release-coverage",
