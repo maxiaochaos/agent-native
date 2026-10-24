@@ -79,7 +79,11 @@ export class App {
         });
     });
     page.on("console", (message) => {
-      if (this.recording && message.type() === "error") {
+      if (
+        this.recording &&
+        message.type() === "error" &&
+        !isSandboxedFrameAutomationNoise(message.text())
+      ) {
         this.failures.push({ kind: "console.error", detail: message.text() });
       }
     });
@@ -102,23 +106,33 @@ export class App {
       this.inflightSaves = 0;
       this.lastSaveActivity = Date.now();
     });
-    page.on("response", (response) => {
+    page.on("response", async (response) => {
       const url = new URL(response.url());
       if (
         this.recording &&
         url.pathname.includes("/_agent-native/") &&
         response.status() >= 400
       ) {
+        const motionTimeline422 =
+          response.status() === 422 &&
+          url.pathname.endsWith("/_agent-native/actions/get-motion-timeline");
         this.failures.push({
           kind: `http ${response.status()}`,
-          detail: `${response.request().method()} ${url.pathname}`,
+          detail: `${response.request().method()} ${url.pathname}${
+            motionTimeline422 ? ` ${await response.text()}` : ""
+          }`,
         });
       }
     });
     await page.addInitScript(() => {
       const seen: string[] = [];
-      (window as unknown as { __e2eErrorToasts: string[] }).__e2eErrorToasts =
-        seen;
+      const scriptedSandboxes: string[] = [];
+      const recorder = window as unknown as {
+        __e2eErrorToasts: string[];
+        __e2eScriptedSandboxes: string[];
+      };
+      recorder.__e2eErrorToasts = seen;
+      recorder.__e2eScriptedSandboxes = scriptedSandboxes;
       new MutationObserver(() => {
         for (const toast of document.querySelectorAll(
           '[data-sonner-toast][data-type="error"]',
@@ -126,7 +140,24 @@ export class App {
           const text = (toast.textContent ?? "").trim();
           if (text && !seen.includes(text)) seen.push(text);
         }
-      }).observe(document, { childList: true, subtree: true });
+        for (const frame of document.querySelectorAll<HTMLIFrameElement>(
+          "iframe[sandbox][srcdoc]",
+        )) {
+          const label = frame.srcdoc.slice(0, 160);
+          if (
+            !frame.sandbox.contains("allow-scripts") &&
+            /<script\b/i.test(frame.srcdoc) &&
+            !scriptedSandboxes.includes(label)
+          ) {
+            scriptedSandboxes.push(label);
+          }
+        }
+      }).observe(document, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["sandbox", "srcdoc"],
+      });
     });
   }
 
@@ -183,13 +214,15 @@ export class App {
     const before = JSON.stringify(await frame.boundingBox());
     await this.page.keyboard.press("Shift+1");
     let previous = "";
+    let unchangedPolls = 0;
     await expect
       .poll(
         async () => {
           const now = JSON.stringify(await frame.boundingBox());
-          const stable = now === previous && now !== before;
+          unchangedPolls = now === previous ? unchangedPolls + 1 : 0;
           previous = now;
-          return stable;
+          // A reload restores the fitted camera, so Shift+1 may move nothing at all.
+          return unchangedPolls >= (now === before ? 10 : 1);
         },
         {
           intervals: [100],
@@ -207,8 +240,9 @@ export class App {
   }
 
   /**
-   * Waits until no save is in flight and none has been sent for longer than the client's save debounce,
-   * measured from this call: the save for the gesture just made may not have been sent yet.
+   * Waits until no save is in flight, none has been sent for longer than the client's save debounce
+   * (measured from this call: the save for the gesture just made may not have been sent yet), and the
+   * app's recorder lists no action or state write still pending.
    */
   async settled(timeout = 20_000) {
     const since = Date.now();
@@ -217,10 +251,23 @@ export class App {
         () =>
           this.inflightSaves === 0 &&
           Date.now() - Math.max(this.lastSaveActivity, since) >
-            SAVE_DEBOUNCE_QUIET_MS,
-        { timeout, message: "a save never settled" },
+            SAVE_DEBOUNCE_QUIET_MS
+            ? this.recorderPending()
+            : ["save"],
+        { timeout, message: "a save or other app work never settled" },
       )
-      .toBe(true);
+      .toEqual([]);
+  }
+
+  private recorderPending() {
+    return this.page
+      .evaluate(() =>
+        // about:blank and host pages have no recorder, so nothing is recorded as pending there.
+        (
+          window.__agentNativeRecorder?.report({ seconds: 0 }).pending ?? []
+        ).map((work) => `${work.type} ${work.name}`),
+      )
+      .catch((error: Error) => [`recorder unreadable: ${error.message}`]);
   }
 
   /** The design as the server stores it: its files and its `data` (canvas frames, board objects, metadata). */
@@ -308,19 +355,31 @@ export class App {
           detail: "a save was still in flight at teardown",
         });
       });
-      toasts = await this.page
-        .evaluate(
-          () =>
-            (window as unknown as { __e2eErrorToasts?: string[] })
-              .__e2eErrorToasts ?? [],
-        )
+      const recorded = await this.page
+        .evaluate(() => {
+          const recorder = window as unknown as {
+            __e2eErrorToasts?: string[];
+            __e2eScriptedSandboxes?: string[];
+          };
+          return {
+            toasts: recorder.__e2eErrorToasts ?? [],
+            scriptedSandboxes: recorder.__e2eScriptedSandboxes ?? [],
+          };
+        })
         .catch((error: Error) => {
           this.failures.push({
             kind: "error toasts unreadable",
             detail: error.message,
           });
-          return [];
+          return { toasts: [], scriptedSandboxes: [] };
         });
+      toasts = recorded.toasts;
+      for (const srcdoc of recorded.scriptedSandboxes) {
+        this.failures.push({
+          kind: "script in a sandboxed srcdoc frame without allow-scripts",
+          detail: srcdoc,
+        });
+      }
       // coercion-ok: the final-state screenshot is evidence only; no test passes or fails on it
       const finalState = await this.page.screenshot().catch(() => null);
       if (finalState)
@@ -329,19 +388,17 @@ export class App {
           contentType: "image/png",
         });
       this.recording = false;
+      if (
+        testInfo.status !== testInfo.expectedStatus ||
+        this.unexpectedFailures(toasts).length > 0
+      ) {
+        await this.attachRecorderReport(testInfo);
+      }
       await this.page.goto("about:blank").catch(() => {});
     }
     for (const id of this.designs)
       await this.action("delete-design", { id }).catch(() => {});
-    const unexpected = [
-      ...this.failures,
-      ...toasts.map((detail) => ({ kind: "error toast", detail })),
-    ].filter(
-      (failure) =>
-        !this.allowed.some(({ pattern }) =>
-          pattern.test(`${failure.kind} ${failure.detail}`),
-        ),
-    );
+    const unexpected = this.unexpectedFailures(toasts);
     if (unexpected.length && testInfo.status === testInfo.expectedStatus) {
       throw new Error(
         `The app reported failures during this test:\n${unexpected
@@ -351,6 +408,30 @@ export class App {
           .join("\n")}`,
       );
     }
+  }
+
+  private unexpectedFailures(toasts: string[]) {
+    return [
+      ...this.failures,
+      ...toasts.map((detail) => ({ kind: "error toast", detail })),
+    ].filter(
+      (failure) =>
+        !this.allowed.some(({ pattern }) =>
+          pattern.test(`${failure.kind} ${failure.detail}`),
+        ),
+    );
+  }
+
+  private async attachRecorderReport(testInfo: TestInfo) {
+    const report = await this.page
+      .evaluate(readRecorderReport)
+      // coercion-ok: the report is evidence only; no test passes or fails on it
+      .catch(() => null);
+    if (report)
+      await testInfo.attach("recorder.json", {
+        body: JSON.stringify(report, null, 2),
+        contentType: "application/json",
+      });
   }
 
   private async action(name: string, body: unknown) {
@@ -364,6 +445,10 @@ export class App {
       throw new Error(`${name} ${response.status()}: ${await response.text()}`);
     return response.json();
   }
+}
+
+function readRecorderReport() {
+  return window.__agentNativeRecorder?.report({ reason: "test" }) ?? null;
 }
 
 /** Saved nodes keyed by node id, with parent, sibling index, attributes and own text. */
@@ -423,6 +508,18 @@ export function expectOnlyChanged(
   expect(drift, "nodes other than the edited ones changed").toEqual([]);
 }
 
+/**
+ * Chromium logs this under Playwright for a sandboxed srcdoc frame that holds no
+ * script at all; the board static preview and export snapshot frames are such frames.
+ * Teardown fails a test separately when such a frame does carry a script.
+ */
+export function isSandboxedFrameAutomationNoise(text: string) {
+  return (
+    text ===
+    "Blocked script execution in 'about:srcdoc' because the document's frame is sandboxed and the 'allow-scripts' permission is not set."
+  );
+}
+
 export function childrenOf(nodes: Map<string, SavedNode>, parent: string) {
   return [...nodes.values()]
     .filter((node) => node.parent === parent)
@@ -437,6 +534,25 @@ export function styleOf(node: SavedNode | undefined) {
     if (property?.trim()) style[property.trim()] = value.join(":").trim();
   }
   return style;
+}
+
+export async function normalizeStyleAttribute(
+  page: Page,
+  style: string | undefined,
+) {
+  if (style === undefined) return null;
+  return page.evaluate((value) => {
+    const element = document.createElement("div");
+    element.setAttribute("style", value);
+    return Object.fromEntries(
+      Array.from(element.style)
+        .sort()
+        .map((property) => [
+          property,
+          element.style.getPropertyValue(property),
+        ]),
+    );
+  }, style);
 }
 
 export const test = base.extend<{ app: App }>({

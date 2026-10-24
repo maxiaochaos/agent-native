@@ -70,12 +70,14 @@ import {
 } from "../server/lib/screenshot-edits.js";
 import { isSeekableRepairPending } from "../server/lib/seekable-media-state.js";
 import { hydrateCommentAuthorNames } from "../server/lib/user-identities.js";
+import { parseAppActivitySummary } from "../shared/app-activity.js";
 import { parseBrowserDiagnosticsRow } from "../shared/browser-diagnostics.js";
 import {
   CLIPS_BUILDER_CREDITS_STATE_KEY,
   normalizeBuilderCreditsStatus,
 } from "../shared/builder-credits.js";
 import { displayCommentMentions } from "../shared/comment-mentions.js";
+import { parseStoredChapters } from "../shared/stored-chapters.js";
 import {
   normalizeTranscriptSegments,
   parseTranscriptSegments,
@@ -295,16 +297,7 @@ export default defineAction({
       );
     }
 
-    let chapters: { startMs: number; title: string }[] = [];
-    try {
-      const parsed = JSON.parse(rec.chaptersJson ?? "[]");
-      if (Array.isArray(parsed)) {
-        chapters = parsed.filter(
-          (c: any) =>
-            typeof c?.startMs === "number" && typeof c?.title === "string",
-        );
-      }
-    } catch {}
+    const chapters = parseStoredChapters(rec.chaptersJson);
 
     const transcriptSegments = normalizeTranscriptSegments({
       segments: parseTranscriptSegments(transcript?.segmentsJson),
@@ -416,6 +409,7 @@ export default defineAction({
         seekableRepairPending,
         uploadProgress: rec.uploadProgress,
         failureReason: rec.failureReason,
+        failureCode: rec.failureCode,
         ...(canEditRecording
           ? {
               uploadAttemptId: rec.uploadAttemptId ?? null,
@@ -443,6 +437,8 @@ export default defineAction({
               ? "failed"
               : transcriptPresentation.status,
             language: transcript.language,
+            source: transcript.source ?? null,
+            importId: transcript.importId ?? null,
             fullText: agentTranscript?.fullText ?? transcript.fullText,
             ...(agentTranscript
               ? {
@@ -515,7 +511,12 @@ export default defineAction({
       })),
       browserDiagnostics: browserDiagnostics
         ? canInspectSensitiveContext
-          ? browserDiagnostics
+          ? {
+              ...browserDiagnostics,
+              appActivity: parseAppActivitySummary(
+                browserDiagnosticsRow?.appActivitySummaryJson,
+              ),
+            }
           : { summary: browserDiagnostics.summary }
         : null,
       bugReport:

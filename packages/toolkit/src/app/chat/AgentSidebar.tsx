@@ -75,6 +75,7 @@ import { useFirstRunOnboardingGateOwnsSurface } from "../onboarding/first-run-st
 import type { BuilderConnectTransport } from "../settings/index.js";
 import { LazyChunkErrorBoundary } from "../shared/LazyChunkErrorBoundary.js";
 import { LazyChunkRetryFallback } from "../shared/LazyChunkRetryFallback.js";
+import { useRegisterAgentChatSurface } from "./agent-chat-presence.js";
 import { AgentSidebarOnboardingContext } from "./agent-sidebar-context.js";
 import {
   AGENT_CHAT_RUNNING_EVENT,
@@ -267,6 +268,7 @@ export interface AgentSidebarProps {
   /** @deprecated Use screenRefreshEnabled when disabling this boundary. */
   screenRefreshOnlyWhenPanelActive?: boolean;
   emptyStateText?: string;
+  mcpSuggestionExcludedIntegrationIds?: AssistantChatProps["mcpSuggestionExcludedIntegrationIds"];
   suggestions?: AssistantChatProps["suggestions"];
   dynamicSuggestions?: AssistantChatProps["dynamicSuggestions"];
   composerToolbarSlot?: AssistantChatProps["composerToolbarSlot"];
@@ -349,6 +351,7 @@ export function AgentSidebar({
   screenRefreshEnabled = true,
   screenRefreshOnlyWhenPanelActive,
   emptyStateText = "How can I help you?",
+  mcpSuggestionExcludedIntegrationIds,
   defaultMode = "chat",
   suggestions,
   dynamicSuggestions,
@@ -417,6 +420,7 @@ export function AgentSidebar({
   const resolvedBrowserTabId =
     browserTabId ??
     (typeof window === "undefined" ? undefined : getBrowserTabId());
+  useRegisterAgentChatSurface(enabled);
   const staticHostedHarnessEnabled = isHostedHarnessConfigured(
     injectedAgentNativeConfig().harness,
   );
@@ -1745,6 +1749,9 @@ export function AgentSidebar({
                 onNavigationChange={onNavigationChange}
                 onTabsClosing={onTabsClosing}
                 emptyStateText={emptyStateText}
+                mcpSuggestionExcludedIntegrationIds={
+                  mcpSuggestionExcludedIntegrationIds
+                }
                 suggestions={suggestions}
                 dynamicSuggestions={dynamicSuggestions}
                 suggestionPlacement="context-chips"

@@ -3,6 +3,7 @@ import nodePath from "node:path";
 
 import {
   AgentProtocolValidationError,
+  AGENT_NATIVE_SUBMISSION_DEADLINES_CAPABILITY_ID,
   parseQueueMessageInput,
 } from "@agent-native/agentkit/protocol";
 import {
@@ -42,6 +43,7 @@ import {
   updateTaskStatusMessage,
 } from "../a2a/task-store.js";
 import type {
+  A2AActionExecutionResult,
   A2AConnectionRequestMetadata,
   Message as A2AMessage,
 } from "../a2a/types.js";
@@ -54,6 +56,7 @@ import {
   resetAgentAppModelDefaultSettings,
   writeAgentAppModelDefaultSettings,
 } from "../agent/app-model-defaults.js";
+import { approvalKeyWithArguments } from "../agent/approval-key.js";
 import { CHATGPT_SUBSCRIPTION_ENGINE_NAME } from "../agent/chatgpt-subscription-contract.js";
 import { readDefaultAgentEngineSetting } from "../agent/default-agent-engine.js";
 import { DEFAULT_ANTHROPIC_MODEL } from "../agent/default-model.js";
@@ -98,6 +101,7 @@ import {
   type AgentActionSurfaceDetails,
   type AgentActionSurfaceResolution,
   type AgentLoopOutcome,
+  type AgentToolCallExecutionResult,
   type ResolvedOwnerApiKey,
   type PreparedAgentRequest,
 } from "../agent/production-agent.js";
@@ -225,6 +229,7 @@ import { normalizeShellArgs, serializeCliArgs } from "../scripts/parse-args.js";
 import type { ResolvedKeyReference } from "../secrets/substitution.js";
 import { getSetting, putSetting } from "../settings/store.js";
 import { type RefusedTurnRetryContext } from "../shared/agent-chat-run-not-started.js";
+import { AGENT_CHAT_THREAD_ABSENCE_HEADER } from "../shared/agent-chat.js";
 import {
   ANALYTICS_CLIENT_PLATFORM_BODY_FIELD,
   normalizeAnalyticsClientPlatform,
@@ -251,6 +256,7 @@ import { sortResourceSkills } from "./agent-chat/skill-frontmatter.js";
 import { discoverAgents } from "./agent-discovery.js";
 import {
   resolveAgentRunOrgId,
+  resolveAgentRunOrgScope,
   resolveAgentRunOwnerContext,
   runWithAgentRunContext,
   seedAgentRunOwnerContext,
@@ -271,7 +277,10 @@ import {
 } from "./auth.js";
 import { captureError } from "./capture-error.js";
 import { chatTitleRequestFromBody, generateChatTitle } from "./chat-title.js";
-import { filesystemActionEntry } from "./filesystem-action-entry.js";
+import {
+  discoveredActionMcpAnnotations,
+  filesystemActionEntry,
+} from "./filesystem-action-entry.js";
 import {
   getH3App,
   markDefaultPluginProvided,
@@ -282,6 +291,7 @@ import { getOrigin } from "./google-oauth.js";
 import { readBody } from "./h3-helpers.js";
 import { loadHostedHarnessConfig } from "./hosted-harness-policy.js";
 import { startIntervalJob } from "./interval-job.js";
+import { isDirectLoopbackRequest } from "./loopback.js";
 import { getModelFamilyOverlay } from "./prompts/index.js";
 import { mountRealtimeVoiceRoutes } from "./realtime-voice.js";
 import {
@@ -292,6 +302,7 @@ import {
   getRequestRunContext,
   ensureRequestRunContext,
 } from "./request-context.js";
+import { getForwardedRequestOrigin } from "./request-origin.js";
 
 export { handleSharedThreadRequest };
 export type { SharedThreadRouteDependencies };
@@ -559,12 +570,28 @@ export { scheduledTriggerAvailability };
 export { shouldDisableRecurringJobsRuntime };
 export { finalizeClaimedAgentChatProcessRunFailure };
 
-function hasSuccessfulSideEffect(run: Pick<ActiveRun, "events">): boolean {
+/** A direct A2A call's result, with the effect a failed call can still report. */
+function a2aActionResult(
+  result: Exclude<
+    AgentToolCallExecutionResult,
+    { status: "approval_required" }
+  >,
+): A2AActionExecutionResult {
+  return {
+    status: result.status,
+    output: result.output,
+    ...(result.completedSideEffect === undefined
+      ? {}
+      : { completedSideEffect: result.completedSideEffect }),
+  };
+}
+
+// A call that committed changes needs a snapshot even when its response then
+// failed; the event keeps that failure.
+function hasCommittedSideEffect(run: Pick<ActiveRun, "events">): boolean {
   return run.events.some(
     ({ event }) =>
-      event.type === "tool_done" &&
-      event.completedSideEffect === true &&
-      event.isError !== true,
+      event.type === "tool_done" && event.completedSideEffect === true,
   );
 }
 
@@ -573,7 +600,7 @@ export async function runPostAgentTurnAutosave(
   scope: AgentChatScope | null | undefined,
   run: ActiveRun,
 ): Promise<void> {
-  if (!callback || !scope || !hasSuccessfulSideEffect(run)) return;
+  if (!callback || !scope || !hasCommittedSideEffect(run)) return;
 
   try {
     await callback(scope, run);
@@ -1605,6 +1632,8 @@ export function createAgentChatPlugin(
               // Fallback: bash-based wrapper for CLI-style scripts
               discoveredActionsAll[name] = {
                 cliWrapper: true,
+                readOnly: false,
+                mcpAnnotationDefaults: discoveredActionMcpAnnotations(false),
                 tool: {
                   description: `Run the ${name} action. Use: pnpm action ${name} --arg=value`,
                   parameters: {
@@ -2313,7 +2342,7 @@ export function createAgentChatPlugin(
               output: "Read-only action unexpectedly requires approval",
             };
           }
-          return { status: result.status, output: result.output };
+          return a2aActionResult(result);
         },
         executeApproval: async (approval) => {
           const result = await executeAgentToolCall({
@@ -2333,7 +2362,7 @@ export function createAgentChatPlugin(
                 "The approved action was unexpectedly gated again and did not run.",
             };
           }
-          return { status: result.status, output: result.output };
+          return a2aActionResult(result);
         },
         handler: async function* (message, context) {
           // Resolve the caller's identity for user-scoped data access.
@@ -2918,7 +2947,14 @@ export function createAgentChatPlugin(
               orgId: getRequestOrgId() ?? null,
               tool: approval.tool,
               toolInput: approval.input,
-              approvalKey: approval.approvalKey,
+              // Executing the approval echoes this key back with no approval
+              // record to check, so it carries the arguments it binds.
+              approvalKey: approval.argumentsHash
+                ? approvalKeyWithArguments(
+                    approval.approvalKey,
+                    approval.argumentsHash,
+                  )
+                : approval.approvalKey,
               callId: approval.toolCallId ?? crypto.randomUUID(),
             });
             const baseUrl = resolveArtifactBaseUrl(context.event);
@@ -3911,6 +3947,7 @@ export function createAgentChatPlugin(
         attachments?: AgentChatAttachment[];
         queuedMessageId?: string;
         queuedMessageClaimId?: string;
+        submissionExpiresAt?: unknown;
         /** The turn was refused before a run started; record why in the thread. */
         failure?: { code: string; message: string };
         /** What a retry of the refused turn sends besides text and attachments. */
@@ -3986,6 +4023,14 @@ export function createAgentChatPlugin(
             turnId: details.turnId,
             agentKitMessageId: details.agentKitMessageId,
             queuedMessageId: details.queuedMessageId,
+            ...(Object.prototype.hasOwnProperty.call(
+              details,
+              "submissionExpiresAt",
+            )
+              ? {
+                  submissionExpiresAt: details.submissionExpiresAt,
+                }
+              : {}),
             ...(details.failure
               ? { refusedRetry: details.retryContext ?? {} }
               : {}),
@@ -4012,6 +4057,7 @@ export function createAgentChatPlugin(
           let submissionFailure:
             | "already_claimed"
             | "claim_expired"
+            | "submission_expired"
             | "invalid_thread_data"
             | undefined;
           await updateThreadData(
@@ -4043,14 +4089,15 @@ export function createAgentChatPlugin(
                   submissionFailure = result.status;
                   return threadData;
                 }
-                const submitted = details.failure
-                  ? foldUnstartedTurnFailure(result.repo, {
-                      runId: details.runId,
-                      threadId,
-                      turnId: details.turnId,
-                      ...details.failure,
-                    })
-                  : result.repo;
+                const submitted =
+                  details.failure && result.status !== "already_submitted"
+                    ? foldUnstartedTurnFailure(result.repo, {
+                        runId: details.runId,
+                        threadId,
+                        turnId: details.turnId,
+                        ...details.failure,
+                      })
+                    : result.repo;
                 const meta = extractThreadMeta(submitted);
                 return {
                   threadData: JSON.stringify(submitted),
@@ -4073,6 +4120,13 @@ export function createAgentChatPlugin(
               data: { code: "run_slot_busy", retryable: true },
             });
           }
+          if (submissionFailure === "submission_expired") {
+            throw createError({
+              statusCode: 409,
+              statusMessage: "Prompt submission expired before it could start",
+              data: { code: "submission_expired", retryable: false },
+            });
+          }
           if (submissionFailure === "invalid_thread_data") {
             throw new TypeError("Agent chat thread data is not valid JSON.");
           }
@@ -4087,6 +4141,7 @@ export function createAgentChatPlugin(
         attachments?: AgentChatAttachment[];
         queuedMessageId?: string;
         agentKitMessageId?: string;
+        submissionExpiresAt?: unknown;
         retryContext: RefusedTurnRetryContext;
         failure: { code: string; message: string };
       }) => {
@@ -4513,10 +4568,12 @@ export function createAgentChatPlugin(
         const orgId = await getOrgIdFromEvent(event);
         const { resolveOwnerEngineApiKey } =
           await import("../agent/production-agent.js");
-        const userApiKey = await resolveOwnerEngineApiKey({
-          engineOption: options?.engine,
-          ownerEmail: owner,
-        });
+        const userApiKey = owner
+          ? await resolveOwnerEngineApiKey({
+              engineOption: options?.engine,
+              ownerEmail: owner,
+            })
+          : { apiKey: undefined, apiKeyEnvVar: undefined };
         const runCtx = ensureRequestRunContext();
         if (runCtx) {
           runCtx.requestOrigin = getOrigin(event);
@@ -5506,19 +5563,32 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
           orgCtx = null;
         }
 
-        const orgId =
-          (options?.resolveOrgId
-            ? await options.resolveOrgId(event)
-            : (orgCtx?.orgId ?? session.orgId ?? null)) ?? null;
+        const orgScope = await resolveAgentRunOrgScope({
+          event,
+          ownerContext: { owner: session.email, anonymous: false },
+          resolveOrgId: options?.resolveOrgId,
+        });
+        if (!orgScope.orgId && orgScope.orgScope !== "personal") {
+          return {
+            ok: false as const,
+            status: 503,
+            error: "Organization scope is temporarily unavailable.",
+          };
+        }
+        const orgId = orgScope.orgId ?? null;
         const canUpdate = await canUpdateAgentAppModelDefaultSettings(
           session.email,
           orgId,
+          orgScope.orgScope,
         );
 
         return {
           ok: true as const,
           userEmail: session.email,
           orgId,
+          ...(orgScope.orgScope === "personal"
+            ? { orgScope: "personal" as const }
+            : {}),
           orgName: orgCtx?.orgId === orgId ? (orgCtx.orgName ?? null) : null,
           role: orgCtx?.orgId === orgId ? (orgCtx.role ?? null) : null,
           canUpdate,
@@ -5526,12 +5596,19 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
       };
 
       const listModelDefaultEngineOptions = async (
-        ctx: { userEmail?: string; orgId?: string | null },
+        ctx: {
+          userEmail?: string;
+          orgId?: string | null;
+          orgScope?: "personal";
+        },
         event: any,
       ) => {
         registerBuiltinEngines();
         const availableEngines = listAgentEngines();
+        const directLoopbackRequest = isDirectLoopbackRequest(event);
         const chatGPTEnabled =
+          directLoopbackRequest &&
+          ctx.orgScope === "personal" &&
           !ctx.orgId &&
           !!ctx.userEmail &&
           availableEngines.some(
@@ -5539,7 +5616,7 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
           ) &&
           (await getUserLabEnabled(ctx.userEmail, CHATGPT_SUBSCRIPTION_LAB));
         // Provider model selections follow the setting scope. ChatGPT catalogs
-        // are user-scoped, so they are only available for personal defaults.
+        // are user-scoped, so organization defaults cannot use them.
         const selectionScope = ctx.orgId ? "org" : "user";
         const selections = new Map<
           string,
@@ -5573,8 +5650,12 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
           {
             userEmail: ctx.userEmail,
             orgId: ctx.orgId ?? undefined,
-            requestOrigin: getOrigin(event),
+            ...(ctx.orgScope === "personal"
+              ? { orgScope: "personal" as const }
+              : {}),
+            requestOrigin: getForwardedRequestOrigin(event),
             isLoopbackRequest: isLoopbackRequest(event),
+            isDirectLoopbackRequest: isDirectLoopbackRequest(event),
           },
           async () => {
             const chatGPTCatalog =
@@ -5612,7 +5693,11 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
       const buildModelDefaultsPayload = async (event: any, appId: string) => {
         const ctx = await resolveModelDefaultsContext(event);
         if (!ctx.ok) return ctx;
-        const scope = { userEmail: ctx.userEmail, orgId: ctx.orgId };
+        const scope = {
+          userEmail: ctx.userEmail,
+          orgId: ctx.orgId,
+          orgScope: ctx.orgScope,
+        };
         const [settings, orgDefault] = await Promise.all([
           readAgentAppModelDefaultSettings(scope, appId),
           readDefaultAgentEngineSetting(scope),
@@ -5683,7 +5768,11 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
 
           if (method === "DELETE") {
             await resetAgentAppModelDefaultSettings(
-              { userEmail: ctx.userEmail, orgId: ctx.orgId },
+              {
+                userEmail: ctx.userEmail,
+                orgId: ctx.orgId,
+                orgScope: ctx.orgScope,
+              },
               appId,
             );
             return buildModelDefaultsPayload(event, appId);
@@ -5736,8 +5825,12 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
               {
                 userEmail: ctx.userEmail,
                 orgId: ctx.orgId ?? undefined,
-                requestOrigin: getOrigin(event),
+                ...(ctx.orgScope === "personal"
+                  ? { orgScope: "personal" as const }
+                  : {}),
+                requestOrigin: getForwardedRequestOrigin(event),
                 isLoopbackRequest: isLoopbackRequest(event),
+                isDirectLoopbackRequest: isDirectLoopbackRequest(event),
               },
               () => listChatGPTSubscriptionModels(ctx.userEmail),
             );
@@ -5760,7 +5853,11 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
           }
 
           await writeAgentAppModelDefaultSettings(
-            { userEmail: ctx.userEmail, orgId: ctx.orgId },
+            {
+              userEmail: ctx.userEmail,
+              orgId: ctx.orgId,
+              orgScope: ctx.orgScope,
+            },
             targetAppId,
             { engine, model, updatedBy: ctx.userEmail },
           );
@@ -6492,15 +6589,25 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             setResponseStatus(event, 400);
             return { error: "message is required" };
           }
-          const orgId = await getOrgIdFromEvent(event);
-          await runWithRequestContext({ userEmail: ownerEmail, orgId }, () =>
+          const orgScope = await resolveAgentRunOrgScope({
+            event,
+            ownerContext: titleOwnerContext,
+            resolveOrgId: options?.resolveOrgId,
+          });
+          const titleRequestContext = {
+            userEmail: ownerEmail,
+            ...orgScope,
+            requestOrigin: getForwardedRequestOrigin(event),
+            isLoopbackRequest: isLoopbackRequest(event),
+            isDirectLoopbackRequest: isDirectLoopbackRequest(event),
+          };
+          await runWithRequestContext(titleRequestContext, () =>
             requireAgentChatAiSetup(),
           );
 
           try {
-            const title = await runWithRequestContext(
-              { userEmail: ownerEmail, orgId },
-              () => generateChatTitle({ ...request, appId: options?.appId }),
+            const title = await runWithRequestContext(titleRequestContext, () =>
+              generateChatTitle({ ...request, appId: options?.appId }),
             );
             return { title };
           } catch (error) {
@@ -6779,8 +6886,13 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
               setResponseStatus(event, 404);
               return { error: "Run not found" };
             }
-            const { getRunByThread, getRunTurnRef } =
-              await import("../agent/run-store.js");
+            const {
+              getRunByThread,
+              getRunPendingConnectionRequestId,
+              getRunTurnRef,
+            } = await import("../agent/run-store.js");
+            const includePendingConnectionRequest =
+              String(query.includePendingConnectionRequest ?? "") === "true";
             if (runIdQuery) {
               const ref = await getRunTurnRef(runIdQuery);
               if (!ref || ref.threadId !== threadId) {
@@ -6798,8 +6910,17 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
                 setResponseStatus(event, 404);
                 return { error: "Run not found" };
               }
-              return { threadId, status: "queued" };
+              return {
+                threadId,
+                status: "queued",
+                ...(includePendingConnectionRequest
+                  ? { pendingConnectionRequestId: null }
+                  : {}),
+              };
             }
+            const pendingConnectionRequestId = includePendingConnectionRequest
+              ? await getRunPendingConnectionRequestId(run.id)
+              : undefined;
             return {
               runId: run.id,
               threadId: run.threadId,
@@ -6811,6 +6932,9 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
               lastProgressAt: run.lastProgressAt,
               dispatchMode: run.dispatchMode,
               terminalReason: run.terminalReason,
+              ...(includePendingConnectionRequest
+                ? { pendingConnectionRequestId }
+                : {}),
             };
           }
 
@@ -7121,11 +7245,12 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
         async (event) => {
           const ownerContext = await resolveOwnerContext(event);
           const owner = ownerContext.owner;
-          const orgId = await resolveAgentRunOrgId({
+          const orgScope = await resolveAgentRunOrgScope({
             event,
             ownerContext,
             resolveOrgId: options?.resolveOrgId,
           });
+          const orgId = orgScope.orgId;
           const method = getMethod(event);
 
           const { threadId, tail: threadTail } = parseThreadRoute(event);
@@ -7149,6 +7274,16 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             scopesMatch(thread.scope, requestedScope) ||
             (!thread.scope && scopesMatch(incomingScope, requestedScope));
 
+          const threadNotFound = () => {
+            if (
+              getHeader(event, AGENT_CHAT_THREAD_ABSENCE_HEADER) === "typed"
+            ) {
+              return { absent: true };
+            }
+            setResponseStatus(event, 404);
+            return { error: "Thread not found" };
+          };
+
           // ── Specific thread: GET/PUT/DELETE /threads/:id ──
           if (threadId) {
             if (method === "GET") {
@@ -7159,8 +7294,7 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
                 { orgId },
               );
               if (!thread || !threadMatchesRequestedScope(thread)) {
-                setResponseStatus(event, 404);
-                return { error: "Thread not found" };
+                return threadNotFound();
               }
               return thread;
             }
@@ -7201,8 +7335,7 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
                   !thread ||
                   !threadMatchesRequestedScope(thread, incomingScope)
                 ) {
-                  setResponseStatus(event, 404);
-                  return { error: "Thread not found" };
+                  return threadNotFound();
                 }
                 const bodyScopeMatchesRequestedScope =
                   !requestedScope ||
@@ -7462,8 +7595,15 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
                   mutation.type === "moveToTop" ||
                   mutation.type === "claim")
               ) {
-                await runWithRequestContext({ userEmail: owner, orgId }, () =>
-                  requireAgentChatAiSetup(),
+                await runWithRequestContext(
+                  {
+                    userEmail: owner,
+                    ...orgScope,
+                    requestOrigin: getForwardedRequestOrigin(event),
+                    isLoopbackRequest: isLoopbackRequest(event),
+                    isDirectLoopbackRequest: isDirectLoopbackRequest(event),
+                  },
+                  () => requireAgentChatAiSetup(),
                 );
               }
               let result: Awaited<
@@ -7903,10 +8043,24 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
             return { error: "Authentication required" };
           }
           try {
+            const orgScope = await resolveAgentRunOrgScope({
+              event,
+              ownerContext: { owner: session.email, anonymous: false },
+              resolveOrgId: options?.resolveOrgId,
+            });
+            if (!orgScope.orgId && orgScope.orgScope !== "personal") {
+              setResponseStatus(event, 503);
+              return {
+                error: "Organization scope is temporarily unavailable.",
+              };
+            }
+            const scope = orgScope.orgId
+              ? { orgId: orgScope.orgId }
+              : { orgId: null, orgScope: "personal" as const };
             return {
               token: await createAgentChatStreamToken({
                 ownerEmail: session.email,
-                orgId: session.orgId ?? null,
+                ...scope,
                 authUserId: session.authUserId,
               }),
               ttlSeconds: AGENT_CHAT_STREAM_TOKEN_TTL_SECONDS,
@@ -7948,6 +8102,9 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
                 owner: principal.ownerEmail,
                 anonymous: false,
                 orgId: principal.orgId,
+                ...(principal.orgScope === "personal"
+                  ? { orgScope: "personal" as const }
+                  : {}),
                 ...(principal.authUserId
                   ? { authUserId: principal.authUserId }
                   : {}),
@@ -8249,6 +8406,27 @@ Non-code requests are still fine on this surface: read data, navigate the UI, su
       // This is mounted last because h3's use() is prefix-based, meaning /_agent-native/agent-chat
       // also matches /_agent-native/agent-chat/threads/... — we skip sub-path requests here so the
       // earlier-mounted handlers (mode, save-key, files, skills, mentions, threads) handle them.
+      const capabilitiesPath = `${routePath}/capabilities`;
+      getH3App(nitroApp).use(
+        capabilitiesPath,
+        defineEventHandler((event) => {
+          const requestPath = new URL(
+            event.node?.req?.url || event.path || "",
+            "http://localhost",
+          ).pathname;
+          if (requestPath !== capabilitiesPath) {
+            setResponseStatus(event, 404);
+            return { error: "Not found" };
+          }
+          if (getMethod(event) !== "GET") {
+            setResponseStatus(event, 405);
+            return { error: "Method not allowed" };
+          }
+          setResponseHeader(event, "Cache-Control", "no-store");
+          return { [AGENT_NATIVE_SUBMISSION_DEADLINES_CAPABILITY_ID]: true };
+        }),
+      );
+
       getH3App(nitroApp).use(
         routePath,
         withTransientDatabaseFallback(routePath, async (event) => {
