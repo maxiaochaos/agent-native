@@ -2,6 +2,33 @@ import { creativeContextMessagesByLocale } from "@agent-native/creative-context/
 
 const messages = {
   composer: { menu: { integrations: "集成" } },
+  appMenu: {
+    label: "应用菜单",
+    actions: "操作…",
+    backToDashboard: "返回仪表板",
+    file: "文件",
+    edit: "编辑",
+    view: "视图",
+    preferences: "偏好设置",
+    help: "帮助",
+    importFile: "导入文件…",
+    export: "导出…",
+    saveLocalCopy: "保存本地副本…",
+    versionHistory: "版本历史",
+    duplicateSelection: "复制所选内容",
+    deleteSelection: "删除所选内容",
+    zoomIn: "放大",
+    zoomOut: "缩小",
+    previousSlide: "上一张幻灯片",
+    nextSlide: "下一张幻灯片",
+    appearance: "外观…",
+    themeLight: "浅色",
+    themeDark: "深色",
+    themeSystem: "跟随系统",
+    documentation: "文档",
+    whatsNew: "新功能",
+    sendFeedback: "发送反馈…",
+  },
   templatesPage: {
     actions: "{{title}} 的模板操作",
     previewAction: "预览",
@@ -105,7 +132,7 @@ const messages = {
     openChat: "打开聊天",
     cloudAuthToken: "认证令牌",
     cloudSetupSteps: "设置步骤",
-    cloudConnectedReloading: "已连接，正在重新加载...",
+    cloudConnectedReloading: "正在重新加载...",
     cloudConnectionFailed: "连接失败",
     cloudTestConnect: "测试并连接",
     cloudServerlessPostgres: "无服务器 Postgres",
@@ -211,6 +238,56 @@ const messages = {
       "您在 Builder {{plan}} 套餐中已使用 {{current}}/{{max}} 个设计系统。升级 Builder 套餐以创建更多。",
     tierLimitUpgrade: "升级套餐",
   },
+  floatingToolbar: {
+    label: "幻灯片工具",
+    move: "移动",
+    moveMenu: "移动工具",
+    hand: "抓手工具",
+    scale: "缩放",
+    insert: "插入",
+    insertMenu: "插入菜单",
+    text: "文本",
+    line: "直线",
+    arrow: "箭头",
+    square: "正方形",
+    ellipse: "椭圆",
+    triangle: "三角形",
+    media: "图片/视频…",
+    mediaNeedsStorage: "请先配置存储，才能上传图片和视频。",
+    transitions: "过渡",
+    transitionsMenu: "过渡选项",
+    transitionsReadOnly: "此演示文稿为只读。",
+    transitionsNeedElement: "请选择一个元素来添加过渡。",
+    transitionNone: "无",
+    transitionAppear: "出现",
+    transitionFade: "淡入淡出",
+    transitionSlide: "滑动",
+    transitionZoom: "缩放",
+    comment: "评论",
+    commentMenu: "评论选项",
+    comments: "评论",
+    annotate: "批注",
+    agent: "智能体",
+    agentMenu: "智能体选项",
+    agentUnavailable: "无法连接到智能体聊天，请重试。",
+    inspiration: "灵感",
+    tightenTone: "精简语气",
+    polish: "润色",
+    speakerNotes: "演讲者备注",
+    speakerNotesMenu: "演讲者备注选项",
+    writeScript: "撰写讲稿",
+    summarizeKeyPoints: "总结要点",
+    expandDetail: "扩展细节",
+    addTimingCues: "添加时间提示",
+  },
+  speakerNotesPanel: {
+    title: "演讲者备注",
+    resize: "调整演讲者备注大小",
+    generate: "生成备注",
+    rewrite: "重写备注",
+    close: "关闭演讲者备注",
+    placeholder: "开始输入，或让智能体快速生成演讲者备注",
+  },
   editorToolbar: {
     layoutTitle: "标题",
     layoutSection: "分节页",
@@ -287,6 +364,9 @@ const messages = {
     elementAnimations: "元素动画",
     layers: "图层",
     closeLayers: "关闭图层面板",
+    searchLayers: "搜索图层",
+    resizeLayers: "调整图层面板大小",
+    resizeSlideList: "调整幻灯片列表宽度",
     expandLayer: "展开图层",
     collapseLayer: "折叠图层",
     tweaks: "微调",
@@ -298,7 +378,8 @@ const messages = {
     shapeArrow: "箭头",
     shapeTriangle: "三角形",
     shapeLine: "线",
-    pinComments: "固定评论",
+    shapeStar: "星形",
+    shapePolygon: "多边形",
     undo: "撤销",
     undoWithShortcut: "撤销 ({{shortcut}})",
     redo: "重做",
@@ -310,8 +391,17 @@ const messages = {
     editorLinkDescription:
       "在编辑器中打开幻灯片。有访问权限的人都可以使用此链接。",
     presentationLink: "演示链接",
-    presentationLinkDescription: "直接以全屏演示模式打开。",
+    presentationLinkDescription: "在演示模式中打开幻灯片",
     present: "演示",
+    presentInTab: "在此标签页中",
+    presentFullScreen: "全屏",
+    presentPresenterView: "演讲者视图",
+    presentPresenterViewDescription: "演示时查看演讲者备注",
+    presenterViewBlocked: "请允许弹出窗口以打开演讲者视图。",
+    export: "导出",
+    privacyPrivate: "私密",
+    privacyOrg: "已与组织共享",
+    privacyPublic: "公开",
     more: "更多",
     importing: "正在导入...",
     importFile: "导入文件",
@@ -355,6 +445,8 @@ const messages = {
     shareWithTeam: "与团队共享...",
     publicShareLink: "公开共享链接...",
     downloadHtml: "下载为 HTML",
+    downloadPdf: "下载为 PDF",
+    downloadPptx: "下载为 PPTX",
     exportPdf: "导出为 PDF",
     exportPptx: "导出为 PPTX",
     connectGoogle: "连接 Google",
@@ -388,6 +480,9 @@ const messages = {
     copied: "已复制",
     openSharedLink: "打开共享链接",
     anyoneWithLink: "拥有此链接的任何人都可以查看此演示文稿。",
+    connectSlides: "连接 Slides",
+    otherAgents: "其他智能体",
+    whoHasAccess: "谁有访问权限",
   },
   slideTextMenu: {
     brandColors: "品牌颜色",
@@ -474,6 +569,35 @@ const messages = {
     goToSlide: "转到幻灯片",
     search: "搜索评论",
     searchPlaceholder: "搜索所有评论...",
+  },
+  contextToolbar: {
+    insert: "插入",
+    insertText: "文本",
+    insertMedia: "图片/视频…",
+    order: "排列顺序",
+    listStyle: "列表样式",
+    removeFormatting: "清除格式",
+    lockAspectRatio: "锁定宽高比",
+    zoom: "缩放",
+    objectsSelected_one: "已选择 {{count}} 个对象",
+    objectsSelected_other: "已选择 {{count}} 个对象",
+    bold: "粗体",
+    strikethrough: "删除线",
+    code: "代码",
+    link: "链接",
+    applyLink: "应用",
+    lineHeight: "行高",
+    replaceImage: "替换",
+    fit: "适应",
+    fitCover: "填充",
+    fitContain: "适应",
+    editWithAgent: "使用智能体编辑",
+    tightenTone: "精简语气",
+    polish: "润色",
+    translate: "翻译",
+    makeMoreVisual: "更具视觉效果",
+    generateImage: "生成图片",
+    removeBackground: "移除背景",
   },
   styleInspector: {
     title: "Style",
@@ -592,6 +716,8 @@ const messages = {
     addTransition: "添加过渡",
     effect: "效果",
     onClick: "点击时",
+    withPrevious: "与上一个同时",
+    trigger: "开始",
     byParagraph: "按段落",
     expand: "展开过渡",
     collapse: "收起过渡",
@@ -669,6 +795,9 @@ const messages = {
     duplicateCurrentSlide: "复制当前幻灯片",
     promptPlaceholder: "描述你想要的幻灯片...",
     newSlide: "新建幻灯片",
+    slidesHeading: "幻灯片",
+    emptyTitle: "还没有幻灯片",
+    emptyDescription: "添加或导入新幻灯片，或让智能体生成一张。",
     closeAddSlides: "关闭",
     describeThisSlide: "描述这张幻灯片",
     cut: "剪切",
@@ -689,6 +818,13 @@ const messages = {
     noSlides: "没有可演示的幻灯片",
     previousSlide: "上一张幻灯片",
     nextSlide: "下一张幻灯片",
+    voiceNavigation: "语音导航",
+    voiceNavigationNextCommand: "下一张幻灯片",
+    voiceNavigationPreviousCommand: "上一张幻灯片",
+    voiceNavigationHint: "说“{{next}}”或“{{previous}}”来切换幻灯片。",
+    voiceNavigationListening: "正在聆听“{{next}}”或“{{previous}}”。",
+    voiceNavigationUnavailable: "此浏览器不支持语音导航。",
+    voiceNavigationError: "语音导航已停止。请检查麦克风权限和连接，然后重试。",
     exitPresentation: "退出演示",
     enterFullscreen: "进入全屏",
     clickToEnterFullscreen: "点击进入全屏",
@@ -773,6 +909,8 @@ const messages = {
     generationFailed: "未能创建幻灯片。请查看聊天中的详情，然后重试。",
     generationOutcomeUnresolved:
       "无法确认幻灯片是否已创建。请先检查演示文稿，再重试。",
+    generationOutcomeUnresolvedWithSlides:
+      "无法确认幻灯片是否已创建完成。继续之前，请查看此处显示的幻灯片。",
     partialGenerationFailed:
       "我们没能完成幻灯片制作。继续之前，请查看已创建的幻灯片和您的原始请求。",
     originalPrompt: "你输入的内容",
@@ -794,6 +932,8 @@ const messages = {
     keepEditing: "继续编辑",
     leaveWithoutSaving: "不保存退出",
     editorMarkupNotSaved: "此编辑未保存，因为它会向幻灯片添加编辑器标记。",
+    historyStepConflict: "此历史记录步骤与当前演示文稿冲突，因此已跳过。",
+    historyStepFailed: "此历史记录步骤无法应用，因此已跳过。",
     textEditConflictNotSaved:
       "你的文本编辑未保存，因为同一段文本同时在其他地方被更改。",
   },
@@ -875,10 +1015,152 @@ const messages = {
     chooseAnotherFile: "选择其他文件",
   },
   home: {
-    fallbackSuggestions: {
-      pitch: "制作产品推介演示文稿",
-      roadmap: "制作产品路线图",
-      explainer: "在演示文稿中讲解一个主题",
+    nextStepBar: {
+      ariaLabel: "你的首个演示文稿的后续操作",
+      refineWithPrompt: "通过提示词优化",
+      export: "导出",
+      shareLink: "分享链接",
+      dismiss: "关闭",
+    },
+    suggestionPrompts: {
+      product: {
+        launch:
+          "制作产品发布演示文稿，介绍客户问题、核心优势、发布计划，并采用自信且以客户为先的语气。",
+        roadmap:
+          "制作季度路线图，呈现战略主题、里程碑、依赖关系，并采用清晰的高管汇报风格。",
+        opportunity:
+          "制作机会分析，说明市场背景、客户痛点、解决方案和风险，并采用果断的产品视角。",
+        priorities:
+          "制作功能优先级演示，比较用户影响、投入、证据和取舍，并采用便于决策的简洁风格。",
+        metrics:
+          "制作产品指标回顾，展示采用率、激活、留存和洞察，并采用坦诚的分析语气。",
+        discovery:
+          "制作客户调研汇报，呈现研究主题、关键引述和未满足需求，并采用基于证据且富有共情的语气。",
+        vision:
+          "制作产品愿景演示，描绘未来状态、指导原则和产品押注，并采用鼓舞人心且务实的语气。",
+        release:
+          "制作版本回顾，整理目标、成果、客户反馈和待解决问题，并采用负责且重视学习的语气。",
+      },
+      design: {
+        caseStudy:
+          "制作设计案例，呈现需求、流程、关键界面和成果，并采用温暖的编辑风格。",
+        system:
+          "制作设计系统概览，展示颜色、字体、组件和使用示例，并采用简洁鲜明的视觉风格。",
+        critique:
+          "制作设计评审演示，呈现目标、当前界面、反馈主题和后续步骤，并采用建设性的语气。",
+        research:
+          "制作用户研究汇报，说明研究背景、模式、引述和机会，并采用富有共情的语气。",
+        concepts:
+          "制作概念探索演示，展示三种视觉方向、示例界面和取舍，并采用活泼的语气。",
+        accessibility:
+          "制作无障碍评审，展示关键障碍、标注示例和改进方案，并采用清晰包容的语气。",
+        brand:
+          "制作品牌方向演示，呈现受众、视觉参考、颜色和字体，并采用鲜明独特的语气。",
+        sprint:
+          "制作设计冲刺回顾，讲述挑战、创意、原型和测试发现，并采用乐观的语气。",
+      },
+      developer: {
+        architecture:
+          "制作系统架构演示，展示组件、数据流和取舍，并采用严谨准确的技术语气。",
+        api: "制作 API 入门指南，涵盖配置、身份验证、示例和错误处理，并采用开发者友好的语气。",
+        release:
+          "制作工程发布计划，列出范围、里程碑、依赖关系和上线步骤，并采用务实的语气。",
+        incident:
+          "制作事故复盘，整理影响、时间线、根因和行动项，并采用不追责的语气。",
+        migration:
+          "制作平台迁移计划，说明现状、阶段、风险和验证方式，并采用令人安心的语气。",
+        security:
+          "制作安全评审，呈现系统边界、威胁、控制措施和缺口，并采用直接的技术语气。",
+        demo: "制作技术演示，介绍问题、架构、现场流程和结果，并采用清晰的语气。",
+        metrics: "制作工程指标回顾，展示交付、可靠性和趋势，并采用坦诚的语气。",
+      },
+      marketing: {
+        campaign:
+          "制作营销活动发布演示，呈现受众、信息、渠道和日程，并采用充满活力的语气。",
+        story:
+          "制作客户故事，讲述挑战、解决方案、成果和证据，并采用亲切真实的语气。",
+        content:
+          "制作内容策略，梳理受众需求、主题、形式和日历，并采用编辑策划风格。",
+        positioning:
+          "制作品牌定位演示，说明受众、品类、承诺和依据，并采用鲜明的语气。",
+        channels:
+          "制作渠道表现回顾，展示触达、互动、转化和经验，并采用清晰的语气。",
+        messaging:
+          "制作产品信息演示，呈现受众、优势、依据和示例，并采用有说服力的语气。",
+        event:
+          "制作活动宣传计划，介绍受众、亮点、日程和渠道，并采用热情友好的语气。",
+        competition:
+          "制作竞争格局演示，比较替代方案、优势、差距和机会，并采用平衡客观的语气。",
+      },
+      sales: {
+        pitch:
+          "制作客户演示文稿，围绕客户目标、解决方案、成果和案例，并采用自信的语气。",
+        proposal:
+          "制作解决方案提案，呈现需求、方法、时间表和投入，并采用清晰且以客户为先的语气。",
+        quarterlyReview:
+          "制作季度业务回顾，整理目标、成果、采用情况和后续步骤，并采用协作的语气。",
+        discovery:
+          "制作需求调研汇报，呈现客户优先事项、痛点和方案匹配度，并采用专注倾听的语气。",
+        objections:
+          "制作异议处理指南，列出常见顾虑、证据和回应，并采用有帮助的语气。",
+        demo: "制作产品演示故事，结合客户背景、关键流程和成果，并采用简洁有说服力的语气。",
+        renewal:
+          "制作续约演示，呈现已交付价值、使用情况和机会，并采用伙伴式的语气。",
+        enablement:
+          "制作销售赋能演示，介绍理想买家、资格判断和沟通要点，并采用实用的语气。",
+      },
+      ops: {
+        weeklyReview:
+          "制作每周运营回顾，展示目标、指标、阻碍和负责人，并采用沉稳直接的语气。",
+        process:
+          "制作流程改进演示，呈现当前步骤、摩擦点和目标流程，并采用务实的语气。",
+        capacity:
+          "制作产能规划，分析需求、团队可用时间、优先级和情景，并采用透明的语气。",
+        service:
+          "制作服务表现回顾，展示数量、响应时间、升级处理和改进，并采用负责的语气。",
+        vendor:
+          "制作供应商评估，比较要求、选项、成本和风险，并采用平衡的决策风格。",
+        metrics:
+          "制作运营仪表盘故事，突出关键指标、趋势和异常，并采用简洁的分析风格。",
+        onboarding:
+          "制作入职流程，呈现阶段、交接、资源和成功指标，并采用支持性的语气。",
+        risk: "制作风险回顾，梳理可能性、影响、缓解方案和负责人，并采用审慎的语气。",
+      },
+      individual: {
+        project:
+          "制作个人项目计划，列出目标、里程碑、资源和风险，并采用鼓舞人心的语气。",
+        portfolio:
+          "制作个人作品集演示，精选作品、过程和成果，并采用自信的编辑风格。",
+        learning:
+          "制作学习路线图，列出技能、资源、练习和里程碑，并采用鼓励性的语气。",
+        event:
+          "制作聚会计划，说明目的、来宾、日程和细节，并采用温暖友好的语气。",
+        budget:
+          "制作个人预算回顾，整理收入、支出、目标和取舍，并采用平静务实的语气。",
+        travel:
+          "制作旅行行程，安排目的地、每日亮点和交通细节，并采用引人入胜的视觉风格。",
+        community:
+          "制作社区工作坊演示，介绍主题、活动和收获，并采用包容友好的语气。",
+        personalStory:
+          "制作个人介绍，讲述经历、兴趣和工作，并采用自然亲切的语气。",
+      },
+      general: {
+        overview: "制作主题概览，说明背景、核心观点和示例，并采用友好的语气。",
+        fundraiser:
+          "制作公益募款演示，介绍使命、需求和影响，并采用充满希望的语气。",
+        lesson:
+          "制作简短课程，呈现学习目标、核心概念和示例，并采用引人入胜的语气。",
+        research:
+          "制作研究报告，说明问题、方法、发现和影响，并采用平衡客观的语气。",
+        eventProposal:
+          "制作活动提案，呈现目的、受众、形式和预算，并采用热情友好的语气。",
+        teamStrategy:
+          "制作团队战略演示，列出优先事项、指标和举措，并采用聚焦的语气。",
+        howTo:
+          "制作可视化操作指南，提供清晰步骤和实用示例，并采用鼓励性的语气。",
+        portfolioIntro:
+          "制作作品集介绍，精选项目并突出优势，并采用精致的语气。",
+      },
     },
     suggestedPrompts: "推荐提示",
     importMenu: {
@@ -1084,6 +1366,89 @@ const messages = {
     emptyTitle: "还没有幻灯片",
     createFirstDeck: "创建你的第一份幻灯片",
     emptyDescription: "使用 AI 生成精美演示文稿。",
+
+    suggestionLabels: {
+      product: {
+        launch: "产品发布演示文稿",
+        roadmap: "季度路线图",
+        opportunity: "机会分析",
+        priorities: "功能优先级演示",
+        metrics: "产品指标回顾",
+        discovery: "客户调研汇报",
+        vision: "产品愿景演示",
+        release: "版本回顾",
+      },
+      design: {
+        caseStudy: "设计案例",
+        system: "设计系统概览",
+        critique: "设计评审演示",
+        research: "用户研究汇报",
+        concepts: "概念探索演示",
+        accessibility: "无障碍评审",
+        brand: "品牌方向演示",
+        sprint: "设计冲刺回顾",
+      },
+      developer: {
+        architecture: "系统架构演示",
+        api: " API 入门指南",
+        release: "工程发布计划",
+        incident: "事故复盘",
+        migration: "平台迁移计划",
+        security: "安全评审",
+        demo: "技术演示",
+        metrics: "工程指标回顾",
+      },
+      marketing: {
+        campaign: "营销活动发布演示",
+        story: "客户故事",
+        content: "内容策略",
+        positioning: "品牌定位演示",
+        channels: "渠道表现回顾",
+        messaging: "产品信息演示",
+        event: "活动宣传计划",
+        competition: "竞争格局演示",
+      },
+      sales: {
+        pitch: "客户演示文稿",
+        proposal: "解决方案提案",
+        quarterlyReview: "季度业务回顾",
+        discovery: "需求调研汇报",
+        objections: "异议处理指南",
+        demo: "产品演示故事",
+        renewal: "续约演示",
+        enablement: "销售赋能演示",
+      },
+      ops: {
+        weeklyReview: "每周运营回顾",
+        process: "流程改进演示",
+        capacity: "产能规划",
+        service: "服务表现回顾",
+        vendor: "供应商评估",
+        metrics: "运营仪表盘故事",
+        onboarding: "入职流程",
+        risk: "风险回顾",
+      },
+      individual: {
+        project: "个人项目计划",
+        portfolio: "个人作品集演示",
+        learning: "学习路线图",
+        event: "聚会计划",
+        budget: "个人预算回顾",
+        travel: "旅行行程",
+        community: "社区工作坊演示",
+        personalStory: "个人介绍",
+      },
+      general: {
+        overview: "主题概览",
+        fundraiser: "公益募款演示",
+        lesson: "简短课程",
+        research: "研究报告",
+        eventProposal: "活动提案",
+        teamStrategy: "团队战略演示",
+        howTo: "可视化操作指南",
+        portfolioIntro: "作品集介绍",
+      },
+    },
   },
   agentChat: {
     setup: {

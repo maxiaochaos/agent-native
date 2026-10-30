@@ -1,7 +1,15 @@
 import { useParams } from "react-router";
 
+import {
+  DesignStylesheetsContext,
+  designStylesheetsKey,
+} from "@/components/design/design-canvas/linked-stylesheets";
 import { useContainHorizontalOverscroll } from "@/hooks/use-contain-horizontal-overscroll";
+import { ReviewAgentProvider } from "@/lib/review-agent/review-agent-context";
+import { useReviewAgentRequests } from "@/lib/review-agent/use-review-agent-requests";
 
+import { AgentChatContextBookkeeping } from "./design-editor/agent-chat-context-bookkeeping";
+import { useDesignAgentSelect } from "./design-editor/design-agent-select";
 import { renderDesignEditorView } from "./design-editor/design-editor-view";
 import { useEditorActiveScreenAndGeometry } from "./design-editor/domains/use-editor-active-screen-and-geometry";
 import { useEditorCanvasAndScreens } from "./design-editor/domains/use-editor-canvas-and-screens";
@@ -73,6 +81,16 @@ function DesignEditor() {
     editorCanvasAndScreens,
     editorLiveEditsAndPresence,
   });
+  // Built here, not in a provider component, because the card menu's handler
+  // (inside `useEditorToolsAndVectors`) starts runs too.
+  const reviewAgent = useReviewAgentRequests({
+    designId: editorCore.id,
+    enabled:
+      editorGenerationAndAccess.canEditDesign &&
+      editorCore.isSignedIn &&
+      !editorCore.shellMode,
+    surfaceActive: editorGenerationAndAccess.pinMode,
+  });
   const editorToolsAndVectors = useEditorToolsAndVectors({
     editorCore,
     editorHistory,
@@ -82,6 +100,7 @@ function DesignEditor() {
     editorCanvasAndScreens,
     editorLiveEditsAndPresence,
     editorContentAndComponents,
+    reviewAgent: reviewAgent.enabled ? reviewAgent : null,
   });
   const editorSelectionAndStyles = useEditorSelectionAndStyles({
     editorCore,
@@ -256,7 +275,12 @@ function DesignEditor() {
     editorLayerActions,
     editorSourceAndSync,
   });
-  return renderDesignEditorView({
+  useDesignAgentSelect(
+    editorCore.id,
+    editorGenerationAndAccess.design?.title,
+    editorFilesAndSaving.files,
+  );
+  const view = renderDesignEditorView({
     editorCore,
     editorHistory,
     editorGenerationAndAccess,
@@ -279,4 +303,19 @@ function DesignEditor() {
     editorSourceAndSync,
     editorScreenRendering,
   });
+  return (
+    <DesignStylesheetsContext.Provider
+      value={designStylesheetsKey(editorFilesAndSaving.files)}
+    >
+      <AgentChatContextBookkeeping
+        enabled={editorCore.isSignedIn}
+        presentRef={editorToolsAndVectors.composerContextHasOurKeyRef}
+      />
+      <ReviewAgentProvider
+        controller={reviewAgent.enabled ? reviewAgent : null}
+      >
+        {view}
+      </ReviewAgentProvider>
+    </DesignStylesheetsContext.Provider>
+  );
 }

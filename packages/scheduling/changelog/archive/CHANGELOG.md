@@ -1,3 +1,174 @@
+## 0.1.25
+
+### Patch Changes
+
+- 38ca6fa: Require host identity (or the booking's capability token) before mutating bookings, revoking private links, duplicating event types, and returning reschedule tokens, closing cross-tenant write/disclosure gaps.
+- Updated dependencies [38ca6fa]
+  - @agent-native/toolkit@0.4.7
+
+## 0.1.24
+
+### Patch Changes
+
+- f43d34c: Add a Microsoft Teams conferencing provider with delegated OAuth and Microsoft Graph meeting creation and cancellation.
+- f43d34c: Batch selected-calendar reads and bound external availability checks to reduce
+  slot lookup latency without overwhelming calendar providers.
+- f43d34c: Add a safe manifest-driven package lifecycle CLI with Scheduling as the first inspectable, installable, and ejectable package.
+- f43d34c: Re-validate availability before creating bookings and make booking writes transactional.
+- Updated dependencies [f43d34c]
+  - @agent-native/toolkit@0.4.6
+
+## 0.1.23
+
+### Patch Changes
+
+- 86697e9: Depend on `@agent-native/toolkit` via `workspace:^` instead of `workspace:*`. Publishing now pins a caret range (e.g. `^0.4.3`) rather than an exact version, so an app that scaffolds `@agent-native/toolkit@latest` separately can dedupe against it through normal semver resolution instead of installing two mismatched toolkit copies side by side (which crashed Vite with `"./collab-ui" is not exported`).
+
+## 0.1.22
+
+### Patch Changes
+
+- Updated dependencies [680b1eb]
+  - @agent-native/toolkit@0.4.4
+
+## 0.1.21
+
+### Patch Changes
+
+- 823d635: Upgrade the workspace toolchain to TypeScript 7 (`tsc`) with a side-by-side TypeScript 6 API package for tools that still need programmatic access. Replace `@typescript/native-preview` / `tsgo` with the stable `typescript` 7 release.
+- Updated dependencies [823d635]
+- Updated dependencies [823d635]
+  - @agent-native/toolkit@0.4.3
+
+## 0.1.20
+
+### Patch Changes
+
+- Updated dependencies [ec523c4]
+  - @agent-native/toolkit@0.4.2
+
+## 0.1.19
+
+### Patch Changes
+
+- Updated dependencies [e1ad535]
+  - @agent-native/toolkit@0.4.1
+
+## 0.1.18
+
+### Patch Changes
+
+- Updated dependencies [9d8c83c]
+- Updated dependencies [9d8c83c]
+  - @agent-native/toolkit@0.4.0
+
+## 0.1.17
+
+### Patch Changes
+
+- Updated dependencies [277d115]
+  - @agent-native/toolkit@0.3.0
+
+## 0.1.16
+
+### Patch Changes
+
+- b24446e: Add `@agent-native/toolkit` for reusable app-building UI, move shared template primitives into it, and keep core UI shim imports working through compatibility re-exports.
+- Updated dependencies [b24446e]
+  - @agent-native/toolkit@0.2.0
+
+## 0.1.15
+
+### Patch Changes
+
+- 6338989: Add Traditional Chinese copy for shared scheduling booking-link components.
+
+## 0.1.14
+
+### Patch Changes
+
+- 2a03c35: Adopt the native TypeScript and oxfmt package build baselines.
+
+## 0.1.13
+
+### Patch Changes
+
+- fd78baa: Localize Dispatch workspace pages and scheduling booking-link controls.
+
+## 0.1.12
+
+### Patch Changes
+
+- c294aaa: Expand localized UI coverage across core client surfaces, Dispatch chrome, scheduling controls, templates, and the docs site.
+
+## 0.1.11
+
+### Patch Changes
+
+- 3c1d3eb: Update dispatch provider APIs and scheduling internals for the runtime refresh.
+
+## 0.1.10
+
+### Patch Changes
+
+- 966838d: Update scheduling package docs after removing the legacy scheduling template.
+
+## 0.1.9
+
+### Patch Changes
+
+- a56d93d: Remove unused imports, dead state, no-op plugin hooks, and debug logging from package internals.
+- a56d93d: Route outbound A2A, Dispatch vault, and scheduling webhook requests through
+  SSRF-safe URL fetch paths.
+
+## 0.1.8
+
+### Patch Changes
+
+- 853ab71: Internal cleanup: remove unused imports and variables (no behavior change).
+
+## 0.1.7
+
+### Patch Changes
+
+- d4013f0: Remove unused imports, dead state, no-op plugin hooks, and debug logging from package internals.
+- d4013f0: Route outbound A2A, Dispatch vault, and scheduling webhook requests through
+  SSRF-safe URL fetch paths.
+
+## 0.1.6
+
+### Patch Changes
+
+- c3852e0: Beta-readiness best-practices audit fixes:
+  - **core / sharing:** `mergeCoreSharingActions` now preserves
+    `toolCallable`/`publicAgent`/`link`/`mcpApp` (via `preserveActionFlags`),
+    restoring the H5 tools-bridge `403` guard on share/unshare/set-visibility that
+    was silently dropped during registry merge.
+  - **core / HTTP actions:** stop echoing raw `error.message` on uncategorized 500s
+    (return a generic message, log detail server-side); validation and explicit
+    user-facing errors still pass through.
+  - **core / auth:** remove the legacy hardcoded fallback secret literal from the
+    production `BETTER_AUTH_SECRET` error message. (The `better-auth` security
+    version bump is deferred to a dedicated follow-up: `1.6.12` pulls
+    `kysely@0.29` which drops exports `better-auth` bundles, breaking the template
+    build — it needs a kysely-compatibility fix + an auth smoke-test.)
+  - **core / dev:** register `client/transcription/use-live-transcription` in the
+    Vite source-alias map so monorepo dev edits resolve from source, not stale
+    `dist`.
+  - **core:** add `engines.node >=22`; correct the `AuthSession.orgId` doc comment
+    (orgs are framework-managed, not the Better Auth organization plugin).
+  - **scheduling:** remove the leftover manual `release` script (publishing goes
+    through changesets/CI).
+  - **shared-app-config:** clarify that the template-catalog `icon` field is an
+    internal icon-alias key resolved by the desktop sidebar `ICON_MAP`, not a raw
+    `@tabler/icons-react` export name.
+
+## 0.1.5
+
+### Patch Changes
+
+- 79a0eb9: Align local Drizzle peer resolution with the framework's Postgres driver version.
+
 ## 0.1.4
 
 ### Patch Changes

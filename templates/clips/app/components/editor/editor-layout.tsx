@@ -8,6 +8,7 @@ import {
 } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
 import { FileStorageSetupPopover } from "@agent-native/toolkit/app/chat/FileStorageSetupPopover";
+import { parseStoredChapters } from "@shared/stored-chapters";
 import {
   IconArrowLeft,
   IconCheck,
@@ -379,14 +380,13 @@ export function EditorLayout({
     () => parseEdits(recording?.editsJson),
     [recording?.editsJson],
   );
-  const chapters: Array<{ startMs: number; title: string }> = useMemo(() => {
-    if (Array.isArray(playerData?.chapters)) return playerData.chapters;
-    try {
-      return recording?.chaptersJson ? JSON.parse(recording.chaptersJson) : [];
-    } catch {
-      return [];
-    }
-  }, [playerData?.chapters, recording?.chaptersJson]);
+  const chapters: Array<{ startMs: number; title: string }> = useMemo(
+    () =>
+      Array.isArray(playerData?.chapters)
+        ? playerData.chapters
+        : parseStoredChapters(recording?.chaptersJson),
+    [playerData?.chapters, recording?.chaptersJson],
+  );
 
   const savedEdits: EditsJson = useMemo(() => {
     const next = pendingTrims ? { ...edits, trims: pendingTrims } : edits;
@@ -423,7 +423,10 @@ export function EditorLayout({
     () => buildTimelinePieces(durationMs, shownEdits),
     [durationMs, shownEdits],
   );
-  const selectedClip = useMemo(() => {
+  const selectedRange = useMemo(() => {
+    if (selection?.kind === "range") {
+      return { startMs: selection.startMs, endMs: selection.endMs };
+    }
     if (selection?.kind !== "clip") return null;
     const piece = pieces.find(
       (p) =>
@@ -477,6 +480,9 @@ export function EditorLayout({
     viewportX: number;
   } | null>(null);
 
+  // The container only mounts once the loading skeleton is gone.
+  const editorReady = !playerDataQuery.isLoading && resumeState !== "waiting";
+
   useEffect(() => {
     if (!containerRef.current) return;
     const el = containerRef.current;
@@ -487,7 +493,7 @@ export function EditorLayout({
     ro.observe(el);
     setViewportWidth(Math.max(1, Math.floor(contentWidthOf(el))));
     return () => ro.disconnect();
-  }, [activeSurface]);
+  }, [activeSurface, editorReady]);
 
   const totalWidth = useMemo(
     () => getTimelineTotalWidth(viewportWidth, zoom),
@@ -525,8 +531,8 @@ export function EditorLayout({
     ) => {
       const nextTotalWidth = getTimelineTotalWidth(viewportWidth, nextZoom);
       const maxScrollLeft = Math.max(0, nextTotalWidth - viewportWidth);
-      const anchorMs = selectedClip
-        ? (selectedClip.startMs + selectedClip.endMs) / 2
+      const anchorMs = selectedRange
+        ? (selectedRange.startMs + selectedRange.endMs) / 2
         : playheadMs;
       const fallbackAnchorRatio =
         durationMs > 0
@@ -543,7 +549,7 @@ export function EditorLayout({
       const anchorX = anchorRatio * nextTotalWidth;
       return Math.max(0, Math.min(maxScrollLeft, anchorX - viewportX));
     },
-    [durationMs, playheadMs, selectedClip, viewportWidth],
+    [durationMs, playheadMs, selectedRange, viewportWidth],
   );
 
   const setAnchoredZoom = useCallback(
@@ -653,7 +659,7 @@ export function EditorLayout({
       el.removeEventListener("gesturechange", handleGestureChange);
       el.removeEventListener("gestureend", handleGestureEnd);
     };
-  }, [scrollLeft, setAnchoredZoom, viewportWidth, zoom]);
+  }, [editorReady, scrollLeft, setAnchoredZoom, viewportWidth, zoom]);
 
   useEffect(() => {
     const v = videoRef.current;
@@ -1119,7 +1125,7 @@ export function EditorLayout({
   const addRedaction = useCallback(
     (rect: RedactionRect) => {
       const at = Math.round(playheadMs);
-      const range = selectedClip ?? { startMs: at, endMs: at + 5_000 };
+      const range = selectedRange ?? { startMs: at, endMs: at + 5_000 };
       const startMs = Math.round(range.startMs);
       const redaction: VideoRedaction = clampRedactionToDuration(
         {
@@ -1141,7 +1147,7 @@ export function EditorLayout({
       playheadMs,
       redactionStyle,
       savedRedactions,
-      selectedClip,
+      selectedRange,
     ],
   );
 
@@ -1332,12 +1338,12 @@ export function EditorLayout({
       await commitEdits(removeCut(savedEdits, selection.cutId));
       return;
     }
-    if (!selectedClip) return;
+    if (!selectedRange) return;
     setSelection(null);
     await commitEdits(
-      addCut(savedEdits, selectedClip.startMs, selectedClip.endMs),
+      addCut(savedEdits, selectedRange.startMs, selectedRange.endMs),
     );
-  }, [commitEdits, savedEdits, selectedClip, selection]);
+  }, [commitEdits, savedEdits, selectedRange, selection]);
 
   const seek = useCallback(
     (ms: number) => {
@@ -1607,7 +1613,7 @@ export function EditorLayout({
             onZoomChange={handleZoomChange}
             timelineActive={activeSurface === "timeline"}
             edits={savedEdits}
-            selectionRange={selectedClip}
+            selectionRange={selectedRange}
             onCutRange={callTrim}
             onSplit={splitAtPlayhead}
             redactMode={redactMode}
@@ -1923,8 +1929,12 @@ export function EditorLayout({
         {chaptersOpen ? (
           <div className="flex min-h-0 min-w-0 flex-col border-l border-border">
             <ChaptersEditor
+              // Its unsaved edit and stored list belong to one recording.
+              key={recordingId}
               recordingId={recordingId}
               chapters={chapters}
+              mediaUpdatedAt={recording.mediaUpdatedAt ?? ""}
+              updatedAt={recording.updatedAt ?? ""}
               currentMs={playheadMs}
               onSeek={seek}
               className="flex-1"

@@ -12,13 +12,26 @@ import {
 import type { A11yFinding } from "@shared/design-review";
 import { readLiteralJsxPropsAtAnchor } from "@shared/local-jsx-visual-edit";
 import type { MotionAnimationStyleDefinition } from "@shared/motion-animation-styles";
-import type { MotionAudioClip } from "@shared/motion-code";
+import {
+  motionTimelineHasIncompatiblePositionTracks,
+  type MotionAudioClip,
+} from "@shared/motion-code";
 import type { MotionNativeStyleInstance } from "@shared/motion-native-style";
-import { motionNativeStyleWithPositionTrack } from "@shared/motion-native-style-runtime";
+import {
+  motionNativeStyleWithPositionTrack,
+  motionNativeStyleWithTextAnimationSettings,
+  motionTextDocumentWithNativeStyleSettings,
+} from "@shared/motion-native-style-runtime";
+import {
+  motionSourceReadCapabilityForSource,
+  motionSourceReadAllowsWrites,
+  type MotionSourceReadCapability,
+} from "@shared/motion-source-read";
 import type {
   MotionTextAnimation,
   MotionTextDocument,
 } from "@shared/motion-text-code";
+import { MOTION_TEXT_SOURCE_VERSION } from "@shared/motion-text-code";
 import {
   motionTimelineDurationForContent,
   type MotionPlaybackMode,
@@ -36,14 +49,15 @@ import type {
 import { motionPathTrackForTarget } from "@/components/design/design-canvas/motion-types";
 import { inspectCodeDataForElement } from "@/components/design/edit-panel/inspect-code-source";
 import { type InspectCodeData } from "@/components/design/EditPanel";
-import {
-  waitForShaderWriteToSettle,
-  type ShaderSourceTransform,
-} from "@/components/design/inspector/GlslShaderPanel";
 import { type LocalhostWriteConsentPayload } from "@/components/design/LocalhostWriteConsentDialog";
+import type { MotionNativeStyleIdentity } from "@/components/design/motion-native-style-identity";
 import { type MotionDockTrack } from "@/components/design/MotionDock";
 import type { ScreenProjectionNodeIdentity } from "@/components/design/multi-screen/types";
 import type { ReviewPanelProps } from "@/components/design/ReviewPanel";
+import {
+  waitForShaderWriteToSettle,
+  type ShaderSourceTransform,
+} from "@/components/design/shader-source-coordination";
 import type { ElementInfo } from "@/components/design/types";
 import {
   acknowledgeClipboardContentMutation,
@@ -93,6 +107,7 @@ import {
 } from "../localhost-consent-request";
 import {
   applyMotionStyleKeyframeEdit,
+  motionSourceReadUnavailableMessageKey,
   motionSourceWriteCapabilityAllowsTargets,
   type MotionSourceWriteCapabilitySnapshot,
   motionSourcePreviewProofForTargets,
@@ -104,7 +119,6 @@ import {
   resolveSourceBaseForPublication,
   prepareCanonicalSourceContent,
 } from "../source-publication";
-import { postShaderFillPreviewClearToPreviewIframes } from "../text-edit-utils";
 import { type DesignFile } from "../types";
 import type { EditorActiveScreenAndGeometry } from "./use-editor-active-screen-and-geometry";
 import type { EditorCanvasAndScreens } from "./use-editor-canvas-and-screens";
@@ -147,7 +161,6 @@ export function useEditorContentAndComponents({
   const {
     t,
     id,
-    location,
     queryClient,
     shellMode,
     setMode,
@@ -170,8 +183,6 @@ export function useEditorContentAndComponents({
     motionAutosaveTimerRef,
     motionAutosaveFlushRef,
     clearMotionAutosaveTimer,
-    setShaderFillPreview,
-    shaderFillPreviewActiveRef,
     activeBreakpointWidthState,
     undoManagerRef,
     linkedComponentMutationQueueRef,
@@ -264,6 +275,7 @@ export function useEditorContentAndComponents({
     setMotionPlaybackMode,
     motionDefaultEase,
     motionPlayhead,
+    motionDockLiveState,
     motionAutoKeyframeEnabled,
     motionTracksDirty,
     setMotionTracksDirty,
@@ -290,6 +302,7 @@ export function useEditorContentAndComponents({
     replacePreviewContent,
     sourceCapabilities,
     activeRuntimeCodeLayerProjection,
+    motionSourceReadCapability,
   } = editorLiveEditsAndPresence;
   const selectedMotionProofNodeId =
     selectedMotionTargetNodeId ??
@@ -324,11 +337,13 @@ export function useEditorContentAndComponents({
   }, [activeFile?.id]);
   const { data: motionSourceCapabilityResult } = useActionQuery<{
     sourceWriteCapability?: MotionSourceWriteCapabilitySnapshot | null;
+    sourceReadCapability?: MotionSourceReadCapability | null;
   }>(
     "get-motion-timeline",
     {
       designId: id ?? "",
       sourceRef: activeFile?.id ?? "",
+      passiveRead: true,
       targetNodeIds: motionProofTargetNodeIds,
       ...(localhostMotionProof
         ? {
@@ -389,26 +404,38 @@ export function useEditorContentAndComponents({
       localhostMotionProof,
       motionProofTargetNodeIds,
     );
+  const activeMotionSourceReadCapability = motionSourceReadCapabilityForSource(
+    [
+      motionSourceReadCapability,
+      motionSourceCapabilityResult?.sourceReadCapability,
+    ],
+    activeFile?.id,
+  );
+  const messageKey = motionSourceReadUnavailableMessageKey(
+    activeMotionSourceReadCapability,
+  );
+  const motionSourceReadUnavailableReason = messageKey ? t(messageKey) : null;
+  const motionSourceReadable = motionSourceReadAllowsWrites(
+    activeMotionSourceReadCapability,
+  );
   const motionControlsWritable =
-    (activeCanvasSourceType === "inline" &&
+    motionSourceReadable &&
+    ((activeCanvasSourceType === "inline" &&
       sourceCapabilities.includes("writeMotion")) ||
-    (activeCanvasSourceType === "localhost" &&
-      Boolean(activeCodeLayerProjection.source.connectionId) &&
-      Boolean(localhostMotionProof) &&
-      motionSourceTargetsWritable);
+      (activeCanvasSourceType === "localhost" &&
+        Boolean(activeCodeLayerProjection.source.connectionId) &&
+        Boolean(localhostMotionProof) &&
+        motionSourceTargetsWritable));
   const writeMotionAvailable =
-    (activeCanvasSourceType === "inline" &&
+    motionSourceReadable &&
+    ((activeCanvasSourceType === "inline" &&
       sourceCapabilities.includes("writeMotion")) ||
-    (activeCanvasSourceType === "localhost" &&
-      Boolean(activeCodeLayerProjection.source.connectionId) &&
-      Boolean(localhostMotionProof));
+      (activeCanvasSourceType === "localhost" &&
+        Boolean(activeCodeLayerProjection.source.connectionId) &&
+        Boolean(localhostMotionProof)));
   const requestLocalhostWriteRef = useRef<RequestLocalhostWrite | null>(null);
   const [uiHidden, setUiHidden] = useState(false);
   const motionLivePlayheadRef = useRef<number | null>(null);
-  const clearShaderFillPreview = useCallback(() => {
-    if (shaderFillPreviewActiveRef.current) setShaderFillPreview(null);
-    postShaderFillPreviewClearToPreviewIframes();
-  }, []);
   const contentHistorySelectionAfterRef =
     useRef<ContentHistorySelectionAfterMap>(new WeakMap());
   const suppressContentHistoryRef = useRef(false);
@@ -458,26 +485,6 @@ export function useEditorContentAndComponents({
     );
     return Boolean(root && root.id !== selectedCodeLayerNode.id);
   }, [activeCodeLayerProjection, selectedCodeLayerNode]);
-
-  useEffect(() => {
-    clearShaderFillPreview();
-  }, [
-    activeFile?.id,
-    clearShaderFillPreview,
-    selectedElement?.selector,
-    selectedElement?.sourceId,
-  ]);
-  useEffect(() => {
-    clearShaderFillPreview();
-  }, [clearShaderFillPreview, location.pathname, location.search]);
-  useEffect(() => {
-    window.addEventListener("pagehide", clearShaderFillPreview);
-    window.addEventListener("beforeunload", clearShaderFillPreview);
-    return () => {
-      window.removeEventListener("pagehide", clearShaderFillPreview);
-      window.removeEventListener("beforeunload", clearShaderFillPreview);
-    };
-  }, [clearShaderFillPreview]);
 
   const defaultComponentName = useMemo(() => {
     if (selectedCodeLayerNode?.layerName)
@@ -598,12 +605,12 @@ export function useEditorContentAndComponents({
   const markMotionTracksDirty = useCallback(() => {
     captureMotionSourceVersion(localhostMotionProof?.moduleVersionHash);
     setMotionTracksDirty(true);
-    setMotionAutosaveRevision((revision) => {
-      const next = revision + 1;
-      motionAutosaveRevisionRef.current = next;
-      motionAutosaveFailedRevisionRef.current = null;
-      return next;
-    });
+    // A save timer can fire before React applies this edit. Moving the ref
+    // now makes it stand down instead of saving the document from before it.
+    const next = motionAutosaveRevisionRef.current + 1;
+    motionAutosaveRevisionRef.current = next;
+    motionAutosaveFailedRevisionRef.current = null;
+    setMotionAutosaveRevision(next);
   }, [captureMotionSourceVersion, localhostMotionProof?.moduleVersionHash]);
 
   const pruneMotionTracksByNodeId = useCallback(
@@ -615,25 +622,42 @@ export function useEditorContentAndComponents({
       if (remainingTextAnimations.length !== textAnimations.length) {
         setMotionTextDocument(
           remainingTextAnimations.length > 0
-            ? { version: 1, animations: remainingTextAnimations }
+            ? {
+                version: MOTION_TEXT_SOURCE_VERSION,
+                animations: remainingTextAnimations,
+              }
             : null,
         );
+        markMotionTracksDirty();
+      }
+      // Marked here, not in the updater: React may run that later, after a
+      // pending save has already sent the tracks from before the prune.
+      if (
+        motionTracks.some((track) => nodeIdsToRemove.has(track.targetNodeId))
+      ) {
         markMotionTracksDirty();
       }
       setMotionTracks((current) => {
         const next = current.filter(
           (track) => !nodeIdsToRemove.has(track.targetNodeId),
         );
-        if (next.length === current.length) return current;
-        markMotionTracksDirty();
-        return next;
+        return next.length === current.length ? current : next;
       });
     },
-    [markMotionTracksDirty, motionTextDocument, setMotionTextDocument],
+    [
+      markMotionTracksDirty,
+      motionTextDocument,
+      motionTracks,
+      setMotionTextDocument,
+    ],
   );
 
   const handleMotionTracksChange = useCallback(
-    (tracks: MotionDockTrack[]) => {
+    (
+      tracks:
+        | MotionDockTrack[]
+        | ((current: MotionDockTrack[]) => MotionDockTrack[]),
+    ) => {
       if (!writeMotionAvailable || activeCanvasSourceType !== "inline") return;
       setMotionTracks(tracks);
       markMotionTracksDirty();
@@ -653,7 +677,10 @@ export function useEditorContentAndComponents({
       );
       const nextDocument =
         nextAnimations.length > 0
-          ? { version: 1 as const, animations: nextAnimations }
+          ? {
+              version: MOTION_TEXT_SOURCE_VERSION,
+              animations: nextAnimations,
+            }
           : null;
       if (JSON.stringify(nextDocument) !== JSON.stringify(motionTextDocument)) {
         setMotionTextDocument(nextDocument);
@@ -682,11 +709,13 @@ export function useEditorContentAndComponents({
     (
       tracks: MotionTrackWire[],
       targetNodeId: string,
+      trackId?: string,
     ): MotionPathTracksChangeResult | void => {
       if (!writeMotionAvailable) return;
       const updatedPositionTrack = motionPathTrackForTarget(
         tracks,
         targetNodeId,
+        trackId,
       );
       if (!updatedPositionTrack) {
         return {
@@ -722,6 +751,16 @@ export function useEditorContentAndComponents({
         if (JSON.stringify(currentStyle) === JSON.stringify(updatedStyle)) {
           return { status: "updated" };
         }
+        if (
+          motionTimelineHasIncompatiblePositionTracks({
+            tracks: motionTracks,
+            nativeStyles: motionNativeStyles.map((style, index) =>
+              index === styleIndex ? updatedStyle : style,
+            ),
+          })
+        ) {
+          return { status: "unsupported", reason: "repeated-position-path" };
+        }
         setMotionNativeStyles((current) =>
           current.map((style, index) =>
             index === styleIndex ? updatedStyle : style,
@@ -731,10 +770,17 @@ export function useEditorContentAndComponents({
         return { status: "updated" };
       }
 
-      const currentPositionTrack = motionTracks.find(
+      const matchingPositionTracks = motionTracks.filter(
         (track) =>
           track.targetNodeId === targetNodeId && track.property === "translate",
       );
+      const currentPositionTrack = updatedPositionTrack.id
+        ? matchingPositionTracks.find(
+            (track) => track.id === updatedPositionTrack.id,
+          )
+        : matchingPositionTracks.length === 1
+          ? matchingPositionTracks[0]
+          : undefined;
       if (
         !currentPositionTrack ||
         JSON.stringify(currentPositionTrack.keyframes) ===
@@ -742,13 +788,25 @@ export function useEditorContentAndComponents({
       ) {
         return currentPositionTrack ? { status: "updated" } : undefined;
       }
-      setMotionTracks((current) =>
-        current.map((track) =>
-          track.targetNodeId === targetNodeId && track.property === "translate"
+      const withUpdatedPosition = (current: typeof motionTracks) =>
+        current.map((track) => {
+          const matchesTrack = updatedPositionTrack.id
+            ? track.id === updatedPositionTrack.id
+            : track.targetNodeId === targetNodeId &&
+              track.property === "translate";
+          return matchesTrack
             ? { ...track, keyframes: updatedPositionTrack.keyframes }
-            : track,
-        ),
-      );
+            : track;
+        });
+      if (
+        motionTimelineHasIncompatiblePositionTracks({
+          tracks: withUpdatedPosition(motionTracks),
+          nativeStyles: motionNativeStyles,
+        })
+      ) {
+        return { status: "unsupported", reason: "repeated-position-path" };
+      }
+      setMotionTracks(withUpdatedPosition);
       markMotionTracksDirty();
       return { status: "updated" };
     },
@@ -825,13 +883,200 @@ export function useEditorContentAndComponents({
         }
       }
       if (!inserted) nextAnimations.push(...targetAnimations);
-      handleMotionTextDocumentChange(
+      let nextDocument: MotionTextDocument | null =
         nextAnimations.length > 0
-          ? { version: 1, animations: nextAnimations }
-          : null,
-      );
+          ? { version: MOTION_TEXT_SOURCE_VERSION, animations: nextAnimations }
+          : null;
+      let nextNativeStyles = motionNativeStyles;
+      if (targetAnimations.length > 0) {
+        const targetTextStyles = motionNativeStyles.filter(
+          (style) =>
+            style.styleKey === "TextStagger" &&
+            style.targetNodeId === targetNodeId,
+        );
+        if (targetTextStyles.length > 1) {
+          toast.error(t("designEditor.motion.textSyncUnsupported"));
+          return;
+        }
+        try {
+          const alreadyAnimated = motionNativeStyles.some(
+            (style) =>
+              style.styleKey === "TextStagger" &&
+              style.targetNodeId === targetNodeId &&
+              ((targetAnimations.some(
+                (animation) => animation.property === "translate",
+              ) &&
+                style.props.positionEnabled === true) ||
+                (targetAnimations.some(
+                  (animation) => animation.property === "rotate",
+                ) &&
+                  style.props.rotationEnabled === true) ||
+                (targetAnimations.some(
+                  (animation) => animation.property === "scale",
+                ) &&
+                  style.props.scaleEnabled === true) ||
+                (targetAnimations.some(
+                  (animation) => animation.property === "opacity",
+                ) &&
+                  style.props.opacityEnabled === true) ||
+                (targetAnimations.some(
+                  (animation) => animation.property === "filter",
+                ) &&
+                  style.props.blurEnabled === true)),
+          );
+          if (alreadyAnimated) {
+            toast.info(t("designEditor.motion.textPropertyAlreadyAnimated"));
+          }
+          nextNativeStyles = motionNativeStyles.map((style) =>
+            style.styleKey === "TextStagger" &&
+            style.targetNodeId === targetNodeId
+              ? motionNativeStyleWithTextAnimationSettings(
+                  style,
+                  targetAnimations[0]!,
+                )
+              : style,
+          );
+          for (const style of nextNativeStyles) {
+            if (
+              style.styleKey === "TextStagger" &&
+              style.targetNodeId === targetNodeId
+            ) {
+              nextDocument = motionTextDocumentWithNativeStyleSettings(
+                nextDocument,
+                style,
+              );
+            }
+          }
+        } catch {
+          toast.error(t("designEditor.motion.textSyncUnsupported"));
+          return;
+        }
+      }
+      if (
+        JSON.stringify(nextNativeStyles) !== JSON.stringify(motionNativeStyles)
+      ) {
+        setMotionNativeStyles(nextNativeStyles);
+      }
+      handleMotionTextDocumentChange(nextDocument);
     },
-    [handleMotionTextDocumentChange, motionTextDocument, writeMotionAvailable],
+    [
+      handleMotionTextDocumentChange,
+      motionNativeStyles,
+      motionTextDocument,
+      setMotionNativeStyles,
+      t,
+      writeMotionAvailable,
+    ],
+  );
+
+  const handleMotionNativeStyleChange = useCallback(
+    (
+      instance: MotionNativeStyleInstance,
+      identity: MotionNativeStyleIdentity,
+    ) => {
+      if (!writeMotionAvailable) return;
+      const index = identity.sourceInstanceId
+        ? motionNativeStyles.findIndex(
+            (candidate) =>
+              candidate.sourceInstanceId === identity.sourceInstanceId &&
+              candidate.styleKey === identity.styleKey &&
+              candidate.targetNodeId === identity.targetNodeId,
+          )
+        : identity.index;
+      const previous = motionNativeStyles[index];
+      if (
+        !previous ||
+        previous.styleKey !== identity.styleKey ||
+        previous.targetNodeId !== identity.targetNodeId
+      ) {
+        return;
+      }
+
+      let nextStyles = [...motionNativeStyles];
+      nextStyles[index] = instance;
+      let nextDocument = motionTextDocument;
+      const targetAnimations =
+        motionTextDocument?.animations.filter(
+          (animation) => animation.targetNodeId === instance.targetNodeId,
+        ) ?? [];
+      if (instance.styleKey === "TextStagger" && targetAnimations.length > 0) {
+        const targetTextStyles = motionNativeStyles.filter(
+          (style) =>
+            style.styleKey === "TextStagger" &&
+            style.targetNodeId === instance.targetNodeId,
+        );
+        if (targetTextStyles.length > 1) {
+          toast.error(t("designEditor.motion.textSyncUnsupported"));
+          return;
+        }
+        try {
+          const duplicateEffect =
+            (previous.props.positionEnabled !== true &&
+              instance.props.positionEnabled === true &&
+              targetAnimations.some(
+                (animation) => animation.property === "translate",
+              )) ||
+            (previous.props.rotationEnabled !== true &&
+              instance.props.rotationEnabled === true &&
+              targetAnimations.some(
+                (animation) => animation.property === "rotate",
+              )) ||
+            (previous.props.scaleEnabled !== true &&
+              instance.props.scaleEnabled === true &&
+              targetAnimations.some(
+                (animation) => animation.property === "scale",
+              )) ||
+            (previous.props.opacityEnabled !== true &&
+              instance.props.opacityEnabled === true &&
+              targetAnimations.some(
+                (animation) => animation.property === "opacity",
+              )) ||
+            (previous.props.blurEnabled !== true &&
+              instance.props.blurEnabled === true &&
+              targetAnimations.some(
+                (animation) => animation.property === "filter",
+              ));
+          if (duplicateEffect) {
+            toast.info(t("designEditor.motion.textPropertyAlreadyAnimated"));
+          }
+          nextDocument = motionTextDocumentWithNativeStyleSettings(
+            motionTextDocument,
+            instance,
+            previous,
+          );
+        } catch {
+          toast.error(t("designEditor.motion.textSyncUnsupported"));
+          return;
+        }
+      }
+
+      if (
+        motionTimelineHasIncompatiblePositionTracks({
+          tracks: motionTracks,
+          nativeStyles: nextStyles,
+        })
+      ) {
+        toast.error(t("designEditor.motion.positionStyleConflict"), {
+          id: "motion-position-style-conflict",
+        });
+        return;
+      }
+      setMotionNativeStyles(nextStyles);
+      if (JSON.stringify(nextDocument) !== JSON.stringify(motionTextDocument)) {
+        setMotionTextDocument(nextDocument);
+      }
+      markMotionTracksDirty();
+    },
+    [
+      markMotionTracksDirty,
+      motionNativeStyles,
+      motionTextDocument,
+      motionTracks,
+      setMotionNativeStyles,
+      setMotionTextDocument,
+      t,
+      writeMotionAvailable,
+    ],
   );
 
   const handleMotionDurationChange = useCallback(
@@ -840,7 +1085,7 @@ export function useEditorContentAndComponents({
       setMotionDurationMs(
         motionTimelineDurationForContent(
           durationMs,
-          motionTracks,
+          [],
           motionTextDocument?.animations ?? [],
         ),
       );
@@ -848,7 +1093,6 @@ export function useEditorContentAndComponents({
     },
     [
       markMotionTracksDirty,
-      motionTracks,
       motionTextDocument?.animations,
       writeMotionAvailable,
     ],
@@ -887,6 +1131,7 @@ export function useEditorContentAndComponents({
         timelineDurationMs: motionDurationMs,
         defaultEase: motionDefaultEase,
         autoKeyframeEnabled: motionAutoKeyframeEnabled,
+        trackId: motionDockLiveState.selectedTrackId ?? undefined,
       };
       if (applyMotionStyleKeyframeEdit(motionTracks, edit) === motionTracks) {
         return;
@@ -901,6 +1146,7 @@ export function useEditorContentAndComponents({
       markMotionTracksDirty,
       motionAutoKeyframeEnabled,
       motionDefaultEase,
+      motionDockLiveState.selectedTrackId,
       motionDockOpen,
       motionDurationMs,
       motionPlayhead,
@@ -924,6 +1170,7 @@ export function useEditorContentAndComponents({
           selectedCodeLayerNode,
           selectedElement,
           selectedMotionTargetNodeId,
+          selectedMotionTrackId: motionDockLiveState.selectedTrackId,
           setMotionTracks,
         },
         cssProperty,
@@ -934,6 +1181,7 @@ export function useEditorContentAndComponents({
       markMotionTracksDirty,
       motionDefaultEase,
       motionPlayhead,
+      motionDockLiveState.selectedTrackId,
       selectedCodeLayerNode,
       selectedElement?.computedStyles,
       selectedElement?.tagName,
@@ -1194,10 +1442,8 @@ export function useEditorContentAndComponents({
         serverAccepted?: boolean;
       } = {},
     ) => {
-      if (
-        options.persist !== false &&
-        !canApplyContentEdit(activeFile?.id ?? "active")
-      ) {
+      if (!activeFile) return { status: "refused" as const };
+      if (options.persist !== false && !canApplyContentEdit(activeFile.id)) {
         return { status: "refused" as const };
       }
       const result = runApplyLocalContentUpdate(
@@ -1235,9 +1481,8 @@ export function useEditorContentAndComponents({
           sourceBaseContent:
             options.sourceBaseContent ??
             sourceBaseForPublication(
-              activeFile?.id ?? "",
-              options.historyBeforeContent ??
-                getScreenContent(activeFile?.id ?? ""),
+              activeFile.id,
+              options.historyBeforeContent ?? getScreenContent(activeFile.id),
             ),
         },
       );
@@ -1284,14 +1529,18 @@ export function useEditorContentAndComponents({
         historyBeforeContent?: string;
         sourceBaseContent?: string;
         identityMigrationSourceContent?: string;
+        deferWhenLinkedMutationPending?: boolean;
         shaderWriteCompletion?: true;
         updatedAt?: string;
         clipboardMutation?: ClipboardContentMutationPublication;
         serverAccepted?: boolean;
       } = {},
     ) => {
+      if (!activeFile) return { status: "refused" as const };
       if (options.persist !== false && !canApplyContentEdit(fileId)) {
-        return { status: "refused" as const };
+        return options.deferWhenLinkedMutationPending
+          ? { status: "deferred" as const }
+          : { status: "refused" as const };
       }
       const result = runApplyFileContentUpdate(
         {
@@ -1490,74 +1739,28 @@ export function useEditorContentAndComponents({
     };
   }
 
-  useEffect(
-    () =>
-      runMotionAutosave({
-        activeCanvasSourceType,
-        activeCodeLayerProjection: motionPreviewProjection,
-        activeContent,
-        activeFile,
-        applyFileContentUpdate,
-        applyMotionEdit,
-        clearMotionAutosaveTimer,
-        getScreenContent,
-        id,
-        lastLocalContentRef,
-        lastScheduledMotionAutosaveFileVersionRef,
-        lastScheduledMotionAutosaveRevisionRef,
-        latestActiveContentRef,
-        motionAutosaveFailedRevisionRef,
-        motionAutosaveFlushRef,
-        motionAutosavePending,
-        motionAutosaveRevision,
-        motionAutosaveRevisionRef,
-        motionAutosaveTimerRef,
-        motionDefaultEase,
-        motionDurationMs,
-        motionPlaybackMode,
-        motionTimelineId,
-        motionTimelineFilePath,
-        motionTracks,
-        motionAnimationStyles,
-        motionNativeStyles,
-        motionAudioClips,
-        motionEasingVariables,
-        motionProofTargetNodeIds,
-        motionTextDocument,
-        motionTracksDirty,
-        motionSourceVersionHashRef,
-        motionSourceVersionCapturedRef,
-        motionSourceConflictRef,
-        motionFileActivationEpochRef,
-        previousMotionFileIdRef,
-        queryClient,
-        removeMotionTimeline,
-        removeMotionTimelineMutation,
-        setMotionHydrationFingerprint,
-        setMotionTimelineId,
-        setMotionTracksDirty,
-        requestLocalhostWrite: (opts) =>
-          requestLocalhostWriteRef.current?.(opts) ?? "not-editable",
-        writeMotionAvailable,
-        sourceWriteUnavailableMessage: t(
-          "designEditor.motion.sourceWriteUnavailable",
-        ),
-        motionSourceConflictMessage: t("designEditor.motion.sourceConflict"),
-        motionReloadFromSourceLabel: t("designEditor.motion.reloadFromSource"),
-      }),
-    [
-      activeFile?.id,
-      activeFile?.updatedAt,
-      activeContent,
+  useEffect(() => {
+    if (!activeFile) return;
+    return runMotionAutosave({
       activeCanvasSourceType,
-      motionPreviewProjection,
+      activeCodeLayerProjection: motionPreviewProjection,
+      activeContent,
+      activeFile,
       applyFileContentUpdate,
       applyMotionEdit,
       clearMotionAutosaveTimer,
       getScreenContent,
       id,
-      motionAutosaveRevision,
+      lastLocalContentRef,
+      lastScheduledMotionAutosaveFileVersionRef,
+      lastScheduledMotionAutosaveRevisionRef,
+      latestActiveContentRef,
+      motionAutosaveFailedRevisionRef,
+      motionAutosaveFlushRef,
       motionAutosavePending,
+      motionAutosaveRevision,
+      motionAutosaveRevisionRef,
+      motionAutosaveTimerRef,
       motionDefaultEase,
       motionDurationMs,
       motionPlaybackMode,
@@ -1574,14 +1777,63 @@ export function useEditorContentAndComponents({
       motionSourceVersionHashRef,
       motionSourceVersionCapturedRef,
       motionSourceConflictRef,
-      writeMotionAvailable,
+      motionFileActivationEpochRef,
+      previousMotionFileIdRef,
       queryClient,
-      t,
       removeMotionTimeline,
-      removeMotionTimelineMutation.isPending,
-      requestLocalhostWriteRef,
-    ],
-  );
+      removeMotionTimelineMutation,
+      setMotionHydrationFingerprint,
+      setMotionTimelineId,
+      setMotionTracksDirty,
+      requestLocalhostWrite: (opts) =>
+        requestLocalhostWriteRef.current?.(opts) ?? "not-editable",
+      writeMotionAvailable,
+      sourceWriteUnavailableMessage:
+        motionSourceReadUnavailableReason ??
+        t("designEditor.motion.sourceWriteUnavailable"),
+      unresolvedStylesheetsMessage: t(
+        "designEditor.motion.unresolvedStylesheets",
+      ),
+      motionSourceConflictMessage: t("designEditor.motion.sourceConflict"),
+      motionReloadFromSourceLabel: t("designEditor.motion.reloadFromSource"),
+    });
+  }, [
+    activeFile?.id,
+    activeFile?.updatedAt,
+    activeContent,
+    activeCanvasSourceType,
+    motionPreviewProjection,
+    applyFileContentUpdate,
+    applyMotionEdit,
+    clearMotionAutosaveTimer,
+    getScreenContent,
+    id,
+    motionAutosaveRevision,
+    motionAutosavePending,
+    motionDefaultEase,
+    motionDurationMs,
+    motionPlaybackMode,
+    motionTimelineId,
+    motionTimelineFilePath,
+    motionTracks,
+    motionAnimationStyles,
+    motionNativeStyles,
+    motionAudioClips,
+    motionEasingVariables,
+    motionProofTargetNodeIds,
+    motionTextDocument,
+    motionTracksDirty,
+    motionSourceReadUnavailableReason,
+    motionSourceVersionHashRef,
+    motionSourceVersionCapturedRef,
+    motionSourceConflictRef,
+    writeMotionAvailable,
+    queryClient,
+    t,
+    removeMotionTimeline,
+    removeMotionTimelineMutation.isPending,
+    requestLocalhostWriteRef,
+  ]);
 
   const handleComponentPropApplied = useMemo(
     () =>
@@ -1714,29 +1966,28 @@ export function useEditorContentAndComponents({
     t,
   ]);
 
-  const handleDetachInstanceMenuAction = useCallback(
-    () =>
-      runDetachInstanceMenuAction({
-        activeContent,
-        activeFile,
-        activeFileId,
-        detachComponentInstanceMutation,
-        handleComponentPropApplied,
-        id,
-        selectedComponentNodeId: selectedInstanceActionNodeId,
-        t,
-      }),
-    [
-      activeFileId,
+  const handleDetachInstanceMenuAction = useCallback(() => {
+    if (!activeFile) return;
+    return runDetachInstanceMenuAction({
       activeContent,
-      activeFile?.updatedAt,
+      activeFile,
+      activeFileId,
       detachComponentInstanceMutation,
       handleComponentPropApplied,
       id,
-      selectedInstanceActionNodeId,
+      selectedComponentNodeId: selectedInstanceActionNodeId,
       t,
-    ],
-  );
+    });
+  }, [
+    activeFileId,
+    activeContent,
+    activeFile?.updatedAt,
+    detachComponentInstanceMutation,
+    handleComponentPropApplied,
+    id,
+    selectedInstanceActionNodeId,
+    t,
+  ]);
 
   const handleSwapInstanceMenuAction = useCallback(() => {
     if (!id || !selectedInstanceActionNodeId) return;
@@ -1866,7 +2117,6 @@ export function useEditorContentAndComponents({
     uiHidden,
     setUiHidden,
     motionLivePlayheadRef,
-    clearShaderFillPreview,
     contentHistorySelectionAfterRef,
     suppressContentHistoryRef,
     componentSwapPickerRequest,
@@ -1880,6 +2130,7 @@ export function useEditorContentAndComponents({
     markMotionTracksDirty,
     pruneMotionTracksByNodeId,
     motionControlsWritable,
+    motionSourceReadUnavailableReason,
     handleMotionTracksChange,
     handleMotionDockTracksChange,
     handleMotionAudioClipsChange,
@@ -1889,6 +2140,7 @@ export function useEditorContentAndComponents({
     handleMotionAnimationStyleRemoved,
     handleMotionTextDocumentChange,
     handleMotionTextAnimationsChange,
+    handleMotionNativeStyleChange,
     handleMotionDurationChange,
     upsertMotionKeyframesFromStyles,
     handleToggleMotionKeyframe,

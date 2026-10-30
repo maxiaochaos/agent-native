@@ -5,6 +5,7 @@ import {
   isTimeLimitStop,
   type AutoContinueRefusalCode,
 } from "../../agent/auto-continue.js";
+import { RUN_STREAM_ENDED_ERROR_CODE } from "../../agent/run-errors.js";
 import { isContinuationTerminalReason } from "../../agent/types.js";
 import {
   BACKGROUND_FUNCTION_WALL_HEADROOM_MS,
@@ -41,6 +42,7 @@ export type RunOutcome = (typeof RUN_OUTCOMES)[number];
  * code is added here with its outcome or it does not type-check.
  */
 export const LEGACY_RUN_CODES = [
+  RUN_STREAM_ENDED_ERROR_CODE,
   "stream_ended",
   "action_not_started",
   "background_run_lost",
@@ -92,6 +94,7 @@ export const LEGACY_RUN_CODES = [
 export type LegacyRunCode = (typeof LEGACY_RUN_CODES)[number];
 
 const LEGACY_RUN_CODE_OUTCOMES = {
+  [RUN_STREAM_ENDED_ERROR_CODE]: "interrupted",
   stream_ended: "interrupted",
   action_not_started: "interrupted",
   background_run_lost: "interrupted",
@@ -183,6 +186,11 @@ export type RunTerminalSource = "stream" | "authority" | "pipe" | "local";
 export interface RunOutcomeReport {
   readonly runId: string;
   readonly threadId: string;
+  /**
+   * The turn the server stored the run under; absent when this page did not
+   * start it, or for a replay whose turn the server did not name.
+   */
+  readonly turnId?: string;
   readonly outcome: RunOutcome;
   /** The legacy code that named this outcome one incident at a time. */
   readonly code?: string;
@@ -214,12 +222,18 @@ export type ServerRunState =
         | "aborted";
       readonly runId: string;
       readonly turnId?: string;
+      readonly startMessageId?: string;
       /** Server clock, epoch ms. */
       readonly startedAt?: number;
       readonly dispatchMode?: string;
       readonly terminalReason?: string | null;
+      /** Present only when the caller requested a durable connection check. */
+      readonly pendingConnectionRequestId?: string | null;
     }
-  | { readonly status: "missing" };
+  | {
+      readonly status: "missing";
+      readonly pendingConnectionRequestId?: null;
+    };
 
 export type RunAuthorityRead =
   | { readonly kind: "read"; readonly state: ServerRunState }

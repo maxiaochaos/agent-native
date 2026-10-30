@@ -10,11 +10,20 @@ import {
 import { writeCollabText } from "@/pages/design-editor/collab-sync";
 import { runRedo } from "@/pages/design-editor/commands/redo";
 import { runUndo } from "@/pages/design-editor/commands/undo";
+import { cancelPendingPastedMediaAbsentFromContent } from "@/pages/design-editor/domains/pending-pasted-media";
 import { LOCAL_EDIT_ORIGIN } from "@/pages/design-editor/editor-session";
-import { YJS_UNDO_SELECTION_META_KEY } from "@/pages/design-editor/history";
+import {
+  YJS_UNDO_SELECTION_META_KEY,
+  type ContentHistoryChange,
+} from "@/pages/design-editor/history";
+import { resolveLocalHistorySelection } from "@/pages/design-editor/history-identity";
 
 const CONTENT_WITH_BOX_A = `<!doctype html><html data-agent-native-node-id="html-1"><body data-agent-native-node-id="body-1">
 <div data-agent-native-node-id="box-a" style="position:absolute;left:10px;top:10px;width:20px;height:20px"></div>
+</body></html>`;
+const CONTENT_WITH_BOX_A_AND_BOX_B = `<!doctype html><html data-agent-native-node-id="html-1"><body data-agent-native-node-id="body-1">
+<div data-agent-native-node-id="box-a" style="position:absolute;left:10px;top:10px;width:20px;height:20px"></div>
+<div data-agent-native-node-id="box-b" style="position:absolute;left:40px;top:10px;width:20px;height:20px"></div>
 </body></html>`;
 const CONTENT_WITHOUT_BOX_A = `<!doctype html><html data-agent-native-node-id="html-1"><body data-agent-native-node-id="body-1"></body></html>`;
 
@@ -114,6 +123,105 @@ function fakeStackItem(meta?: Record<string, unknown>) {
 }
 
 describe("runUndo — single-screen Yjs undo restores the stamped selection", () => {
+  it("cancels preview-only pending media absent from the Yjs undo result", () => {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("content");
+    ytext.insert(0, "<!doctype html><html><body></body></html>");
+    const um = new Y.UndoManager(ytext, {
+      trackedOrigins: new Set([LOCAL_EDIT_ORIGIN]),
+    });
+    writeCollabText(
+      ydoc,
+      ytext,
+      "<!doctype html><html><body><main>Changed</main></body></html>",
+      LOCAL_EDIT_ORIGIN,
+    );
+    um.stopCapturing();
+    const pendingByScreen = new Map([
+      ["file-1", new Map([["preview-only-image", false]])],
+    ]);
+    const cancelPendingPastedMediaForHistoryReplay = vi.fn(
+      (screenId: string, _previousContent: string, replayedContent: string) =>
+        cancelPendingPastedMediaAbsentFromContent(
+          pendingByScreen,
+          screenId,
+          replayedContent,
+        ),
+    );
+
+    runUndo(
+      baseArgs({
+        activeFile: {
+          id: "file-1",
+          fileType: "html",
+          updatedAt: "2024-01-01T00:00:00Z",
+        },
+        um,
+        undoManagerRef: { current: um },
+        ydoc,
+        getScreenContent: () =>
+          '<main><img data-agent-native-node-id="preview-only-image"></main>',
+        cancelPendingPastedMediaForHistoryReplay,
+        queueFileContentSave: vi.fn(),
+      }),
+    );
+
+    expect(cancelPendingPastedMediaForHistoryReplay).toHaveBeenCalledOnce();
+    expect(pendingByScreen.get("file-1")).toEqual(
+      new Map([["preview-only-image", true]]),
+    );
+    um.destroy();
+    ydoc.destroy();
+  });
+
+  it("cancels a pending paste when Yjs undo removes it", () => {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("content");
+    const before =
+      '<main><img data-agent-native-node-id="pending-image"></main>';
+    ytext.insert(0, "<main></main>");
+    const um = new Y.UndoManager(ytext, {
+      trackedOrigins: new Set([LOCAL_EDIT_ORIGIN]),
+    });
+    writeCollabText(ydoc, ytext, before, LOCAL_EDIT_ORIGIN);
+    um.stopCapturing();
+    const pendingByScreen = new Map([
+      ["file-1", new Map([["pending-image", false]])],
+    ]);
+    const cancelPendingPastedMediaForHistoryReplay = vi.fn(
+      (screenId: string, _previousContent: string, replayedContent: string) =>
+        cancelPendingPastedMediaAbsentFromContent(
+          pendingByScreen,
+          screenId,
+          replayedContent,
+        ),
+    );
+
+    runUndo(
+      baseArgs({
+        activeFile: {
+          id: "file-1",
+          fileType: "html",
+          updatedAt: "2024-01-01T00:00:00Z",
+        },
+        um,
+        undoManagerRef: { current: um },
+        ydoc,
+        cancelPendingPastedMediaForHistoryReplay,
+        queueFileContentSave: vi.fn(),
+      }),
+    );
+
+    expect(cancelPendingPastedMediaForHistoryReplay).toHaveBeenCalledWith(
+      "file-1",
+      before,
+      expect.not.stringContaining("pending-image"),
+    );
+    expect(pendingByScreen.get("file-1")?.get("pending-image")).toBe(true);
+    um.destroy();
+    ydoc.destroy();
+  });
+
   it("keeps the real Yjs redo item after canonicalizing an undo result", () => {
     const ydoc = new Y.Doc();
     const ytext = ydoc.getText("content");
@@ -267,5 +375,125 @@ describe("runUndo — single-screen Yjs undo restores the stamped selection", ()
     );
 
     expect(capturedElement).toBeNull();
+  });
+});
+
+it("restores a created layer selection after local-history redo without Yjs", () => {
+  const { node: createdNode } = sourceBoxA();
+  let selectedElement: unknown = null;
+  let selectedLayerIds: string[] = [];
+  const entry: ContentHistoryChange = {
+    fileId: "file-1",
+    before: CONTENT_WITHOUT_BOX_A,
+    after: CONTENT_WITH_BOX_A,
+    selectionBefore: { selectedElement: null, selectedLayerIds: [] },
+    selectionAfter: {
+      selectedElement: null,
+      selectedLayerIds: [createdNode.id],
+    },
+  };
+  const localContentUndoStackRef = { current: [entry] };
+  const localContentRedoStackRef = { current: [] as ContentHistoryChange[] };
+  const historyOrderRef = { current: ["content"] };
+  const redoOrderRef = { current: [] as string[] };
+  const args = baseArgs({
+    activeFile: {
+      id: "file-1",
+      fileType: "html",
+      updatedAt: "2024-01-01T00:00:00Z",
+    },
+    getFreshActiveContent: () => CONTENT_WITHOUT_BOX_A,
+    getScreenContent: () => CONTENT_WITHOUT_BOX_A,
+    historyOrderRef,
+    localContentRedoStackRef,
+    localContentUndoStackRef,
+    redoOrderRef,
+    setSelectedElement: vi.fn((update: unknown) => {
+      selectedElement =
+        typeof update === "function"
+          ? (update as (previous: unknown) => unknown)(selectedElement)
+          : update;
+    }),
+    setSelectedLayerIdsState: vi.fn((update: unknown) => {
+      selectedLayerIds =
+        typeof update === "function"
+          ? (update as (previous: string[]) => string[])(selectedLayerIds)
+          : (update as string[]);
+    }),
+  });
+
+  expect(
+    resolveLocalHistorySelection(
+      entry.selectionAfter!,
+      entry.fileId,
+      entry.after,
+    ).selectedLayerIds,
+  ).toEqual([createdNode.id]);
+
+  runUndo(args);
+  expect(localContentRedoStackRef.current).toEqual([entry]);
+  expect(selectedLayerIds).toEqual([]);
+
+  runRedo(args as unknown as Parameters<typeof runRedo>[0]);
+
+  expect(localContentUndoStackRef.current).toEqual([entry]);
+  expect(localContentRedoStackRef.current).toEqual([]);
+  expect(selectedLayerIds).toEqual([createdNode.id]);
+  expect(selectedElement).toMatchObject({
+    sourceLayerIdentity: { screenId: "file-1" },
+  });
+});
+
+it("restores the pre-create selection when local-history undo removes a new layer", () => {
+  const { node: selectedNode, element: selectedNodeElement } = sourceBoxA();
+  let selectedElement: unknown = null;
+  let selectedLayerIds: string[] = ["box-b"];
+  const entry: ContentHistoryChange = {
+    fileId: "file-1",
+    before: CONTENT_WITH_BOX_A,
+    after: CONTENT_WITH_BOX_A_AND_BOX_B,
+    selectionBefore: {
+      selectedElement: selectedNodeElement,
+      selectedLayerIds: [selectedNode.id],
+    },
+    selectionAfter: {
+      selectedElement: null,
+      selectedLayerIds: ["box-b"],
+    },
+  };
+  const localContentUndoStackRef = { current: [entry] };
+  const localContentRedoStackRef = { current: [] as ContentHistoryChange[] };
+  const historyOrderRef = { current: ["content"] };
+  const args = baseArgs({
+    activeFile: {
+      id: "file-1",
+      fileType: "html",
+      updatedAt: "2024-01-01T00:00:00Z",
+    },
+    getFreshActiveContent: () => CONTENT_WITH_BOX_A_AND_BOX_B,
+    getScreenContent: () => CONTENT_WITH_BOX_A_AND_BOX_B,
+    historyOrderRef,
+    localContentRedoStackRef,
+    localContentUndoStackRef,
+    setSelectedElement: vi.fn((update: unknown) => {
+      selectedElement =
+        typeof update === "function"
+          ? (update as (previous: unknown) => unknown)(selectedElement)
+          : update;
+    }),
+    setSelectedLayerIdsState: vi.fn((update: unknown) => {
+      selectedLayerIds =
+        typeof update === "function"
+          ? (update as (previous: string[]) => string[])(selectedLayerIds)
+          : (update as string[]);
+    }),
+  });
+
+  runUndo(args);
+
+  expect(localContentRedoStackRef.current).toEqual([entry]);
+  expect(selectedLayerIds).toEqual([selectedNode.id]);
+  expect(selectedElement).toMatchObject({
+    sourceLayerIdentity: { screenId: "file-1" },
   });
 });

@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CHATGPT_DIRECTORY_PROFILE as contentProfile } from "../../../../templates/content/server/lib/chatgpt-directory-tools.js";
 import { CHATGPT_DIRECTORY_PROFILE as designProfile } from "../../../../templates/design/server/lib/chatgpt-directory-tools.js";
+import { CHATGPT_DIRECTORY_PROFILE as slides2Profile } from "../../../../templates/slides-2/server/lib/chatgpt-directory-tools.js";
 import { CHATGPT_DIRECTORY_PROFILE as slidesProfile } from "../../../../templates/slides/server/lib/chatgpt-directory-tools.js";
 import { isActionHiddenFromEveryAgentSurface } from "../action.js";
 import {
@@ -21,6 +22,7 @@ import {
   filterMcpOnlyActions,
 } from "../server/agent-chat/action-filters-a2a.js";
 import { resolveAgentChatMcpOptions } from "../server/agent-chat/mcp-options.js";
+import * as embedSession from "../server/embed-session.js";
 import {
   canRenewMcpDirectoryWidgetCapabilityScope,
   createMcpDirectoryWidgetReadCapability,
@@ -48,6 +50,13 @@ import {
 } from "./build-server.js";
 import { mcpToolInputSchema } from "./tool-input-schema.js";
 
+vi.mock("../server/better-auth-instance.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../server/better-auth-instance.js")
+  >()),
+  findBetterAuthUserIdForEmail: vi.fn(async () => undefined),
+}));
+
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../../../",
@@ -58,6 +67,11 @@ const templateProfiles = [
   { appId: "slides", profile: slidesProfile },
   { appId: "design", profile: designProfile },
   { appId: "content", profile: contentProfile },
+] as const;
+
+const registryProfiles = [
+  ...templateProfiles,
+  { appId: "slides-2", profile: slides2Profile },
 ] as const;
 
 // Framework actions the runtime merges into every app (mergeCoreSharingActions
@@ -83,6 +97,12 @@ const sharedActionsByApp: Record<string, Record<string, unknown>> = {
     "unshare-resource": unshareResource,
     "set-resource-visibility": setResourceVisibility,
   },
+  "slides-2": {
+    "list-resource-shares": listResourceShares,
+    "share-resource": shareResource,
+    "unshare-resource": unshareResource,
+    "set-resource-visibility": setResourceVisibility,
+  },
 };
 
 function externalMcpActions(
@@ -102,15 +122,17 @@ async function loadTemplateActions(appId: string) {
     path.join(projectRoot, ".generated/actions-registry.ts"),
     "utf8",
   );
-  const profile = templateProfiles.find(
+  const profile = registryProfiles.find(
     (profile) => profile.appId === appId,
   )?.profile;
   if (!profile) throw new Error(`Unknown ChatGPT directory template ${appId}.`);
   const toolNames = profile.connectorCatalog;
-  const sharedActions = sharedActionsByApp[appId] ?? {};
+  const sharedActions =
+    sharedActionsByApp[appId === "slides-2" ? "slides" : appId] ?? {};
   const loadNames = [
     ...new Set([
       ...toolNames,
+      ...Object.keys(profile.widgetTargets ?? {}),
       ...Object.keys(profile.widgetReadActionArguments ?? {}),
       ...Object.keys(profile.widgetWriteActionArguments ?? {}),
     ]),
@@ -176,6 +198,228 @@ function mentionsTool(text: string, name: string): boolean {
 }
 
 describe("ChatGPT directory template profiles", () => {
+  it.each(
+    [
+      { appId: "slides-2", profile: slides2Profile },
+      { appId: "slides", profile: slidesProfile },
+    ].flatMap((template) =>
+      [
+        { mode: "generic", catalogMode: undefined },
+        { mode: "directory", catalogMode: "directory" as const },
+      ].map((mode) => ({
+        ...template,
+        ...mode,
+      })),
+    ),
+  )(
+    "$appId create/add return full-app links without UI resources or tickets in $mode mode",
+    async ({ appId, profile, catalogMode }) => {
+      const mintTicket = vi
+        .spyOn(embedSession, "createEmbedSessionTicket")
+        .mockRejectedValue(
+          new Error("Plain links must not mint embed tickets."),
+        );
+      const { actions, productionActions } = await loadTemplateActions(appId);
+      const names = ["create-deck", "add-slide"];
+      const deckId = "deck-full-app-link";
+      const payload = { id: deckId, deckId, title: "Test deck", slideCount: 1 };
+      const entries = {
+        ...productionActions,
+        ...Object.fromEntries(
+          names.map((name) => [
+            name,
+            {
+              ...productionActions[name]!,
+              schema: undefined,
+              run: async () => payload,
+            },
+          ]),
+        ),
+      };
+      const server = await createMCPServerForRequest(
+        {
+          name: `agent-native-${appId}`,
+          appId,
+          description: "Slides full-app links",
+          catalogMode,
+          builtinCrossAppTools: false,
+          connectorCatalog: profile.connectorCatalog,
+          widgetDomain: profile.widgetDomain,
+          directoryProfile: profile,
+          actions: entries,
+          productionActions: entries,
+          widgetReadActions: selectMcpDirectoryWidgetReadActions(
+            profile,
+            actions,
+          ),
+          widgetWriteActions: selectMcpDirectoryWidgetWriteActions(
+            profile,
+            actions,
+          ),
+        },
+        {
+          userEmail: "reviewer@example.test",
+          identityAssurance: "user",
+          mcpCredentialIssuedAtMs: Date.now() - 1_000,
+          orgId: null,
+          orgDomain: undefined,
+        },
+        {
+          origin: profile.widgetDomain,
+          transport: "http",
+          inlineMcpApps: true,
+        },
+      );
+      const [clientTransport, serverTransport] =
+        InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "slides-links-spec", version: "1" });
+      try {
+        await Promise.all([
+          client.connect(clientTransport),
+          server.connect(serverTransport),
+        ]);
+        const { tools } = await client.listTools();
+        for (const name of names) {
+          const tool = tools.find((tool) => tool.name === name);
+          expect(tool, name).toBeDefined();
+          expect(tool?._meta?.ui, name).toBeUndefined();
+          expect(tool?._meta?.["openai/outputTemplate"], name).toBeUndefined();
+          const result = await client.callTool({ name, arguments: { deckId } });
+          expect(result.isError, name).not.toBe(true);
+          const openLink = result._meta?.["agent-native/openLink"] as {
+            webUrl: string;
+            label: string;
+          };
+          expect(openLink, name).toMatchObject({
+            label:
+              appId === "slides"
+                ? "Open deck in Slides"
+                : "Open deck in Slides 2",
+          });
+          const url = new URL(openLink.webUrl);
+          expect(url.origin).toBe(profile.widgetDomain);
+          expect(url.pathname).toBe("/_agent-native/open");
+          expect(url.searchParams.get("app")).toBe(appId);
+          expect(url.searchParams.get("view")).toBe("editor");
+          expect(url.searchParams.get("deckId")).toBe(deckId);
+          expect(JSON.stringify(result.content)).toContain(openLink.webUrl);
+          expect(JSON.stringify(result)).not.toMatch(
+            /ui:\/\/|embed\/start|embedTicket|openai\/outputTemplate/,
+          );
+          expect(result._meta?.ui).toBeUndefined();
+        }
+        if (catalogMode === "directory") {
+          expect(client.getServerCapabilities()?.resources).toBeUndefined();
+        } else {
+          expect((await client.listResources()).resources).toEqual([]);
+        }
+        expect(mintTicket).not.toHaveBeenCalled();
+      } finally {
+        await Promise.all([client.close(), server.close()]);
+        mintTicket.mockRestore();
+      }
+    },
+    ACTION_REGISTRY_TEST_TIMEOUT_MS,
+  );
+
+  it.each(registryProfiles)(
+    "$appId validates ordinary targets against the real registry without expanding directory tools",
+    async ({ appId, profile }) => {
+      const { actions, productionActions } = await loadTemplateActions(appId);
+      const { directoryProfile } = resolveAgentChatMcpOptions({
+        mcp: { directoryProfile: profile },
+      });
+      const config = {
+        name: `agent-native-${appId}`,
+        appId,
+        description: "Ordinary card and directory compatibility",
+        catalogMode: "directory" as const,
+        connectorCatalog: profile.connectorCatalog,
+        widgetDomain: profile.widgetDomain,
+        actions: productionActions,
+        productionActions,
+        directoryProfile,
+        widgetReadActions: selectMcpDirectoryWidgetReadActions(
+          directoryProfile,
+          actions,
+        ),
+        widgetWriteActions: selectMcpDirectoryWidgetWriteActions(
+          directoryProfile,
+          actions,
+        ),
+      };
+      expect(() => validateMcpDirectoryProfile(config)).not.toThrow();
+      expect(() =>
+        validateMcpDirectoryProfile({
+          ...config,
+          directoryProfile: {
+            ...directoryProfile!,
+            widgetTargets: {
+              ...profile.widgetTargets,
+              "unknown-card": () => ({
+                targetPath: "/unknown",
+                resourceIds: {},
+              }),
+            },
+          },
+        }),
+      ).toThrow(/widget target "unknown-card"/);
+
+      for (const name of Object.keys(profile.widgetTargets).filter(
+        (name) => !profile.connectorCatalog.includes(name),
+      )) {
+        expect(productionActions[name]?.mcpApp?.resource).toBeDefined();
+        const optedOutActions = {
+          ...productionActions,
+          [name]: { ...productionActions[name]!, mcpTool: false },
+        };
+        expect(() =>
+          validateMcpDirectoryProfile({
+            ...config,
+            actions: optedOutActions,
+            productionActions: optedOutActions,
+          }),
+        ).toThrow(/widget target/);
+        expect(() =>
+          validateMcpDirectoryProfile({
+            ...config,
+            externalAgents: { denyActions: [name] },
+          }),
+        ).toThrow(/widget target/);
+      }
+
+      const server = await createMCPServerForRequest(
+        config,
+        {
+          userEmail: "reviewer@example.test",
+        },
+        { origin: profile.widgetDomain, transport: "http" },
+      );
+      const [clientTransport, serverTransport] =
+        InMemoryTransport.createLinkedPair();
+      const client = new Client({
+        name: "ordinary-target-validation",
+        version: "1",
+      });
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+      try {
+        const { tools } = await client.listTools();
+        expect(
+          tools
+            .filter((tool) => Object.hasOwn(productionActions, tool.name))
+            .map((tool) => tool.name)
+            .sort(),
+        ).toEqual([...profile.connectorCatalog].sort());
+      } finally {
+        await Promise.all([client.close(), server.close()]);
+      }
+    },
+    120_000,
+  );
+
   it.each(templateProfiles)(
     "$appId keeps the full widget enabled at its canonical domain",
     ({ appId, profile }) => {
@@ -1055,7 +1299,9 @@ describe("ChatGPT directory template profiles", () => {
       ]);
       try {
         const { tools } = await client.listTools();
-        const widgetTargetNames = Object.keys(profile.widgetTargets).sort();
+        const widgetTargetNames = Object.keys(profile.widgetTargets)
+          .filter((name) => profile.connectorCatalog.includes(name))
+          .sort();
         const widgetToolNames = tools
           .filter((tool) => typeof tool._meta?.ui?.resourceUri === "string")
           .map((tool) => tool.name)
@@ -1088,22 +1334,26 @@ describe("ChatGPT directory template profiles", () => {
         const sessionTool = tools.find(
           (tool) => tool.name === "create_embed_session",
         );
-        expect(sessionTool?.annotations).toMatchObject({
-          readOnlyHint: false,
-          destructiveHint: false,
-          openWorldHint: false,
-        });
-        expect(sessionTool?._meta?.ui?.visibility).toEqual(["app"]);
-        expect(sessionTool?.inputSchema.required).toEqual(["sourceTicket"]);
-        expect(sessionTool?.inputSchema.properties).not.toHaveProperty(
-          "sourceTool",
-        );
-        expect(sessionTool?.inputSchema.properties).not.toHaveProperty(
-          "toolInput",
-        );
-        expect(sessionTool?.inputSchema.properties).not.toHaveProperty(
-          "toolOutput",
-        );
+        if (widgetTargetNames.length === 0) {
+          expect(sessionTool).toBeUndefined();
+        } else {
+          expect(sessionTool?.annotations).toMatchObject({
+            readOnlyHint: false,
+            destructiveHint: false,
+            openWorldHint: false,
+          });
+          expect(sessionTool?._meta?.ui?.visibility).toEqual(["app"]);
+          expect(sessionTool?.inputSchema.required).toEqual(["sourceTicket"]);
+          expect(sessionTool?.inputSchema.properties).not.toHaveProperty(
+            "sourceTool",
+          );
+          expect(sessionTool?.inputSchema.properties).not.toHaveProperty(
+            "toolInput",
+          );
+          expect(sessionTool?.inputSchema.properties).not.toHaveProperty(
+            "toolOutput",
+          );
+        }
       } finally {
         await Promise.all([client.close(), server.close()]);
       }
@@ -1179,9 +1429,15 @@ describe("ChatGPT directory template profiles", () => {
       const stubbedActions = {
         ...productionActions,
         ...Object.fromEntries(
+          // The stub enforces no input schema, so it declares none to
+          // prepare a call against.
           readNames.map((name) => [
             name,
-            { ...productionActions[name]!, run: async () => payload },
+            {
+              ...productionActions[name]!,
+              schema: undefined,
+              run: async () => payload,
+            },
           ]),
         ),
       };
@@ -1310,6 +1566,12 @@ describe("ChatGPT directory template profiles", () => {
       validateMcpDirectoryProfile({
         ...config,
         directoryProfile: { connectorCatalog: ["disabled-group"] },
+      }),
+    ).toThrow(/not registered or is not exposed to MCP/);
+    expect(() =>
+      validateMcpDirectoryProfile({
+        ...config,
+        externalAgents: { denyActions: ["mcp-only"] },
       }),
     ).toThrow(/not registered or is not exposed to MCP/);
   });
@@ -1503,7 +1765,96 @@ describe("ChatGPT directory template profiles", () => {
           widgetTargets: { "create-document": target, "get-document": target },
         },
       }),
-    ).toThrow(/widget target "get-document" must name a listed action/);
+    ).toThrow(
+      /widget target "get-document" must name an MCP action with an mcpApp resource/,
+    );
+  });
+
+  it("keeps a denied create_embed_session out of tools/list and tools/call", async () => {
+    const config = {
+      name: "content",
+      description: "Content directory.",
+      catalogMode: "directory" as const,
+      widgetDomain: "https://content.example.test",
+      actions: {
+        "create-document": {
+          tool: { description: "Create one document." },
+          readOnly: false,
+          mcpAnnotations: {
+            readOnlyHint: false,
+            destructiveHint: false,
+            openWorldHint: false,
+          },
+          mcpApp: {
+            resource: {
+              uri: "ui://content/create-document",
+              title: "Document",
+              html: "<html></html>",
+            },
+          },
+          run: async () => ({ id: "doc-1" }),
+        },
+      },
+      directoryProfile: {
+        connectorCatalog: ["create-document"],
+        widgetTargets: {
+          "create-document": () => ({
+            targetPath: "/page/doc-1",
+            resourceIds: { documentId: "doc-1" },
+          }),
+        },
+      },
+    };
+
+    async function connect(denyActions: string[]) {
+      const server = await createMCPServerForRequest(
+        { ...config, externalAgents: { denyActions } },
+        {
+          userEmail: "reviewer@example.test",
+          identityAssurance: "user",
+          orgId: null,
+          orgDomain: undefined,
+        },
+        { origin: config.widgetDomain, transport: "http" },
+      );
+      const [clientTransport, serverTransport] =
+        InMemoryTransport.createLinkedPair();
+      const client = new Client({ name: "directory-deny-spec", version: "1" });
+      await Promise.all([
+        client.connect(clientTransport),
+        server.connect(serverTransport),
+      ]);
+      return {
+        client,
+        close: () => Promise.all([client.close(), server.close()]),
+      };
+    }
+
+    const served = await connect([]);
+    try {
+      const { tools } = await served.client.listTools();
+      expect(tools.map((tool) => tool.name)).toContain("create_embed_session");
+    } finally {
+      await served.close();
+    }
+
+    const denied = await connect(["create_embed_session"]);
+    try {
+      const { tools } = await denied.client.listTools();
+      expect(tools.map((tool) => tool.name)).not.toContain(
+        "create_embed_session",
+      );
+      const called = await denied.client.callTool({
+        name: "create_embed_session",
+        arguments: { sourceTicket: "ticket" },
+      });
+      expect(called.isError).toBe(true);
+      expect(JSON.stringify(called.content)).toContain(
+        "Unknown tool: create_embed_session",
+      );
+    } finally {
+      await denied.close();
+    }
   });
 
   it("requires read routes before widget tools run and preserves legacy tool discovery", () => {
@@ -1609,11 +1960,16 @@ describe("Slides widget share grant", () => {
       expiresAtMs = Date.now() + fifteenMinutes,
     }: { userEmail?: string; orgId?: string; expiresAtMs?: number } = {},
   ) {
-    const target = slidesProfile.widgetTargets["create-deck"](
-      {},
-      { id: deckId },
-    );
-    if (!target) throw new Error("Slides create-deck target is missing.");
+    const target = {
+      targetPath: `/deck/${encodeURIComponent(deckId)}`,
+      resourceIds: { deckId, resourceType: "deck" } as Record<string, string>,
+      writeActions: [
+        "patch-deck",
+        "share-resource",
+        "unshare-resource",
+        "set-resource-visibility",
+      ],
+    };
     const materialize = (rules: ArgumentRules): ArgumentRules =>
       Object.fromEntries(
         Object.entries(rules).map(([name, rule]) => [
@@ -2149,6 +2505,14 @@ describe("Slides widget share grant", () => {
           },
         }),
       ).toThrow(/exact resource ID binding/);
+      for (const denied of ["list-resource-shares", "unshare-resource"]) {
+        expect(() =>
+          validateMcpDirectoryProfile({
+            ...config,
+            externalAgents: { denyActions: [denied] },
+          }),
+        ).toThrow(/listed in externalAgents\.denyActions/);
+      }
     },
     ACTION_REGISTRY_TEST_TIMEOUT_MS,
   );

@@ -3,6 +3,32 @@
 All notable user-facing changes to Chat are documented here. Open it any
 time from the command menu (Cmd+K → "What's new").
 
+## 2026-10-28
+
+### Improved
+
+- Factory skips fork pull requests assigned to verified BuilderIO members
+
+### Fixed
+
+- External pull requests stay in Factory's manual review queue, and their manual decisions remain visible while approval status is reconciled.
+- Factory keeps manual approval and reconciliation states when GitHub results are ambiguous or pull requests close.
+- Factory keeps completed pull requests closed when it recovers an approval.
+- Factory pauses automatic pull request approvals until reconciliation is complete
+- Factory preserves manual review holds when GitHub approval verification is interrupted
+- Factory rechecks pull-request feedback before reusing an approval and avoids approving terminal items.
+- Factory skips fork pull requests assigned to BuilderIO members.
+- Prevent duplicate Factory approvals while ambiguous provider results are reconciled
+- Previously approved fork pull requests now move to manual handling when assigned to a Builder team member.
+
+## 2026-10-23
+
+### Fixed
+
+- Prompt automation jobs created, edited, restored, or started by external agents require approval.
+
+  Single-line automation settings now reject line breaks.
+
 ## 2026-10-10
 
 ### Improved
@@ -36,6 +62,10 @@ time from the command menu (Cmd+K → "What's new").
 - PR babysitting now follows unresolved bot review feedback, defers while Builder is active, and shows recommendation, decision, and because on the Audit tab.
 
 ## 2026-09-10
+
+### Added
+
+- Inbox items can now be marked resolved or sent back to automation by hand, from the row menu or the item detail view, independent of the automation pipeline.
 
 ### Improved
 

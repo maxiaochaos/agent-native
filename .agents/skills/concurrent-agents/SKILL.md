@@ -63,13 +63,11 @@ A switch carries the whole index and worktree, so proceed only when every dirty
 path belongs to this task. If any path is unrelated or incomplete, keep the
 checkout in place and report the exact paths without asking again.
 
-In a shared checkout, keep its branch unchanged. For an explicit `/ship` or
-PR-publishing request that cannot safely use the current checkout, follow
-`new-branch` to create a managed task-owned worktree from the correct base,
-carry only the requested task's changes, and create its task branch without
-asking. For other work, use the current branch unless the user gave an exact
-branch operation. Keep platform-assigned Builder.io and Fusion branches in
-place.
+In a shared checkout, don't switch its branch under other sessions. When the
+task needs a branch, follow `new-branch` to create a task-owned worktree from
+the correct base, carry only this task's changes, and create its branch without
+asking; branching never needs permission. Keep platform-assigned Builder.io and
+Fusion branches in place.
 
 ## Timing the next branch
 
@@ -96,8 +94,13 @@ and `gh pr list --head <branch>` for the current PR. If the work you were
 about to do just landed, continue from the latest branch snapshot.
 
 Do not rebase or merge `origin/main` just to clear behind status or restart
-checks. Rebase or merge it only when GitHub reports an actual conflict; for a
-shared branch, prefer a normal merge.
+checks. During an explicitly authorized `/ship` for the same PR, a clean
+task-owned PR worktree at the exact live head may merge freshly fetched
+`origin/main` when GitHub reports a conflict or a failing required check is
+fixed there; the authorization persists across resumed turns and heartbeat
+continuations, so no extra approval is needed. For shared branches, use a
+normal merge and never rebase. Pending checks or behind status alone are not a
+reason to sync.
 
 ## Reading a Codex peer's intent
 

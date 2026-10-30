@@ -21,10 +21,13 @@ import {
   parseCanvasFrameGeometryById,
 } from "../shared/canvas-frames.js";
 import { getOverviewScreenFileIds } from "../shared/design-files.js";
+import { designOutputWriteReceipt } from "../shared/generation-output-receipt.js";
 import {
   assertDesignHtmlCreateIntegrity,
   describeDesignHtmlIntegrityIssue,
 } from "../shared/html-integrity.js";
+import { assertHubSpotEmailFrameContent } from "../shared/hubspot-email-authoring.js";
+import { isHubSpotEmailHtml } from "../shared/hubspot-email.js";
 import { getResponsiveBreakpointWidths } from "../shared/responsive-frame-layout.js";
 import { annotateScreenHtmlForPersist } from "../shared/screen-annotation.js";
 import { assertDesignWidgetWriteScope } from "./widget-write-scope.js";
@@ -42,12 +45,12 @@ function screenRestoreSnapshotMatches(
   filename: string,
   fileType: string,
   contentHashes: readonly string[],
-): boolean {
+): { createdAt?: string | null } | null {
   let snapshot: unknown;
   try {
     snapshot = JSON.parse(rawSnapshot);
   } catch (error) {
-    if (error instanceof SyntaxError) return false;
+    if (error instanceof SyntaxError) return null;
     throw error;
   }
   if (
@@ -59,24 +62,49 @@ function screenRestoreSnapshotMatches(
       (hash) => typeof hash === "string" && contentHashes.includes(hash),
     )
   ) {
-    return false;
+    return null;
   }
-  return [snapshot.screenMetadata, snapshot.localhostScreen].some(
+  let createdAt: string | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(snapshot, "createdAt")) {
+    if (snapshot.createdAt === null) {
+      createdAt = null;
+    } else if (
+      typeof snapshot.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(snapshot.createdAt))
+    ) {
+      return null;
+    } else {
+      createdAt = snapshot.createdAt;
+    }
+  }
+  const hasConnectionMetadata = [
+    snapshot.screenMetadata,
+    snapshot.localhostScreen,
+  ].some(
     (metadata) =>
       isRecord(metadata) &&
       typeof metadata.connectionId === "string" &&
       metadata.connectionId.length > 0,
   );
+  return createdAt !== undefined || hasConnectionMetadata
+    ? { createdAt }
+    : null;
 }
 
 export default defineAction({
   description:
     "Add a new file to a design project. Validates that the design exists and " +
-    "the user has editor access. Returns the new file's ID, filename, and design URL path when the file is renderable.",
+    "the user has editor access. For HubSpot conversion, save email-safe HTML as a new sibling while preserving its source. Optional frameType=hubspot-email retains email authoring metadata; it is not required for export. Returns the new file's ID, filename, and design URL path when the file is renderable.",
   schema: z.object({
     designId: z.string().describe("Design project ID to add the file to"),
     filename: z.string().describe("Filename (e.g. 'index.html', 'styles.css')"),
     content: z.string().describe("File content"),
+    frameType: z
+      .literal("hubspot-email")
+      .optional()
+      .describe(
+        "Optional internal email authoring type; when supplied, include the HubSpot email marker in email-safe HTML. Any HTML frame can use export-hubspot-html, which validates actual compatibility.",
+      ),
     restoreClaimId: z
       .string()
       .optional()
@@ -102,6 +130,7 @@ export default defineAction({
       designId,
       filename,
       content,
+      frameType,
       fileType,
       restoreClaimId,
       duplicateSourceFileId,
@@ -143,6 +172,7 @@ export default defineAction({
     const requestedId = nanoid();
     const now = new Date().toISOString();
 
+    assertHubSpotEmailFrameContent({ content, fileType, frameType });
     const annotatedContent = annotateScreenHtmlForPersist(content, fileType);
     const restoredContentHashes = screenRestoreContentHashes(
       annotatedContent,
@@ -162,6 +192,7 @@ export default defineAction({
           | {
               id: string;
               designId: string;
+              sourceFileId: string;
               snapshot: string;
               consumedAt: string | null;
               restoredFileId: string | null;
@@ -169,13 +200,21 @@ export default defineAction({
           | undefined;
         let id = requestedId;
         let existingRestoredFile:
-          | { id: string; filename: string; fileType: string; content: string }
+          | {
+              id: string;
+              filename: string;
+              fileType: string;
+              content: string;
+              createdAt: string | null;
+            }
           | undefined;
+        let restoreCreatedAt: string | null | undefined;
         if (restoreClaimId) {
           const [candidate] = await tx
             .select({
               id: schema.designScreenRestoreClaims.id,
               designId: schema.designScreenRestoreClaims.designId,
+              sourceFileId: schema.designScreenRestoreClaims.sourceFileId,
               snapshot: schema.designScreenRestoreClaims.snapshot,
               consumedAt: schema.designScreenRestoreClaims.consumedAt,
               restoredFileId: schema.designScreenRestoreClaims.restoredFileId,
@@ -194,6 +233,12 @@ export default defineAction({
               statusCode: 403,
             });
           }
+          if (!candidate.sourceFileId) {
+            fail("This Screen restore is no longer available.", {
+              errorCode: "screen_restore_claim_invalid",
+              statusCode: 403,
+            });
+          }
           if (candidate.restoredFileId) {
             const [boundFile] = await tx
               .select({
@@ -201,6 +246,7 @@ export default defineAction({
                 filename: schema.designFiles.filename,
                 fileType: schema.designFiles.fileType,
                 content: schema.designFiles.content,
+                createdAt: schema.designFiles.createdAt,
               })
               .from(schema.designFiles)
               .where(
@@ -223,38 +269,36 @@ export default defineAction({
               existingRestoredFile = boundFile;
               id = boundFile.id;
             } else {
-              if (
-                candidate.consumedAt !== null ||
-                !screenRestoreSnapshotMatches(
-                  candidate.snapshot,
-                  filename,
-                  fileType,
-                  restoredContentHashes,
-                )
-              ) {
+              const snapshot = screenRestoreSnapshotMatches(
+                candidate.snapshot,
+                filename,
+                fileType,
+                restoredContentHashes,
+              );
+              if (candidate.consumedAt !== null || !snapshot) {
                 fail("This Screen restore is no longer available.", {
                   errorCode: "screen_restore_claim_invalid",
                   statusCode: 403,
                 });
               }
               id = candidate.restoredFileId;
+              restoreCreatedAt = snapshot.createdAt;
             }
           } else {
-            if (
-              candidate.consumedAt !== null ||
-              !screenRestoreSnapshotMatches(
-                candidate.snapshot,
-                filename,
-                fileType,
-                restoredContentHashes,
-              )
-            ) {
+            const snapshot = screenRestoreSnapshotMatches(
+              candidate.snapshot,
+              filename,
+              fileType,
+              restoredContentHashes,
+            );
+            if (candidate.consumedAt !== null || !snapshot) {
               fail("This Screen restore is no longer available.", {
                 errorCode: "screen_restore_claim_invalid",
                 statusCode: 403,
               });
             }
             restoreClaim = candidate;
+            restoreCreatedAt = snapshot.createdAt;
           }
         }
 
@@ -263,6 +307,7 @@ export default defineAction({
             id,
             content: existingRestoredFile.content,
             fileType: existingRestoredFile.fileType,
+            createdAt: existingRestoredFile.createdAt,
             created: false,
           };
         }
@@ -365,13 +410,15 @@ export default defineAction({
           if (copiedMetadata) duplicateDesignData = JSON.stringify(nextData);
         }
 
+        const createdAt =
+          restoreCreatedAt === undefined ? now : restoreCreatedAt;
         await tx.insert(schema.designFiles).values({
           id,
           designId,
           filename,
           fileType: fileType ?? "html",
           content: annotatedContent,
-          createdAt: now,
+          createdAt,
           updatedAt: now,
         });
 
@@ -409,6 +456,7 @@ export default defineAction({
           id,
           content: annotatedContent,
           fileType: fileType ?? "html",
+          createdAt,
           created: true,
         };
       },
@@ -462,13 +510,36 @@ export default defineAction({
                     },
                   },
                 ),
-                width: CREATED_SCREEN_WIDTH,
-                height: CREATED_SCREEN_HEIGHT,
+                width: isHubSpotEmailHtml(createdFile.content)
+                  ? 600
+                  : CREATED_SCREEN_WIDTH,
+                height: isHubSpotEmailHtml(createdFile.content)
+                  ? 800
+                  : CREATED_SCREEN_HEIGHT,
               },
             ],
             resolveFileId: (placement) => placement.fileId,
           });
-          return { ...current, canvasFrames: merged.canvasFrames };
+          return {
+            ...current,
+            canvasFrames: merged.canvasFrames,
+            ...(isHubSpotEmailHtml(createdFile.content)
+              ? {
+                  screenMetadata: {
+                    ...(isRecord(current.screenMetadata)
+                      ? current.screenMetadata
+                      : {}),
+                    [id]: {
+                      width: 600,
+                      height: 800,
+                      heightMode: "hug",
+                      heightPinned: false,
+                      breakpointWidths: [],
+                    },
+                  },
+                }
+              : {}),
+          };
         },
         isApplied: (current) =>
           Boolean(parseCanvasFrameGeometryById(current.canvasFrames)[id]),
@@ -491,7 +562,12 @@ export default defineAction({
       designId,
       filename,
       fileType: resolvedFileType,
+      frameType: isHubSpotEmailHtml(createdFile.content)
+        ? "hubspot-email"
+        : null,
+      createdAt: createdFile.createdAt,
       renderable,
+      _receipt: designOutputWriteReceipt(designId, createdFile.created ? 1 : 0),
       urlPath: renderable
         ? `/design/${encodeURIComponent(designId)}?editorView=overview&screen=${encodeURIComponent(id)}`
         : null,

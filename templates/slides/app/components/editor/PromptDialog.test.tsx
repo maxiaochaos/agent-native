@@ -946,6 +946,29 @@ describe("uploadPromptFiles", () => {
     expect(screen.getByRole("button", { name: "Custom keys" })).toBeTruthy();
   });
 
+  it("renders the large home composer with dictation", () => {
+    render(
+      <PromptPopover
+        open
+        presentation="inline"
+        title="New presentation"
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+      />,
+      undefined,
+      false,
+    );
+
+    expect(promptComposerProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({ layoutVariant: "hero", voiceEnabled: true }),
+    );
+    expect(
+      screen
+        .getByRole("group", { name: "New presentation" })
+        .getAttribute("data-agentkit-composer-size"),
+    ).toBe("large");
+  });
+
   it("keeps hosted images URL-only while adding bytes for unhosted images", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -1384,6 +1407,26 @@ describe("inline prompt starters", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+  });
+
+  it("focuses the active composer through its public handle", () => {
+    const controllerRef = createRef<PromptPopoverHandle>();
+    render(
+      <PromptPopover
+        presentation="inline"
+        open
+        title="New presentation"
+        onOpenChange={vi.fn()}
+        onSubmit={vi.fn()}
+        controllerRef={controllerRef}
+      />,
+    );
+
+    act(() => controllerRef.current?.focus());
+
+    expect(screen.getByRole("textbox", { name: "Prompt" })).toBe(
+      document.activeElement,
+    );
   });
 
   it("renders immediately without a loading indicator during provider readiness checks", async () => {

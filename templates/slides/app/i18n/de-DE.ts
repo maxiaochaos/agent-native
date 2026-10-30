@@ -2,6 +2,33 @@ import { creativeContextMessagesByLocale } from "@agent-native/creative-context/
 
 const messages = {
   composer: { menu: { integrations: "Integrationen" } },
+  appMenu: {
+    label: "App-Menü",
+    actions: "Aktionen…",
+    backToDashboard: "Zurück zum Dashboard",
+    file: "Datei",
+    edit: "Bearbeiten",
+    view: "Ansicht",
+    preferences: "Einstellungen",
+    help: "Hilfe",
+    importFile: "Datei importieren…",
+    export: "Exportieren…",
+    saveLocalCopy: "Lokale Kopie speichern…",
+    versionHistory: "Versionsverlauf",
+    duplicateSelection: "Auswahl duplizieren",
+    deleteSelection: "Auswahl löschen",
+    zoomIn: "Vergrößern",
+    zoomOut: "Verkleinern",
+    previousSlide: "Vorherige Folie",
+    nextSlide: "Nächste Folie",
+    appearance: "Darstellung…",
+    themeLight: "Hell",
+    themeDark: "Dunkel",
+    themeSystem: "System",
+    documentation: "Dokumentation",
+    whatsNew: "Neuigkeiten",
+    sendFeedback: "Feedback senden…",
+  },
   templatesPage: {
     actions: "Vorlagenaktionen für {{title}}",
     previewAction: "Vorschau",
@@ -111,7 +138,7 @@ const messages = {
     openChat: "Chat öffnen",
     cloudAuthToken: "Auth-Token",
     cloudSetupSteps: "Einrichtungsschritte",
-    cloudConnectedReloading: "Erfolgreich verbunden. Wird neu geladen...",
+    cloudConnectedReloading: "Wird neu geladen...",
     cloudConnectionFailed: "Verbindung fehlgeschlagen",
     cloudTestConnect: "Testen und verbinden",
     cloudServerlessPostgres: "Serverloses Postgres",
@@ -223,6 +250,60 @@ const messages = {
       "Du nutzt {{current}} von {{max}} Designsystemen in deinem Builder-Plan {{plan}}. Upgrade deinen Builder-Plan, um ein weiteres zu erstellen.",
     tierLimitUpgrade: "Builder-Plan upgraden",
   },
+  floatingToolbar: {
+    label: "Folienwerkzeuge",
+    move: "Verschieben",
+    moveMenu: "Verschiebewerkzeuge",
+    hand: "Hand-Werkzeug",
+    scale: "Skalieren",
+    insert: "Einfügen",
+    insertMenu: "Einfügen-Menü",
+    text: "Text",
+    line: "Linie",
+    arrow: "Pfeil",
+    square: "Quadrat",
+    ellipse: "Ellipse",
+    triangle: "Dreieck",
+    media: "Bild/Video…",
+    mediaNeedsStorage:
+      "Richte den Speicher ein, um Bilder und Videos hochzuladen.",
+    transitions: "Übergänge",
+    transitionsMenu: "Übergangsoptionen",
+    transitionsReadOnly: "Dieses Deck ist schreibgeschützt.",
+    transitionsNeedElement:
+      "Wähle ein Element aus, um einen Übergang hinzuzufügen.",
+    transitionNone: "Keiner",
+    transitionAppear: "Erscheinen",
+    transitionFade: "Einblenden",
+    transitionSlide: "Schieben",
+    transitionZoom: "Zoom",
+    comment: "Kommentar",
+    commentMenu: "Kommentaroptionen",
+    comments: "Kommentare",
+    annotate: "Markieren",
+    agent: "Agent",
+    agentMenu: "Agent-Optionen",
+    agentUnavailable:
+      "Der Agent-Chat ist nicht erreichbar. Versuche es erneut.",
+    inspiration: "Inspiration",
+    tightenTone: "Ton straffen",
+    polish: "Feinschliff",
+    speakerNotes: "Sprechernotizen",
+    speakerNotesMenu: "Optionen für Sprechernotizen",
+    writeScript: "Skript schreiben",
+    summarizeKeyPoints: "Kernpunkte zusammenfassen",
+    expandDetail: "Details erweitern",
+    addTimingCues: "Zeitangaben hinzufügen",
+  },
+  speakerNotesPanel: {
+    title: "Sprechernotizen",
+    resize: "Größe der Sprechernotizen ändern",
+    generate: "Notizen generieren",
+    rewrite: "Notizen umschreiben",
+    close: "Sprechernotizen schließen",
+    placeholder:
+      "Schreibe los oder erstelle Sprechernotizen schnell mit dem Agenten",
+  },
   editorToolbar: {
     layoutTitle: "Titel",
     layoutSection: "Abschnittstrenner",
@@ -301,6 +382,9 @@ const messages = {
     elementAnimations: "Elementanimationen",
     layers: "Ebenen",
     closeLayers: "Ebenen-Panel schließen",
+    searchLayers: "Ebenen durchsuchen",
+    resizeLayers: "Ebenen-Panel anpassen",
+    resizeSlideList: "Folienliste anpassen",
     expandLayer: "Ebene erweitern",
     collapseLayer: "Ebene reduzieren",
     tweaks: "Feinabstimmung",
@@ -312,7 +396,8 @@ const messages = {
     shapeArrow: "Pfeil",
     shapeTriangle: "Dreieck",
     shapeLine: "Linie",
-    pinComments: "Kommentare anheften",
+    shapeStar: "Stern",
+    shapePolygon: "Polygon",
     undo: "Rückgängig",
     undoWithShortcut: "Rückgängig ({{shortcut}})",
     redo: "Wiederholen",
@@ -324,9 +409,19 @@ const messages = {
     editorLinkDescription:
       "Öffnet das Deck im Editor. Alle mit Zugriff können diesen Link verwenden.",
     presentationLink: "Präsentationslink",
-    presentationLinkDescription:
-      "Öffnet direkt im Vollbild-Präsentationsmodus.",
+    presentationLinkDescription: "Öffnet das Deck im Präsentationsmodus",
     present: "Präsentieren",
+    presentInTab: "In diesem Tab",
+    presentFullScreen: "Vollbild",
+    presentPresenterView: "Referentenansicht",
+    presentPresenterViewDescription:
+      "Sprechernotizen während der Präsentation anzeigen",
+    presenterViewBlocked:
+      "Erlaube Pop-ups, um die Referentenansicht zu öffnen.",
+    export: "Exportieren",
+    privacyPrivate: "Privat",
+    privacyOrg: "Mit der Organisation geteilt",
+    privacyPublic: "Öffentlich",
     more: "Mehr",
     importing: "Wird importiert...",
     importFile: "Datei importieren",
@@ -374,6 +469,8 @@ const messages = {
     shareWithTeam: "Mit Team teilen...",
     publicShareLink: "Öffentlicher Freigabelink...",
     downloadHtml: "Als HTML herunterladen",
+    downloadPdf: "Als PDF herunterladen",
+    downloadPptx: "Als PPTX herunterladen",
     exportPdf: "Als PDF exportieren",
     exportPptx: "Als PPTX exportieren",
     connectGoogle: "Google verbinden",
@@ -408,6 +505,9 @@ const messages = {
     copied: "Kopiert",
     openSharedLink: "Geteilten Link öffnen",
     anyoneWithLink: "Jeder mit diesem Link kann diese Präsentation ansehen.",
+    connectSlides: "Slides verbinden",
+    otherAgents: "Andere Agenten",
+    whoHasAccess: "Wer Zugriff hat",
   },
   slideTextMenu: {
     brandColors: "Markenfarben",
@@ -494,6 +594,35 @@ const messages = {
     goToSlide: "Zur Folie",
     search: "Kommentare durchsuchen",
     searchPlaceholder: "Alle Kommentare durchsuchen...",
+  },
+  contextToolbar: {
+    insert: "Einfügen",
+    insertText: "Text",
+    insertMedia: "Bild/Video…",
+    order: "Reihenfolge",
+    listStyle: "Listenstil",
+    removeFormatting: "Formatierung entfernen",
+    lockAspectRatio: "Seitenverhältnis sperren",
+    zoom: "Zoom",
+    objectsSelected_one: "{{count}} Objekte ausgewählt",
+    objectsSelected_other: "{{count}} Objekte ausgewählt",
+    bold: "Fett",
+    strikethrough: "Durchgestrichen",
+    code: "Code",
+    link: "Link",
+    applyLink: "Anwenden",
+    lineHeight: "Zeilenhöhe",
+    replaceImage: "Ersetzen",
+    fit: "Anpassen",
+    fitCover: "Füllen",
+    fitContain: "Einpassen",
+    editWithAgent: "Mit Agent bearbeiten",
+    tightenTone: "Ton straffen",
+    polish: "Verfeinern",
+    translate: "Übersetzen",
+    makeMoreVisual: "Visueller gestalten",
+    generateImage: "Bild generieren",
+    removeBackground: "Hintergrund entfernen",
   },
   styleInspector: {
     title: "Style",
@@ -613,6 +742,8 @@ const messages = {
     addTransition: "Übergang hinzufügen",
     effect: "Effekt",
     onClick: "Bei Klick",
+    withPrevious: "Mit vorheriger",
+    trigger: "Start",
     byParagraph: "Nach Absatz",
     expand: "Übergang erweitern",
     collapse: "Übergang einklappen",
@@ -702,6 +833,10 @@ const messages = {
     duplicateCurrentSlide: "Duplicar diapositiva actual",
     promptPlaceholder: "Describe las diapositivas que quieres...",
     newSlide: "Neue Folie",
+    slidesHeading: "Folien",
+    emptyTitle: "Noch keine Folien",
+    emptyDescription:
+      "Füge eine neue Folie hinzu, importiere eine oder bitte den Agenten, eine zu erstellen.",
     closeAddSlides: "Schließen",
     describeThisSlide: "Beschreibe diese Folie",
     cut: "Ausschneiden",
@@ -722,6 +857,16 @@ const messages = {
     noSlides: "No hay diapositivas para presentar",
     previousSlide: "Diapositiva anterior",
     nextSlide: "Siguiente diapositiva",
+    voiceNavigation: "Sprachnavigation",
+    voiceNavigationNextCommand: "Nächste Folie",
+    voiceNavigationPreviousCommand: "Vorherige Folie",
+    voiceNavigationHint:
+      "Sagen Sie „{{next}}“ oder „{{previous}}“, um zu navigieren.",
+    voiceNavigationListening: "Höre auf „{{next}}“ oder „{{previous}}“.",
+    voiceNavigationUnavailable:
+      "Sprachsteuerung ist in diesem Browser nicht verfügbar.",
+    voiceNavigationError:
+      "Die Sprachnavigation wurde gestoppt. Prüfen Sie die Mikrofonberechtigung und Verbindung und versuchen Sie es erneut.",
     exitPresentation: "Salir de la presentación",
     enterFullscreen: "Entrar en pantalla completa",
     clickToEnterFullscreen: "Haz clic para entrar en pantalla completa",
@@ -819,6 +964,8 @@ const messages = {
       "Es wurden keine Folien erstellt. Prüfe die Details im Chat und versuche es erneut.",
     generationOutcomeUnresolved:
       "Wir konnten nicht bestätigen, ob Folien erstellt wurden. Prüfe das Deck, bevor du es erneut versuchst.",
+    generationOutcomeUnresolvedWithSlides:
+      "Wir konnten nicht bestätigen, ob die Folienerstellung abgeschlossen ist. Sieh dir die hier angezeigten Folien an, bevor du fortfährst.",
     partialGenerationFailed:
       "Wir konnten deine Folien nicht fertigstellen. Sieh dir die vorhandenen Folien und deine ursprüngliche Anfrage an, bevor du fortfährst.",
     originalPrompt: "Deine Anfrage",
@@ -841,6 +988,10 @@ const messages = {
     leaveWithoutSaving: "Ohne Speichern beenden",
     editorMarkupNotSaved:
       "Diese Änderung wurde nicht gespeichert, weil sie der Folie Editor-Markup hinzugefügt hätte.",
+    historyStepConflict:
+      "Dieser Verlaufsschritt wurde übersprungen, weil er mit der aktuellen Präsentation in Konflikt steht.",
+    historyStepFailed:
+      "Dieser Verlaufsschritt wurde übersprungen, weil er nicht angewendet werden konnte.",
     textEditConflictNotSaved:
       "Deine Textänderung wurde nicht gespeichert, weil derselbe Text gleichzeitig an anderer Stelle geändert wurde.",
   },
@@ -933,10 +1084,154 @@ const messages = {
     chooseAnotherFile: "Andere Datei wählen",
   },
   home: {
-    fallbackSuggestions: {
-      pitch: "Einen Produktpitch erstellen",
-      roadmap: "Eine Produkt-Roadmap erstellen",
-      explainer: "Ein Thema in einer Präsentation erklären",
+    nextStepBar: {
+      ariaLabel: "Nächste Schritte für deine erste Präsentation",
+      refineWithPrompt: "Mit einer Eingabe verfeinern",
+      export: "Exportieren",
+      shareLink: "Link teilen",
+      dismiss: "Schließen",
+    },
+    suggestionPrompts: {
+      product: {
+        launch:
+          "Erstelle eine Produktlaunch-Präsentation mit Kundenproblem, Vorteilen, Launchplan und einem selbstbewussten, kundenorientierten Ton.",
+        roadmap:
+          "Erstelle eine Quartalsroadmap mit strategischen Themen, Meilensteinen, Abhängigkeiten und einem klaren Ton für Führungskräfte.",
+        opportunity:
+          "Erstelle einen Chancenüberblick mit Marktumfeld, Kundenproblemen, Lösung, Risiken und einem entschlossenen Ton aus Produktsicht.",
+        priorities:
+          "Erstelle eine Priorisierungspräsentation mit Kundennutzen, Aufwand, Belegen, Abwägungen und einem entscheidungsreifen Ton.",
+        metrics:
+          "Erstelle einen Produktkennzahlenbericht mit Nutzung, Aktivierung, Bindung, Erkenntnissen und einem offenen analytischen Ton.",
+        discovery:
+          "Erstelle einen Bericht zur Kundenforschung mit Themen, Zitaten, Bedürfnissen und einem empathischen, faktenbasierten Ton.",
+        vision:
+          "Erstelle eine Produktvision mit Zukunftsbild, Leitprinzipien, Produktwetten und einem inspirierenden, praxisnahen Ton.",
+        release:
+          "Erstelle einen Release-Rückblick mit Zielen, Ergebnissen, Kundenfeedback, offenen Punkten und einem lernorientierten Ton.",
+      },
+      design: {
+        caseStudy:
+          "Erstelle eine Design-Fallstudie mit Briefing, Prozess, wichtigen Screens, Ergebnissen und einem warmen Editorial-Ton.",
+        system:
+          "Erstelle einen Überblick zum Designsystem mit Farben, Typografie, Komponenten, Beispielen und einem klaren visuellen Ton.",
+        critique:
+          "Erstelle eine Designkritik mit Zielen, aktuellen Screens, Feedbackthemen, nächsten Schritten und einem konstruktiven Ton.",
+        research:
+          "Erstelle einen Bericht zur Nutzerforschung mit Kontext, Mustern, Zitaten, Chancen und einem empathischen Ton.",
+        concepts:
+          "Erstelle eine Konzeptsuche mit drei visuellen Richtungen, Beispiel-Screens, Abwägungen und einem spielerischen Ton.",
+        accessibility:
+          "Erstelle eine Barrierefreiheitsprüfung mit Hürden, kommentierten Beispielen, Verbesserungen und einem klar inklusiven Ton.",
+        brand:
+          "Erstelle eine Markenpräsentation mit Zielgruppe, visuellen Referenzen, Farben, Typografie und einem unverwechselbaren Ton.",
+        sprint:
+          "Erstelle einen Design-Sprint-Rückblick mit Herausforderung, Ideen, Prototyp, Erkenntnissen und einem optimistischen Ton.",
+      },
+      developer: {
+        architecture:
+          "Erstelle eine Systemarchitektur-Präsentation mit Komponenten, Datenfluss, Abwägungen und einem präzisen technischen Ton.",
+        api: "Erstelle einen API-Einstiegsleitfaden mit Einrichtung, Authentifizierung, Beispielen, Fehlern und einem entwicklerfreundlichen Ton.",
+        release:
+          "Erstelle einen technischen Releaseplan mit Umfang, Meilensteinen, Abhängigkeiten, Rollout und einem praktischen Ton.",
+        incident:
+          "Erstelle einen Incident-Rückblick mit Auswirkungen, Zeitachse, Ursache, Maßnahmen und einem vorwurfsfreien Ton.",
+        migration:
+          "Erstelle einen Migrationsplan mit aktuellem Stand, Phasen, Risiken, Validierung und einem beruhigenden Ton.",
+        security:
+          "Erstelle eine Sicherheitsprüfung mit Systemgrenzen, Bedrohungen, Kontrollen, Lücken und einem direkten technischen Ton.",
+        demo: "Erstelle eine technische Demo mit Problem, Architektur, Live-Ablauf, Ergebnissen und einem klaren Ton.",
+        metrics:
+          "Erstelle einen Engineering-Kennzahlenbericht mit Auslieferung, Zuverlässigkeit, Trends und einem offenen Ton.",
+      },
+      marketing: {
+        campaign:
+          "Erstelle eine Kampagnenpräsentation mit Zielgruppe, Botschaft, Kanälen, Zeitplan und einem dynamischen Ton.",
+        story:
+          "Erstelle eine Kundengeschichte mit Herausforderung, Lösung, Ergebnissen, Belegen und einem menschlichen Ton.",
+        content:
+          "Erstelle eine Contentstrategie mit Zielgruppenbedürfnissen, Themen, Formaten, Kalender und einem redaktionellen Ton.",
+        positioning:
+          "Erstelle eine Markenpositionierung mit Zielgruppe, Kategorie, Versprechen, Belegen und einem unverwechselbaren Ton.",
+        channels:
+          "Erstelle einen Kanalbericht mit Reichweite, Interaktion, Konversionen, Erkenntnissen und einem klaren Ton.",
+        messaging:
+          "Erstelle eine Produktbotschaft mit Zielgruppe, Vorteilen, Belegen, Beispielen und einem überzeugenden Ton.",
+        event:
+          "Erstelle einen Eventplan mit Zielgruppe, Aufhänger, Zeitplan, Kanälen und einem einladenden Ton.",
+        competition:
+          "Erstelle einen Wettbewerbsüberblick mit Alternativen, Stärken, Lücken, Chancen und einem ausgewogenen Ton.",
+      },
+      sales: {
+        pitch:
+          "Erstelle einen Kundenpitch mit Kundenzielen, Lösung, Ergebnissen, Belegen und einem selbstbewussten Ton.",
+        proposal:
+          "Erstelle einen Lösungsvorschlag mit Bedarf, Ansatz, Zeitplan, Investition und einem klar kundenorientierten Ton.",
+        quarterlyReview:
+          "Erstelle einen Quartalsrückblick mit Zielen, Ergebnissen, Nutzung, nächsten Schritten und einem partnerschaftlichen Ton.",
+        discovery:
+          "Erstelle einen Bericht zu Kundengesprächen mit Prioritäten, Problemen, Passung und einem aufmerksamen Ton.",
+        objections:
+          "Erstelle einen Leitfaden für Einwände mit häufigen Fragen, Belegen, Antworten und einem hilfreichen Ton.",
+        demo: "Erstelle eine Produktdemo mit Kundenkontext, wichtigen Abläufen, Ergebnissen und einem knappen überzeugenden Ton.",
+        renewal:
+          "Erstelle eine Verlängerungspräsentation mit geliefertem Nutzen, Nutzung, Chancen und einem partnerschaftlichen Ton.",
+        enablement:
+          "Erstelle ein Vertriebstraining mit idealen Käufern, Qualifizierung, Gesprächsleitfäden und einem praktischen Ton.",
+      },
+      ops: {
+        weeklyReview:
+          "Erstelle einen wöchentlichen Betriebsbericht mit Zielen, Kennzahlen, Blockern, Verantwortlichen und einem ruhigen direkten Ton.",
+        process:
+          "Erstelle eine Prozessverbesserung mit aktuellen Schritten, Reibungspunkten, künftigem Ablauf und einem praktischen Ton.",
+        capacity:
+          "Erstelle einen Kapazitätsplan mit Nachfrage, Verfügbarkeit, Prioritäten, Szenarien und einem transparenten Ton.",
+        service:
+          "Erstelle einen Servicebericht mit Volumen, Reaktionszeiten, Eskalationen, Korrekturen und einem verantwortungsbewussten Ton.",
+        vendor:
+          "Erstelle eine Lieferantenbewertung mit Anforderungen, Optionen, Kosten, Risiken und einem ausgewogenen Ton.",
+        metrics:
+          "Erstelle eine Kennzahlenpräsentation mit wichtigen Messwerten, Trends, Ausnahmen und einem prägnanten analytischen Ton.",
+        onboarding:
+          "Erstelle einen Onboardingablauf mit Phasen, Übergaben, Ressourcen, Erfolgskennzahlen und einem unterstützenden Ton.",
+        risk: "Erstelle einen Risikobericht mit Wahrscheinlichkeit, Auswirkungen, Gegenmaßnahmen, Verantwortlichen und einem sachlichen Ton.",
+      },
+      individual: {
+        project:
+          "Erstelle einen persönlichen Projektplan mit Ziel, Meilensteinen, Ressourcen, Risiken und einem motivierenden Ton.",
+        portfolio:
+          "Erstelle ein persönliches Portfolio mit ausgewählten Arbeiten, Vorgehen, Ergebnissen und einem selbstbewussten Editorial-Ton.",
+        learning:
+          "Erstelle einen Lernplan mit Fähigkeiten, Ressourcen, Übungen und Meilensteinen in einem ermutigenden Ton.",
+        event:
+          "Erstelle einen Veranstaltungsplan mit Zweck, Gästen, Ablauf, Details und einem herzlichen Ton.",
+        budget:
+          "Erstelle einen persönlichen Budgetbericht mit Einnahmen, Ausgaben, Zielen und einem ruhigen praktischen Ton.",
+        travel:
+          "Erstelle einen Reiseplan mit Zielen, täglichen Highlights, Logistik und einem einladenden visuellen Ton.",
+        community:
+          "Erstelle eine Präsentation für einen Community-Workshop mit Thema, Aktivitäten, Erkenntnissen und einem inklusiven Ton.",
+        personalStory:
+          "Erstelle eine persönliche Vorstellung mit Hintergrund, Interessen, Arbeit und einem natürlichen Gesprächston.",
+      },
+      general: {
+        overview:
+          "Erstelle einen verständlichen Themenüberblick mit Kontext, Kernideen, Beispielen und einem einladenden Ton.",
+        fundraiser:
+          "Erstelle eine Spendenpräsentation mit Mission, Bedarf, Wirkung und einem hoffnungsvollen Ton.",
+        lesson:
+          "Erstelle eine kurze Lektion mit Lernzielen, Kernideen, Beispielen und einem ansprechenden Ton.",
+        research:
+          "Erstelle einen Forschungsbericht mit Frage, Methode, Ergebnissen, Folgerungen und einem ausgewogenen Ton.",
+        eventProposal:
+          "Erstelle einen Veranstaltungsvorschlag mit Zweck, Zielgruppe, Format, Budget und einem einladenden Ton.",
+        teamStrategy:
+          "Erstelle eine Teamstrategie mit Prioritäten, Messwerten, Initiativen und einem fokussierten Ton.",
+        howTo:
+          "Erstelle eine visuelle Anleitung mit klaren Schritten, hilfreichen Beispielen und einem ermutigenden Ton.",
+        portfolioIntro:
+          "Erstelle eine Portfolio-Einführung mit ausgewählten Projekten, Stärken und einem gepflegten Ton.",
+      },
     },
     suggestedPrompts: "Vorgeschlagene Prompts",
     importMenu: {
@@ -1157,6 +1452,89 @@ const messages = {
     createFirstDeck: "Erstelle dein erstes Deck",
     emptyDescription:
       "Erstelle schöne Präsentationen mit KI-gestützter Generierung.",
+
+    suggestionLabels: {
+      product: {
+        launch: "Produktlaunch-Präsentation",
+        roadmap: "Quartalsroadmap",
+        opportunity: "Chancenüberblick",
+        priorities: "Priorisierungspräsentation",
+        metrics: "Produktkennzahlenbericht",
+        discovery: "Bericht zur Kundenforschung",
+        vision: "Produktvision",
+        release: "Release-Rückblick",
+      },
+      design: {
+        caseStudy: "Design-Fallstudie",
+        system: "Überblick zum Designsystem",
+        critique: "Designkritik",
+        research: "Bericht zur Nutzerforschung",
+        concepts: "Konzeptsuche",
+        accessibility: "Barrierefreiheitsprüfung",
+        brand: "Markenpräsentation",
+        sprint: "Design-Sprint-Rückblick",
+      },
+      developer: {
+        architecture: "Systemarchitektur-Präsentation",
+        api: "API-Einstiegsleitfaden",
+        release: "technischen Releaseplan",
+        incident: "Incident-Rückblick",
+        migration: "Migrationsplan",
+        security: "Sicherheitsprüfung",
+        demo: "technische Demo",
+        metrics: "Engineering-Kennzahlenbericht",
+      },
+      marketing: {
+        campaign: "Kampagnenpräsentation",
+        story: "Kundengeschichte",
+        content: "Contentstrategie",
+        positioning: "Markenpositionierung",
+        channels: "Kanalbericht",
+        messaging: "Produktbotschaft",
+        event: "Eventplan",
+        competition: "Wettbewerbsüberblick",
+      },
+      sales: {
+        pitch: "Kundenpitch",
+        proposal: "Lösungsvorschlag",
+        quarterlyReview: "Quartalsrückblick",
+        discovery: "Bericht zu Kundengesprächen",
+        objections: "Leitfaden für Einwände",
+        demo: "Produktdemo",
+        renewal: "Verlängerungspräsentation",
+        enablement: "Vertriebstraining",
+      },
+      ops: {
+        weeklyReview: "wöchentlichen Betriebsbericht",
+        process: "Prozessverbesserung",
+        capacity: "Kapazitätsplan",
+        service: "Servicebericht",
+        vendor: "Lieferantenbewertung",
+        metrics: "Kennzahlenpräsentation",
+        onboarding: "Onboardingablauf",
+        risk: "Risikobericht",
+      },
+      individual: {
+        project: "persönlichen Projektplan",
+        portfolio: "persönliches Portfolio",
+        learning: "Lernplan",
+        event: "Veranstaltungsplan",
+        budget: "persönlichen Budgetbericht",
+        travel: "Reiseplan",
+        community: "Community-Workshop-Präsentation",
+        personalStory: "persönliche Vorstellung",
+      },
+      general: {
+        overview: "verständlichen Themenüberblick",
+        fundraiser: "Spendenpräsentation",
+        lesson: "kurze Lektion",
+        research: "Forschungsbericht",
+        eventProposal: "Veranstaltungsvorschlag",
+        teamStrategy: "Teamstrategie",
+        howTo: "visuelle Anleitung",
+        portfolioIntro: "Portfolio-Einführung",
+      },
+    },
   },
   agentChat: {
     setup: {

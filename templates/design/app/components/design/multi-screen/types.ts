@@ -12,6 +12,8 @@ import type { SourceNodeProvenance } from "@shared/preview-source-provenance";
 import type { VectorEndpointStyle } from "@shared/vector-endpoints";
 import type { ReactNode, RefObject } from "react";
 
+import type { ReviewActiveThreadReporter } from "@/components/visual-editor/review-active-thread-reporter";
+import type { ReviewThreadAgentAction } from "@/lib/review-thread-agent-actions";
 import type { TextCommitStatus } from "@/pages/design-editor/command-types";
 
 import type {
@@ -181,7 +183,6 @@ export interface MultiScreenCanvasProps {
   selectedPenPathNodeId?: string | null;
   hiddenScreenIds?: ReadonlySet<string> | readonly string[];
   lockedScreenIds?: ReadonlySet<string> | readonly string[];
-  fullViewScreenIds?: string[];
   pendingReviewScreenIds?: ReadonlySet<string> | readonly string[];
   onReviewPendingScreen?: (screenId: string) => void;
   interactMode?: boolean;
@@ -212,9 +213,13 @@ export interface MultiScreenCanvasProps {
     threadId?: string;
   } | null;
   reviewCurrentUserEmail?: string | null;
+  onReviewActiveThreadChange?: ReviewActiveThreadReporter;
   onExitReviewPinMode?: () => void;
   onDispatchCommentToAgent?: (comment: ReviewComment) => void;
-  onSendThreadToAgent?: (thread: ReviewThread) => void;
+  onSendThreadToAgent?: (
+    thread: ReviewThread,
+    action: ReviewThreadAgentAction,
+  ) => void;
   reviewSendingThreadId?: string | null;
   reviewDesignTitle?: string;
   toolProps?: CanvasToolProps;
@@ -226,6 +231,7 @@ export interface MultiScreenCanvasProps {
   ) => void;
   onSelectForGesture?: (id: string) => void;
   onEdit?: (id: string) => void;
+  onRenameScreen?: (id: string, name: string) => void;
   metadataById?: Record<string, ScreenMetadata | undefined>;
   screenRootComputedStylesById?: Record<string, Record<string, string>>;
   getScreenMetadata?: (screen: ScreenFile) => ScreenMetadata | undefined;
@@ -262,6 +268,14 @@ export interface MultiScreenCanvasProps {
   onPrimitiveCreated?: (
     screenId: string,
     nodeId: string,
+    options?: {
+      nextTool?: "move" | "pen";
+      preserveActiveTool?: boolean;
+    },
+  ) => void;
+  onPrimitivesCreated?: (
+    created: ReadonlyArray<{ screenId: string; nodeId: string }>,
+    selected?: { screenId: string; nodeId: string },
     options?: {
       nextTool?: "move" | "pen";
       preserveActiveTool?: boolean;
@@ -359,10 +373,9 @@ export interface MultiScreenCanvasProps {
       row: number;
       rowEnd: number;
     };
-    targetAnchorRect?: CrossScreenHitTestAnchorRect;
+    targetAbsoluteOrigin?: CrossScreenHitTestOrigin;
     targetCanvasPoint?: Point;
     targetLocalPoint?: Point;
-    targetOutsideBoardContentBounds?: boolean;
     sourcePointerOffset?: Point;
     sourceComputedSize?: { width?: number; height?: number };
     sourceHtmlSnapshot?: string;
@@ -373,6 +386,13 @@ export interface MultiScreenCanvasProps {
   }) => void;
   boardFileId?: string;
   canvasBackground?: string | null;
+  /**
+   * While a run is generating into this design, its id: a screen streaming in
+   * from `generate-design` is drawn where it will land, beside the others.
+   */
+  generatingDesignId?: string | null;
+  /** The design on this canvas; a settling preview never outlives it. */
+  activeDesignId?: string | undefined;
   boardFileContent?: string;
   boardCodeLayerSource?: CodeLayerSource;
   boardFrameGeometry?: FrameGeometry;
@@ -431,6 +451,7 @@ export interface MultiScreenCanvasProps {
   onBoardElementHover?: (info: ElementInfo | null) => void;
   onBoardElementClear?: () => void;
   onBoardElementDblClickText?: (info: ElementInfo) => void;
+  onBoardFrameLabelRename?: (info: ElementInfo, name: string) => void;
   onBoardIframeHotkey?: (event: IframeHotkeyPayload) => void;
   onBoardFigmaClipboardPaste?: (
     event: IframeFigmaClipboardPastePayload,
@@ -511,6 +532,8 @@ export interface MultiScreenCanvasProps {
     fitBounds: FrameBounds;
     canvasZoom?: number;
     paddingScreenPx?: number;
+    /** Pan at the current zoom, and only when no part of `fitBounds` is in view. */
+    revealOnly?: boolean;
     nonce: number;
   } | null;
   suppressLineupRecenter?: {
@@ -548,6 +571,7 @@ export type MultiScreenCanvasReviewProps = Pick<
   | "reviewTargetId"
   | "reviewFocusRequest"
   | "reviewCurrentUserEmail"
+  | "onReviewActiveThreadChange"
   | "onExitReviewPinMode"
   | "onDispatchCommentToAgent"
   | "onSendThreadToAgent"
@@ -579,6 +603,7 @@ export type MultiScreenCanvasBoardProps = Pick<
   | "onBoardElementHover"
   | "onBoardElementClear"
   | "onBoardElementDblClickText"
+  | "onBoardFrameLabelRename"
   | "onBoardIframeHotkey"
   | "onBoardFigmaClipboardPaste"
   | "onBoardImagePaste"
@@ -633,6 +658,7 @@ export type MultiScreenCanvasCreationProps = Pick<
   | "onActiveToolChange"
   | "onCreatePrimitive"
   | "onPrimitiveCreated"
+  | "onPrimitivesCreated"
   | "onUpdatePenPath"
   | "onPrimitiveReparent"
   | "onCreateScreenFrame"
@@ -866,6 +892,7 @@ export interface ResizeDragState {
   type: "resize";
   originClient: Point;
   originFrames: FrameGeometryById;
+  savedFrames: FrameGeometryById;
   originBounds: FrameGeometry;
   targetIds: string[];
   handle: ResizeHandle;
@@ -1025,6 +1052,11 @@ export interface CrossScreenHitTestAnchorRect {
   height: number;
 }
 
+export interface CrossScreenHitTestOrigin {
+  left: number;
+  top: number;
+}
+
 export interface CrossScreenHitTestResult {
   targetAnchorProvenance?: SourceNodeProvenance;
   anchorNodeId?: string;
@@ -1037,6 +1069,7 @@ export interface CrossScreenHitTestResult {
   dropMode?: CrossScreenDropMode;
   anchorRect?: CrossScreenHitTestAnchorRect;
   guideRect?: CrossScreenHitTestAnchorRect;
+  absoluteOrigin?: CrossScreenHitTestOrigin;
   gridPlacement?: {
     column: number;
     columnEnd: number;

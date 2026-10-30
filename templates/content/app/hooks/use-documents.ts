@@ -29,6 +29,7 @@ import type {
 import type { ContentSidebarSections } from "@shared/content-personal-navigation";
 import type { ContentRecentResult } from "@shared/content-personal-navigation";
 import { applyContentPersonalNavigationPatch } from "@shared/content-personal-navigation-patch";
+import { buildListRowExcerpt } from "@shared/og-description";
 import type { QueryClient } from "@tanstack/react-query";
 import {
   hashKey,
@@ -57,6 +58,7 @@ import {
   documentQueryKey,
   type DocumentQueryContext,
 } from "../lib/document-query";
+import { trackDocumentReadFailures } from "../lib/document-read-failures";
 import {
   documentScopedReadRetryOptions,
   isWithinCreateSettlingWindow,
@@ -88,6 +90,7 @@ import {
 } from "./use-content-action-mutation";
 import {
   contentDatabaseConstrainedQueryFilter,
+  contentDatabaseExcerptContainingDocumentFilter,
   contentDatabaseItemsContainingDocumentFilter,
   contentDatabaseNavigationQueryFilter,
   invalidateContentDatabaseNavigationQueries,
@@ -312,6 +315,7 @@ export type DocumentUpdateRequestWithCas = DocumentUpdateRequest & {
   authoredBaseContent?: string;
   authoredCandidateContent?: string;
   editorSnapshotTitle?: string;
+  editorSnapshotTitleBase?: string;
   editorSnapshotContent?: string;
 };
 
@@ -454,6 +458,17 @@ export function patchDocumentInDatabaseCache<
     return {
       ...item,
       document: { ...item.document, ...patch },
+      // A saved body, even an empty one, replaces the excerpt the read sent.
+      ...(patch.content !== undefined &&
+      "excerpt" in item &&
+      item.excerpt !== undefined
+        ? {
+            excerpt: buildListRowExcerpt({
+              content: patch.content,
+              title: patch.title ?? item.document.title,
+            }),
+          }
+        : {}),
     };
   });
   return changed ? ({ ...current, items } as T) : current;
@@ -491,13 +506,17 @@ function patchDocumentWithFavoriteMembershipInDatabaseCache(
     : setDocumentFavoriteInDatabaseCache(patched, documentId, patch.isFavorite);
 }
 
+// Only the page's own reads hold its body; lists, database rows and navigation
+// carry none. `pagePatch` lets the page copies keep a body and its revision
+// together while the rest take the answer's metadata.
 export function patchDocumentCaches(
   queryClient: Pick<QueryClient, "setQueryData" | "setQueriesData">,
   documentId: string,
   patch: PageOwnedDocumentCachePatch,
+  pagePatch: PageOwnedDocumentCachePatch = patch,
 ) {
   queryClient.setQueriesData(documentQueryFilter(documentId), (old: unknown) =>
-    old && typeof old === "object" ? { ...old, ...patch } : old,
+    old && typeof old === "object" ? { ...old, ...pagePatch } : old,
   );
   queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, (old: unknown) =>
     patchDocumentInListDocumentsCache(old, documentId, patch),
@@ -703,15 +722,48 @@ export function removeCreatedDocumentNavigation(
   }
 }
 
+// A save that sends no body still answers with the page's current body
+// revision, hash and timestamp. If another writer moved the body since the
+// cache read it, those name a body the cache does not hold: beside the cached
+// body they make every later save's base invalid and stamp a draft with a body
+// it was not written on. The page's own reads keep their body and the fields
+// that go with it until a fresh read brings the new body.
+export function documentUpdateMovedBody(
+  data: Pick<DocumentUpdateResponse, "bodyRevision">,
+  variables: Pick<DocumentUpdateRequestWithCas, "content">,
+  cachedBodyRevisions: readonly (number | undefined)[],
+): boolean {
+  return (
+    variables.content === undefined &&
+    cachedBodyRevisions.some((revision) => revision !== data.bodyRevision)
+  );
+}
+
+function cachedDocumentBodyRevisions(
+  queryClient: Pick<QueryClient, "getQueriesData">,
+  documentId: string,
+): Array<number | undefined> {
+  return queryClient
+    .getQueriesData<Document>(documentQueryFilter(documentId))
+    .flatMap(([, cached]) =>
+      cached && typeof cached === "object" ? [cached.bodyRevision] : [],
+    );
+}
+
 export function documentUpdateSuccessPatch(
   data: DocumentUpdateResponse,
   variables: DocumentUpdateRequestWithCas,
+  bodyMovedElsewhere = false,
 ): PageOwnedDocumentCachePatch {
   return {
-    updatedAt: data.updatedAt,
-    revision: data.revision,
-    bodyRevision: data.bodyRevision,
-    contentHash: data.contentHash,
+    ...(bodyMovedElsewhere
+      ? {}
+      : {
+          updatedAt: data.updatedAt,
+          revision: data.revision,
+          bodyRevision: data.bodyRevision,
+          contentHash: data.contentHash,
+        }),
     ...(variables.title !== undefined ? { title: data.title } : {}),
     ...(variables.content !== undefined ? { content: data.content } : {}),
     ...(variables.description !== undefined
@@ -796,8 +848,13 @@ function documentReadParams(id: string, context: DocumentQueryContext) {
 export function useDocument(
   id: string | null,
   context: DocumentQueryContext = {},
-  options: { enabled?: boolean; refetchOnMount?: false } = {},
+  options: {
+    enabled?: boolean;
+    refetchOnMount?: false;
+    batchRefetches?: false;
+  } = {},
 ) {
+  trackDocumentReadFailures(useQueryClient());
   return useActionQuery<Document>(
     "get-document",
     id ? documentReadParams(id, context) : undefined,
@@ -839,6 +896,9 @@ export function usePageOpenDocument(
     enabled: !(
       cachedDocument && isDocumentCreationPending(queryClient, cachedDocument)
     ),
+    // The editor holds its skeleton until this read lands, even over a cached
+    // document, so the read never waits on other reads in a batch.
+    batchRefetches: false,
     ...(adoption === "fresh" ? { refetchOnMount: false } : {}),
   });
   // Runs after the query's own subscription, so from here on sync reaches
@@ -862,6 +922,7 @@ export function startPageOpenDocumentReads(
   context: DocumentQueryContext = {},
   { beforeSession = false }: { beforeSession?: boolean } = {},
 ) {
+  trackDocumentReadFailures(queryClient);
   const queryKey = documentQueryKey(documentId, context);
   const cached = queryClient.getQueryData<Document>(queryKey);
   if (cached && isDocumentCreationPending(queryClient, cached)) return;
@@ -980,6 +1041,7 @@ export interface PreviewDocumentDraftRecord {
   title: string;
   content: string;
   baseDocumentUpdatedAt: string | null;
+  baseContentHash?: string | null;
   loadedContentWasEmpty: number;
   deferredReason: string | null;
   editorSessionId: string | null;
@@ -1093,6 +1155,7 @@ export function useUpdatePreviewDocumentDraft() {
           title: string;
           content: string;
           baseDocumentUpdatedAt: string | null;
+          baseContentHash: string | null;
           loadedContentWasEmpty: boolean;
           deferredReason: "hydration" | "conflict" | null;
           editorSessionId?: string;
@@ -1538,14 +1601,23 @@ export function useUpdateDocument(options?: { saveOrigin?: "recovery" }) {
           return;
         }
 
+        const bodyMovedElsewhere = documentUpdateMovedBody(
+          data,
+          variables,
+          cachedDocumentBodyRevisions(queryClient, variables.id),
+        );
         patchDocumentCaches(
           queryClient,
           variables.id,
           documentUpdateSuccessPatch(data, variables),
+          documentUpdateSuccessPatch(data, variables, bodyMovedElsewhere),
         );
+        if (bodyMovedElsewhere)
+          void queryClient.invalidateQueries(documentQueryFilter(variables.id));
         if (variables.title !== undefined) {
           invalidateContentQueries(queryClient, [
             contentDatabaseConstrainedQueryFilter(),
+            contentDatabaseExcerptContainingDocumentFilter(variables.id),
             ...contentRowTargets(queryClient, [variables.id]),
             ["action", "search-documents"],
           ]);

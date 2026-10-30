@@ -1,3 +1,4 @@
+import type { currentAccess } from "@agent-native/core/sharing";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => {
@@ -14,12 +15,14 @@ const mocks = vi.hoisted(() => {
   };
   const selectChain = {
     from: vi.fn(),
+    leftJoin: vi.fn(),
     where: vi.fn(),
     limit: vi.fn(),
     orderBy: vi.fn(),
   };
   const select = vi.fn(() => selectChain);
   selectChain.from.mockReturnValue(selectChain);
+  selectChain.leftJoin.mockReturnValue(selectChain);
   selectChain.where.mockImplementation((condition) => {
     state.whereCondition = condition;
     return selectChain;
@@ -50,8 +53,10 @@ const mocks = vi.hoisted(() => {
     asc: vi.fn((column) => ({ asc: column })),
     and: vi.fn((...conditions) => ({ conditions })),
     eq: vi.fn((left, right) => ({ left, right })),
+    sql: vi.fn((strings, ...values) => ({ strings, values })),
     getDb: vi.fn(() => ({ select })),
     resolveAccess: vi.fn(),
+    currentAccess: vi.fn<() => ReturnType<typeof currentAccess>>(() => ({})),
     currentRequestUserIsOrgAdmin: vi.fn(),
     getAppConfig: vi.fn(() => ({
       observability: { superOrgId: state.superOrgId },
@@ -71,7 +76,11 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("@agent-native/core/tracking", () => ({ track: mocks.track }));
 
-vi.mock("@agent-native/core/sharing", () => ({
+vi.mock("@agent-native/core/sharing", async (importOriginal) => ({
+  roleSatisfies: (
+    await importOriginal<typeof import("@agent-native/core/sharing")>()
+  ).roleSatisfies,
+  currentAccess: mocks.currentAccess,
   registerShareableResource: vi.fn(),
   resolveAccess: mocks.resolveAccess,
 }));
@@ -91,7 +100,7 @@ vi.mock("drizzle-orm", () => ({
   and: mocks.and,
   asc: mocks.asc,
   eq: mocks.eq,
-  sql: vi.fn((strings, ...values) => ({ strings, values })),
+  sql: mocks.sql,
 }));
 
 vi.mock("../server/db/index.js", () => ({
@@ -111,6 +120,12 @@ vi.mock("../server/db/index.js", () => ({
       createdAt: "designFiles.createdAt",
       updatedAt: "designFiles.updatedAt",
     },
+    designScreenRestoreClaims: {
+      designId: "designScreenRestoreClaims.designId",
+      sourceFileId: "designScreenRestoreClaims.sourceFileId",
+      snapshot: "designScreenRestoreClaims.snapshot",
+      restoredFileId: "designScreenRestoreClaims.restoredFileId",
+    },
   },
 }));
 
@@ -124,6 +139,7 @@ import action from "./get-design.js";
 describe("get-design", () => {
   beforeEach(() => {
     mocks.resolveAccess.mockReset();
+    mocks.currentAccess.mockReset().mockReturnValue({});
     mocks.currentRequestUserIsOrgAdmin.mockReset();
     mocks.currentRequestUserIsOrgAdmin.mockResolvedValue(false);
     mocks.getAppConfig.mockClear();
@@ -145,11 +161,13 @@ describe("get-design", () => {
     mocks.state.whereCondition = null;
     mocks.select.mockClear();
     mocks.selectChain.where.mockClear();
+    mocks.selectChain.leftJoin.mockClear();
     mocks.selectChain.limit.mockClear();
     mocks.selectChain.orderBy.mockReset();
     mocks.asc.mockClear();
     mocks.and.mockClear();
     mocks.eq.mockClear();
+    mocks.sql.mockClear();
     mocks.resolveAccess.mockImplementation(
       async (_resource: string, _id: string, options?: { orgId?: string }) => ({
         role: "viewer",
@@ -218,6 +236,54 @@ describe("get-design", () => {
     expect(result.data).not.toContain("previewToken");
     expect(result.data).not.toContain("example-private-bridge-token");
   });
+
+  it.each([
+    { userEmail: undefined, sourceRole: "viewer", canPersistSource: false },
+    {
+      userEmail: "viewer@example.com",
+      sourceRole: "viewer",
+      canPersistSource: false,
+    },
+    {
+      userEmail: "editor@example.com",
+      sourceRole: "editor",
+      canPersistSource: true,
+    },
+    {
+      userEmail: "owner@example.com",
+      sourceRole: "owner",
+      canPersistSource: true,
+    },
+  ])(
+    "separates Visual Edit role from source persistence for $sourceRole",
+    async ({ userEmail, sourceRole, canPersistSource }) => {
+      const resource = mocks.state.reviewResource;
+      mocks.resolveAccess.mockResolvedValueOnce({ role: "editor", resource });
+      mocks.resolveAccess.mockResolvedValueOnce({ role: sourceRole, resource });
+      mocks.currentAccess.mockReturnValue({
+        ...(userEmail ? { userEmail } : {}),
+        orgId: "org-a",
+        authCapability: "capability:visual-edit:design:design_123",
+      });
+      const result = await action.run(
+        { id: "design_123" },
+        {
+          ...(userEmail ? { userEmail } : {}),
+          orgId: "org-a",
+          caller: "frontend",
+        },
+      );
+      expect(result).toMatchObject({ accessRole: "editor", canPersistSource });
+      if (userEmail)
+        expect(mocks.resolveAccess).toHaveBeenLastCalledWith(
+          "design",
+          "design_123",
+          { userEmail, orgId: "org-a" },
+          { skipResourceBody: true },
+        );
+      else expect(mocks.resolveAccess).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("allows an org admin to read a same-org design for Human Review", async () => {
     mocks.currentRequestUserIsOrgAdmin.mockResolvedValue(true);
@@ -351,13 +417,46 @@ describe("get-design", () => {
     });
   });
 
-  it("returns files in a stable order so a design lays itself out the same way twice", async () => {
+  it("breaks created-at ties with the restore key and file ID", async () => {
     await action.run({ id: "design_123" });
 
-    expect(mocks.selectChain.orderBy).toHaveBeenCalledWith(
-      { asc: "designFiles.createdAt" },
-      { asc: "designFiles.id" },
-    );
+    const [createdAtOrder, stableIdentityOrder] = mocks.selectChain.orderBy.mock
+      .calls[0] as [
+      { asc: string },
+      { asc: { strings: TemplateStringsArray; values: unknown[] } },
+    ];
+    expect(createdAtOrder).toEqual({ asc: "designFiles.createdAt" });
+    expect(Array.from(stableIdentityOrder.asc.strings)).toEqual([
+      "coalesce(",
+      "::jsonb ->> 'fileOrderKey', ",
+      ", ",
+      ")",
+    ]);
+    expect(stableIdentityOrder.asc.values).toEqual([
+      "designScreenRestoreClaims.snapshot",
+      "designScreenRestoreClaims.sourceFileId",
+      "designFiles.id",
+    ]);
+    expect(mocks.selectChain.leftJoin.mock.calls[0]).toEqual([
+      {
+        designId: "designScreenRestoreClaims.designId",
+        sourceFileId: "designScreenRestoreClaims.sourceFileId",
+        snapshot: "designScreenRestoreClaims.snapshot",
+        restoredFileId: "designScreenRestoreClaims.restoredFileId",
+      },
+      {
+        conditions: [
+          {
+            left: "designScreenRestoreClaims.designId",
+            right: "designFiles.designId",
+          },
+          {
+            left: "designScreenRestoreClaims.restoredFileId",
+            right: "designFiles.id",
+          },
+        ],
+      },
+    ]);
   });
 
   it("can list file metadata without fetching file content", async () => {

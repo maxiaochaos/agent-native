@@ -2,9 +2,13 @@ import { agentNativePath } from "@agent-native/core/client/api-path";
 import { type CodeLayerNode, type CodeLayerTreeNode } from "@shared/code-layer";
 import type { InteractionState } from "@shared/interaction-states";
 import { isRunningAppSourceType } from "@shared/source-mode";
-import { useState, useCallback, useRef, useMemo } from "react";
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { toast } from "sonner";
 
+import {
+  parseSolidFillLayer,
+  splitCssLayers,
+} from "@/components/design/edit-panel/fill-gradient-helpers";
 import { type LayersPanelMoveIntent } from "@/components/design/LayersPanel";
 import {
   getInitialFrameGeometry,
@@ -26,8 +30,10 @@ import type {
 
 import {
   bridgeSourceIdForCodeLayerNode,
+  canonicalElementInfoForCodeLayerNode,
   elementInfoFromCodeLayerNode,
   findCodeLayerSiblingOrder,
+  hasSettledPortableStyles,
   preferredCodeLayerSelector,
 } from "../code-layer-state";
 import { runCanMoveLayer } from "../commands/can-move-layer";
@@ -54,6 +60,7 @@ import {
   measurePositionCoordinateContext,
   positionCoordinateRenderOffsetForWindow,
 } from "../position-coordinate-context";
+import { readRelativePositionStyles } from "../relative-position-offset";
 import {
   isScreenRootElementInfo,
   resolveMarqueeAdditive,
@@ -93,7 +100,9 @@ function readRenderedLayerInfo(
         preferredCodeLayerSelector(owner.node),
       );
       if (!element) continue;
-      const computed = preview.getComputedStyle(element);
+      const relativePosition = readRelativePositionStyles(element, (target) =>
+        preview.getComputedStyle(target),
+      );
       const parent = element.parentElement;
       const renderOffset = positionCoordinateRenderOffsetForWindow(preview);
       if (!renderOffset) continue;
@@ -115,9 +124,10 @@ function readRenderedLayerInfo(
         sourceLayerIdentity: { screenId: owner.fileId, nodeId: owner.node.id },
         computedStyles: {
           ...base.computedStyles,
-          position: computed.position,
-          zIndex: computed.zIndex,
+          ...relativePosition.computedStyles,
         },
+        relativeContainingBlockDirection:
+          relativePosition.relativeContainingBlockDirection,
         boundingRect: {
           x: rect.x + scrollX,
           y: rect.y + scrollY,
@@ -211,6 +221,7 @@ export function useEditorLayerActions({
     setSelectedLayerIdsState,
     renderedElementInfoByLayerKeyRef,
     renderedElementInfoRevisionRef,
+    setRenderedElementInfoVersion,
     rehydrateRenderedElementInfoRef,
     codeLayerOwnerByNodeIdRef,
     overviewSelectedScreenIds,
@@ -234,8 +245,8 @@ export function useEditorLayerActions({
   } = editorHistory;
   const {
     lastMarqueeSelectionSignatureRef,
-    recordSelectionHistoryAroundChange,
-    recordMarqueeSelectionHistoryAroundChange,
+    applySelectionChange,
+    applyMarqueeSelectionChange,
     design,
     canEditDesign,
     canEditLiveScreens,
@@ -290,21 +301,14 @@ export function useEditorLayerActions({
     applyLinkedComponentEdit,
     getFreshActiveContent,
     handleStyleChange,
+    canvasContextMenuRef,
   } = editorSelectionAndStyles;
-  const {
-    handleCopySelection,
-    handleDuplicateSelection,
-    handleDeleteSelection,
-  } = editorClipboard;
   const { setRuntimeStructureDeleteRequest, getActiveFileSelectedNodeIds } =
     editorLayoutAndStructure;
   const {
     setRuntimeStructureMoveRequest,
     runtimeStructureMoveRevisionRef,
     setRuntimeLayerRenameRequest,
-    handleFlipHorizontal,
-    handleFlipVertical,
-    changeSelectedZIndex,
   } = editorEditCommands;
   const {
     codeLayerOwnerByNodeId,
@@ -412,19 +416,6 @@ export function useEditorLayerActions({
     selectedElementLayerId ??
     activeFile?.id ??
     "";
-  const selectedElementFullViewScreenId =
-    viewMode === "overview" && selectedElement
-      ? selectedElementLayerId
-        ? (codeLayerOwnerByNodeId.get(selectedElementLayerId)?.fileId ??
-          activeFileId)
-        : activeFileId
-      : null;
-  const fullViewScreenIds = useMemo(
-    () =>
-      selectedElementFullViewScreenId ? [selectedElementFullViewScreenId] : [],
-    [selectedElementFullViewScreenId],
-  );
-
   const singleSelectedOverviewScreenId =
     viewMode === "overview" &&
     !selectedElement &&
@@ -478,10 +469,17 @@ export function useEditorLayerActions({
   const inScreenBackgroundImage =
     selectedElement?.inlineStyles?.backgroundImage ??
     selectedElement?.computedStyles.backgroundImage;
+  const inScreenBackgroundLayers = splitCssLayers(
+    inScreenBackgroundImage ?? "",
+  );
+  const onlyBackgroundLayer =
+    inScreenBackgroundLayers.length === 1 ? inScreenBackgroundLayers[0] : null;
+  // The handles rewrite the whole value as one gradient; a solid layer is stored as a linear-gradient too.
   const inScreenGradientEditCssValue =
     inScreenGradientEditNodeId &&
-    inScreenBackgroundImage?.trim().startsWith("linear-gradient(")
-      ? inScreenBackgroundImage
+    onlyBackgroundLayer?.startsWith("linear-gradient(") &&
+    !parseSolidFillLayer(onlyBackgroundLayer)
+      ? onlyBackgroundLayer
       : null;
   const inScreenGradientEditTarget = useMemo<{
     screenId: string;
@@ -745,8 +743,9 @@ export function useEditorLayerActions({
   );
 
   const handleLayerMoveToScreen = useCallback(
-    (intent: LayersPanelMoveIntent, targetFileId: string) =>
-      runLayerMoveToScreen(
+    (intent: LayersPanelMoveIntent, targetFileId: string) => {
+      if (!activeFile) return;
+      return runLayerMoveToScreen(
         {
           activeBreakpointWidthState,
           activeFileId,
@@ -756,6 +755,9 @@ export function useEditorLayerActions({
           activeFile,
           applyFileContentUpdate,
           boardFileId,
+          canvasFrameGeometryById: getCanvasFrameGeometry(
+            designDataJsonRef.current,
+          ),
           codeLayerOwnerByNodeId,
           effectiveCodeLayerState,
           files,
@@ -774,7 +776,8 @@ export function useEditorLayerActions({
         },
         intent,
         targetFileId,
-      ),
+      );
+    },
     [
       activeFileId,
       overviewSelectedScreenIds,
@@ -795,8 +798,9 @@ export function useEditorLayerActions({
   );
 
   const handleLayerMove = useCallback(
-    (intent: LayersPanelMoveIntent) =>
-      runLayerMove(
+    (intent: LayersPanelMoveIntent) => {
+      if (!activeFile) return;
+      return runLayerMove(
         {
           activeBreakpointWidthState,
           activeFileId,
@@ -836,7 +840,8 @@ export function useEditorLayerActions({
           visualScreenFileIds,
         },
         intent,
-      ),
+      );
+    },
     [
       activeFileId,
       overviewSelectedScreenIds,
@@ -968,9 +973,18 @@ export function useEditorLayerActions({
               measured.positionContainingBlockOrigin,
             positionContainingBlockTransform:
               measured.positionContainingBlockTransform,
+            svgShapeOffset: measured.svgShapeOffset,
+            relativeContainingBlockDirection:
+              measured.relativeContainingBlockDirection,
             computedStyles: {
               ...measured.computedStyles,
               ...current.computedStyles,
+              position: measured.computedStyles.position,
+              left: measured.computedStyles.left,
+              right: measured.computedStyles.right,
+              top: measured.computedStyles.top,
+              bottom: measured.computedStyles.bottom,
+              zIndex: measured.computedStyles.zIndex,
             },
           };
           return samePlainData(merged, current) ? current : merged;
@@ -1017,8 +1031,61 @@ export function useEditorLayerActions({
       });
     }
   }, []);
-  rehydrateRenderedElementInfoRef.current = () =>
+  const measureMultiSelectionLayers = useCallback((ids: string[]) => {
+    if (ids.length < 2) return;
+    const renderedRevision = renderedElementInfoRevisionRef.current;
+    const breakpointWidth = activeBreakpointWidthStateRef.current;
+    const currentBoardFileId = boardFileIdRef.current;
+    const measurements = ids.flatMap((layerId) => {
+      const owner = codeLayerOwnerByNodeIdRef.current.get(layerId);
+      if (!owner) return [];
+      const layerKey = `${owner.fileId}:${owner.node.id}`;
+      const cached = renderedElementInfoByLayerKeyRef.current.get(layerKey);
+      if (hasSettledPortableStyles(cached ?? null)) return [];
+      return [
+        requestSelectionMeasurement({
+          targetWindows: () =>
+            designPreviewWindowsForScreen(
+              owner.fileId,
+              breakpointWidth,
+              currentBoardFileId,
+            ),
+          screenId: owner.fileId,
+          selector: preferredCodeLayerSelector(owner.node),
+        }).then((measured) => {
+          if (
+            !measured ||
+            renderedElementInfoRevisionRef.current !== renderedRevision ||
+            codeLayerOwnerByNodeIdRef.current.get(layerId)?.node !== owner.node
+          ) {
+            return false;
+          }
+          renderedElementInfoByLayerKeyRef.current.set(
+            layerKey,
+            canonicalElementInfoForCodeLayerNode(
+              measured,
+              owner.node,
+              owner.fileId,
+            ),
+          );
+          return true;
+        }),
+      ];
+    });
+    if (measurements.length === 0) return;
+    void Promise.all(measurements).then((stored) => {
+      if (stored.includes(true)) {
+        setRenderedElementInfoVersion((version) => version + 1);
+      }
+    });
+  }, []);
+  useEffect(() => {
+    measureMultiSelectionLayers(selectedLayerIdsState);
+  }, [measureMultiSelectionLayers, selectedLayerIdsState]);
+  rehydrateRenderedElementInfoRef.current = () => {
     hydrateRenderedLayerInfoForIds(selectedLayerIdsStateRef.current);
+    measureMultiSelectionLayers(selectedLayerIdsStateRef.current);
+  };
 
   const handleLayerSelectionChange = useCallback(
     (
@@ -1030,10 +1097,11 @@ export function useEditorLayerActions({
         range: boolean;
       },
     ) => {
+      if (!activeFile) return;
       if (!sameStringIds(selectedLayerIdsStateRef.current, ids)) {
         selectionRevisionRef.current += 1;
       }
-      recordSelectionHistoryAroundChange(() => {
+      applySelectionChange(() => {
         explicitOverviewScreenSelectionRef.current = [];
         const effectiveIds = runLayerSelectionChange(
           {
@@ -1076,7 +1144,7 @@ export function useEditorLayerActions({
       getScreenContent,
       activeBreakpointWidthStateRef,
       overviewSelectedScreenIds,
-      recordSelectionHistoryAroundChange,
+      applySelectionChange,
       selectedElement,
       layerSelectionHydrationRevisionRef,
       hydrateRenderedLayerInfoForIds,
@@ -1094,7 +1162,7 @@ export function useEditorLayerActions({
       } = {},
     ) => {
       if (!intent.cancelled) selectionRevisionRef.current += 1;
-      recordMarqueeSelectionHistoryAroundChange(() => {
+      applyMarqueeSelectionChange(() => {
         if (
           !intent.cancelled &&
           (intent.source !== "marquee" || options.clearExplicitScreenSelection)
@@ -1155,7 +1223,7 @@ export function useEditorLayerActions({
     [
       clearPendingOverviewLayerSelectionTimer,
       getCodeLayerProjectionForScreen,
-      recordMarqueeSelectionHistoryAroundChange,
+      applyMarqueeSelectionChange,
     ],
   );
 
@@ -1244,6 +1312,7 @@ export function useEditorLayerActions({
 
   const handleLayerRename = useCallback(
     (layerId: string, name: string) => {
+      if (!activeFile) return;
       const owner = codeLayerOwnerByNodeId.get(layerId);
       if (owner && canEditLiveScreen(owner.fileId) && !canEditDesign) {
         runtimeLayerRenameRevisionRef.current += 1;
@@ -1304,8 +1373,9 @@ export function useEditorLayerActions({
   );
 
   const handleToggleLayerLocked = useCallback(
-    (layerId: string, locked: boolean) =>
-      runToggleLayerLocked(
+    (layerId: string, locked: boolean) => {
+      if (!activeFile) return;
+      return runToggleLayerLocked(
         {
           activeFile,
           applyFileContentUpdate,
@@ -1326,7 +1396,8 @@ export function useEditorLayerActions({
         },
         layerId,
         locked,
-      ),
+      );
+    },
     [
       activeFile?.id,
       applyLayerStatePreview,
@@ -1348,8 +1419,9 @@ export function useEditorLayerActions({
   );
 
   const handleToggleLayerHidden = useCallback(
-    (layerId: string, hidden: boolean) =>
-      runToggleLayerHidden(
+    (layerId: string, hidden: boolean) => {
+      if (!activeFile) return;
+      return runToggleLayerHidden(
         {
           activeFile,
           applyFileContentUpdate,
@@ -1370,7 +1442,8 @@ export function useEditorLayerActions({
         },
         layerId,
         hidden,
-      ),
+      );
+    },
     [
       activeFile?.id,
       applyLayerStatePreview,
@@ -1422,13 +1495,6 @@ export function useEditorLayerActions({
     onMoveLayer: handleLayerMove,
     canMoveLayer,
     onSelectionChange: handleLayerSelectionChange,
-    onCopyLayer: handleCopySelection,
-    onCopyLink: handleCopyLayerLink,
-    onDuplicateLayer: handleDuplicateSelection,
-    onDeleteLayer: handleDeleteSelection,
-    onReorderLayer: changeSelectedZIndex,
-    onFlipHorizontal: handleFlipHorizontal,
-    onFlipVertical: handleFlipVertical,
   };
   const layerPanelHandlersRef = useRef(layerPanelHandlers);
   layerPanelHandlersRef.current = layerPanelHandlers;
@@ -1450,18 +1516,11 @@ export function useEditorLayerActions({
       onSelectionChange: (
         ...args: Parameters<typeof handleLayerSelectionChange>
       ) => latest().onSelectionChange(...args),
-      onCopyLayer: () => latest().onCopyLayer(),
-      onCopyLink: (nodeId: string) => latest().onCopyLink(nodeId),
-      onDuplicateLayer: () => latest().onDuplicateLayer(),
-      onDeleteLayer: () => latest().onDeleteLayer(),
-      onReorderLayer: (
-        _ids: string[],
-        direction: Parameters<typeof changeSelectedZIndex>[0],
-      ) => latest().onReorderLayer(direction),
-      onFlipHorizontal: () => latest().onFlipHorizontal(),
-      onFlipVertical: () => latest().onFlipVertical(),
+      // Layer rows open the canvas menu so both offer the same commands.
+      onOpenContextMenu: (point: { clientX: number; clientY: number }) =>
+        canvasContextMenuRef.current?.openAt(point),
     };
-  }, []);
+  }, [canvasContextMenuRef]);
 
   const handleToggleHiddenForSelection = useCallback(() => {
     if (!canEditDesign && !canEditLiveScreens) return;
@@ -1510,7 +1569,6 @@ export function useEditorLayerActions({
     handleJoinPublishWaitlist,
     activeLayerId,
     handleCopyLayerLink,
-    fullViewScreenIds,
     gradientEditTarget,
     inScreenGradientEditTarget,
     handleInScreenGradientEditChange,

@@ -1,4 +1,7 @@
-import { SSR_QUERY_CACHE_KEY_HEADER } from "@agent-native/core/shared";
+import {
+  SSR_MAX_AGE_HEADER,
+  SSR_QUERY_CACHE_KEY_HEADER,
+} from "@agent-native/core/shared";
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -10,6 +13,9 @@ const where = vi.hoisted(() => vi.fn(() => ({ limit })));
 const from = vi.hoisted(() => vi.fn(() => ({ where })));
 const select = vi.hoisted(() => vi.fn(() => ({ from })));
 const configuredBasePath = vi.hoisted(() => ({ current: "" }));
+const clipsAppUrl = vi.hoisted(() => ({
+  current: "https://clips.example.test" as string | null,
+}));
 const mockVerifyScopedAgentAccessToken = vi.hoisted(() =>
   vi.fn((_token: unknown, _options: unknown) => ({ ok: false })),
 );
@@ -32,6 +38,10 @@ vi.mock("@agent-native/core/server", () => ({
   getRequestUserEmail: () => null,
   verifyScopedAgentAccessToken: (token: unknown, options: unknown) =>
     mockVerifyScopedAgentAccessToken(token, options),
+}));
+
+vi.mock("../../server/lib/clips-peer", () => ({
+  resolveClipsAppUrl: () => clipsAppUrl.current,
 }));
 
 vi.mock("@agent-native/core/sharing", () => ({
@@ -60,7 +70,24 @@ vi.mock("../../server/db", () => ({
 
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { AgentReadableDocumentDiscovery, loader, meta } from "../routes/p.$id";
+import {
+  AgentReadableDocumentDiscovery,
+  headers,
+  loader,
+  meta,
+  PUBLIC_DOCUMENT_CACHE_SECONDS,
+  ReadOnlyMarkdownContent,
+} from "../routes/p.$id";
+
+function firstPaint(content: string, appUrl: string | null) {
+  return renderToStaticMarkup(
+    createElement(ReadOnlyMarkdownContent, {
+      documentId: "doc-1",
+      content,
+      clipsAppUrl: appUrl,
+    }),
+  );
+}
 
 function requestFor(id = "doc-1", token?: string) {
   const url = new URL(`https://content.example.test/p/${id}`);
@@ -87,6 +114,7 @@ describe("public document route", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     configuredBasePath.current = "";
+    clipsAppUrl.current = "https://clips.example.test";
     resultQueue.current = [];
     mockVerifyScopedAgentAccessToken.mockReturnValue({ ok: false });
   });
@@ -127,7 +155,7 @@ describe("public document route", () => {
   it("does not disclose private document fields to an anonymous share-page request", async () => {
     resultQueue.current = [documentRows("private")];
 
-    const result = await loader(requestFor());
+    const result = (await loader(requestFor())).data;
 
     expect(result).toMatchObject({
       document: null,
@@ -213,12 +241,76 @@ describe("public document route", () => {
     expect(JSON.stringify(privateMeta)).not.toContain("Launch notes");
   });
 
-  it("serves a public document without private loader headers", async () => {
+  it("renders a Clip as a link to it on Clips before the editor mounts", () => {
+    const html = firstPaint(
+      `Before.
+
+<ClipEmbed id="clip-embed-1" recordingId="rec_1" origin="link" title="Quarterly demo" />
+
+<ClipEmbed id="clip-embed-2" recordingId="rec_2" origin="link" />
+
+After.`,
+      "https://clips.example.test",
+    );
+    expect(html).toContain('<a href="https://clips.example.test/share/rec_1"');
+    expect(html).toContain(">Quarterly demo</a>");
+    expect(html).toContain('<a href="https://clips.example.test/share/rec_2"');
+    expect(html).toContain(">clipEmbed.openInClips</a>");
+    expect(html).toContain("Before.");
+    expect(html).toContain("After.");
+    expect(html).not.toContain("ClipEmbed");
+    expect(html).not.toContain("aria-hidden");
+  });
+
+  it("names a Clip without a link when this Content has no Clips", () => {
+    const html = firstPaint(
+      '<ClipEmbed id="clip-embed-1" recordingId="rec_1" origin="link" />',
+      null,
+    );
+    expect(html).not.toContain("<a ");
+    expect(html).toContain(">Clip<");
+    expect(html).not.toContain("ClipEmbed");
+  });
+
+  it("names other registry blocks by their saved title or registry label", () => {
+    const html = firstPaint(
+      `<Callout id="callout-1" title="Rollout note">
+
+First part
+
+Second part
+
+</Callout>
+
+<Diagram id="diagram-1" caption="Flow" />
+
+## Next
+
+- one
+- two`,
+      "https://clips.example.test",
+    );
+    expect(html).toContain(">Rollout note<");
+    expect(html).toContain(">Diagram<");
+    expect(html).not.toContain("Callout");
+    expect(html).not.toContain("&lt;");
+    expect(html).toContain(">Next</h2>");
+    expect(html).toContain("<li>one</li><li>two</li>");
+  });
+
+  it("hands the public page the Clips URL from deployment config", async () => {
+    resultQueue.current = [documentRows("public")];
+    await expect(loader(requestFor())).resolves.toMatchObject({
+      data: { clipsAppUrl: "https://clips.example.test" },
+    });
+  });
+
+  it("serves a public document cached for seconds, without private loader headers", async () => {
     resultQueue.current = [documentRows("public")];
 
     const result = await loader(requestFor());
 
-    expect(result).toMatchObject({
+    expect(result.data).toMatchObject({
       document: {
         id: "doc-1",
         title: "Launch notes",
@@ -227,7 +319,9 @@ describe("public document route", () => {
       basePath: "",
       origin: "https://content.example.test",
     });
-    expect((result as any).type).not.toBe("DataWithResponseInit");
+    expect(result.init?.headers).toEqual({
+      [SSR_MAX_AGE_HEADER]: String(PUBLIC_DOCUMENT_CACHE_SECONDS),
+    });
     expect(where).toHaveBeenCalledWith([
       { column: "id_col", value: "doc-1" },
       { column: "trashed_at_col", value: null },
@@ -249,6 +343,7 @@ describe("public document route", () => {
       "Cache-Control": "private, max-age=0, no-store",
       "Referrer-Policy": "no-referrer",
       [SSR_QUERY_CACHE_KEY_HEADER]: "query",
+      [SSR_MAX_AGE_HEADER]: "0",
     });
     expect(result.data).toMatchObject({
       document: { id: "doc-1", title: "Launch notes" },
@@ -266,5 +361,45 @@ describe("public document route", () => {
       { column: "id_col", value: "doc-1" },
       { column: "trashed_at_col", value: null },
     ]);
+  });
+
+  it("keeps the short window on private notices", async () => {
+    resultQueue.current = [documentRows("private")];
+
+    const result = await loader(requestFor());
+
+    expect(result.data).toMatchObject({ document: null });
+    expect(result.init?.headers).toEqual({
+      [SSR_MAX_AGE_HEADER]: String(PUBLIC_DOCUMENT_CACHE_SECONDS),
+    });
+  });
+
+  it("keeps the short window on a thrown not-found", () => {
+    const answer = headers({
+      loaderHeaders: new Headers(),
+      parentHeaders: new Headers(),
+      actionHeaders: new Headers(),
+      errorHeaders: new Headers(),
+    });
+
+    // Restoring a page from Trash brings its public link back within seconds.
+    expect(answer.get(SSR_MAX_AGE_HEADER)).toBe(
+      String(PUBLIC_DOCUMENT_CACHE_SECONDS),
+    );
+  });
+
+  it("keeps a loader answer's own headers and window", () => {
+    const answer = headers({
+      loaderHeaders: new Headers({
+        "Referrer-Policy": "no-referrer",
+        [SSR_MAX_AGE_HEADER]: "0",
+      }),
+      parentHeaders: new Headers(),
+      actionHeaders: new Headers(),
+      errorHeaders: undefined,
+    });
+
+    expect(answer.get("Referrer-Policy")).toBe("no-referrer");
+    expect(answer.get(SSR_MAX_AGE_HEADER)).toBe("0");
   });
 });

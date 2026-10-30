@@ -77,6 +77,11 @@ describe("TimelineTrack pointer gestures", () => {
 
   const pieces = () =>
     Array.from(container.querySelectorAll('[role="button"]'));
+  const firstPiece = () => {
+    const piece = pieces().shift();
+    if (!piece) throw new Error("no timeline piece rendered");
+    return piece;
+  };
   const track = () => container.firstElementChild!;
   const handles = () =>
     Array.from(container.querySelectorAll("[data-side]")) as HTMLElement[];
@@ -138,6 +143,143 @@ describe("TimelineTrack pointer gestures", () => {
     expect(onPreview).not.toHaveBeenCalledWith(
       expect.objectContaining({ trims: expect.anything() }),
     );
+  });
+
+  it("selects an exact range when dragging across a section", () => {
+    render(DEFAULT_EDITS);
+
+    act(() => {
+      pointer(pieces()[0], "pointerdown", 200);
+      pointer(track(), "pointermove", 650);
+      pointer(track(), "pointerup", 650);
+    });
+
+    expect(onSelectionChange).toHaveBeenLastCalledWith({
+      kind: "range",
+      startMs: 2_000,
+      endMs: 6_500,
+    });
+    expect(onSeek).not.toHaveBeenCalled();
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  describe("with a range already selected", () => {
+    const RANGE: TrackSelection = {
+      kind: "range",
+      startMs: 2_000,
+      endMs: 6_000,
+    };
+
+    it("moves the range when the drag starts inside it", () => {
+      render(DEFAULT_EDITS, RANGE);
+
+      act(() => {
+        pointer(firstPiece(), "pointerdown", 400);
+        pointer(track(), "pointermove", 500);
+        pointer(track(), "pointerup", 500);
+      });
+
+      expect(onSelectionChange).toHaveBeenLastCalledWith({
+        kind: "range",
+        startMs: 3_000,
+        endMs: 7_000,
+      });
+    });
+
+    it("keeps the range length when moved past the end of the track", () => {
+      render(DEFAULT_EDITS, RANGE);
+
+      act(() => {
+        pointer(firstPiece(), "pointerdown", 400);
+        pointer(track(), "pointermove", 990);
+        pointer(track(), "pointerup", 990);
+      });
+
+      expect(onSelectionChange).toHaveBeenLastCalledWith({
+        kind: "range",
+        startMs: 6_000,
+        endMs: 10_000,
+      });
+    });
+
+    it("resizes from the edge, keeping the opposite edge fixed", () => {
+      render(DEFAULT_EDITS, RANGE);
+
+      act(() => {
+        pointer(firstPiece(), "pointerdown", 602);
+        pointer(track(), "pointermove", 800);
+        pointer(track(), "pointerup", 800);
+      });
+
+      expect(onSelectionChange).toHaveBeenLastCalledWith({
+        kind: "range",
+        startMs: 2_000,
+        endMs: 8_000,
+      });
+    });
+
+    it("still selects and seeks on a click at the edge of the range", () => {
+      render(DEFAULT_EDITS, RANGE);
+
+      act(() => {
+        pointer(firstPiece(), "pointerdown", 602);
+        pointer(track(), "pointerup", 602);
+      });
+
+      expect(onSelectionChange).toHaveBeenLastCalledWith({
+        kind: "clip",
+        anchorMs: 6_020,
+      });
+      expect(onSeek).toHaveBeenCalledWith(6_020);
+    });
+
+    it("starts a new selection when the drag starts outside the range", () => {
+      render(DEFAULT_EDITS, RANGE);
+
+      act(() => {
+        pointer(firstPiece(), "pointerdown", 800);
+        pointer(track(), "pointermove", 900);
+        pointer(track(), "pointerup", 900);
+      });
+
+      expect(onSelectionChange).toHaveBeenLastCalledWith({
+        kind: "range",
+        startMs: 8_000,
+        endMs: 9_000,
+      });
+    });
+  });
+
+  it("keeps edge drags separate from range drags", () => {
+    render(addSplitAt(DEFAULT_EDITS, 4_000, "split-a"));
+
+    act(() => {
+      pointer(handles()[0], "pointerdown", 400);
+      pointer(track(), "pointermove", 250);
+      pointer(track(), "pointerup", 250);
+    });
+
+    expect(getCuts(onCommit.mock.calls[0][0])).toMatchObject([
+      { startMs: 2_500, endMs: 4_000 },
+    ]);
+    expect(onSelectionChange).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "range" }),
+    );
+  });
+
+  it("selects the section on a click that does not drag", () => {
+    render(DEFAULT_EDITS);
+
+    act(() => {
+      pointer(pieces()[0], "pointerdown", 500);
+      pointer(track(), "pointerup", 500);
+    });
+
+    expect(onSelectionChange).toHaveBeenLastCalledWith({
+      kind: "clip",
+      anchorMs: 5_000,
+    });
+    expect(onSeek).toHaveBeenCalledWith(5_000);
   });
 
   it("removes what the line is dragged past, and selects the section on the left", () => {
@@ -232,8 +374,7 @@ describe("TimelineTrack pointer gestures", () => {
 
     act(() => {
       pointer(gap, "pointerdown", 450);
-      pointer(track(), "pointermove", 700);
-      pointer(track(), "pointerup", 700);
+      pointer(track(), "pointerup", 450);
     });
 
     expect(onSelectionChange).toHaveBeenCalledWith({

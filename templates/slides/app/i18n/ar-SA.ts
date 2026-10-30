@@ -2,6 +2,33 @@ import { creativeContextMessagesByLocale } from "@agent-native/creative-context/
 
 const messages = {
   composer: { menu: { integrations: "التكاملات" } },
+  appMenu: {
+    label: "قائمة التطبيق",
+    actions: "الإجراءات…",
+    backToDashboard: "العودة إلى لوحة التحكم",
+    file: "ملف",
+    edit: "تحرير",
+    view: "عرض",
+    preferences: "التفضيلات",
+    help: "مساعدة",
+    importFile: "استيراد ملف…",
+    export: "تصدير…",
+    saveLocalCopy: "حفظ نسخة محلية…",
+    versionHistory: "سجل الإصدارات",
+    duplicateSelection: "تكرار التحديد",
+    deleteSelection: "حذف التحديد",
+    zoomIn: "تكبير",
+    zoomOut: "تصغير",
+    previousSlide: "الشريحة السابقة",
+    nextSlide: "الشريحة التالية",
+    appearance: "المظهر…",
+    themeLight: "فاتح",
+    themeDark: "داكن",
+    themeSystem: "النظام",
+    documentation: "الوثائق",
+    whatsNew: "ما الجديد",
+    sendFeedback: "إرسال ملاحظات…",
+  },
   templatesPage: {
     actions: "إجراءات القالب {{title}}",
     previewAction: "معاينة",
@@ -107,7 +134,7 @@ const messages = {
     openChat: "فتح الدردشة",
     cloudAuthToken: "Token de autenticação",
     cloudSetupSteps: "Etapas de configuração",
-    cloudConnectedReloading: "Conectado com sucesso. Recarregando...",
+    cloudConnectedReloading: "جارٍ إعادة التحميل...",
     cloudConnectionFailed: "Falha na conexão",
     cloudTestConnect: "Testar e conectar",
     cloudServerlessPostgres: "Postgres serverless",
@@ -216,6 +243,56 @@ const messages = {
       "أنت تستخدم {{current}} من {{max}} أنظمة تصميم في خطة Builder {{plan}}. قم بالترقية لإنشاء نظام آخر.",
     tierLimitUpgrade: "ترقية خطة Builder",
   },
+  floatingToolbar: {
+    label: "أدوات الشريحة",
+    move: "تحريك",
+    moveMenu: "أدوات التحريك",
+    hand: "أداة اليد",
+    scale: "تغيير الحجم",
+    insert: "إدراج",
+    insertMenu: "قائمة الإدراج",
+    text: "نص",
+    line: "خط",
+    arrow: "سهم",
+    square: "مربع",
+    ellipse: "شكل بيضاوي",
+    triangle: "مثلث",
+    media: "صورة/فيديو…",
+    mediaNeedsStorage: "قم بإعداد التخزين لرفع الصور ومقاطع الفيديو.",
+    transitions: "الانتقالات",
+    transitionsMenu: "خيارات الانتقال",
+    transitionsReadOnly: "هذه المجموعة للقراءة فقط.",
+    transitionsNeedElement: "حدد عنصرًا لإضافة انتقال.",
+    transitionNone: "بلا",
+    transitionAppear: "ظهور",
+    transitionFade: "تلاشي",
+    transitionSlide: "انزلاق",
+    transitionZoom: "تكبير",
+    comment: "تعليق",
+    commentMenu: "خيارات التعليق",
+    comments: "التعليقات",
+    annotate: "تعليق توضيحي",
+    agent: "الوكيل",
+    agentMenu: "خيارات الوكيل",
+    agentUnavailable: "تعذّر الوصول إلى دردشة الوكيل. حاول مرة أخرى.",
+    inspiration: "إلهام",
+    tightenTone: "تكثيف الأسلوب",
+    polish: "صقل",
+    speakerNotes: "ملاحظات المتحدث",
+    speakerNotesMenu: "خيارات ملاحظات المتحدث",
+    writeScript: "كتابة نص",
+    summarizeKeyPoints: "تلخيص النقاط الرئيسية",
+    expandDetail: "توسيع التفاصيل",
+    addTimingCues: "إضافة إشارات التوقيت",
+  },
+  speakerNotesPanel: {
+    title: "ملاحظات المتحدث",
+    resize: "تغيير حجم ملاحظات المتحدث",
+    generate: "إنشاء الملاحظات",
+    rewrite: "إعادة كتابة الملاحظات",
+    close: "إغلاق ملاحظات المتحدث",
+    placeholder: "ابدأ الكتابة أو أنشئ ملاحظات المتحدث بسرعة مع الوكيل",
+  },
   editorToolbar: {
     layoutTitle: "العنوان",
     layoutSection: "فاصل قسم",
@@ -297,6 +374,9 @@ const messages = {
     elementAnimations: "حركات العناصر",
     layers: "الطبقات",
     closeLayers: "إغلاق لوحة الطبقات",
+    searchLayers: "البحث في الطبقات",
+    resizeLayers: "تغيير حجم لوحة الطبقات",
+    resizeSlideList: "تغيير عرض قائمة الشرائح",
     expandLayer: "توسيع الطبقة",
     collapseLayer: "طي الطبقة",
     tweaks: "تعديلات",
@@ -308,7 +388,8 @@ const messages = {
     shapeArrow: "سهم",
     shapeTriangle: "مثلث",
     shapeLine: "خط",
-    pinComments: "تثبيت التعليقات",
+    shapeStar: "نجمة",
+    shapePolygon: "مضلع",
     undo: "تراجع",
     undoWithShortcut: "تراجع ({{shortcut}})",
     redo: "إعادة",
@@ -320,8 +401,17 @@ const messages = {
     editorLinkDescription:
       "يفتح العرض في المحرر. يمكن لأي شخص لديه وصول استخدام هذا الرابط.",
     presentationLink: "رابط العرض",
-    presentationLinkDescription: "يفتح مباشرة في وضع العرض بملء الشاشة.",
+    presentationLinkDescription: "يفتح العرض في وضع التقديم",
     present: "تقديم",
+    presentInTab: "في هذا التبويب",
+    presentFullScreen: "ملء الشاشة",
+    presentPresenterView: "عرض مقدّم العرض",
+    presentPresenterViewDescription: "عرض ملاحظات المتحدث أثناء التقديم",
+    presenterViewBlocked: "اسمح بالنوافذ المنبثقة لفتح عرض مقدّم العرض.",
+    export: "تصدير",
+    privacyPrivate: "خاص",
+    privacyOrg: "مشترك مع المؤسسة",
+    privacyPublic: "عام",
     more: "المزيد",
     importing: "جارٍ الاستيراد...",
     importFile: "استيراد ملف",
@@ -366,6 +456,8 @@ const messages = {
     shareWithTeam: "مشاركة مع الفريق...",
     publicShareLink: "رابط مشاركة عام...",
     downloadHtml: "تنزيل بصيغة HTML",
+    downloadPdf: "تنزيل بصيغة PDF",
+    downloadPptx: "تنزيل بصيغة PPTX",
     exportPdf: "تصدير بصيغة PDF",
     exportPptx: "تصدير بصيغة PPTX",
     connectGoogle: "توصيل Google",
@@ -400,6 +492,9 @@ const messages = {
     copied: "تم النسخ",
     openSharedLink: "فتح الرابط المشترك",
     anyoneWithLink: "يمكن لأي شخص لديه هذا الرابط عرض هذا العرض التقديمي.",
+    connectSlides: "ربط Slides",
+    otherAgents: "وكلاء آخرون",
+    whoHasAccess: "من لديه حق الوصول",
   },
   slideTextMenu: {
     brandColors: "ألوان العلامة التجارية",
@@ -490,6 +585,39 @@ const messages = {
     goToSlide: "الانتقال إلى الشريحة",
     search: "البحث في التعليقات",
     searchPlaceholder: "البحث في كل التعليقات...",
+  },
+  contextToolbar: {
+    insert: "إدراج",
+    insertText: "نص",
+    insertMedia: "صورة/فيديو…",
+    order: "الترتيب",
+    listStyle: "نمط القائمة",
+    removeFormatting: "إزالة التنسيق",
+    lockAspectRatio: "قفل نسبة العرض إلى الارتفاع",
+    zoom: "تكبير/تصغير",
+    objectsSelected_zero: "تم تحديد {{count}} كائنات",
+    objectsSelected_one: "تم تحديد {{count}} كائنات",
+    objectsSelected_two: "تم تحديد {{count}} كائنات",
+    objectsSelected_few: "تم تحديد {{count}} كائنات",
+    objectsSelected_many: "تم تحديد {{count}} كائنات",
+    objectsSelected_other: "تم تحديد {{count}} كائنات",
+    bold: "غامق",
+    strikethrough: "يتوسطه خط",
+    code: "رمز برمجي",
+    link: "رابط",
+    applyLink: "تطبيق",
+    lineHeight: "ارتفاع السطر",
+    replaceImage: "استبدال",
+    fit: "ملاءمة",
+    fitCover: "تعبئة",
+    fitContain: "ملاءمة",
+    editWithAgent: "التعديل بواسطة الوكيل",
+    tightenTone: "تكثيف النبرة",
+    polish: "تحسين الصياغة",
+    translate: "ترجمة",
+    makeMoreVisual: "جعله أكثر بصرية",
+    generateImage: "إنشاء صورة",
+    removeBackground: "إزالة الخلفية",
   },
   styleInspector: {
     title: "Style",
@@ -608,6 +736,8 @@ const messages = {
     addTransition: "إضافة انتقال",
     effect: "التأثير",
     onClick: "عند النقر",
+    withPrevious: "مع السابق",
+    trigger: "البدء",
     byParagraph: "حسب الفقرة",
     expand: "توسيع الانتقال",
     collapse: "طي الانتقال",
@@ -701,6 +831,10 @@ const messages = {
     duplicateCurrentSlide: "Duplicar diapositiva actual",
     promptPlaceholder: "Describe las diapositivas que quieres...",
     newSlide: "شريحة جديدة",
+    slidesHeading: "الشرائح",
+    emptyTitle: "لا توجد شرائح بعد",
+    emptyDescription:
+      "أضف شريحة جديدة أو استوردها، أو اطلب من الوكيل إنشاء واحدة.",
     closeAddSlides: "إغلاق",
     describeThisSlide: "صف هذه الشريحة",
     cut: "قص",
@@ -721,6 +855,14 @@ const messages = {
     noSlides: "No hay diapositivas para presentar",
     previousSlide: "Diapositiva anterior",
     nextSlide: "Siguiente diapositiva",
+    voiceNavigation: "التنقل الصوتي",
+    voiceNavigationNextCommand: "الشريحة التالية",
+    voiceNavigationPreviousCommand: "الشريحة السابقة",
+    voiceNavigationHint: "قل «{{next}}» أو «{{previous}}» للتنقل.",
+    voiceNavigationListening: "يستمع إلى «{{next}}» أو «{{previous}}».",
+    voiceNavigationUnavailable: "التنقل الصوتي غير متاح في هذا المتصفح.",
+    voiceNavigationError:
+      "توقف التنقل الصوتي. تحقّق من إذن الميكروفون واتصاله، ثم حاول مرة أخرى.",
     exitPresentation: "Salir de la presentación",
     enterFullscreen: "Entrar en pantalla completa",
     clickToEnterFullscreen: "Haz clic para entrar en pantalla completa",
@@ -812,6 +954,8 @@ const messages = {
       "لم يتم إنشاء الشرائح. راجع التفاصيل في الدردشة، ثم حاول مرة أخرى.",
     generationOutcomeUnresolved:
       "تعذر علينا التأكد مما إذا كانت الشرائح قد أُنشئت. تحقق من العرض قبل المحاولة مرة أخرى.",
+    generationOutcomeUnresolvedWithSlides:
+      "تعذر علينا التأكد من اكتمال إنشاء الشرائح. راجع الشرائح المعروضة هنا قبل المتابعة.",
     partialGenerationFailed:
       "تعذّر علينا إكمال إنشاء الشرائح. راجع الشرائح الموجودة وطلبك الأصلي قبل المتابعة.",
     originalPrompt: "ما طلبته",
@@ -838,6 +982,9 @@ const messages = {
     leaveWithoutSaving: "الخروج دون حفظ",
     editorMarkupNotSaved:
       "لم يتم حفظ هذا التعديل لأنه كان سيضيف ترميز المحرر إلى الشريحة.",
+    historyStepConflict:
+      "تم تخطي خطوة السجل هذه لتعارضها مع العرض التقديمي الحالي.",
+    historyStepFailed: "تم تخطي هذه الخطوة من السجل لتعذر تطبيقها.",
     textEditConflictNotSaved:
       "لم يتم حفظ تعديل النص لأن النص نفسه تم تغييره في مكان آخر في الوقت نفسه.",
   },
@@ -924,10 +1071,152 @@ const messages = {
     chooseAnotherFile: "اختيار ملف آخر",
   },
   home: {
-    fallbackSuggestions: {
-      pitch: "أنشئ عرضًا تقديميًا لمنتج",
-      roadmap: "أنشئ خارطة طريق لمنتج",
-      explainer: "اشرح موضوعًا في عرض تقديمي",
+    nextStepBar: {
+      ariaLabel: "الخطوات التالية لعرضك التقديمي الأول",
+      refineWithPrompt: "حسّن العرض بطلب",
+      export: "تصدير",
+      shareLink: "مشاركة الرابط",
+      dismiss: "إغلاق",
+    },
+    suggestionPrompts: {
+      product: {
+        launch:
+          "أنشئ عرض إطلاق منتج يوضح مشكلة العميل والمزايا الأساسية وخطة الإطلاق بنبرة واثقة تضع العميل أولًا.",
+        roadmap:
+          "أنشئ خارطة طريق ربع سنوية تعرض المحاور الاستراتيجية والمراحل والاعتماديات بأسلوب تنفيذي واضح.",
+        opportunity:
+          "أنشئ ملخص فرصة يشرح سياق السوق ومشكلات العملاء والحل والمخاطر بمنظور منتج حاسم.",
+        priorities:
+          "أنشئ عرضًا لترتيب أولويات الميزات يقارن أثرها وجهدها وأدلتها ومفاضلاتها بأسلوب موجز يدعم القرار.",
+        metrics:
+          "أنشئ مراجعة لمؤشرات المنتج تعرض التبني والتنشيط والاحتفاظ والدروس بنبرة تحليلية صريحة.",
+        discovery:
+          "أنشئ تقريرًا لاكتشاف احتياجات العملاء يعرض محاور البحث والاقتباسات والاحتياجات غير الملباة بنبرة متعاطفة تستند إلى الأدلة.",
+        vision:
+          "أنشئ عرض رؤية للمنتج يصور المستقبل والمبادئ والتوجهات الاستثمارية بنبرة ملهمة وعملية.",
+        release:
+          "أنشئ مراجعة إصدار تلخص الأهداف والنتائج وآراء العملاء والمسائل المفتوحة بنبرة مسؤولة تركز على التعلم.",
+      },
+      design: {
+        caseStudy:
+          "أنشئ دراسة حالة تصميم تعرض الموجز والعملية والشاشات الأساسية والنتائج بأسلوب تحريري دافئ.",
+        system:
+          "أنشئ عرضًا لنظام التصميم يوضح الألوان والخطوط والمكونات وأمثلة الاستخدام بأسلوب بصري واضح.",
+        critique:
+          "أنشئ مراجعة تصميم تعرض الأهداف والشاشات الحالية ومحاور الملاحظات والخطوات التالية بنبرة بناءة.",
+        research:
+          "أنشئ تقرير بحث مستخدمين يشرح السياق والأنماط والاقتباسات والفرص بنبرة متعاطفة.",
+        concepts:
+          "أنشئ استكشافًا للمفاهيم يعرض ثلاثة اتجاهات بصرية وشاشات نموذجية ومفاضلاتها بنبرة مرحة.",
+        accessibility:
+          "أنشئ مراجعة لإمكانية الوصول تعرض العوائق والأمثلة المشروحة والتحسينات بنبرة واضحة وشاملة.",
+        brand:
+          "أنشئ عرضًا لاتجاه العلامة التجارية يوضح الجمهور والمراجع البصرية والألوان والخطوط بنبرة مميزة.",
+        sprint:
+          "أنشئ ملخصًا لسباق التصميم يعرض التحدي والأفكار والنموذج الأولي ونتائج الاختبار بنبرة متفائلة.",
+      },
+      developer: {
+        architecture:
+          "أنشئ عرضًا لمعمارية النظام يوضح المكونات وتدفق البيانات والمفاضلات بنبرة تقنية دقيقة.",
+        api: "أنشئ دليلًا للبدء باستخدام واجهة API يشمل الإعداد والمصادقة والأمثلة والأخطاء بنبرة مناسبة للمطورين.",
+        release:
+          "أنشئ خطة إصدار هندسية عملية تحدد النطاق والمراحل والاعتماديات وخطوات الإطلاق.",
+        incident:
+          "أنشئ مراجعة للحادثة تلخص الأثر والتسلسل الزمني والسبب الجذري والإجراءات بنبرة بلا لوم.",
+        migration:
+          "أنشئ خطة لترحيل المنصة تشرح الوضع الحالي والمراحل والمخاطر والتحقق بنبرة مطمئنة.",
+        security:
+          "أنشئ مراجعة أمنية تحدد حدود النظام والتهديدات والضوابط والثغرات بنبرة تقنية مباشرة.",
+        demo: "أنشئ عرضًا تقنيًا يشرح المشكلة والمعمارية والتدفق المباشر والنتائج بأسلوب واضح.",
+        metrics:
+          "أنشئ مراجعة لمؤشرات الهندسة تعرض التسليم والموثوقية والاتجاهات بنبرة صريحة.",
+      },
+      marketing: {
+        campaign:
+          "أنشئ عرض إطلاق حملة يوضح الجمهور والرسالة والقنوات والجدول الزمني بنبرة حيوية.",
+        story: "أنشئ قصة عميل تعرض التحدي والحل والنتائج والأدلة بنبرة إنسانية.",
+        content:
+          "أنشئ استراتيجية محتوى تحدد احتياجات الجمهور والموضوعات والصيغ والتقويم بأسلوب تحريري.",
+        positioning:
+          "أنشئ عرض تموضع للعلامة التجارية يحدد الجمهور والفئة والوعد والأدلة بنبرة مميزة.",
+        channels:
+          "أنشئ مراجعة أداء للقنوات تعرض الوصول والتفاعل والتحويلات والدروس بأسلوب واضح.",
+        messaging:
+          "أنشئ عرض رسائل المنتج يوضح الجمهور والمزايا والأدلة والأمثلة بنبرة مقنعة.",
+        event:
+          "أنشئ خطة للترويج لفعالية تحدد الجمهور والجاذبية والجدول والقنوات بنبرة مرحبة.",
+        competition:
+          "أنشئ عرضًا للمشهد التنافسي يقارن البدائل ونقاط القوة والفجوات والفرص بنبرة متوازنة.",
+      },
+      sales: {
+        pitch:
+          "أنشئ عرضًا للعميل يربط أهدافه بالحل والنتائج والأدلة بنبرة واثقة.",
+        proposal:
+          "أنشئ مقترح حل واضحًا يشرح الاحتياجات والمنهج والجدول الزمني والاستثمار بنبرة تركز على العميل.",
+        quarterlyReview:
+          "أنشئ مراجعة أعمال ربع سنوية تلخص الأهداف والنتائج والتبني والخطوات التالية بنبرة تعاونية.",
+        discovery:
+          "أنشئ تقرير اكتشاف يعرض أولويات العميل ونقاط الألم ومدى ملاءمة الحل بنبرة منصتة.",
+        objections:
+          "أنشئ دليلًا للتعامل مع الاعتراضات يشرح المخاوف الشائعة والأدلة والردود بنبرة مفيدة.",
+        demo: "أنشئ قصة عرض للمنتج تربط سياق العميل والتدفقات الأساسية والنتائج بنبرة موجزة ومقنعة.",
+        renewal:
+          "أنشئ عرض تجديد يوضح القيمة المقدمة والاستخدام والفرص بنبرة شراكة.",
+        enablement:
+          "أنشئ عرض تمكين للمبيعات يشرح المشترين المثاليين والتأهيل ونقاط الحوار بأسلوب عملي.",
+      },
+      ops: {
+        weeklyReview:
+          "أنشئ مراجعة تشغيل أسبوعية تعرض الأهداف والمؤشرات والعوائق والمسؤولين بنبرة هادئة ومباشرة.",
+        process:
+          "أنشئ عرضًا لتحسين العمليات يوضح الخطوات الحالية ومواطن الاحتكاك والتدفق المستقبلي بأسلوب عملي.",
+        capacity:
+          "أنشئ خطة سعة تعرض الطلب وتوفر الفريق والأولويات والسيناريوهات بنبرة شفافة.",
+        service:
+          "أنشئ مراجعة لأداء الخدمة تعرض الحجم وأوقات الاستجابة والتصعيدات والتحسينات بنبرة مسؤولة.",
+        vendor:
+          "أنشئ تقييمًا للموردين يقارن المتطلبات والخيارات والتكاليف والمخاطر بنبرة متوازنة.",
+        metrics:
+          "أنشئ عرضًا للوحة العمليات يبرز المؤشرات والاتجاهات والاستثناءات بأسلوب تحليلي موجز.",
+        onboarding:
+          "أنشئ مسارًا للتهيئة يوضح المراحل والتسليمات والموارد ومقاييس النجاح بنبرة داعمة.",
+        risk: "أنشئ مراجعة للمخاطر تلخص الاحتمالية والأثر والتخفيف والمسؤولين بنبرة متزنة.",
+      },
+      individual: {
+        project:
+          "أنشئ خطة مشروع شخصية تحدد الهدف والمراحل والموارد والمخاطر بنبرة محفزة.",
+        portfolio:
+          "أنشئ عرض ملف أعمال شخصيًا يبرز المشاريع المختارة والعملية والنتائج بأسلوب تحريري واثق.",
+        learning:
+          "أنشئ خارطة تعلم تحدد المهارات والموارد والتدريب والمراحل بنبرة مشجعة.",
+        event:
+          "أنشئ خطة لقاء توضح الهدف والضيوف والجدول والتفاصيل بنبرة دافئة ومرحبة.",
+        budget:
+          "أنشئ مراجعة ميزانية شخصية تلخص الدخل والإنفاق والأهداف والمفاضلات بنبرة عملية وهادئة.",
+        travel:
+          "أنشئ برنامج رحلة يحدد الوجهات وأبرز الأنشطة اليومية والترتيبات بأسلوب بصري جذاب.",
+        community:
+          "أنشئ عرض ورشة مجتمعية يوضح الموضوع والأنشطة والدروس بنبرة شاملة.",
+        personalStory:
+          "أنشئ مقدمة شخصية تعرض الخلفية والاهتمامات والعمل بنبرة طبيعية وحوارية.",
+      },
+      general: {
+        overview:
+          "أنشئ عرضًا واضحًا لموضوع يشرح السياق والأفكار الرئيسية والأمثلة بنبرة مرحبة.",
+        fundraiser:
+          "أنشئ عرضًا لجمع التبرعات يشرح الرسالة والحاجة والأثر بنبرة تبعث الأمل.",
+        lesson:
+          "أنشئ درسًا قصيرًا يوضح أهداف التعلم والمفاهيم الرئيسية والأمثلة بنبرة تفاعلية.",
+        research:
+          "أنشئ تقريرًا بحثيًا يشرح السؤال والمنهج والنتائج والدلالات بنبرة متوازنة.",
+        eventProposal:
+          "أنشئ مقترح فعالية يوضح الهدف والجمهور والصيغة والميزانية بنبرة جذابة.",
+        teamStrategy:
+          "أنشئ عرض استراتيجية للفريق يحدد الأولويات والمؤشرات والمبادرات بنبرة مركزة.",
+        howTo: "أنشئ دليلًا مرئيًا بخطوات واضحة وأمثلة مفيدة بنبرة مشجعة.",
+        portfolioIntro:
+          "أنشئ مقدمة لملف أعمال تعرض المشاريع المختارة ونقاط القوة بأسلوب مصقول.",
+      },
     },
     suggestedPrompts: "الاقتراحات المقترحة",
     importMenu: {
@@ -1141,6 +1430,89 @@ const messages = {
     createFirstDeck: "أنشئ أول عرض لك",
     emptyDescription:
       "أنشئ عروضًا تقديمية جميلة باستخدام الإنشاء المدعوم بالذكاء الاصطناعي.",
+
+    suggestionLabels: {
+      product: {
+        launch: "عرض إطلاق منتج",
+        roadmap: "خارطة طريق ربع سنوية",
+        opportunity: "ملخص فرصة",
+        priorities: "عرضًا لترتيب أولويات الميزات",
+        metrics: "مراجعة لمؤشرات المنتج",
+        discovery: "تقريرًا لاكتشاف احتياجات العملاء",
+        vision: "عرض رؤية للمنتج",
+        release: "مراجعة إصدار",
+      },
+      design: {
+        caseStudy: "دراسة حالة تصميم",
+        system: "عرضًا لنظام التصميم",
+        critique: "مراجعة تصميم",
+        research: "تقرير بحث مستخدمين",
+        concepts: "استكشافًا للمفاهيم",
+        accessibility: "مراجعة لإمكانية الوصول",
+        brand: "عرضًا لاتجاه العلامة التجارية",
+        sprint: "ملخصًا لسباق التصميم",
+      },
+      developer: {
+        architecture: "عرضًا لمعمارية النظام",
+        api: "دليلًا للبدء باستخدام واجهة",
+        release: "خطة إصدار هندسية عملية",
+        incident: "مراجعة للحادثة",
+        migration: "خطة لترحيل المنصة",
+        security: "مراجعة أمنية",
+        demo: "عرضًا تقنيًا",
+        metrics: "مراجعة لمؤشرات الهندسة",
+      },
+      marketing: {
+        campaign: "عرض إطلاق حملة",
+        story: "قصة عميل",
+        content: "استراتيجية محتوى",
+        positioning: "عرض تموضع للعلامة التجارية",
+        channels: "مراجعة أداء للقنوات",
+        messaging: "عرض رسائل المنتج",
+        event: "خطة للترويج لفعالية",
+        competition: "عرضًا للمشهد التنافسي",
+      },
+      sales: {
+        pitch: "عرضًا للعميل",
+        proposal: "مقترح حل واضحًا",
+        quarterlyReview: "مراجعة أعمال ربع سنوية",
+        discovery: "تقرير اكتشاف",
+        objections: "دليلًا للتعامل",
+        demo: "قصة عرض للمنتج",
+        renewal: "عرض تجديد",
+        enablement: "عرض تمكين للمبيعات",
+      },
+      ops: {
+        weeklyReview: "مراجعة تشغيل أسبوعية",
+        process: "عرضًا لتحسين العمليات",
+        capacity: "خطة سعة",
+        service: "مراجعة لأداء الخدمة",
+        vendor: "تقييمًا للموردين",
+        metrics: "عرضًا للوحة العمليات",
+        onboarding: "مسارًا للتهيئة",
+        risk: "مراجعة للمخاطر",
+      },
+      individual: {
+        project: "خطة مشروع شخصية",
+        portfolio: "عرض ملف أعمال شخصيًا",
+        learning: "خارطة تعلم",
+        event: "خطة لقاء",
+        budget: "مراجعة ميزانية شخصية",
+        travel: "برنامج رحلة",
+        community: "عرض ورشة مجتمعية",
+        personalStory: "مقدمة شخصية",
+      },
+      general: {
+        overview: "عرضًا واضحًا لموضوع",
+        fundraiser: "عرضًا لجمع التبرعات",
+        lesson: "درسًا قصيرًا",
+        research: "تقريرًا بحثيًا",
+        eventProposal: "مقترح فعالية",
+        teamStrategy: "عرض استراتيجية للفريق",
+        howTo: "دليلًا مرئيًا بخطوات واضحة",
+        portfolioIntro: "مقدمة لملف أعمال",
+      },
+    },
   },
   agentChat: {
     setup: {

@@ -7,6 +7,7 @@ import {
   getOAuthTokenSnapshotForUserOwner,
   replaceOAuthTokensIfRevision,
   saveOAuthTokens,
+  type OAuthTokenSnapshot,
 } from "./store.js";
 
 const DEFAULT_EXPIRY_SKEW_MS = 60_000;
@@ -92,6 +93,7 @@ export interface OAuthCredentialAccessResult<
 > {
   state: OAuthCredentialState<T>;
   accessToken: string | null;
+  refreshFailure?: "transient";
 }
 
 export interface OAuthRefreshContext<T extends OAuthCredential> {
@@ -208,6 +210,7 @@ async function acquireLease(
   legacyCredential: boolean,
   leaseMs: number,
   now: number,
+  allowExpiredTakeover = false,
 ): Promise<LeaseAcquisition> {
   const next = await mutateSetting(leaseKey(identity), (current) => {
     const currentHolder =
@@ -219,8 +222,9 @@ async function acquireLease(
     if (currentHolder && currentHolder !== holder) {
       if (
         expiresAt > now ||
-        currentRevision === revision ||
-        (currentRevision === -1 && legacyCredential)
+        (!allowExpiredTakeover &&
+          (currentRevision === revision ||
+            (currentRevision === -1 && legacyCredential)))
       ) {
         return current!;
       }
@@ -254,6 +258,7 @@ function startLeaseHeartbeat(
   legacyCredential: boolean,
   leaseMs: number,
   dependencies: LifecycleDependencies,
+  allowExpiredTakeover = false,
 ): () => Promise<void> {
   let renewal: Promise<void> | undefined;
   const timer = setInterval(
@@ -266,6 +271,7 @@ function startLeaseHeartbeat(
         legacyCredential,
         leaseMs,
         dependencies.now(),
+        allowExpiredTakeover,
       )
         .then(() => undefined)
         .catch(() => undefined)
@@ -539,12 +545,35 @@ export async function resolveOAuthCredentialAccess<
     return { state, accessToken: null };
   }
   if (!state.credential.tokens.refresh_token) {
+    if (state.kind === "expired" || options.forceRefresh) {
+      await markReconnectRequired(
+        identity,
+        state,
+        options.legacyAccountKey === true,
+      );
+      state = await readStoredOAuthCredentialState<T>(identity, {
+        ...(options.allowLegacy !== undefined
+          ? { allowLegacy: options.allowLegacy }
+          : {}),
+        ...(options.legacyAccountKey !== undefined
+          ? { legacyAccountKey: options.legacyAccountKey }
+          : {}),
+        now: dependencies.now(),
+        ...(options.validateCredential
+          ? { validateCredential: options.validateCredential }
+          : {}),
+      });
+      return {
+        state,
+        accessToken:
+          state.kind === "connected"
+            ? state.credential.tokens.access_token
+            : null,
+      };
+    }
     return {
       state,
-      accessToken:
-        state.kind === "connected"
-          ? state.credential.tokens.access_token
-          : null,
+      accessToken: state.credential.tokens.access_token,
     };
   }
 
@@ -702,6 +731,54 @@ export async function resolveOAuthCredentialAccess<
           validateCredential: options.validateCredential,
         });
         if (latest.kind === "connected") {
+          if (options.forceRefresh && latest.revision === baselineRevision) {
+            if (
+              options.shouldMarkReconnectRequiredOnRefreshFailure?.(error) ===
+              true
+            ) {
+              await markReconnectRequired(
+                identity,
+                latest,
+                options.legacyAccountKey === true,
+              );
+              const reconnect = await readStoredOAuthCredentialState<T>(
+                identity,
+                {
+                  ...(options.allowLegacy !== undefined
+                    ? { allowLegacy: options.allowLegacy }
+                    : {}),
+                  ...(options.legacyAccountKey !== undefined
+                    ? { legacyAccountKey: options.legacyAccountKey }
+                    : {}),
+                  now: dependencies.now(),
+                  ...(options.validateCredential
+                    ? { validateCredential: options.validateCredential }
+                    : {}),
+                },
+              );
+              if (
+                reconnect.kind === "connected" &&
+                reconnect.revision !== latest.revision
+              ) {
+                return {
+                  state: reconnect,
+                  accessToken: reconnect.credential.tokens.access_token,
+                };
+              }
+              return { state: reconnect, accessToken: null };
+            }
+            if (
+              options.shouldMarkReconnectRequiredOnRefreshFailure?.(error) ===
+              false
+            ) {
+              return {
+                state: latest,
+                accessToken: null,
+                refreshFailure: "transient",
+              };
+            }
+            return { state: latest, accessToken: null };
+          }
           return {
             state: latest,
             accessToken: latest.credential.tokens.access_token,
@@ -712,7 +789,11 @@ export async function resolveOAuthCredentialAccess<
             options.shouldMarkReconnectRequiredOnRefreshFailure?.(error) ===
             false
           ) {
-            return { state: latest, accessToken: null };
+            return {
+              state: latest,
+              accessToken: null,
+              refreshFailure: "transient",
+            };
           }
           await markReconnectRequired(
             identity,
@@ -725,6 +806,15 @@ export async function resolveOAuthCredentialAccess<
             now: dependencies.now(),
             validateCredential: options.validateCredential,
           });
+          if (
+            reconnect.kind === "connected" &&
+            reconnect.revision !== latest.revision
+          ) {
+            return {
+              state: reconnect,
+              accessToken: reconnect.credential.tokens.access_token,
+            };
+          }
           return { state: reconnect, accessToken: null };
         }
         return { state: latest, accessToken: null };
@@ -743,8 +833,202 @@ export async function resolveOAuthCredentialAccess<
   return {
     state,
     accessToken:
-      state.kind === "connected" ? state.credential.tokens.access_token : null,
+      state.kind === "connected" &&
+      (!options.forceRefresh || state.revision !== initialRevision)
+        ? state.credential.tokens.access_token
+        : null,
+    ...(state.kind === "expired" ||
+    (options.forceRefresh &&
+      state.kind === "connected" &&
+      state.revision === initialRevision)
+      ? { refreshFailure: "transient" as const }
+      : {}),
   };
+}
+
+type StoredTokenBundle<T> = Omit<OAuthTokenSnapshot, "tokens"> & {
+  tokens: T;
+};
+
+async function readStoredTokenBundle<T>(
+  identity: OAuthCredentialIdentity,
+  storageOwner: string,
+): Promise<StoredTokenBundle<T>> {
+  const stored = await getOAuthTokenSnapshot(
+    identity.provider,
+    identity.accountId,
+    storageOwner,
+  );
+  if (!stored) throw new Error("OAuth token bundle is no longer available.");
+  const tokens = stored.tokens as {
+    access_token?: unknown;
+    accessToken?: unknown;
+  };
+  const accessToken = tokens.access_token ?? tokens.accessToken;
+  if (typeof accessToken !== "string" || !accessToken.trim()) {
+    throw new Error("OAuth token bundle has no access token.");
+  }
+  return {
+    ...stored,
+    tokens: stored.tokens as unknown as T,
+  };
+}
+
+/**
+ * Refresh a flat OAuth token row under the lifecycle lease, with provider
+ * network I/O outside database transactions and a revision check on save.
+ */
+export async function resolveOAuthTokenBundleAccess<T = OAuthCredentialTokens>(
+  identity: OAuthCredentialIdentity,
+  options: {
+    storageOwner: string;
+    shouldRefresh: (tokens: T, now: number) => boolean;
+    refresh: (tokens: T) => Promise<T>;
+    leaseMs?: number;
+    waitMs?: number;
+    maxWaitMs?: number;
+    dependencies?: Partial<LifecycleDependencies>;
+  },
+): Promise<T> {
+  assertIdentity(identity);
+  if (!options.storageOwner.trim()) {
+    throw new Error("OAuth token storage owner is required.");
+  }
+  const storageOwner = options.storageOwner.trim();
+  const identityOwner = identity.owner.id.trim();
+  if (
+    identity.owner.scope === "user"
+      ? storageOwner.toLowerCase() !== identityOwner.toLowerCase()
+      : storageOwner !== identityOwner
+  ) {
+    throw new Error("OAuth token storage owner does not match its identity.");
+  }
+  const dependencies = { ...defaultDependencies, ...options.dependencies };
+  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
+  const waitMs = options.waitMs ?? DEFAULT_WAIT_MS;
+  const maxWaitMs = options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  const startedAt = dependencies.now();
+  let snapshot = await readStoredTokenBundle<T>(identity, options.storageOwner);
+  if (!options.shouldRefresh(snapshot.tokens, startedAt))
+    return snapshot.tokens;
+
+  const holder = dependencies.holderId();
+  while (dependencies.now() - startedAt <= maxWaitMs) {
+    const lease = await acquireLease(
+      identity,
+      holder,
+      snapshot.revision,
+      false,
+      leaseMs,
+      dependencies.now(),
+      true,
+    );
+    if (lease === "held") {
+      await dependencies.sleep(waitMs);
+      snapshot = await readStoredTokenBundle<T>(identity, options.storageOwner);
+      if (!options.shouldRefresh(snapshot.tokens, dependencies.now())) {
+        return snapshot.tokens;
+      }
+      continue;
+    }
+
+    try {
+      snapshot = await readStoredTokenBundle<T>(identity, options.storageOwner);
+      if (!options.shouldRefresh(snapshot.tokens, dependencies.now())) {
+        return snapshot.tokens;
+      }
+      const alignedLease = await acquireLease(
+        identity,
+        holder,
+        snapshot.revision,
+        false,
+        leaseMs,
+        dependencies.now(),
+        true,
+      );
+      if (alignedLease !== "acquired") continue;
+
+      const stopHeartbeat = startLeaseHeartbeat(
+        identity,
+        holder,
+        snapshot.revision,
+        false,
+        leaseMs,
+        dependencies,
+        true,
+      );
+      const refreshed = await options
+        .refresh(snapshot.tokens)
+        .finally(stopHeartbeat);
+      const refreshedAccessToken = (refreshed as { access_token?: unknown })
+        .access_token;
+      if (
+        typeof refreshedAccessToken !== "string" ||
+        !refreshedAccessToken.trim()
+      ) {
+        throw new Error("OAuth token refresh returned no access token.");
+      }
+
+      const stillOwnsLease = await acquireLease(
+        identity,
+        holder,
+        snapshot.revision,
+        false,
+        leaseMs,
+        dependencies.now(),
+        true,
+      );
+      if (stillOwnsLease !== "acquired") {
+        snapshot = await readStoredTokenBundle<T>(
+          identity,
+          options.storageOwner,
+        );
+        if (!options.shouldRefresh(snapshot.tokens, dependencies.now())) {
+          return snapshot.tokens;
+        }
+        continue;
+      }
+
+      const latestBeforeSave = await readStoredTokenBundle<T>(
+        identity,
+        options.storageOwner,
+      );
+      if (
+        latestBeforeSave.revision !== snapshot.revision ||
+        latestBeforeSave.legacyRevision !== snapshot.legacyRevision ||
+        latestBeforeSave.storageVersion !== snapshot.storageVersion ||
+        !options.shouldRefresh(latestBeforeSave.tokens, dependencies.now())
+      ) {
+        snapshot = latestBeforeSave;
+        if (!options.shouldRefresh(snapshot.tokens, dependencies.now())) {
+          return snapshot.tokens;
+        }
+        continue;
+      }
+
+      const saved = await replaceOAuthTokensIfRevision(
+        identity.provider,
+        identity.accountId,
+        options.storageOwner,
+        snapshot.revision,
+        snapshot.legacyRevision,
+        snapshot.storageVersion,
+        refreshed as unknown as Record<string, unknown>,
+      );
+      const latest = await readStoredTokenBundle<T>(
+        identity,
+        options.storageOwner,
+      );
+      if (saved || !options.shouldRefresh(latest.tokens, dependencies.now())) {
+        return latest.tokens;
+      }
+      snapshot = latest;
+    } finally {
+      await releaseLease(identity, holder);
+    }
+  }
+
+  throw new Error("Timed out waiting for the OAuth token refresh.");
 }
 
 export async function revokeOAuthCredential<T extends OAuthCredential>(

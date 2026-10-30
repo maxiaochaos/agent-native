@@ -5,7 +5,7 @@ import {
   ensureIndexExists,
   ensureTableExists,
 } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
 import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import { getRequestOrgId } from "../server/request-context.js";
 
@@ -198,58 +198,58 @@ export function resolveUsageAppKey(app?: string | null): string {
   return (config.app.id ?? config.app.name ?? "").trim();
 }
 
-let _initPromise: Promise<void> | undefined;
+export const usageStore = defineStore({
+  id: "usage",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createSql = `
+          CREATE TABLE IF NOT EXISTS token_usage (
+            id BIGINT PRIMARY KEY,
+            owner_email TEXT NOT NULL,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+            cost_cents_x100 BIGINT NOT NULL DEFAULT 0,
+            builder_credits_used NUMERIC,
+            engine_name TEXT,
+            cost_source TEXT NOT NULL DEFAULT 'estimated',
+            model TEXT NOT NULL DEFAULT '',
+            label TEXT NOT NULL DEFAULT 'chat',
+            app TEXT NOT NULL DEFAULT '',
+            ref_id TEXT NOT NULL DEFAULT '',
+            org_id TEXT,
+            run_id TEXT,
+            thread_id TEXT,
+            task_id TEXT,
+            -- guard:allow-identity-column integration scope IDs identify an integration record, not a user principal.
+            integration_scope_id TEXT,
+            source_platform TEXT,
+            source_id TEXT,
+            created_at BIGINT NOT NULL
+          )
+        `;
 
-export async function ensureUsageTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const createSql = `
-        CREATE TABLE IF NOT EXISTS token_usage (
-          id BIGINT PRIMARY KEY,
-          owner_email TEXT NOT NULL,
-          input_tokens BIGINT NOT NULL DEFAULT 0,
-          output_tokens BIGINT NOT NULL DEFAULT 0,
-          cache_read_tokens BIGINT NOT NULL DEFAULT 0,
-          cache_write_tokens BIGINT NOT NULL DEFAULT 0,
-          cost_cents_x100 BIGINT NOT NULL DEFAULT 0,
-          builder_credits_used NUMERIC,
-          engine_name TEXT,
-          cost_source TEXT NOT NULL DEFAULT 'estimated',
-          model TEXT NOT NULL DEFAULT '',
-          label TEXT NOT NULL DEFAULT 'chat',
-          app TEXT NOT NULL DEFAULT '',
-          ref_id TEXT NOT NULL DEFAULT '',
-          org_id TEXT,
-          run_id TEXT,
-          thread_id TEXT,
-          task_id TEXT,
-          -- guard:allow-identity-column integration scope IDs identify an integration record, not a user principal.
-          integration_scope_id TEXT,
-          source_platform TEXT,
-          source_id TEXT,
-          created_at BIGINT NOT NULL
-        )
-      `;
+        const additions: Array<[string, string]> = [
+          ["cache_read_tokens", `BIGINT NOT NULL DEFAULT 0`],
+          ["cache_write_tokens", `BIGINT NOT NULL DEFAULT 0`],
+          ["builder_credits_used", "NUMERIC"],
+          ["engine_name", "TEXT"],
+          ["cost_source", `TEXT NOT NULL DEFAULT 'estimated'`],
+          ["label", `TEXT NOT NULL DEFAULT 'chat'`],
+          ["app", `TEXT NOT NULL DEFAULT ''`],
+          ["ref_id", `TEXT NOT NULL DEFAULT ''`],
+          ["org_id", "TEXT"],
+          ["run_id", "TEXT"],
+          ["thread_id", "TEXT"],
+          ["task_id", "TEXT"],
+          ["integration_scope_id", "TEXT"],
+          ["source_platform", "TEXT"],
+          ["source_id", "TEXT"],
+        ];
 
-      const additions: Array<[string, string]> = [
-        ["cache_read_tokens", `BIGINT NOT NULL DEFAULT 0`],
-        ["cache_write_tokens", `BIGINT NOT NULL DEFAULT 0`],
-        ["builder_credits_used", "NUMERIC"],
-        ["engine_name", "TEXT"],
-        ["cost_source", `TEXT NOT NULL DEFAULT 'estimated'`],
-        ["label", `TEXT NOT NULL DEFAULT 'chat'`],
-        ["app", `TEXT NOT NULL DEFAULT ''`],
-        ["ref_id", `TEXT NOT NULL DEFAULT ''`],
-        ["org_id", "TEXT"],
-        ["run_id", "TEXT"],
-        ["thread_id", "TEXT"],
-        ["task_id", "TEXT"],
-        ["integration_scope_id", "TEXT"],
-        ["source_platform", "TEXT"],
-        ["source_id", "TEXT"],
-      ];
-
-      {
         await ensureTableExists("token_usage", createSql);
         for (const [col, def] of additions) {
           await ensureColumnExists(
@@ -258,7 +258,17 @@ export async function ensureUsageTable(): Promise<void> {
             `ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS ${col} ${def}`,
           );
         }
+      },
+    },
+    {
+      name: "widen-bigint",
+      run: async () => {
         await widenIntColumnsToBigInt("token_usage", ["created_at"]);
+      },
+    },
+    {
+      name: "indexes",
+      run: async () => {
         await ensureIndexExists(
           "idx_token_usage_owner_created",
           `CREATE INDEX IF NOT EXISTS idx_token_usage_owner_created ON token_usage (owner_email, created_at)`,
@@ -285,15 +295,13 @@ export async function ensureUsageTable(): Promise<void> {
           "idx_token_usage_run_id",
           `CREATE INDEX IF NOT EXISTS idx_token_usage_run_id ON token_usage (run_id) WHERE run_id IS NOT NULL`,
         );
-        return;
-      }
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+      },
+    },
+  ],
+});
+
+export function ensureUsageTable(): Promise<void> {
+  return usageStore.ready();
 }
 
 export function calculateCost(
@@ -386,15 +394,6 @@ export async function recordUsage(
   const resolvedRef = refId ?? "";
   const resolvedOrgId = orgId ?? getRequestOrgId() ?? null;
 
-  if (resolvedRef) {
-    await client.execute({
-      sql: `DELETE FROM token_usage
-        WHERE label = ? AND ref_id = ?
-          AND (org_id IS NULL OR org_id = ?)`,
-      args: [resolvedLabel, resolvedRef, resolvedOrgId],
-    });
-  }
-
   const resolvedCostSource =
     costSource ?? (costCentsX100 == null ? "estimated" : "reported");
   const costX100 =
@@ -409,34 +408,45 @@ export async function recordUsage(
           cacheWriteTokens,
         ));
   const id = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+  const insertArgs = [
+    id,
+    ownerEmail,
+    inTok,
+    outTok,
+    cacheReadTokens,
+    cacheWriteTokens,
+    costX100,
+    builderCreditsUsed ?? null,
+    engineName ?? null,
+    resolvedCostSource,
+    modelName,
+    resolvedLabel,
+    resolvedApp,
+    resolvedRef,
+    resolvedOrgId,
+    runId ?? null,
+    threadId ?? null,
+    taskId ?? null,
+    integrationScopeId ?? null,
+    sourcePlatform ?? null,
+    sourceId ?? null,
+    Date.now(),
+  ];
+  const replaceRefSql = resolvedRef
+    ? `WITH prior_usage AS (
+        DELETE FROM token_usage
+        WHERE label = ? AND ref_id = ?
+          AND (org_id IS NULL OR org_id = ?)
+        RETURNING id
+      ) `
+    : "";
   await client.execute({
-    sql: `INSERT INTO token_usage
+    sql: `${replaceRefSql}INSERT INTO token_usage
       (id, owner_email, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_cents_x100, builder_credits_used, engine_name, cost_source, model, label, app, ref_id, org_id, run_id, thread_id, task_id, integration_scope_id, source_platform, source_id, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    args: [
-      id,
-      ownerEmail,
-      inTok,
-      outTok,
-      cacheReadTokens,
-      cacheWriteTokens,
-      costX100,
-      builderCreditsUsed ?? null,
-      engineName ?? null,
-      resolvedCostSource,
-      modelName,
-      resolvedLabel,
-      resolvedApp,
-      resolvedRef,
-      resolvedOrgId,
-      runId ?? null,
-      threadId ?? null,
-      taskId ?? null,
-      integrationScopeId ?? null,
-      sourcePlatform ?? null,
-      sourceId ?? null,
-      Date.now(),
-    ],
+    args: resolvedRef
+      ? [resolvedLabel, resolvedRef, resolvedOrgId, ...insertArgs]
+      : insertArgs,
   });
 
   void import("./alerts-store.js")

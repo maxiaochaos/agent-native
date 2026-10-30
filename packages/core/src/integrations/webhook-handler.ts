@@ -21,14 +21,17 @@ import {
 } from "../agent/engine/index.js";
 import { resolveMainChatMaxOutputTokens } from "../agent/engine/output-tokens.js";
 import type { AgentEngine, EngineMessage } from "../agent/engine/types.js";
+import { buildWorkspaceAppRequestContext } from "../agent/jev-tool-prefetch.js";
 import {
   runAgentLoop,
   actionsToEngineTools,
   filterInitialEngineTools,
+  getJevContextCredentials,
   resolveOwnerEngineApiKey,
   type ActionEntry,
   type ResolvedOwnerApiKey,
 } from "../agent/production-agent.js";
+import { IncompleteAgentRunError } from "../agent/run-errors.js";
 import {
   appendDurableContinuationContext,
   runAgentLoopDirectWithSoftTimeout,
@@ -48,6 +51,7 @@ import {
   threadDataToEngineMessages,
 } from "../agent/thread-data-builder.js";
 import { attachToolSearch } from "../agent/tool-search.js";
+import type { AgentMessage } from "../agent/types.js";
 import type { AgentChatEvent, ContinuationReason } from "../agent/types.js";
 import type { ArtifactReceipt } from "../artifacts/detect.js";
 import {
@@ -57,7 +61,8 @@ import {
   setThreadSourceIfMissing,
 } from "../chat-threads/store.js";
 import { updateThreadData } from "../chat-threads/store.js";
-import { getOrgA2ASecret, resolveOrgIdForEmail } from "../org/context.js";
+import { getOrgA2ASecret } from "../org/context.js";
+import { preloadJevContextWithStatus } from "../server/agent-chat/prompt-resources.js";
 import { withConfiguredAppBasePath } from "../server/app-base-path.js";
 import { getAppProductionUrl } from "../server/app-url.js";
 import { runWithRequestContext } from "../server/request-context.js";
@@ -92,6 +97,10 @@ import {
   stageTaskDeliveryPayload,
   type PendingTask,
 } from "./pending-tasks-store.js";
+import {
+  integrationRequestContext,
+  resolveIntegrationRequestScope,
+} from "./request-scope.js";
 import { integrationScopeSubjectKey } from "./scope-store.js";
 import { getThreadMapping, saveThreadMapping } from "./thread-mapping-store.js";
 import type {
@@ -194,6 +203,8 @@ export type IntegrationResponseDeliveryTaskPayload = {
   kind: "response-delivery";
   incoming: IncomingMessage;
   message: OutgoingMessage;
+  principalType?: "user" | "service";
+  orgScope?: "personal";
   placeholderRef?: string;
   strictTargetRef?: boolean;
   internalThreadId?: string;
@@ -430,14 +441,12 @@ async function enqueueAndDispatch(
 ): Promise<void> {
   const taskId = crypto.randomUUID();
 
-  let orgId: string | null = options.orgId ?? null;
-  if (options.orgId === undefined) {
-    try {
-      orgId = (await resolveOrgIdForEmail(options.ownerEmail)) ?? null;
-    } catch {
-      orgId = null;
-    }
-  }
+  const requestScope = await resolveIntegrationRequestScope({
+    ownerEmail: options.ownerEmail,
+    orgId: options.orgId,
+    principalType: options.principalType,
+  });
+  const orgId = requestScope.orgId;
 
   let placeholderRef: string | undefined;
   try {
@@ -456,6 +465,7 @@ async function enqueueAndDispatch(
     incoming,
     placeholderRef,
     principalType: options.principalType ?? "user",
+    ...(requestScope.orgScope ? { orgScope: requestScope.orgScope } : {}),
   });
 
   await insertPendingTask({
@@ -532,7 +542,12 @@ export async function processIntegrationTask(
     incoming: IncomingMessage;
     placeholderRef?: string;
     principalType?: "user" | "service";
+    orgScope?: "personal";
   };
+  const principalType = parsed.principalType ?? options.principalType ?? "user";
+  const orgScope =
+    parsed.orgScope ??
+    (task.orgId === null && principalType === "user" ? "personal" : undefined);
 
   if (!campaignOptions?.continuationInvocation) {
     await recordInboundIntegrationAudit(task, parsed.incoming);
@@ -542,8 +557,9 @@ export async function processIntegrationTask(
     taskId: task.id,
     attempts: task.attempts,
     placeholderRef: parsed.placeholderRef,
-    orgId: task.orgId ?? undefined,
-    principalType: parsed.principalType ?? options.principalType ?? "user",
+    orgId: task.orgId,
+    orgScope,
+    principalType,
     durableCampaign: campaignOptions?.enabled === true,
   });
 }
@@ -594,7 +610,8 @@ async function processIncomingMessage(
     taskId?: string;
     attempts?: number;
     placeholderRef?: string;
-    orgId?: string;
+    orgId?: string | null;
+    orgScope?: "personal";
     principalType?: "user" | "service";
     durableCampaign?: boolean;
   } = {},
@@ -609,6 +626,14 @@ async function processIncomingMessage(
     ownerEmail,
     engine: engineOption,
   } = options;
+  const requestScope = await resolveIntegrationRequestScope({
+    ownerEmail,
+    orgId: opts.orgId === undefined ? options.orgId : opts.orgId,
+    orgScope: opts.orgScope,
+    principalType: opts.principalType,
+  });
+  const orgId = requestScope.orgId;
+  const requestContext = integrationRequestContext(requestScope);
   let effectiveSystemPrompt = systemPrompt + buildRuntimeContextPrompt();
   const deliveryOptions = {
     placeholderRef: opts.placeholderRef,
@@ -680,11 +705,56 @@ async function processIncomingMessage(
   effectiveSystemPrompt += await loadIntegrationMemoryPrompt(
     incoming.integrationScopeId,
   ).catch(() => "");
+  const workspaceAppHistory: AgentMessage[] = (incoming.contextMessages ?? [])
+    .filter((message) => {
+      const isCurrent =
+        message.text.trim() === incoming.text.trim() &&
+        (!incoming.senderId || message.senderId === incoming.senderId);
+      return !isCurrent;
+    })
+    .map((message) => ({
+      role:
+        message.senderId && message.senderId === incoming.senderId
+          ? "user"
+          : "assistant",
+      content: message.text,
+    }));
+  const appRequest = buildWorkspaceAppRequestContext({
+    request: incoming.text,
+    history: workspaceAppHistory,
+    selectedObjectContext: buildProviderConversationContext(incoming),
+  });
+  const appPreload = await runWithRequestContext(
+    {
+      userEmail: ownerEmail,
+      ...requestContext,
+      isIntegrationCaller: true,
+    },
+    async () => {
+      const jevCredentials = await getJevContextCredentials(ownerEmail);
+      return preloadJevContextWithStatus({
+        request: appRequest,
+        appRequest,
+        owner: ownerEmail,
+        orgId,
+        apiKey: jevCredentials.apiKey,
+        personalApiKey: jevCredentials.personalApiKey,
+        directApiKey: jevCredentials.directApiKey,
+        builderAuth: jevCredentials.builderAuth,
+        selfAppId: options.appId,
+        workspaceAppsEnabled: Boolean(actions["call-agent"]),
+        appDiscoveryOnly: true,
+      });
+    },
+  );
+  if (appPreload.relevantAppsContext) {
+    effectiveSystemPrompt += `\n\n${appPreload.relevantAppsContext}`;
+  }
 
   const budgetReservations = await reserveApplicableIntegrationBudgets({
     incoming,
     ownerEmail,
-    orgId: opts.orgId ?? null,
+    orgId,
     reservationId: opts.taskId ?? `integration:${incoming.externalThreadId}`,
   });
   if (!budgetReservations.allowed) {
@@ -695,6 +765,8 @@ async function processIncomingMessage(
       kind: "response-delivery",
       incoming,
       message: outgoing,
+      principalType: opts.principalType ?? "user",
+      ...(requestScope.orgScope ? { orgScope: requestScope.orgScope } : {}),
       ...(opts.placeholderRef ? { placeholderRef: opts.placeholderRef } : {}),
     };
     try {
@@ -742,10 +814,8 @@ async function processIncomingMessage(
   let thread: Awaited<ReturnType<typeof getThread>>;
   try {
     if (!mapping) {
-      const threadOrgId =
-        opts.orgId ?? (await resolveOrgIdForEmail(ownerEmail));
       const createdThread = await runWithRequestContext(
-        { userEmail: ownerEmail, orgId: threadOrgId ?? undefined },
+        { userEmail: ownerEmail, ...requestContext },
         () =>
           createThread(ownerEmail, {
             title: `${adapter.label}: ${incoming.senderName || incoming.senderId || "User"}`,
@@ -867,6 +937,8 @@ async function processIncomingMessage(
         kind: "response-delivery",
         incoming,
         message: exhaustedMessage,
+        principalType: opts.principalType ?? "user",
+        ...(requestScope.orgScope ? { orgScope: requestScope.orgScope } : {}),
         ...(exhaustedProgress?.responseTargetRef
           ? {
               placeholderRef: exhaustedProgress.responseTargetRef,
@@ -1056,13 +1128,11 @@ async function processIncomingMessage(
     });
   }
 
-  let orgId: string | null | undefined;
   let artifactSecrets: string[];
   let runnableActions: Record<string, ActionEntry>;
   let tools: ReturnType<typeof actionsToEngineTools>;
   let availableTools: ReturnType<typeof actionsToEngineTools>;
   try {
-    orgId = opts.orgId ?? (await resolveOrgIdForEmail(ownerEmail));
     artifactSecrets = await resolveIntegrationArtifactSecrets(orgId);
     runnableActions = attachToolSearch({ ...actions });
     availableTools = actionsToEngineTools(runnableActions);
@@ -1100,6 +1170,8 @@ async function processIncomingMessage(
   const runOptions: StartRunOptions = {
     useHostedSoftTimeoutDefault: true,
     backgroundFunction: isInBackgroundFunctionRuntime(),
+    executionLease: true,
+    recoverChunkBoundaries: true,
     ...(campaign
       ? {
           turnId: campaign.row.turnId,
@@ -1110,14 +1182,15 @@ async function processIncomingMessage(
   };
 
   return new Promise<ProcessIntegrationTaskResult>((resolve) => {
+    // raw-sql-ok: This run callback contains log and response strings, not SQL.
     startRun(
       runId,
       threadId,
-      async (send, signal) => {
+      async (send, signal, control) => {
         await runWithRequestContext(
           {
             userEmail: ownerEmail,
-            orgId: orgId ?? undefined,
+            ...requestContext,
             isIntegrationCaller: true,
             integration: opts.taskId
               ? {
@@ -1213,6 +1286,7 @@ async function processIncomingMessage(
                       send(event);
                     },
                     signal,
+                    beforeWrite: control.flushEvents,
                     threadId,
                     approvedToolCalls: incoming.approvedToolCalls,
                     maxOutputTokens: resolveMainChatMaxOutputTokens(
@@ -1228,9 +1302,13 @@ async function processIncomingMessage(
                     useHostedDefault: true,
                     backgroundFunction: isInBackgroundFunctionRuntime(),
                   },
+                  control,
                 );
                 return usage;
               } catch (error) {
+                if (error instanceof IncompleteAgentRunError) {
+                  usage = error.usage;
+                }
                 if (
                   attempt > 0 ||
                   opts.principalType !== "service" ||
@@ -1399,6 +1477,10 @@ async function processIncomingMessage(
               kind: "response-delivery",
               incoming,
               message: outgoing,
+              principalType: opts.principalType ?? "user",
+              ...(requestScope.orgScope
+                ? { orgScope: requestScope.orgScope }
+                : {}),
               ...(progress?.responseTargetRef
                 ? {
                     placeholderRef: progress.responseTargetRef,
@@ -1688,6 +1770,10 @@ async function processIncomingMessage(
                   kind: "response-delivery",
                   incoming,
                   message: outgoingForDelivery,
+                  principalType: opts.principalType ?? "user",
+                  ...(requestScope.orgScope
+                    ? { orgScope: requestScope.orgScope }
+                    : {}),
                   internalThreadId: threadId,
                 }),
                 ...(threadCheckpoint?.userMessageId

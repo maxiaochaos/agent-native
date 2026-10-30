@@ -1,11 +1,5 @@
 import { useT } from "@agent-native/core/client/i18n";
-import {
-  IconArchive,
-  IconFolder,
-  IconFolderPlus,
-  IconTrash,
-  IconX,
-} from "@tabler/icons-react";
+import { IconArchive, IconFolder, IconTrash, IconX } from "@tabler/icons-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -14,8 +8,13 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+
+import { FolderMoveItems } from "./folder-move-items";
 
 export interface BulkMoveTarget {
   id: string | null;
@@ -107,36 +106,27 @@ export function BulkActionToolbar({
             <DropdownMenuLabel>
               {t("clipsFinalRaw.moveSelected", { count })}
             </DropdownMenuLabel>
-            <DropdownMenuSeparator />
             <DropdownMenuItem
               disabled={isPending}
               onSelect={() => {
                 setTimeout(() => onCreateFolder?.(), 0);
               }}
             >
-              <IconFolderPlus className="h-4 w-4 me-2" />
               {t("navigation.newFolder")}
             </DropdownMenuItem>
             <DropdownMenuSeparator />
-            {moveTargets.map((target, index) => (
-              <DropdownMenuItem
-                key={target.id ?? `root-${index}`}
-                disabled={target.disabled || isPending}
-                onSelect={() => onMove?.(target.id)}
-              >
-                <span
-                  className="truncate"
-                  style={{ paddingInlineStart: (target.depth ?? 0) * 12 }}
-                >
-                  {target.name}
-                </span>
-                {target.disabled && (
-                  <span className="ms-auto text-xs text-muted-foreground">
-                    {t("clipsFinalRaw.current")}
-                  </span>
-                )}
-              </DropdownMenuItem>
-            ))}
+            <FolderMoveItems
+              parts={{
+                Item: DropdownMenuItem,
+                Separator: DropdownMenuSeparator,
+                Sub: DropdownMenuSub,
+                SubTrigger: DropdownMenuSubTrigger,
+                SubContent: DropdownMenuSubContent,
+              }}
+              targets={moveTargets}
+              disabled={isPending}
+              onMove={(folderId) => onMove?.(folderId)}
+            />
           </DropdownMenuContent>
         </DropdownMenu>
       )}

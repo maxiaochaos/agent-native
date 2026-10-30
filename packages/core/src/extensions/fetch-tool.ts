@@ -1,3 +1,4 @@
+import { fail, isActionContractError } from "../action.js";
 /**
  * Fetch tool — outbound HTTP for automations and agent use.
  *
@@ -9,9 +10,8 @@
  * Values are resolved server-side AFTER the model emits the tool call —
  * the raw secret never enters the model's context.
  */
-
-import { fail, isActionContractError } from "../action.js";
 import type { ActionEntry } from "../agent/production-agent.js";
+import { frameworkMcpTools } from "../mcp/framework-tools.js";
 import type { ResolvedKeyReference } from "../secrets/substitution.js";
 import { SAVE_TO_FILE_MAX_BYTES } from "../workspace-files/constants.js";
 import {
@@ -155,17 +155,23 @@ export interface FetchToolOptions {
 export function createFetchToolEntry(
   opts: FetchToolOptions = {},
 ): Record<string, ActionEntry> {
-  return {
+  return frameworkMcpTools({
     "web-request": {
+      // Non-GET requests and saveToFile write, and MCP cannot tell calls apart.
+      mcpAnnotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: true,
+      },
       tool: {
-        description: `Make an outbound HTTP request to an external URL: APIs, webhooks, or web pages. HTML/XHTML responses up to 20 MB are extracted before maxChars limits the response body; optional metadata and links can add characters. Raw and other inline responses remain capped at 1 MB. saveToFile can stage responses up to 20 MB. For HTML, it saves extracted Markdown or text unless responseMode is raw; with search, it returns bounded matches instead of a preview. Sends realistic Chrome-on-macOS headers by default; explicit headers override them. Supports \${keys.NAME} placeholders in url, headers, and body, resolved server-side so raw secrets never enter context. Never use this for internal /_agent-native/ endpoints or localhost action URLs; call registered actions directly.`,
+        description: `Make an outbound HTTP request to a URL you already know: APIs, webhooks, or web pages. If web-search is available, use it to discover URLs, find current information, or locate documentation first. In constrained callers without web-search, use a URL from context instead of guessing; do not use this to build Google or other search-engine queries. HTML/XHTML responses up to 20 MB are extracted before maxChars limits the response body; optional metadata and links can add characters. Raw and other inline responses remain capped at 1 MB. saveToFile can stage responses up to 20 MB. For HTML, it saves extracted Markdown or text unless responseMode is raw; with search, it returns bounded matches instead of a preview. Sends realistic Chrome-on-macOS headers by default; explicit headers override them. Supports \${keys.NAME} placeholders in url, headers, and body, resolved server-side so raw secrets never enter context. Never use this for internal /_agent-native/ endpoints or localhost action URLs; call registered actions directly.`,
         parameters: {
           type: "object" as const,
           properties: {
             url: {
               type: "string",
               description:
-                'Full URL. May contain ${keys.NAME} references, e.g. "${keys.SLACK_WEBHOOK}".',
+                'Full URL you already know. Use web-search when available to discover URLs; otherwise use a URL supplied in context. May contain ${keys.NAME} references, e.g. "${keys.SLACK_WEBHOOK}".',
             },
             method: {
               type: "string",
@@ -528,6 +534,7 @@ export function createFetchToolEntry(
           let searchSourceTruncated = false;
           let fileContent = body;
           let fileContentType = contentType;
+          let savedContentFormat: "raw" | "markdown" | "text" | undefined;
           const search = parseWebContentSearchOptions(args.search);
           const hasSearch = hasWebContentSearch(search);
           const includeLinks =
@@ -570,22 +577,43 @@ export function createFetchToolEntry(
                   "HTML extraction did not produce saved content",
                 );
               }
+              // Empty markdown/text is a raw fallback, same as a null
+              // extraction. Format that body as raw so a markup-only page is
+              // not saved as an empty text/markdown file. Use fullContentFormat
+              // (extraction success for the save path), not rawBodyFallback —
+              // links/metadata modes leave display content empty by design.
+              const savingRawFallback = processed.fullContentFormat === "raw";
               fileContent = formatWebContentResult({
                 ...processed,
-                mode: saveContentFormat,
+                mode: savingRawFallback ? "raw" : saveContentFormat,
                 content: processed.fullContent,
                 fullContent: undefined,
+                fullContentFormat: undefined,
                 matches: undefined,
                 totalMatches: undefined,
                 omittedMatches: undefined,
                 searchSource: undefined,
                 searchTruncated: undefined,
+                rawBodyFallback: savingRawFallback
+                  ? undefined
+                  : processed.rawBodyFallback,
                 truncated: false,
               });
+              // When extraction failed or yielded no usable text, `fullContent`
+              // is the raw response body; preserve the original content type
+              // and label the saved format as `raw`.
+              savedContentFormat = savingRawFallback
+                ? "raw"
+                : (processed.fullContentFormat ?? saveContentFormat);
+              // When extraction failed, `fullContent` is the raw response
+              // body; preserve the original response media type (e.g.
+              // `application/xhtml+xml`) instead of relabeling it `text/html`.
               fileContentType =
-                saveContentFormat === "markdown"
+                savedContentFormat === "markdown"
                   ? "text/markdown"
-                  : "text/plain";
+                  : savedContentFormat === "text"
+                    ? "text/plain"
+                    : contentType;
             }
 
             if (
@@ -593,7 +621,8 @@ export function createFetchToolEntry(
               isHtmlContentType &&
               normalizedResponseMode !== "raw" &&
               processed.truncated &&
-              processed.contentLength !== undefined
+              processed.contentLength !== undefined &&
+              !processed.rawBodyFallback
             ) {
               displayBody += `\n\nFull extracted content: ${processed.contentLength} characters. Retry with saveToFile (up to ${MAX_WEB_REQUEST_HTML_BYTES} bytes), then use workspace-files grep or read with offsets.`;
             }
@@ -632,7 +661,10 @@ export function createFetchToolEntry(
                   `Refusing to save a failed response to durable workspace file "${saveToFilePath}" (status ${response.status}). Use a scratch/... path for diagnostics.`,
                 );
               }
-              const savedFormat = saveContentFormat ?? "raw";
+              const savedFormat =
+                (saveContentFormat && savedContentFormat) ||
+                saveContentFormat ||
+                "raw";
               const meta = await writeWorkspaceFile(
                 scope,
                 saveToFilePath,
@@ -719,7 +751,7 @@ export function createFetchToolEntry(
       },
       readOnly: true,
     },
-  };
+  });
 }
 
 function parseBooleanArg(value: unknown): boolean {

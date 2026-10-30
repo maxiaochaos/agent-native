@@ -23,6 +23,7 @@ type SavedComment = {
   body: string;
   anchor: {
     nodeId: string;
+    screenPoint: { xPct: number; yPct: number };
     relativePoint: { xPct: number; yPct: number };
   } | null;
 };
@@ -58,7 +59,6 @@ async function openThreadsPanel(page: Page): Promise<void> {
   await expect(page.locator("[data-review-comments-panel]")).toBeVisible();
 }
 
-// oracle: none — verifies the comment flow, not measured Figma behavior.
 test("the Pin comment tool opens the Threads panel", async ({ app }) => {
   const page = app.page;
   await app.open(await app.seed(COMMENT_SCREEN));
@@ -71,9 +71,7 @@ test("the Pin comment tool opens the Threads panel", async ({ app }) => {
   await expect(page.locator("[data-review-comments-panel]")).toBeVisible();
 });
 
-// oracle: none — verifies the comment flow, not measured Figma behavior.
-// fixme: product bug: (1) The pin is drawn centred at (412,263) for a click at (491,274): about 79px left, at roughly the button's left edge, as if the
-test.fixme("comments toolbar opens an anchored composer", async ({ app }) => {
+test("comments toolbar opens an anchored composer", async ({ app }) => {
   const page = app.page;
   const id = await app.seed(COMMENT_SCREEN);
   let listQuery = "";
@@ -106,9 +104,11 @@ test.fixme("comments toolbar opens an anchored composer", async ({ app }) => {
   await page.mouse.click(click.x, click.y);
 
   const draftForm = page
-    .locator('form:has(textarea[placeholder="Leave feedback…"])')
+    .locator('form:has([role="textbox"][aria-label="Leave feedback…"])')
     .first();
-  const composer = draftForm.locator('textarea[placeholder="Leave feedback…"]');
+  const composer = draftForm.getByRole("textbox", {
+    name: "Leave feedback…",
+  });
   await expect(composer).toBeVisible();
   const commentButton = draftForm.getByRole("button", {
     name: "Comment",
@@ -117,15 +117,17 @@ test.fixme("comments toolbar opens an anchored composer", async ({ app }) => {
   await expect(commentButton).toBeDisabled();
   await composer.fill("Browser comment check ");
   await composer.press("@");
-  const mentionMenu = page.getByRole("menu", { name: "Mention someone" });
+  const mentionMenu = page.getByRole("listbox", { name: "Mention someone" });
   await expect(mentionMenu).toBeVisible();
-  await expect(composer).toHaveValue("Browser comment check @");
+  await expect(composer).toHaveText("Browser comment check @");
   await composer.pressSequentially("Ali");
-  await expect(
-    mentionMenu.getByRole("textbox", { name: "Mention someone" }),
-  ).toHaveValue("Ali");
-  await mentionMenu.getByRole("menuitem").first().click();
-  await expect(composer).toHaveValue("Browser comment check @alice+e2e");
+  await expect(mentionMenu.getByRole("option").first()).toContainText(
+    "alice+e2e",
+  );
+  await mentionMenu.getByRole("option").first().click();
+  await expect(composer.locator("[data-review-mention-chip]")).toHaveText(
+    "@alice+e2e",
+  );
 
   const tools = (await draftForm
     .locator("[data-review-comment-tools]")
@@ -144,7 +146,7 @@ test.fixme("comments toolbar opens an anchored composer", async ({ app }) => {
   expect(attach.x + attach.width).toBeLessThanOrEqual(tools.x + tools.width);
   await expect(
     draftForm.getByRole("button", { name: "Send to agent" }),
-  ).toBeVisible();
+  ).toHaveCount(0);
 
   const createResponse = page.waitForResponse(
     (response) =>
@@ -160,8 +162,9 @@ test.fixme("comments toolbar opens an anchored composer", async ({ app }) => {
     { label: "alice+e2e", email: E2E_MENTION_EMAIL, id: null },
   ]);
   expect(created.anchor?.nodeId).toBe("deep-button");
-  // The pin point is a percentage of the 1440px screen: 40px body padding + 24px card padding + 90% of 200px.
-  expect(created.anchor?.relativePoint.xPct).toBeCloseTo((244 / 1440) * 100, 1);
+  // On the 1440px screen the click sits at 40px body padding + 24px card padding + 90% of the 200px button.
+  expect(created.anchor?.screenPoint.xPct).toBeCloseTo((244 / 1440) * 100, 1);
+  expect(created.anchor?.relativePoint.xPct).toBeCloseTo(90, 1);
   await expect(composer).toBeHidden();
   await expect
     .soft(page.locator("[data-review-pin]"), "one thread draws one pin")
@@ -187,10 +190,10 @@ test.fixme("comments toolbar opens an anchored composer", async ({ app }) => {
   await expect(threadPopover(page)).toBeVisible();
   await expect(
     page
-      .locator("[data-review-comments-panel] article")
-      .getByText("Browser comment check @alice+e2e", { exact: true }),
+      .locator("[data-review-comments-panel] [data-review-thread-row]")
+      .filter({ hasText: "Browser comment check @alice+e2e" }),
   ).toBeVisible();
-  const replyInput = page.locator("textarea[data-review-reply-input]:visible");
+  const replyInput = page.locator("[data-review-reply-input]:visible");
   await replyInput.fill("Browser comment reply");
   const replyResponse = page.waitForResponse(
     (response) =>
@@ -246,7 +249,7 @@ test.fixme("comments toolbar opens an anchored composer", async ({ app }) => {
         parentCommentId: created.id,
         status: "open",
         body: "Browser comment reply",
-        nodeId: null,
+        nodeId: "deep-button",
       },
     ]);
   await page.locator("[data-review-pin]").first().click();

@@ -157,6 +157,7 @@ describe("new comment responsive draft", () => {
     return (
       <>
         <button data-outside>Outside</button>
+        <div data-page-editor contentEditable tabIndex={-1} />
         {width < 800 ? (
           <section key="anchored">{sidebar}</section>
         ) : (
@@ -283,6 +284,45 @@ describe("new comment responsive draft", () => {
     expect(richEditorValue(input())).toBe("Keep this draft");
   });
 
+  it.each([390, 1280])(
+    "takes focus from the page that opened a new comment at %ipx",
+    async (width) => {
+      await show(width);
+      // The selection toolbar and Mod+Shift+M leave focus in the page.
+      const page = container.querySelector<HTMLElement>("[data-page-editor]")!;
+      page.focus();
+      expect(document.activeElement).toBe(page);
+      await open();
+      expect(document.activeElement).toBe(input());
+    },
+  );
+
+  it("lets focus moved away right after opening stay put", async () => {
+    await show(1280);
+    vi.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+      ],
+    });
+    try {
+      await act(async () => start(selected));
+      const outside =
+        container.querySelector<HTMLButtonElement>("[data-outside]");
+      if (!outside) throw new Error("Outside focus target was not rendered");
+      outside.focus();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        vi.advanceTimersToNextFrame();
+      });
+      expect(document.activeElement).toBe(outside);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retains a failed submission, clears success and explicitly starts a fresh selection", async () => {
     await show(390);
     await open();
@@ -314,6 +354,58 @@ describe("new comment responsive draft", () => {
     expect(richEditor(container)).toBeNull();
     await open();
     expect(richEditorValue(input())).toBe("");
+  });
+
+  it("cancels an empty new comment on Escape, and asks before discarding typed text", async () => {
+    const confirmation = () =>
+      document.querySelector<HTMLElement>('[role="alertdialog"]');
+    await show(1280);
+    await open();
+    await press("Escape");
+    await settle();
+    expect(confirmation()).toBeNull();
+    expect(richEditor(container)).toBeNull();
+    expect(completed).toHaveBeenCalledTimes(1);
+
+    await open();
+    await type("Unsent thought");
+    await press("Escape");
+    await settle();
+    expect(confirmation()?.textContent).toContain(
+      "comments.discardCommentQuestion",
+    );
+    expect(richEditorValue(input())).toBe("Unsent thought");
+    const discard = [...confirmation()!.querySelectorAll("button")].find(
+      (button) => button.textContent === "comments.discard",
+    )!;
+    expect(document.activeElement).toBe(discard);
+    await act(async () => discard.click());
+    await settle();
+    expect(confirmation()).toBeNull();
+    expect(richEditor(container)).toBeNull();
+    expect(completed).toHaveBeenCalledTimes(2);
+    await open();
+    expect(richEditorValue(input())).toBe("");
+  });
+
+  it("keeps a written new comment open when another thread opens, and closes an empty one", async () => {
+    await show(1280);
+    await open();
+    await act(async () => owner.setPendingComment(null, { keepWritten: true }));
+    await settle();
+    expect(owner.pendingComment).toBeNull();
+    expect(richEditor(container)).toBeNull();
+
+    await open();
+    await type("Half a thought");
+    await act(async () => owner.setPendingComment(null, { keepWritten: true }));
+    await settle();
+    expect(owner.pendingComment).not.toBeNull();
+    expect(richEditorValue(input())).toBe("Half a thought");
+    // Closing it on purpose still works.
+    await act(async () => owner.setPendingComment(null));
+    await settle();
+    expect(owner.pendingComment).toBeNull();
   });
 
   it("isolates document drafts and does not preserve text when a new selection replaces one", async () => {
@@ -586,9 +678,14 @@ describe("new comment responsive draft", () => {
       "utf8",
     );
     expect(source).toContain("usePendingCommentDraft(documentId)");
-    expect(source).toContain("pendingComment={pendingComment}");
+    // The rail shows a new comment only while its Blocks field tab is open.
+    expect(source).toMatch(
+      /pendingComment=\{\s*presentation === "history" \|\| blockFieldComments\.pendingVisible\s*\? pendingComment\s*: null\s*\}/,
+    );
     expect(source).toContain("onPendingChange={changePendingComment}");
     expect(source).toContain("if (!completePendingComment(id)) return;");
+    // Opening a thread keeps a new comment someone has written.
+    expect(source).toContain("setPendingComment(null, { keepWritten: true });");
     expect(source).not.toMatch(
       /\[pendingComment,\s*setPendingComment\]\s*=\s*useState/,
     );

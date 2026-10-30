@@ -5,6 +5,7 @@ import { useEffect, useCallback, useRef, useMemo } from "react";
 import { registerPendingTextHostCommit } from "@/components/design/design-canvas/pending-text-capture";
 import { type StyleChangeMeta } from "@/components/design/EditPanel";
 import {
+  sendBreakpointPreviewStyleChange,
   sendLinkedScreenPreviewInteractionStateStyle,
   sendLinkedScreenPreviewStyleChange,
 } from "@/components/design/multi-screen/linked-screen-preview";
@@ -85,6 +86,7 @@ export function useEditorScreenChangeHandlers({
     activeBreakpointWidthState,
     activeBreakpointWidthStateRef,
     undoManagerRef,
+    localContentUndoStackRef,
     captureCurrentSelection,
     prepareTextCreationFinalization,
   } = editorHistory;
@@ -351,8 +353,9 @@ export function useEditorScreenChangeHandlers({
         replacementElementInfo?: ElementInfo;
         replacementSnapshotHtml?: string;
       },
-    ) =>
-      runVisualStructureChange(
+    ) => {
+      if (!activeFile) return false;
+      return runVisualStructureChange(
         {
           activeCanvasSourceType,
           activeFile,
@@ -371,7 +374,8 @@ export function useEditorScreenChangeHandlers({
         placement,
         elementInfo,
         details,
-      ),
+      );
+    },
     [
       activeFile,
       activeCanvasSourceType,
@@ -436,6 +440,7 @@ export function useEditorScreenChangeHandlers({
         placement?: "before" | "after" | "inside";
       },
     ) => {
+      if (!activeFile) return false;
       if (isRunningAppSourceType(activeCanvasSourceType) && activeFile) {
         if (!canEditActiveVisualScreen) return false;
         recordPendingLiveStructureEdit(
@@ -471,6 +476,7 @@ export function useEditorScreenChangeHandlers({
           canEditLiveScreen: canEditActiveVisualScreen,
           remapMotionTracksForClone,
           getFreshActiveContent,
+          localContentUndoStackRef,
           selectedElement,
           selectedLayerIdsState,
           setSelectedElement,
@@ -494,6 +500,7 @@ export function useEditorScreenChangeHandlers({
       canEditActiveVisualScreen,
       componentCloneContextForFile,
       getFreshActiveContent,
+      localContentUndoStackRef,
       recordPendingLiveStructureEdit,
       selectedElement,
       selectedLayerIdsState,
@@ -516,8 +523,9 @@ export function useEditorScreenChangeHandlers({
         requirePersistedSourceAcceptance?: boolean;
         relativeOperations?: Record<string, PendingRelativeStyleOperation>;
       },
-    ) =>
-      runScreenVisualStyleChange(
+    ) => {
+      if (!activeFile) return;
+      return runScreenVisualStyleChange(
         {
           activeBreakpointUpperBoundPx: activeBreakpointUpperBoundAtEvent(),
           activeBreakpointWidthStateRef,
@@ -538,7 +546,8 @@ export function useEditorScreenChangeHandlers({
         styles,
         elementInfo,
         metadata,
-      ),
+      );
+    },
     [
       activeBreakpointUpperBoundAtEvent,
       activeFile?.id,
@@ -634,33 +643,58 @@ export function useEditorScreenChangeHandlers({
           activeBreakpointUpperBoundAtEvent(),
         );
         if (nextContent === baseContent) return;
-        applyFileContentUpdate(screenId, nextContent, {
+        const publication = applyFileContentUpdate(screenId, nextContent, {
           refreshPreview: false,
           forcePreviewFullDocument: true,
         });
-        previewInteractionState(
-          Object.fromEntries(
-            Object.keys(styles).map((property) => [property, ""]),
-          ),
+        const clearPreview = Object.fromEntries(
+          Object.keys(styles).map((property) => [property, ""]),
         );
+        if (publication.status !== "accepted") {
+          previewInteractionState(clearPreview);
+          return;
+        }
+        previewInteractionState(clearPreview);
         return;
       }
+      // A runtime style lands inline in every frame it reaches, so a
+      // breakpoint-scoped edit previews only its own frame and commits by
+      // replacing content, which carries the scoped @media rule.
+      const scopedBreakpointWidthPx =
+        activeBreakpointUpperBoundAtEvent() == null
+          ? null
+          : (activeBreakpointWidthStateRef.current ?? null);
       if (!metadata?.requirePersistedSourceAcceptance) {
         for (const [property, value] of Object.entries(styles)) {
-          sendLinkedScreenPreviewStyleChange(
-            screenId,
-            selector,
-            property,
-            value,
-            {
-              selectorCandidates,
-              nodeId: elementInfo?.runtimeSourceId ?? elementInfo?.sourceId,
-              relativeOperation: relativeOperationsForStyles(
-                { [property]: value },
-                metadata,
-              )?.[property],
-            },
-          );
+          const previewOptions = {
+            selectorCandidates,
+            nodeId: elementInfo?.runtimeSourceId ?? elementInfo?.sourceId,
+            relativeOperation: relativeOperationsForStyles(
+              { [property]: value },
+              metadata,
+            )?.[property],
+          };
+          if (scopedBreakpointWidthPx == null) {
+            sendLinkedScreenPreviewStyleChange(
+              screenId,
+              selector,
+              property,
+              value,
+              previewOptions,
+            );
+          } else if (
+            metadata?.phase === "preview" ||
+            metadata?.phase === "cancel"
+          ) {
+            sendBreakpointPreviewStyleChange(
+              screenId,
+              scopedBreakpointWidthPx,
+              selector,
+              property,
+              value,
+              previewOptions,
+            );
+          }
         }
       }
       if (
@@ -672,7 +706,9 @@ export function useEditorScreenChangeHandlers({
       const relativeOperations = relativeOperationsForStyles(styles, metadata);
       handleScreenVisualStyleChange(screenId, selector, styles, elementInfo, {
         phase: metadata?.phase === "commit" ? "commit" : undefined,
-        runtimeApplied: !metadata?.requirePersistedSourceAcceptance,
+        runtimeApplied:
+          !metadata?.requirePersistedSourceAcceptance &&
+          scopedBreakpointWidthPx == null,
         requirePersistedSourceAcceptance:
           metadata?.requirePersistedSourceAcceptance,
         ...(relativeOperations ? { relativeOperations } : {}),
@@ -741,8 +777,9 @@ export function useEditorScreenChangeHandlers({
         replacementElementInfo?: ElementInfo;
         replacementSnapshotHtml?: string;
       },
-    ) =>
-      runScreenVisualStructureChange(
+    ) => {
+      if (!activeFile) return false;
+      return runScreenVisualStructureChange(
         {
           activeFile,
           applyLinkedComponentEdit,
@@ -765,7 +802,8 @@ export function useEditorScreenChangeHandlers({
         placement,
         elementInfo,
         details,
-      ),
+      );
+    },
     [
       activeFile?.id,
       applyFileContentUpdate,
@@ -800,8 +838,9 @@ export function useEditorScreenChangeHandlers({
         anchorRect?: { x: number; y: number; width: number; height: number };
         placement?: "before" | "after" | "inside";
       },
-    ) =>
-      runScreenVisualDuplicateChange(
+    ) => {
+      if (!activeFile) return false;
+      return runScreenVisualDuplicateChange(
         {
           activeFile,
           applyLinkedComponentEdit,
@@ -823,7 +862,8 @@ export function useEditorScreenChangeHandlers({
         cloneHtml,
         elementInfo,
         details,
-      ),
+      );
+    },
     [
       remapMotionTracksForClone,
       applyLinkedComponentEdit,
@@ -854,8 +894,9 @@ export function useEditorScreenChangeHandlers({
         routePath?: string;
         relativeOperations?: Record<string, PendingRelativeStyleOperation>;
       },
-    ) =>
-      runScreenTextContentChange(
+    ) => {
+      if (!activeFile) return "refused";
+      return runScreenTextContentChange(
         {
           activeFile,
           applyFileContentUpdate,
@@ -882,7 +923,8 @@ export function useEditorScreenChangeHandlers({
         value,
         elementInfo,
         details,
-      ),
+      );
+    },
     [
       activeFile?.id,
       applyFileContentUpdate,

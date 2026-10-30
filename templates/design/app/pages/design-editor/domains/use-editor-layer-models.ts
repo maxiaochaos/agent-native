@@ -10,7 +10,7 @@ import {
   type CodeLayerProjection,
   type CodeLayerTreeNode,
 } from "@shared/code-layer";
-import { useState, useCallback, useRef, useMemo } from "react";
+import { useState, useCallback, useRef, useMemo, useEffect } from "react";
 import { toast } from "sonner";
 
 import {
@@ -18,6 +18,7 @@ import {
   type LayersPanelNode,
 } from "@/components/design/LayersPanel";
 import { getCanonicalScreenStack } from "@/components/design/multi-screen/frame-geometry";
+import { GENERATION_DRAFT_SETTLE_MS } from "@/hooks/use-generating-design-preview";
 import { prettyScreenName } from "@/lib/screen-names";
 
 import {
@@ -43,7 +44,6 @@ import {
 } from "../derive/layer-model-coverage";
 import { NO_SELECTORS } from "../design-editor-shared";
 import { withMeasuredGeometry } from "../editor-helpers";
-import { getDesignEditorStateUrlSearch } from "../editor-state";
 import { layerStateIdsForScreen } from "../layer-state-scope";
 import {
   shouldPreferRuntimeLayerProjection,
@@ -97,20 +97,13 @@ export function useEditorLayerModels({
   editorSelectionAndStyles: EditorSelectionAndStyles;
   editorExportAndHandoff: EditorExportAndHandoff;
 }) {
+  const { t, initialSearchParams, viewMode, selectedElement, activeFileId } =
+    editorCore;
   const {
-    t,
-    location,
-    initialSearchParams,
-    mode,
-    activeTool,
-    viewMode,
-    selectedElement,
-    activeFileId,
-  } = editorCore;
-  const {
-    setActiveLeftPanel,
     expandedLayerIds,
     selectedLayerIdsState,
+    renderedElementInfoByLayerKeyRef,
+    renderedElementInfoVersion,
     codeLayerOwnerByNodeIdRef,
     overviewSelectedScreenIds,
     createdOverviewLayerSelection,
@@ -119,9 +112,9 @@ export function useEditorLayerModels({
     lockedLayerIds,
     hiddenLayerIds,
   } = editorHistory;
-  const { design } = editorGenerationAndAccess;
+  const { design, generating, pendingGenerationActive } =
+    editorGenerationAndAccess;
   const {
-    navigate,
     files,
     codeLayerSourceForScreen,
     runtimeLayerSnapshotsById,
@@ -138,7 +131,6 @@ export function useEditorLayerModels({
     getProjectionContentForScreen,
   } = editorCanvasAndScreens;
   const {
-    zoom,
     activeCodeLayerProjection,
     selectedElementLayerId,
     selectedCanvasSelectorCandidates,
@@ -758,6 +750,45 @@ export function useEditorLayerModels({
     () => overviewScreens.length === 0 && (boardElements?.length ?? 0) === 0,
     [boardElements, overviewScreens.length],
   );
+  // A run that starts on an empty design builds its first screen in the
+  // generation preview, which follows the saved screen across a skeleton-first
+  // build's calls. It stays up until the run ends, then briefly while the
+  // last section's frames finish drawing. Set during render, so the preview
+  // never unmounts in between.
+  const generationActive = generating || pendingGenerationActive;
+  // `null` until the design has loaded: a loading design looks empty.
+  const [buildingFirstScreen, setBuildingFirstScreen] = useState<
+    boolean | null
+  >(null);
+  const [generationWasActive, setGenerationWasActive] = useState(false);
+  const [firstScreenSettling, setFirstScreenSettling] = useState(false);
+  if (generationWasActive !== generationActive) {
+    setGenerationWasActive(generationActive);
+    if (generationActive) {
+      setBuildingFirstScreen(design ? designIsEmpty : null);
+      setFirstScreenSettling(false);
+    } else {
+      if (buildingFirstScreen) setFirstScreenSettling(true);
+      setBuildingFirstScreen(null);
+    }
+  } else if (generationActive && buildingFirstScreen === null && design) {
+    setBuildingFirstScreen(designIsEmpty);
+  }
+  useEffect(() => {
+    if (!firstScreenSettling) return;
+    const timer = window.setTimeout(
+      () => setFirstScreenSettling(false),
+      GENERATION_DRAFT_SETTLE_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [firstScreenSettling]);
+  const firstScreenBuild =
+    buildingFirstScreen === true || firstScreenSettling
+      ? {
+          settling: firstScreenSettling,
+          savedHtml: overviewScreens[0]?.content,
+        }
+      : null;
   const [chatMessageCount, setChatMessageCount] = useState(0);
 
   const designAgentSuggestions = useMemo(
@@ -896,46 +927,6 @@ export function useEditorLayerModels({
     [codeLayerOwnerByNodeId, selectedElementLayerId, selectedLayerIds],
   );
 
-  const handleShaderEditCode = useCallback(
-    (_shaderId: string) => {
-      const targetFileId = activeFile?.id ?? activeFileId;
-      if (!targetFileId) return;
-      setActiveLeftPanel("code");
-      const nextSearch = getDesignEditorStateUrlSearch({
-        currentSearch: location.search,
-        viewMode,
-        screenId: activeFile?.id ?? activeFileId ?? undefined,
-        leftPanel: "code",
-        codeFileId: targetFileId,
-        selectionId: selectedUrlSelectionId,
-        zoom,
-        tool: activeTool,
-        mode,
-      });
-      if (nextSearch === location.search) return;
-      void navigate(
-        {
-          pathname: location.pathname,
-          search: nextSearch,
-          hash: location.hash,
-        },
-        { replace: true, preventScrollReset: true },
-      );
-    },
-    [
-      activeFile?.id,
-      activeFileId,
-      activeTool,
-      location.hash,
-      location.pathname,
-      location.search,
-      navigate,
-      selectedUrlSelectionId,
-      mode,
-      viewMode,
-      zoom,
-    ],
-  );
   const selectedLayerIdsRef = useRef<string[]>(selectedLayerIds);
 
   const selectedElementScreenId = useMemo(() => {
@@ -954,13 +945,35 @@ export function useEditorLayerModels({
         .map((layerId) => {
           const owner = codeLayerOwnerByNodeId.get(layerId);
           if (!owner) return null;
+          // A bridge selection made before its screen's layers loaded carries
+          // no layer identity, yet this layer was resolved from it.
+          const selectedInfo =
+            selectedElement &&
+            !selectedElement.sourceLayerIdentity &&
+            layerId === selectedElementLayerId &&
+            owner.fileId === activeFile?.id
+              ? {
+                  ...selectedElement,
+                  sourceLayerIdentity: {
+                    screenId: owner.fileId,
+                    nodeId: owner.node.id,
+                  },
+                }
+              : selectedElement;
+          const ownsSelectedElement =
+            selectedInfo?.sourceLayerIdentity?.screenId === owner.fileId &&
+            selectedInfo.sourceLayerIdentity.nodeId === owner.node.id;
           return {
             layerId,
             fileId: owner.fileId,
             node: owner.node,
             tree: owner.tree,
             elementInfo: elementInfoForOwnedCodeLayerNode({
-              info: selectedElement,
+              info: ownsSelectedElement
+                ? selectedInfo
+                : (renderedElementInfoByLayerKeyRef.current.get(
+                    `${owner.fileId}:${owner.node.id}`,
+                  ) ?? null),
               node: owner.node,
               ownerFileId: owner.fileId,
             }),
@@ -968,8 +981,12 @@ export function useEditorLayerModels({
         })
         .filter((target): target is SelectedLayerTarget => Boolean(target)),
     [
+      activeFile?.id,
       codeLayerOwnerByNodeId,
+      renderedElementInfoByLayerKeyRef,
+      renderedElementInfoVersion,
       selectedElement,
+      selectedElementLayerId,
       selectedElementScreenId,
       selectedLayerIds,
     ],
@@ -1071,6 +1088,7 @@ export function useEditorLayerModels({
     overviewLayerPanelFiles,
     boardElements,
     designIsEmpty,
+    firstScreenBuild,
     chatMessageCount,
     setChatMessageCount,
     designAgentSuggestions,
@@ -1082,7 +1100,6 @@ export function useEditorLayerModels({
     canEditSelectedLiveLayer,
     canEditSingleSelectedLiveLayer,
     selectedUrlSelectionId,
-    handleShaderEditCode,
     selectedLayerIdsRef,
     selectedElementScreenId,
     selectedLayerTargets,

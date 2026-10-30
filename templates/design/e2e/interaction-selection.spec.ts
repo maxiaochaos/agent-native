@@ -322,11 +322,91 @@ async function clickScreenNode(
   );
 }
 
+test("screen plain click selects the containing frame; Cmd-click selects the child", async ({
+  app,
+}) => {
+  const { id, before } = await openScreenFixture(app);
+
+  await clickScreenNode(app, "kid-a");
+  await expect.poll(() => app.selectedLayers()).toEqual(["Card"]);
+  await app.page.keyboard.press("Escape");
+  await expect.poll(() => app.selectedLayers()).toEqual([]);
+
+  const card = await app.designRect("card");
+  const emptyCardPoint = await app.pagePoint(
+    card.x + card.width / 2,
+    card.y + card.height - 20,
+  );
+  await app.page.mouse.click(emptyCardPoint.x, emptyCardPoint.y);
+  await expect.poll(() => app.selectedLayers()).toEqual(["Card"]);
+
+  await clickScreenNode(app, "kid-a");
+  await expect.poll(() => app.selectedLayers()).toEqual(["Card"]);
+
+  await clickScreenNode(app, "kid-a", ["Meta"]);
+  await expect.poll(() => app.selectedLayers()).toEqual(["Kid A"]);
+
+  await app.settled();
+  expectOnlyChanged(before, await app.savedNodes(id), []);
+});
+
+test("board plain click inside a selected Card keeps it; Cmd-click selects the child", async ({
+  app,
+  page,
+}) => {
+  await openBoardFixture(app, FIXTURE);
+  const card = (await node(page, "card").boundingBox())!;
+  await page.mouse.click(card.x + card.width / 2, card.y + card.height - 20);
+  await expect.poll(() => app.selectedLayers()).toEqual(["Card"]);
+
+  const kidA = (await node(page, "kid-a").boundingBox())!;
+  await click(page, kidA);
+  await expect.poll(() => app.selectedLayers()).toEqual(["Card"]);
+
+  await click(page, kidA, ["Meta"]);
+  await expect.poll(() => app.selectedLayers()).toEqual(["Kid A"]);
+});
+
 test.use({ viewport: { width: 1600, height: 1000 } });
 
 test.beforeEach(async ({ page }, testInfo) => {
   baseURL =
     (testInfo.project.use.baseURL as string | undefined) ?? e2eBaseURL();
+});
+
+test("double-clicking a board frame title saves its new name", async ({
+  page,
+}) => {
+  const id = await newBoardDesign(page, OVERLAPPING_BOARD_FRAMES);
+  await gotoEditor(page, id);
+  const board = boardIframe(page).contentFrame();
+  await board
+    .locator("[data-agent-native-frame-label]")
+    .filter({ hasText: "Drag frame" })
+    .dblclick();
+  const input = board.locator("[data-agent-native-frame-label-input]");
+  await expect(input).toBeVisible();
+  await input.fill("Workspace");
+  await input.press("Enter");
+  await expect
+    .poll(async () => {
+      const response = await page.request.get(
+        `${baseURL}/_agent-native/actions/get-design?id=${encodeURIComponent(id)}`,
+      );
+      if (!response.ok()) throw new Error(`get-design: ${response.status()}`);
+      const record = await response.json();
+      return record.files.find(
+        (file: { filename: string }) => file.filename === "__board__.html",
+      )?.content;
+    })
+    .toContain('data-agent-native-layer-name="Workspace"');
+  await page.reload();
+  await expect(
+    boardIframe(page)
+      .contentFrame()
+      .locator("[data-agent-native-frame-label]")
+      .filter({ hasText: "Workspace" }),
+  ).toBeVisible();
 });
 
 test("board regression: an overlapping Frame drop into another board Frame persists after reload", async ({
@@ -544,9 +624,13 @@ test("board regression: overlapping board Frames keep the pointer drop without c
       ).__boardDragTrace ?? [],
   );
 
+  // The frame already sits on the board body, so wait for the drop's save itself.
   await expect
-    .poll(() => persistedBoardPosition(page, id, "drag-frame"))
-    .toMatchObject({ parentTagName: "body" });
+    .poll(async () => {
+      const saved = await persistedBoardPosition(page, id, "drag-frame");
+      return Math.abs(saved.left - expected.left) <= 6;
+    })
+    .toBe(true);
   const persisted = await persistedBoardPosition(page, id, "drag-frame");
   expect(Math.abs(persisted.left - expected.left)).toBeLessThanOrEqual(6);
   expect(Math.abs(persisted.top - expected.top)).toBeLessThanOrEqual(6);
@@ -579,11 +663,8 @@ test("board regression: overlapping board Frames keep the pointer drop without c
   expect(afterReload.parentTagName).toBe("body");
 });
 
-// PR #5644 made a plain click inside a SCREEN select the deepest block under
-// the pointer directly (see editor-chrome.bridge.ts's plainClickSelectionTarget).
-// The infinite-canvas board surface keeps container-first selection, so these
-// tests use the same nested Card/Kid A fixture as a board object
-// (newBoardDesign) instead of a screen (newDesign).
+// Screens and the infinite-canvas board share container-first selection; these
+// tests exercise it on a board object (newBoardDesign).
 test.describe("click selects the container on the board surface, not the deep child", () => {
   test("selected nested frame drag from its grandchild tracks the pointer and persists", async ({
     page,
@@ -621,7 +702,8 @@ test.describe("click selects the container on the board surface, not the deep ch
       x: selectedChildBefore.x + selectedChildBefore.width / 2,
       y: selectedChildBefore.y + selectedChildBefore.height / 2,
     };
-    const dragEnd = { x: dragStart.x + 64, y: dragStart.y + 48 };
+    // Ends clear of Outer's edge and centre lines, so snapping cannot pull it.
+    const dragEnd = { x: dragStart.x + 80, y: dragStart.y + 56 };
 
     await page.mouse.move(dragStart.x, dragStart.y);
     await page.mouse.down();
@@ -711,7 +793,7 @@ test.describe("click selects the container on the board surface, not the deep ch
     await expect
       .poll(() => app.selectedLayers(), {
         message:
-          "a plain click on the board selects the top-level container, not the deep child (screens select the deep child, PR #5644)",
+          "a plain click on the board selects the top-level container, not the deep child",
       })
       .toEqual(["Card"]);
   });
@@ -935,8 +1017,7 @@ test.describe("marquee semantics", () => {
     expectOnlyChanged(before, await app.savedNodes(id), []);
   });
 
-  // fixme: product bug: Cmd+marquee selects an ancestor together with its descendants: Layers shows [Card, Kid B, Kid A], inspector '3 selected'. The bridge's
-  test.fixme("cmd+marquee over Card reaches into Kid A and Kid B", async ({
+  test("cmd+marquee over Card reaches into Kid A and Kid B", async ({
     app,
     page,
   }) => {
@@ -1109,7 +1190,10 @@ async function selectAlphaButton(app: App) {
     alpha.y + alpha.height / 2,
     "index.html",
   );
+  // Cmd+click reaches a nested layer; a plain click takes the top-level one.
+  await app.page.keyboard.down("ControlOrMeta");
   await app.page.mouse.click(center.x, center.y);
+  await app.page.keyboard.up("ControlOrMeta");
   await expect
     .poll(() => app.selectedLayers(), {
       message: "precondition: the click selects the nested Alpha Button",

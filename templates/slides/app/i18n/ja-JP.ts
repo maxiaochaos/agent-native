@@ -2,6 +2,33 @@ import { creativeContextMessagesByLocale } from "@agent-native/creative-context/
 
 const messages = {
   composer: { menu: { integrations: "連携" } },
+  appMenu: {
+    label: "アプリメニュー",
+    actions: "アクション…",
+    backToDashboard: "ダッシュボードに戻る",
+    file: "ファイル",
+    edit: "編集",
+    view: "表示",
+    preferences: "環境設定",
+    help: "ヘルプ",
+    importFile: "ファイルをインポート…",
+    export: "エクスポート…",
+    saveLocalCopy: "ローカルコピーを保存…",
+    versionHistory: "バージョン履歴",
+    duplicateSelection: "選択項目を複製",
+    deleteSelection: "選択項目を削除",
+    zoomIn: "拡大",
+    zoomOut: "縮小",
+    previousSlide: "前のスライド",
+    nextSlide: "次のスライド",
+    appearance: "外観…",
+    themeLight: "ライト",
+    themeDark: "ダーク",
+    themeSystem: "システム",
+    documentation: "ドキュメント",
+    whatsNew: "新機能",
+    sendFeedback: "フィードバックを送信…",
+  },
   templatesPage: {
     actions: "{{title}} のテンプレート操作",
     previewAction: "プレビュー",
@@ -110,7 +137,7 @@ const messages = {
     openChat: "チャットを開く",
     cloudAuthToken: "認証トークン",
     cloudSetupSteps: "設定手順",
-    cloudConnectedReloading: "接続しました。再読み込み中...",
+    cloudConnectedReloading: "再読み込み中...",
     cloudConnectionFailed: "接続に失敗しました",
     cloudTestConnect: "テストして接続",
     cloudServerlessPostgres: "サーバーレスPostgres",
@@ -220,6 +247,59 @@ const messages = {
       "Builderの{{plan}}プランでデザインシステムを{{current}}/{{max}}件使用しています。アップグレードして新しく作成してください。",
     tierLimitUpgrade: "プランをアップグレード",
   },
+  floatingToolbar: {
+    label: "スライドツール",
+    move: "移動",
+    moveMenu: "移動ツール",
+    hand: "手のひらツール",
+    scale: "拡大縮小",
+    insert: "挿入",
+    insertMenu: "挿入メニュー",
+    text: "テキスト",
+    line: "線",
+    arrow: "矢印",
+    square: "正方形",
+    ellipse: "楕円",
+    triangle: "三角形",
+    media: "画像/動画…",
+    mediaNeedsStorage:
+      "画像や動画をアップロードするには、ストレージを設定してください。",
+    transitions: "トランジション",
+    transitionsMenu: "トランジションのオプション",
+    transitionsReadOnly: "このデッキは読み取り専用です。",
+    transitionsNeedElement: "トランジションを追加する要素を選択してください。",
+    transitionNone: "なし",
+    transitionAppear: "出現",
+    transitionFade: "フェード",
+    transitionSlide: "スライド",
+    transitionZoom: "ズーム",
+    comment: "コメント",
+    commentMenu: "コメントのオプション",
+    comments: "コメント",
+    annotate: "注釈",
+    agent: "エージェント",
+    agentMenu: "エージェントのオプション",
+    agentUnavailable:
+      "エージェントチャットに接続できませんでした。もう一度お試しください。",
+    inspiration: "インスピレーション",
+    tightenTone: "トーンを引き締める",
+    polish: "仕上げ",
+    speakerNotes: "スピーカーノート",
+    speakerNotesMenu: "スピーカーノートのオプション",
+    writeScript: "スクリプトを作成",
+    summarizeKeyPoints: "要点を要約",
+    expandDetail: "詳細を追加",
+    addTimingCues: "タイミングの指示を追加",
+  },
+  speakerNotesPanel: {
+    title: "スピーカーノート",
+    resize: "スピーカーノートのサイズを変更",
+    generate: "ノートを生成",
+    rewrite: "ノートを書き直す",
+    close: "スピーカーノートを閉じる",
+    placeholder:
+      "入力を始めるか、エージェントでスピーカーノートをすばやく生成しましょう",
+  },
   editorToolbar: {
     layoutTitle: "タイトル",
     layoutSection: "セクション区切り",
@@ -297,6 +377,9 @@ const messages = {
     elementAnimations: "要素アニメーション",
     layers: "レイヤー",
     closeLayers: "レイヤーパネルを閉じる",
+    searchLayers: "レイヤーを検索",
+    resizeLayers: "レイヤーパネルの高さを調整",
+    resizeSlideList: "スライド一覧の幅を調整",
     expandLayer: "レイヤーを展開",
     collapseLayer: "レイヤーを折りたたむ",
     tweaks: "調整",
@@ -308,7 +391,8 @@ const messages = {
     shapeArrow: "矢印",
     shapeTriangle: "三角形",
     shapeLine: "線",
-    pinComments: "コメントをピン留め",
+    shapeStar: "星",
+    shapePolygon: "多角形",
     undo: "元に戻す",
     undoWithShortcut: "元に戻す ({{shortcut}})",
     redo: "やり直す",
@@ -320,9 +404,18 @@ const messages = {
     editorLinkDescription:
       "デッキをエディターで開きます。アクセス権を持つ人はこのリンクを使用できます。",
     presentationLink: "プレゼンテーションリンク",
-    presentationLinkDescription:
-      "全画面プレゼンテーションモードで直接開きます。",
+    presentationLinkDescription: "デッキをプレゼンテーションモードで開きます",
     present: "発表",
+    presentInTab: "このタブで",
+    presentFullScreen: "全画面表示",
+    presentPresenterView: "発表者ビュー",
+    presentPresenterViewDescription: "発表中にスピーカーノートを表示",
+    presenterViewBlocked:
+      "発表者ビューを開くには、ポップアップを許可してください。",
+    export: "エクスポート",
+    privacyPrivate: "非公開",
+    privacyOrg: "組織と共有",
+    privacyPublic: "公開",
     more: "その他",
     importing: "インポート中...",
     importFile: "ファイルをインポート",
@@ -370,6 +463,8 @@ const messages = {
     shareWithTeam: "チームと共有...",
     publicShareLink: "公開共有リンク...",
     downloadHtml: "HTML としてダウンロード",
+    downloadPdf: "PDF としてダウンロード",
+    downloadPptx: "PPTX としてダウンロード",
     exportPdf: "PDF としてエクスポート",
     exportPptx: "PPTX としてエクスポート",
     connectGoogle: "Google に接続",
@@ -405,6 +500,9 @@ const messages = {
     openSharedLink: "共有リンクを開く",
     anyoneWithLink:
       "このリンクを持つ人は誰でもこのプレゼンテーションを表示できます。",
+    connectSlides: "Slides を接続",
+    otherAgents: "その他のエージェント",
+    whoHasAccess: "アクセスできる人",
   },
   slideTextMenu: {
     brandColors: "ブランドカラー",
@@ -491,6 +589,35 @@ const messages = {
     goToSlide: "スライドに移動",
     search: "コメントを検索",
     searchPlaceholder: "すべてのコメントを検索...",
+  },
+  contextToolbar: {
+    insert: "挿入",
+    insertText: "テキスト",
+    insertMedia: "画像/動画…",
+    order: "重なり順",
+    listStyle: "リストスタイル",
+    removeFormatting: "書式をクリア",
+    lockAspectRatio: "縦横比を固定",
+    zoom: "ズーム",
+    objectsSelected_one: "{{count}} 個のオブジェクトを選択中",
+    objectsSelected_other: "{{count}} 個のオブジェクトを選択中",
+    bold: "太字",
+    strikethrough: "取り消し線",
+    code: "コード",
+    link: "リンク",
+    applyLink: "適用",
+    lineHeight: "行の高さ",
+    replaceImage: "置き換え",
+    fit: "フィット",
+    fitCover: "塗りつぶし",
+    fitContain: "フィット",
+    editWithAgent: "エージェントで編集",
+    tightenTone: "トーンを引き締める",
+    polish: "推敲する",
+    translate: "翻訳",
+    makeMoreVisual: "より視覚的にする",
+    generateImage: "画像を生成",
+    removeBackground: "背景を削除",
   },
   styleInspector: {
     title: "Style",
@@ -610,6 +737,8 @@ const messages = {
     addTransition: "トランジションを追加",
     effect: "効果",
     onClick: "クリック時",
+    withPrevious: "直前と同時",
+    trigger: "開始",
     byParagraph: "段落ごと",
     expand: "トランジションを展開",
     collapse: "トランジションを折りたたむ",
@@ -690,6 +819,10 @@ const messages = {
     duplicateCurrentSlide: "复制当前幻灯片",
     promptPlaceholder: "描述你想要的幻灯片...",
     newSlide: "新しいスライド",
+    slidesHeading: "スライド",
+    emptyTitle: "スライドはまだありません",
+    emptyDescription:
+      "新しいスライドを追加またはインポートするか、エージェントに生成を依頼してください。",
     closeAddSlides: "閉じる",
     describeThisSlide: "このスライドを説明してください",
     cut: "切り取り",
@@ -710,6 +843,17 @@ const messages = {
     noSlides: "没有可演示的幻灯片",
     previousSlide: "上一张幻灯片",
     nextSlide: "下一张幻灯片",
+    voiceNavigation: "音声ナビゲーション",
+    voiceNavigationNextCommand: "次のスライド",
+    voiceNavigationPreviousCommand: "前のスライド",
+    voiceNavigationHint:
+      "「{{next}}」または「{{previous}}」と言うと移動します。",
+    voiceNavigationListening:
+      "「{{next}}」または「{{previous}}」を聞き取っています。",
+    voiceNavigationUnavailable:
+      "このブラウザーでは音声ナビゲーションを利用できません。",
+    voiceNavigationError:
+      "音声ナビゲーションが停止しました。マイクの権限と接続を確認して、もう一度お試しください。",
     exitPresentation: "退出演示",
     enterFullscreen: "进入全屏",
     clickToEnterFullscreen: "点击进入全屏",
@@ -801,6 +945,8 @@ const messages = {
       "スライドを作成できませんでした。チャットで詳細を確認して、もう一度お試しください。",
     generationOutcomeUnresolved:
       "スライドが作成されたか確認できません。再試行する前にデッキを確認してください。",
+    generationOutcomeUnresolvedWithSlides:
+      "スライドの作成が完了したか確認できませんでした。続行する前に、ここに表示されているスライドを確認してください。",
     partialGenerationFailed:
       "スライドを最後まで作成できませんでした。続ける前に、作成済みのスライドと最初のリクエストを確認してください。",
     originalPrompt: "入力した内容",
@@ -823,6 +969,10 @@ const messages = {
     leaveWithoutSaving: "保存せずに終了",
     editorMarkupNotSaved:
       "この編集は、スライドにエディターのマークアップが追加されるため保存されませんでした。",
+    historyStepConflict:
+      "現在のプレゼンテーションと競合するため、この履歴ステップはスキップされました。",
+    historyStepFailed:
+      "この履歴操作は適用できなかったため、スキップされました。",
     textEditConflictNotSaved:
       "同じテキストが同時に別の場所で変更されたため、テキストの編集は保存されませんでした。",
   },
@@ -914,10 +1064,154 @@ const messages = {
     chooseAnotherFile: "別のファイルを選択",
   },
   home: {
-    fallbackSuggestions: {
-      pitch: "製品のピッチ資料を作成",
-      roadmap: "製品ロードマップを作成",
-      explainer: "プレゼンでテーマを説明",
+    nextStepBar: {
+      ariaLabel: "最初のプレゼンテーションの次のステップ",
+      refineWithPrompt: "プロンプトで調整",
+      export: "エクスポート",
+      shareLink: "リンクを共有",
+      dismiss: "閉じる",
+    },
+    suggestionPrompts: {
+      product: {
+        launch:
+          "顧客の課題、主なメリット、発売計画をまとめ、自信と顧客重視が伝わる製品ローンチ資料を作成してください。",
+        roadmap:
+          "戦略テーマ、マイルストーン、依存関係を整理した、明快な経営層向け四半期ロードマップを作成してください。",
+        opportunity:
+          "市場背景、顧客の課題、解決策、リスクを示し、決断力のある製品視点で機会分析を作成してください。",
+        priorities:
+          "ユーザーへの影響、工数、根拠、トレードオフを比較し、判断しやすい簡潔な機能優先度資料を作成してください。",
+        metrics:
+          "利用、アクティベーション、継続率、洞察をまとめた、率直で分析的な製品指標レビューを作成してください。",
+        discovery:
+          "調査テーマ、重要な引用、未充足ニーズをまとめた、根拠に基づく共感的な顧客調査報告を作成してください。",
+        vision:
+          "目指す未来、原則、製品への投資案を描いた、実践的で人を鼓舞する製品ビジョン資料を作成してください。",
+        release:
+          "目標、成果、顧客の声、未解決事項を整理した、責任感と学びを重視するリリースレビューを作成してください。",
+      },
+      design: {
+        caseStudy:
+          "依頼内容、制作プロセス、主要画面、成果をまとめた、温かみのある編集調のデザイン事例を作成してください。",
+        system:
+          "色、書体、コンポーネント、使用例を示した、端正で視覚的なデザインシステム紹介を作成してください。",
+        critique:
+          "目標、現状の画面、フィードバック、次の手順をまとめた、建設的なデザインレビューを作成してください。",
+        research:
+          "調査背景、傾向、引用、機会をまとめた、共感を大切にするユーザー調査報告を作成してください。",
+        concepts:
+          "3つのビジュアル案、画面例、選択の利点と欠点を示した、遊び心のあるコンセプト資料を作成してください。",
+        accessibility:
+          "主な障壁、注釈付きの例、改善策を示した、明快で包摂的なアクセシビリティレビューを作成してください。",
+        brand:
+          "対象者、ビジュアル参考、色、書体をまとめた、個性が伝わるブランド方針資料を作成してください。",
+        sprint:
+          "課題、アイデア、プロトタイプ、テスト結果を振り返る、前向きなデザインスプリント報告を作成してください。",
+      },
+      developer: {
+        architecture:
+          "コンポーネント、データの流れ、設計上の選択を示した、正確で技術的なシステム構成資料を作成してください。",
+        api: "セットアップ、認証、例、エラー対応をまとめた、開発者にわかりやすいAPI入門ガイドを作成してください。",
+        release:
+          "範囲、節目、依存関係、展開手順をまとめた、実用的なエンジニアリングリリース計画を作成してください。",
+        incident:
+          "影響、時系列、根本原因、対策を整理した、個人を責めないインシデントレビューを作成してください。",
+        migration:
+          "現状、段階、リスク、検証方法を示した、安心感のあるプラットフォーム移行計画を作成してください。",
+        security:
+          "システム境界、脅威、対策、課題をまとめた、率直で技術的なセキュリティレビューを作成してください。",
+        demo: "課題、構成、ライブでの操作、結果を示した、明快な技術デモ資料を作成してください。",
+        metrics:
+          "デリバリー、信頼性、傾向をまとめた、率直なエンジニアリング指標レビューを作成してください。",
+      },
+      marketing: {
+        campaign:
+          "対象者、メッセージ、チャネル、日程をまとめた、活気のあるキャンペーン開始資料を作成してください。",
+        story:
+          "課題、解決策、成果、根拠を紹介する、人間味のある顧客事例を作成してください。",
+        content:
+          "読者のニーズ、テーマ、形式、予定を整理した、編集方針が伝わるコンテンツ戦略を作成してください。",
+        positioning:
+          "対象者、カテゴリー、約束、根拠を示した、個性のあるブランドポジショニング資料を作成してください。",
+        channels:
+          "リーチ、反応、コンバージョン、学びをまとめた、明快なチャネル成果レビューを作成してください。",
+        messaging:
+          "対象者、利点、根拠、例を示した、説得力のある製品メッセージ資料を作成してください。",
+        event:
+          "対象者、見どころ、日程、チャネルを紹介する、親しみやすいイベント告知計画を作成してください。",
+        competition:
+          "代替案、強み、課題、機会を比較した、公平な競合状況資料を作成してください。",
+      },
+      sales: {
+        pitch:
+          "顧客の目標、解決策、成果、実績を示した、自信のある顧客向け提案資料を作成してください。",
+        proposal:
+          "ニーズ、進め方、日程、投資額をまとめた、顧客重視で明快な提案資料を作成してください。",
+        quarterlyReview:
+          "目標、成果、利用状況、次の手順をまとめた、協力的な四半期ビジネスレビューを作成してください。",
+        discovery:
+          "顧客の優先事項、課題、適合度を整理した、相手の話を大切にする調査報告を作成してください。",
+        objections:
+          "よくある懸念、根拠、回答をまとめた、役立つ異議対応ガイドを作成してください。",
+        demo: "顧客の背景、主な操作、成果を結び付けた、簡潔で説得力のある製品デモ資料を作成してください。",
+        renewal:
+          "提供した価値、利用状況、機会をまとめた、パートナーシップを大切にする更新提案を作成してください。",
+        enablement:
+          "理想の顧客、見極め方、会話例をまとめた、実用的な営業支援資料を作成してください。",
+      },
+      ops: {
+        weeklyReview:
+          "目標、指標、障害、担当者をまとめた、落ち着いて率直な週次オペレーションレビューを作成してください。",
+        process:
+          "現在の手順、問題点、目標の流れを示した、実践的な業務改善資料を作成してください。",
+        capacity:
+          "需要、チームの稼働状況、優先事項、シナリオを示した、透明性のあるキャパシティ計画を作成してください。",
+        service:
+          "件数、応答時間、エスカレーション、改善策をまとめた、責任感のあるサービス評価を作成してください。",
+        vendor:
+          "要件、選択肢、費用、リスクを比較した、バランスの取れた判断資料を作成してください。",
+        metrics:
+          "主要指標、傾向、例外を強調した、簡潔で分析的な運用ダッシュボード資料を作成してください。",
+        onboarding:
+          "段階、引き継ぎ、資料、成功指標を示した、支援的なオンボーディング手順を作成してください。",
+        risk: "可能性、影響、軽減策、担当者を整理した、慎重なリスクレビューを作成してください。",
+      },
+      individual: {
+        project:
+          "目標、節目、リソース、リスクをまとめた、意欲を高める個人プロジェクト計画を作成してください。",
+        portfolio:
+          "選んだ作品、制作過程、成果を紹介する、自信のある編集調のポートフォリオ資料を作成してください。",
+        learning:
+          "スキル、教材、練習、節目を整理した、励みになる学習ロードマップを作成してください。",
+        event:
+          "目的、参加者、予定、詳細をまとめた、温かく親しみやすい集まりの計画を作成してください。",
+        budget:
+          "収入、支出、目標、選択肢をまとめた、落ち着いて実用的な個人予算レビューを作成してください。",
+        travel:
+          "行き先、日ごとの見どころ、移動情報をまとめた、魅力的な旅行日程を作成してください。",
+        community:
+          "テーマ、活動、持ち帰れる学びを紹介する、包摂的な地域ワークショップ資料を作成してください。",
+        personalStory:
+          "経歴、関心、仕事を紹介する、自然で会話のような自己紹介資料を作成してください。",
+      },
+      general: {
+        overview:
+          "背景、主な考え、例を紹介する、親しみやすいテーマ概要を作成してください。",
+        fundraiser:
+          "使命、必要性、成果を伝える、希望のある寄付募集資料を作成してください。",
+        lesson:
+          "学習目標、重要な概念、例をまとめた、参加したくなる短い授業資料を作成してください。",
+        research:
+          "問い、方法、発見、意味を整理した、バランスの取れた調査報告を作成してください。",
+        eventProposal:
+          "目的、対象者、形式、予算をまとめた、魅力的なイベント企画書を作成してください。",
+        teamStrategy:
+          "優先事項、指標、取り組みをまとめた、集中力のあるチーム戦略資料を作成してください。",
+        howTo:
+          "明確な手順と役立つ例を示した、励みになるビジュアルガイドを作成してください。",
+        portfolioIntro:
+          "選んだプロジェクトと強みを紹介する、洗練されたポートフォリオ導入資料を作成してください。",
+      },
     },
     suggestedPrompts: "おすすめのプロンプト",
     importMenu: {
@@ -1136,6 +1430,89 @@ const messages = {
     emptyTitle: "まだデッキがありません",
     createFirstDeck: "最初のデッキを作成",
     emptyDescription: "AI 生成で美しいプレゼンテーションを作成できます。",
+
+    suggestionLabels: {
+      product: {
+        launch: "顧客の課題、主なメリット",
+        roadmap: "戦略テーマ、マイルストーン",
+        opportunity: "市場背景、顧客の課題",
+        priorities: "ユーザーへの影響、工数",
+        metrics: "利用、アクティベーション",
+        discovery: "調査テーマ、重要な引用",
+        vision: "目指す未来、原則",
+        release: "目標、成果",
+      },
+      design: {
+        caseStudy: "依頼内容、制作プロセス",
+        system: "色、書体",
+        critique: "目標、現状の画面",
+        research: "調査背景、傾向",
+        concepts: "3つのビジュアル案、画面例",
+        accessibility: "主な障壁、注釈付きの例",
+        brand: "対象者、ビジュアル参考",
+        sprint: "課題、アイデア",
+      },
+      developer: {
+        architecture: "コンポーネント、データの流れ",
+        api: "セットアップ、認証",
+        release: "範囲、節目",
+        incident: "影響、時系列",
+        migration: "現状、段階",
+        security: "システム境界、脅威",
+        demo: "課題、構成",
+        metrics: "デリバリー、信頼性",
+      },
+      marketing: {
+        campaign: "対象者、メッセージ",
+        story: "課題、解決策",
+        content: "読者のニーズ、テーマ",
+        positioning: "対象者、カテゴリー",
+        channels: "リーチ、反応",
+        messaging: "対象者、利点",
+        event: "対象者、見どころ",
+        competition: "代替案、強み",
+      },
+      sales: {
+        pitch: "顧客の目標、解決策",
+        proposal: "ニーズ、進め方",
+        quarterlyReview: "目標、成果",
+        discovery: "顧客の優先事項、課題",
+        objections: "よくある懸念、根拠",
+        demo: "顧客の背景、主な操作",
+        renewal: "提供した価値、利用状況",
+        enablement: "理想の顧客、見極め方",
+      },
+      ops: {
+        weeklyReview: "目標、指標",
+        process: "現在の手順、問題点",
+        capacity: "需要、チームの稼働状況",
+        service: "件数、応答時間",
+        vendor: "要件、選択肢",
+        metrics: "主要指標、傾向",
+        onboarding: "段階、引き継ぎ",
+        risk: "可能性、影響",
+      },
+      individual: {
+        project: "目標、節目",
+        portfolio: "選んだ作品、制作過程",
+        learning: "スキル、教材",
+        event: "目的、参加者",
+        budget: "収入、支出",
+        travel: "行き先、日ごとの見どころ",
+        community: "テーマ、活動",
+        personalStory: "経歴、関心",
+      },
+      general: {
+        overview: "背景、主な考え",
+        fundraiser: "使命、必要性",
+        lesson: "学習目標、重要な概念",
+        research: "問い、方法",
+        eventProposal: "目的、対象者",
+        teamStrategy: "優先事項、指標",
+        howTo: "明確な手順と役立つ例",
+        portfolioIntro: "ポートフォリオ紹介",
+      },
+    },
   },
   agentChat: {
     setup: {

@@ -2,6 +2,33 @@ import { creativeContextMessagesByLocale } from "@agent-native/creative-context/
 
 const messages = {
   composer: { menu: { integrations: "연동" } },
+  appMenu: {
+    label: "앱 메뉴",
+    actions: "작업…",
+    backToDashboard: "대시보드로 돌아가기",
+    file: "파일",
+    edit: "편집",
+    view: "보기",
+    preferences: "환경설정",
+    help: "도움말",
+    importFile: "파일 가져오기…",
+    export: "내보내기…",
+    saveLocalCopy: "로컬 사본 저장…",
+    versionHistory: "버전 기록",
+    duplicateSelection: "선택 항목 복제",
+    deleteSelection: "선택 항목 삭제",
+    zoomIn: "확대",
+    zoomOut: "축소",
+    previousSlide: "이전 슬라이드",
+    nextSlide: "다음 슬라이드",
+    appearance: "모양…",
+    themeLight: "라이트",
+    themeDark: "다크",
+    themeSystem: "시스템",
+    documentation: "문서",
+    whatsNew: "새로운 기능",
+    sendFeedback: "피드백 보내기…",
+  },
   templatesPage: {
     actions: "{{title}} 템플릿 작업",
     previewAction: "미리보기",
@@ -109,7 +136,7 @@ const messages = {
     openChat: "채팅 열기",
     cloudAuthToken: "인증 토큰",
     cloudSetupSteps: "설정 단계",
-    cloudConnectedReloading: "연결되었습니다. 다시 불러오는 중...",
+    cloudConnectedReloading: "다시 불러오는 중...",
     cloudConnectionFailed: "연결 실패",
     cloudTestConnect: "테스트 후 연결",
     cloudServerlessPostgres: "서버리스 Postgres",
@@ -219,6 +246,57 @@ const messages = {
       "Builder {{plan}} 플랜에서 디자인 시스템을 {{current}}/{{max}}개 사용 중입니다. 업그레이드하여 새로 만드세요.",
     tierLimitUpgrade: "Builder 플랜 업그레이드",
   },
+  floatingToolbar: {
+    label: "슬라이드 도구",
+    move: "이동",
+    moveMenu: "이동 도구",
+    hand: "손 도구",
+    scale: "크기 조정",
+    insert: "삽입",
+    insertMenu: "삽입 메뉴",
+    text: "텍스트",
+    line: "선",
+    arrow: "화살표",
+    square: "정사각형",
+    ellipse: "타원",
+    triangle: "삼각형",
+    media: "이미지/동영상…",
+    mediaNeedsStorage: "이미지와 동영상을 업로드하려면 저장소를 설정하세요.",
+    transitions: "전환",
+    transitionsMenu: "전환 옵션",
+    transitionsReadOnly: "이 덱은 읽기 전용입니다.",
+    transitionsNeedElement: "전환을 추가할 요소를 선택하세요.",
+    transitionNone: "없음",
+    transitionAppear: "나타나기",
+    transitionFade: "페이드",
+    transitionSlide: "슬라이드",
+    transitionZoom: "확대/축소",
+    comment: "댓글",
+    commentMenu: "댓글 옵션",
+    comments: "댓글",
+    annotate: "주석",
+    agent: "에이전트",
+    agentMenu: "에이전트 옵션",
+    agentUnavailable: "에이전트 채팅에 연결할 수 없습니다. 다시 시도하세요.",
+    inspiration: "영감",
+    tightenTone: "어조 다듬기",
+    polish: "다듬기",
+    speakerNotes: "발표자 노트",
+    speakerNotesMenu: "발표자 노트 옵션",
+    writeScript: "스크립트 작성",
+    summarizeKeyPoints: "핵심 요약",
+    expandDetail: "상세 내용 확장",
+    addTimingCues: "타이밍 표시 추가",
+  },
+  speakerNotesPanel: {
+    title: "발표자 노트",
+    resize: "발표자 노트 크기 조절",
+    generate: "노트 생성",
+    rewrite: "노트 다시 쓰기",
+    close: "발표자 노트 닫기",
+    placeholder:
+      "직접 작성하거나 에이전트로 발표자 노트를 빠르게 생성해 보세요",
+  },
   editorToolbar: {
     layoutTitle: "제목",
     layoutSection: "섹션 구분",
@@ -296,6 +374,9 @@ const messages = {
     elementAnimations: "요소 애니메이션",
     layers: "레이어",
     closeLayers: "레이어 패널 닫기",
+    searchLayers: "레이어 검색",
+    resizeLayers: "레이어 패널 크기 조절",
+    resizeSlideList: "슬라이드 목록 너비 조절",
     expandLayer: "레이어 펼치기",
     collapseLayer: "레이어 접기",
     tweaks: "조정",
@@ -307,7 +388,8 @@ const messages = {
     shapeArrow: "화살표",
     shapeTriangle: "삼각형",
     shapeLine: "선",
-    pinComments: "댓글 고정",
+    shapeStar: "별",
+    shapePolygon: "다각형",
     undo: "실행 취소",
     undoWithShortcut: "실행 취소 ({{shortcut}})",
     redo: "다시 실행",
@@ -319,8 +401,17 @@ const messages = {
     editorLinkDescription:
       "편집기에서 덱을 엽니다. 접근 권한이 있는 누구나 이 링크를 사용할 수 있습니다.",
     presentationLink: "프레젠테이션 링크",
-    presentationLinkDescription: "전체 화면 프레젠테이션 모드로 바로 엽니다.",
+    presentationLinkDescription: "덱을 프레젠테이션 모드로 엽니다",
     present: "발표",
+    presentInTab: "이 탭에서",
+    presentFullScreen: "전체 화면",
+    presentPresenterView: "발표자 보기",
+    presentPresenterViewDescription: "발표하는 동안 발표자 노트 보기",
+    presenterViewBlocked: "발표자 보기를 열려면 팝업을 허용하세요.",
+    export: "내보내기",
+    privacyPrivate: "비공개",
+    privacyOrg: "조직과 공유됨",
+    privacyPublic: "공개",
     more: "더 보기",
     importing: "가져오는 중...",
     importFile: "파일 가져오기",
@@ -367,6 +458,8 @@ const messages = {
     shareWithTeam: "팀과 공유...",
     publicShareLink: "공개 공유 링크...",
     downloadHtml: "HTML로 다운로드",
+    downloadPdf: "PDF로 다운로드",
+    downloadPptx: "PPTX로 다운로드",
     exportPdf: "PDF로 내보내기",
     exportPptx: "PPTX로 내보내기",
     connectGoogle: "Google 연결",
@@ -401,6 +494,9 @@ const messages = {
     openSharedLink: "공유 링크 열기",
     anyoneWithLink:
       "이 링크가 있는 사람은 누구나 이 프레젠테이션을 볼 수 있습니다.",
+    connectSlides: "Slides 연결",
+    otherAgents: "다른 에이전트",
+    whoHasAccess: "접근 권한이 있는 사람",
   },
   slideTextMenu: {
     brandColors: "브랜드 색상",
@@ -487,6 +583,35 @@ const messages = {
     goToSlide: "슬라이드로 이동",
     search: "댓글 검색",
     searchPlaceholder: "모든 댓글 검색...",
+  },
+  contextToolbar: {
+    insert: "삽입",
+    insertText: "텍스트",
+    insertMedia: "이미지/동영상…",
+    order: "순서",
+    listStyle: "목록 스타일",
+    removeFormatting: "서식 지우기",
+    lockAspectRatio: "가로세로 비율 잠금",
+    zoom: "확대/축소",
+    objectsSelected_one: "개체 {{count}}개 선택됨",
+    objectsSelected_other: "개체 {{count}}개 선택됨",
+    bold: "굵게",
+    strikethrough: "취소선",
+    code: "코드",
+    link: "링크",
+    applyLink: "적용",
+    lineHeight: "줄 간격",
+    replaceImage: "바꾸기",
+    fit: "맞춤",
+    fitCover: "채우기",
+    fitContain: "맞춤",
+    editWithAgent: "에이전트로 편집",
+    tightenTone: "톤 간결하게",
+    polish: "다듬기",
+    translate: "번역",
+    makeMoreVisual: "더 시각적으로",
+    generateImage: "이미지 생성",
+    removeBackground: "배경 제거",
   },
   styleInspector: {
     title: "Style",
@@ -605,6 +730,8 @@ const messages = {
     addTransition: "전환 추가",
     effect: "효과",
     onClick: "클릭 시",
+    withPrevious: "이전과 함께",
+    trigger: "시작",
     byParagraph: "단락별",
     expand: "전환 펼치기",
     collapse: "전환 접기",
@@ -684,6 +811,10 @@ const messages = {
     duplicateCurrentSlide: "复制当前幻灯片",
     promptPlaceholder: "描述你想要的幻灯片...",
     newSlide: "새 슬라이드",
+    slidesHeading: "슬라이드",
+    emptyTitle: "아직 슬라이드가 없습니다",
+    emptyDescription:
+      "새 슬라이드를 추가하거나 가져오거나, 에이전트에게 생성을 요청하세요.",
     closeAddSlides: "닫기",
     describeThisSlide: "이 슬라이드를 설명하세요",
     cut: "잘라내기",
@@ -704,6 +835,16 @@ const messages = {
     noSlides: "没有可演示的幻灯片",
     previousSlide: "上一张幻灯片",
     nextSlide: "下一张幻灯片",
+    voiceNavigation: "음성 탐색",
+    voiceNavigationNextCommand: "다음 슬라이드",
+    voiceNavigationPreviousCommand: "이전 슬라이드",
+    voiceNavigationHint:
+      "탐색하려면 “{{next}}” 또는 “{{previous}}”라고 말하세요.",
+    voiceNavigationListening: "“{{next}}” 또는 “{{previous}}”를 듣고 있습니다.",
+    voiceNavigationUnavailable:
+      "이 브라우저에서는 음성 탐색을 사용할 수 없습니다.",
+    voiceNavigationError:
+      "음성 탐색이 중지되었습니다. 마이크 권한과 연결을 확인한 후 다시 시도해 주세요.",
     exitPresentation: "退出演示",
     enterFullscreen: "进入全屏",
     clickToEnterFullscreen: "点击进入全屏",
@@ -794,6 +935,8 @@ const messages = {
       "슬라이드를 만들지 못했습니다. 채팅에서 세부 정보를 확인한 뒤 다시 시도하세요.",
     generationOutcomeUnresolved:
       "슬라이드가 만들어졌는지 확인할 수 없습니다. 다시 시도하기 전에 덱을 확인하세요.",
+    generationOutcomeUnresolvedWithSlides:
+      "슬라이드 생성이 완료되었는지 확인할 수 없습니다. 계속하기 전에 여기에 표시된 슬라이드를 확인하세요.",
     partialGenerationFailed:
       "슬라이드 만들기를 완료하지 못했어요. 계속하기 전에 이미 만들어진 슬라이드와 처음 요청한 내용을 확인해 주세요.",
     originalPrompt: "요청하신 내용",
@@ -816,6 +959,9 @@ const messages = {
     leaveWithoutSaving: "저장하지 않고 나가기",
     editorMarkupNotSaved:
       "이 편집은 슬라이드에 편집기 마크업이 추가되므로 저장되지 않았습니다.",
+    historyStepConflict:
+      "현재 프레젠테이션과 충돌하여 이 기록 단계를 건너뛰었습니다.",
+    historyStepFailed: "이 기록 단계는 적용할 수 없어 건너뛰었습니다.",
     textEditConflictNotSaved:
       "같은 텍스트가 동시에 다른 곳에서 변경되어 텍스트 편집이 저장되지 않았습니다.",
   },
@@ -903,10 +1049,154 @@ const messages = {
     chooseAnotherFile: "다른 파일 선택",
   },
   home: {
-    fallbackSuggestions: {
-      pitch: "제품 피치 덱 만들기",
-      roadmap: "제품 로드맵 만들기",
-      explainer: "프레젠테이션으로 주제 설명하기",
+    nextStepBar: {
+      ariaLabel: "첫 프레젠테이션을 위한 다음 단계",
+      refineWithPrompt: "프롬프트로 다듬기",
+      export: "내보내기",
+      shareLink: "링크 공유",
+      dismiss: "닫기",
+    },
+    suggestionPrompts: {
+      product: {
+        launch:
+          "고객 문제, 핵심 이점, 출시 계획을 담고 고객 중심의 자신감 있는 분위기를 살린 제품 출시 발표 자료를 만드세요.",
+        roadmap:
+          "전략 주제, 주요 일정, 의존 관계를 담은 분기별 로드맵을 명확한 경영진 보고 스타일로 만드세요.",
+        opportunity:
+          "시장 상황, 고객의 불편, 해결책과 위험을 다루고 결단력 있는 제품 관점을 담은 기회 분석을 만드세요.",
+        priorities:
+          "사용자 영향, 작업량, 근거와 선택지를 비교해 의사결정에 적합한 간결한 기능 우선순위 자료를 만드세요.",
+        metrics:
+          "도입, 활성화, 유지율과 인사이트를 담고 솔직한 분석 어조를 살린 제품 지표 리뷰를 만드세요.",
+        discovery:
+          "조사 주제, 핵심 인용문, 충족되지 않은 요구를 담고 근거와 공감을 갖춘 고객 조사 보고서를 만드세요.",
+        vision:
+          "미래 모습, 원칙, 제품 투자 방향을 제시하고 실용적이면서 영감을 주는 제품 비전 자료를 만드세요.",
+        release:
+          "목표, 결과, 고객 의견과 미해결 항목을 정리하고 책임감과 배움을 강조하는 출시 회고 자료를 만드세요.",
+      },
+      design: {
+        caseStudy:
+          "요청 배경, 과정, 주요 화면과 결과를 담은 따뜻한 편집 스타일의 디자인 사례 자료를 만드세요.",
+        system:
+          "색상, 서체, 구성 요소와 사용 예시를 보여 주는 선명하고 시각적인 디자인 시스템 소개 자료를 만드세요.",
+        critique:
+          "목표, 현재 화면, 피드백 주제와 다음 단계를 담고 건설적인 분위기를 살린 디자인 리뷰를 만드세요.",
+        research:
+          "조사 배경, 패턴, 인용문과 기회를 담고 공감을 중시하는 사용자 조사 보고서를 만드세요.",
+        concepts:
+          "세 가지 시각 방향, 예시 화면과 장단점을 보여 주는 경쾌한 콘셉트 탐색 자료를 만드세요.",
+        accessibility:
+          "주요 장벽, 주석이 달린 예시와 개선안을 제시하는 명확하고 포용적인 접근성 리뷰를 만드세요.",
+        brand:
+          "대상, 시각 참고 자료, 색상과 서체를 담은 개성 있는 브랜드 방향 자료를 만드세요.",
+        sprint:
+          "과제, 아이디어, 프로토타입과 테스트 결과를 돌아보는 낙관적인 디자인 스프린트 회고 자료를 만드세요.",
+      },
+      developer: {
+        architecture:
+          "구성 요소, 데이터 흐름과 선택의 장단점을 보여 주는 정확한 시스템 아키텍처 자료를 만드세요.",
+        api: "설정, 인증, 예시와 오류 처리를 다루는 개발자 친화적인 API 시작 가이드를 만드세요.",
+        release:
+          "범위, 주요 일정, 의존 관계와 배포 단계를 정리한 실용적인 엔지니어링 출시 계획을 만드세요.",
+        incident:
+          "영향, 시간 순서, 근본 원인과 조치를 정리하고 비난 없이 개선에 집중하는 사고 회고를 만드세요.",
+        migration:
+          "현재 상태, 단계, 위험과 검증 방법을 설명하는 안심할 수 있는 플랫폼 이전 계획을 만드세요.",
+        security:
+          "시스템 경계, 위협, 통제와 공백을 다루는 직설적인 기술 보안 리뷰를 만드세요.",
+        demo: "문제, 아키텍처, 실시간 흐름과 결과를 소개하는 명확한 기술 데모 자료를 만드세요.",
+        metrics:
+          "전달 속도, 안정성과 추세를 정리한 솔직한 엔지니어링 지표 리뷰를 만드세요.",
+      },
+      marketing: {
+        campaign:
+          "대상, 메시지, 채널과 일정을 담은 활기찬 캠페인 출시 자료를 만드세요.",
+        story:
+          "과제, 해결책, 결과와 근거를 소개하는 사람 중심의 고객 사례를 만드세요.",
+        content:
+          "대상 고객의 요구, 주제, 형식과 일정을 정리한 편집 방향이 뚜렷한 콘텐츠 전략을 만드세요.",
+        positioning:
+          "대상, 카테고리, 약속과 근거를 제시하는 차별화된 브랜드 포지셔닝 자료를 만드세요.",
+        channels:
+          "도달, 참여, 전환과 교훈을 보여 주는 명확한 채널 성과 리뷰를 만드세요.",
+        messaging:
+          "대상, 이점, 근거와 예시를 담은 설득력 있는 제품 메시지 자료를 만드세요.",
+        event:
+          "대상, 주요 매력, 일정과 채널을 소개하는 친근한 행사 홍보 계획을 만드세요.",
+        competition:
+          "대안, 강점, 공백과 기회를 비교하는 균형 잡힌 경쟁 구도 자료를 만드세요.",
+      },
+      sales: {
+        pitch:
+          "고객 목표, 해결책, 결과와 근거를 중심으로 자신감 있는 고객 제안 자료를 만드세요.",
+        proposal:
+          "요구 사항, 접근 방식, 일정과 투자 내용을 담은 고객 중심의 명확한 솔루션 제안서를 만드세요.",
+        quarterlyReview:
+          "목표, 결과, 도입 현황과 다음 단계를 정리한 협력적인 분기별 비즈니스 리뷰를 만드세요.",
+        discovery:
+          "고객의 우선순위, 어려움과 적합성을 정리하고 경청하는 태도를 보여 주는 탐색 결과 자료를 만드세요.",
+        objections:
+          "흔한 우려, 근거와 답변을 정리한 유용한 이의 대응 가이드를 만드세요.",
+        demo: "고객 상황, 핵심 흐름과 결과를 연결한 간결하고 설득력 있는 제품 데모 스토리를 만드세요.",
+        renewal:
+          "제공한 가치, 사용 현황과 기회를 보여 주는 파트너십 중심의 갱신 자료를 만드세요.",
+        enablement:
+          "이상적인 구매자, 자격 판단과 대화 예시를 담은 실용적인 영업 지원 자료를 만드세요.",
+      },
+      ops: {
+        weeklyReview:
+          "목표, 지표, 장애물과 담당자를 정리한 차분하고 직접적인 주간 운영 리뷰를 만드세요.",
+        process:
+          "현재 단계, 불편 요소와 목표 흐름을 보여 주는 실용적인 프로세스 개선 자료를 만드세요.",
+        capacity:
+          "수요, 팀 가용 시간, 우선순위와 시나리오를 담은 투명한 수용량 계획을 만드세요.",
+        service:
+          "규모, 응답 시간, 상향 처리와 개선 사항을 정리한 책임감 있는 서비스 성과 리뷰를 만드세요.",
+        vendor:
+          "요구 사항, 선택지, 비용과 위험을 비교하는 균형 잡힌 공급업체 평가 자료를 만드세요.",
+        metrics:
+          "주요 지표, 추세와 예외를 강조하는 간결한 운영 대시보드 스토리를 만드세요.",
+        onboarding:
+          "단계, 인계, 자료와 성공 지표를 담은 지원 중심의 온보딩 흐름을 만드세요.",
+        risk: "가능성, 영향, 완화 방안과 담당자를 정리한 신중한 위험 리뷰를 만드세요.",
+      },
+      individual: {
+        project:
+          "목표, 주요 일정, 자원과 위험을 담은 동기 부여가 되는 개인 프로젝트 계획을 만드세요.",
+        portfolio:
+          "선별한 작업, 과정과 결과를 소개하는 자신감 있는 편집 스타일의 개인 포트폴리오 자료를 만드세요.",
+        learning:
+          "기술, 자료, 연습과 주요 일정을 정리한 격려하는 학습 로드맵을 만드세요.",
+        event:
+          "목적, 참석자, 일정과 세부 사항을 담은 따뜻하고 친근한 모임 계획을 만드세요.",
+        budget:
+          "수입, 지출, 목표와 선택지를 정리한 차분하고 실용적인 개인 예산 리뷰를 만드세요.",
+        travel:
+          "목적지, 날짜별 주요 일정과 이동 정보를 담은 매력적인 여행 일정을 만드세요.",
+        community:
+          "주제, 활동과 배울 점을 소개하는 포용적인 커뮤니티 워크숍 자료를 만드세요.",
+        personalStory:
+          "배경, 관심사와 일을 소개하는 자연스럽고 대화체의 자기소개 자료를 만드세요.",
+      },
+      general: {
+        overview:
+          "배경, 핵심 아이디어와 예시를 소개하는 친근한 주제 개요 자료를 만드세요.",
+        fundraiser:
+          "사명, 필요성과 영향을 전달하는 희망적인 비영리 모금 자료를 만드세요.",
+        lesson:
+          "학습 목표, 핵심 개념과 예시를 담은 흥미로운 짧은 수업 자료를 만드세요.",
+        research:
+          "질문, 방법, 발견과 의미를 정리한 균형 잡힌 연구 보고서를 만드세요.",
+        eventProposal:
+          "목적, 대상, 형식과 예산을 담은 매력적인 행사 제안서를 만드세요.",
+        teamStrategy:
+          "우선순위, 지표와 계획을 정리한 집중력 있는 팀 전략 자료를 만드세요.",
+        howTo:
+          "명확한 단계와 유용한 예시를 보여 주는 격려하는 시각 가이드를 만드세요.",
+        portfolioIntro:
+          "선별한 프로젝트와 강점을 소개하는 세련된 포트폴리오 도입 자료를 만드세요.",
+      },
     },
     suggestedPrompts: "추천 프롬프트",
     importMenu: {
@@ -1122,6 +1412,89 @@ const messages = {
     emptyTitle: "아직 덱이 없습니다",
     createFirstDeck: "첫 덱 만들기",
     emptyDescription: "AI 생성으로 아름다운 프레젠테이션을 만드세요.",
+
+    suggestionLabels: {
+      product: {
+        launch: "고객 문제 핵심 이점",
+        roadmap: "전략 주제 주요 일정",
+        opportunity: "시장 상황 고객의 불편",
+        priorities: "사용자 영향 작업량 근거",
+        metrics: "도입 활성화 유지율과 인사이트",
+        discovery: "조사 주제 핵심 인용문",
+        vision: "미래 모습 원칙 제품",
+        release: "목표 결과 고객 의견",
+      },
+      design: {
+        caseStudy: "요청 배경 과정 주요",
+        system: "색상 서체 구성 요소",
+        critique: "목표 현재 화면 피드백",
+        research: "조사 배경 패턴 인용문",
+        concepts: "세 가지 시각 방향",
+        accessibility: "주요 장벽 주석이 달린",
+        brand: "대상 시각 참고 자료",
+        sprint: "과제 아이디어 프로토타입과 테스트",
+      },
+      developer: {
+        architecture: "구성 요소 데이터 흐름",
+        api: "설정 인증 예시와 오류",
+        release: "범위 주요 일정 의존",
+        incident: "영향 시간 순서 근본",
+        migration: "현재 상태 단계 위험",
+        security: "시스템 경계 위협 통제",
+        demo: "문제 아키텍처 실시간 흐름",
+        metrics: "전달 속도 안정성과 추세",
+      },
+      marketing: {
+        campaign: "대상 메시지 채널과 일정",
+        story: "과제 해결책 결과와 근거",
+        content: "대상 고객의 요구 주제",
+        positioning: "대상 카테고리 약속과 근거",
+        channels: "도달 참여 전환과 교훈",
+        messaging: "대상 이점 근거와 예시",
+        event: "대상 주요 매력 일정",
+        competition: "대안 강점 공백과 기회",
+      },
+      sales: {
+        pitch: "고객 목표 해결책 결과",
+        proposal: "요구 사항 접근 방식",
+        quarterlyReview: "목표 결과 도입 현황",
+        discovery: "고객의 우선순위 어려움과 적합성",
+        objections: "흔한 우려 근거와 답변",
+        demo: "고객 상황 핵심 흐름",
+        renewal: "제공한 가치 사용 현황",
+        enablement: "이상적인 구매자 자격 판단",
+      },
+      ops: {
+        weeklyReview: "목표 지표 장애물과 담당자",
+        process: "현재 단계 불편 요소",
+        capacity: "수요 팀 가용 시간",
+        service: "규모 응답 시간 상향",
+        vendor: "요구 사항 선택지 비용",
+        metrics: "주요 지표 추세와 예외",
+        onboarding: "단계 인계 자료와 성공",
+        risk: "가능성 영향 완화 방안",
+      },
+      individual: {
+        project: "목표 주요 일정 자원",
+        portfolio: "선별한 작업 과정과 결과",
+        learning: "학습 로드맵",
+        event: "목적 참석자 일정과 세부",
+        budget: "수입 지출 목표와 선택지",
+        travel: "목적지 날짜별 주요 일정",
+        community: "주제 활동과 배울 점",
+        personalStory: "개인 소개",
+      },
+      general: {
+        overview: "배경 핵심 아이디어와 예시",
+        fundraiser: "사명과 영향",
+        lesson: "학습 목표 핵심 개념",
+        research: "질문 방법 발견과 의미",
+        eventProposal: "목적 대상 형식과 예산",
+        teamStrategy: "우선순위, 지표, 계획",
+        howTo: "명확한 단계와 유용한 예시",
+        portfolioIntro: "포트폴리오 소개",
+      },
+    },
   },
   agentChat: {
     setup: {

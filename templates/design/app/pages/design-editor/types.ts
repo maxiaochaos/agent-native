@@ -74,7 +74,7 @@ export interface DesignFile {
   filename: string;
   fileType: string;
   content: string;
-  createdAt: string;
+  createdAt: string | null;
   updatedAt: string;
 }
 
@@ -96,5 +96,6 @@ export interface DesignData {
   visibility?: "private" | "org" | "public";
   data?: string | null;
   accessRole?: DesignAccessRole;
+  canPersistSource?: boolean;
   files: DesignFile[];
 }

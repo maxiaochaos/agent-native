@@ -1,3 +1,4 @@
+import type { EngineModelGroup } from "@agent-native/core/client/agent-chat";
 import { useT } from "@agent-native/core/client/i18n";
 import { AgentMark } from "@agent-native/toolkit/app/shared";
 import { IconCheck, IconChevronDown } from "@tabler/icons-react";
@@ -24,6 +25,34 @@ export interface CommentAiSelection {
 
 export const commentAiSelectionKey = (selection: CommentAiSelection) =>
   `${selection.engine}:${selection.model}`;
+
+/**
+ * One selection per model name. With Builder.io connected, a provider key
+ * adds its own group, and the two name one model differently ("gpt-5-4",
+ * "gpt-5.4"), so ids alone can't dedupe them. The current choice wins, then
+ * its engine, then the first group listed.
+ */
+export function commentAiSelections(
+  groups: readonly Pick<EngineModelGroup, "engine" | "label" | "models">[],
+  current: { model: string; engine: string },
+): CommentAiSelection[] {
+  const rank = (selection: CommentAiSelection) =>
+    selection.engine !== current.engine
+      ? 0
+      : selection.model === current.model
+        ? 2
+        : 1;
+  const byName = new Map<string, CommentAiSelection>();
+  for (const group of groups) {
+    for (const model of group.models) {
+      const selection = { model, engine: group.engine, provider: group.label };
+      const name = modelDisplayName(model);
+      const kept = byName.get(name);
+      if (!kept || rank(selection) > rank(kept)) byName.set(name, selection);
+    }
+  }
+  return [...byName.values()];
+}
 
 /** Words a person might type after `@` to find a model, e.g. "Sonnet". */
 export function modelAliases(model: string): string[] {
@@ -94,8 +123,8 @@ export function CommentAiModelList({
 
 /**
  * Send control shown once an AI recipient is in the draft. The main segment
- * sends; the chevron picks how AI should respond. The model is chosen from
- * the recipient pill itself.
+ * sends and names the response it asks for; the chevron picks it. The model
+ * is chosen from the recipient pill itself.
  */
 export function CommentAiSendControl({
   mode,
@@ -115,6 +144,13 @@ export function CommentAiSendControl({
     ["suggest", t("comments.aiSuggestChanges")],
     ["apply-resolve", t("comments.aiApplyAndResolve")],
   ];
+  const sendLabels: Record<CommentAiMode, string> = {
+    auto: t("comments.aiSendShort"),
+    reply: t("comments.aiSendReply"),
+    suggest: t("comments.aiSendSuggest"),
+    "apply-resolve": t("comments.aiSendApply"),
+  };
+  const modeLabel = modes.find(([value]) => value === mode)?.[1];
   const segment =
     "inline-flex h-7 items-center bg-foreground text-background transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 disabled:pointer-events-none disabled:opacity-35";
   return (
@@ -127,11 +163,16 @@ export function CommentAiSendControl({
         )}
         disabled={disabled}
         onClick={onSubmit}
-        aria-label={t("comments.aiSend")}
+        aria-label={
+          mode === "auto" || !modeLabel
+            ? t("comments.aiSend")
+            : t("comments.aiSendMode", { mode: modeLabel })
+        }
         data-comment-send
+        data-comment-ai-send-mode={mode}
       >
         <AgentMark size={14} />
-        {t("comments.aiSendShort")}
+        {sendLabels[mode]}
       </button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>

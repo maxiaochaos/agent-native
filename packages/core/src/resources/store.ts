@@ -1,12 +1,15 @@
 import crypto from "crypto";
 
-import { getDbExec, type DbExec } from "../db/client.js";
+import { getDbExec, type DbExec, type DbExecStatement } from "../db/client.js";
 import {
   ensureColumnExists,
   ensureIndexExists,
   ensureTableExists,
 } from "../db/ddl-guard.js";
+import { isMigrationAuthorizedRuntime } from "../db/migration-runtime.js";
 import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { isRecordingStoreMigration } from "../db/runtime-facts.js";
+import { defineStore } from "../db/store-registry.js";
 import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import { noteJobFrontmatterWrite } from "../jobs/frontmatter-loss.js";
 import {
@@ -323,6 +326,28 @@ export interface ResourceWriteOptions extends StoreWriteOptions {
   metadata?: string | Record<string, unknown> | null;
 }
 
+/** Notify listeners after commit and await asynchronous post-commit work. */
+export interface TransactionScopedResourceWrite<T> {
+  value: T;
+  notifyAfterCommit: () => void | Promise<void>;
+}
+
+export interface PreparedResourceMutation<
+  T,
+> extends TransactionScopedResourceWrite<T> {
+  statements: DbExecStatement[];
+}
+
+export interface PrepareResourceCreateInput {
+  id: string;
+  owner: string;
+  path: string;
+  content: string;
+  mimeType?: string;
+  options?: ResourceWriteOptions;
+  now?: number;
+}
+
 export interface ResourceConditionalWrite {
   owner: string;
   path: string;
@@ -402,7 +427,6 @@ export interface EffectiveResourceContext {
   layers: EffectiveResourceLayer[];
 }
 
-let _initPromise: Promise<void> | undefined;
 let _lastScratchCleanupAt = 0;
 
 const AGENT_SCRATCH_TTL_MS = 24 * 60 * 60 * 1000;
@@ -1147,21 +1171,7 @@ function scheduleExpiredAgentScratchCleanup(client: DbExec): void {
     });
 }
 
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    _initPromise = retainRequestDbPoolScope(
-      _doEnsureTable().catch((err) => {
-        _initPromise = undefined;
-        throw err;
-      }),
-    );
-  }
-  return _initPromise;
-}
-
-async function _doEnsureTable(): Promise<void> {
-  const client = getDbExec();
-  const createSql = `
+const RESOURCES_CREATE_SQL = `
     CREATE TABLE IF NOT EXISTS resources (
       id TEXT PRIMARY KEY,
       path TEXT NOT NULL,
@@ -1182,69 +1192,119 @@ async function _doEnsureTable(): Promise<void> {
     )
   `;
 
-  {
-    await ensureTableExists("resources", createSql);
-    const pgColumns: Array<[string, string]> = [
-      ["created_by", "TEXT NOT NULL DEFAULT 'user'"],
-      ["visibility", "TEXT NOT NULL DEFAULT 'workspace'"],
-      ["thread_id", "TEXT"],
-      ["run_id", "TEXT"],
-      ["expires_at", "BIGINT"],
-      ["metadata", "TEXT"],
-    ];
-    for (const [col, def] of pgColumns) {
-      await ensureColumnExists(
-        "resources",
-        col,
-        `ALTER TABLE resources ADD COLUMN IF NOT EXISTS ${col} ${def}`,
-      );
-    }
-  }
+export const resourcesStore = defineStore({
+  id: "resources",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        await ensureTableExists("resources", RESOURCES_CREATE_SQL);
+        const pgColumns: Array<[string, string]> = [
+          ["created_by", "TEXT NOT NULL DEFAULT 'user'"],
+          ["visibility", "TEXT NOT NULL DEFAULT 'workspace'"],
+          ["thread_id", "TEXT"],
+          ["run_id", "TEXT"],
+          ["expires_at", "BIGINT"],
+          ["metadata", "TEXT"],
+        ];
+        for (const [col, def] of pgColumns) {
+          await ensureColumnExists(
+            "resources",
+            col,
+            `ALTER TABLE resources ADD COLUMN IF NOT EXISTS ${col} ${def}`,
+          );
+        }
+      },
+    },
+    {
+      name: "widen-bigint",
+      run: () =>
+        widenIntColumnsToBigInt("resources", [
+          "created_at",
+          "updated_at",
+          "expires_at",
+        ]),
+    },
+    {
+      name: "visibility-expires-index",
+      run: async () => {
+        await ensureIndexExists(
+          "resources_visibility_expires_idx",
+          `CREATE INDEX IF NOT EXISTS resources_visibility_expires_idx ON resources (visibility, expires_at)`,
+        ).catch((err) => {
+          // At release, fail so the ledger never records an index that was not built.
+          if (isMigrationAuthorizedRuntime() || isRecordingStoreMigration()) {
+            throw err;
+          }
+          // An index is an optimization, not a correctness requirement: a
+          // concurrent creator or a permissions edge must not fail table init and
+          // take the app down with it. The scan it avoids is slow, not wrong — but
+          // say so, because "silently slow forever" is the outcome nobody notices.
+          // coercion-ok: absence of an index degrades latency, never correctness
+          console.warn(
+            "[resources] could not ensure resources_visibility_expires_idx; scratch cleanup will full-scan:",
+            (err as Error)?.message ?? err,
+          );
+        });
+      },
+    },
+    {
+      name: "path-pattern-index",
+      run: async () => {
+        // The (path, owner) unique index uses the default operator class, which a
+        // prefix LIKE cannot use under a non-C collation; the trigger dispatcher
+        // reads jobs/ by prefix every few seconds.
+        //
+        // NOT built CONCURRENTLY: this ensure path runs at release over the pooled
+        // Neon endpoint, where a transaction-pooled connection returns from
+        // `CREATE INDEX CONCURRENTLY` without creating anything (see the matching
+        // note in chat-threads/store.ts). A plain build is the form that lands.
+        await ensureIndexExists(
+          "resources_path_pattern_idx",
+          `CREATE INDEX IF NOT EXISTS resources_path_pattern_idx ON resources (path text_pattern_ops)`,
+        ).catch((err) => {
+          if (isMigrationAuthorizedRuntime() || isRecordingStoreMigration()) {
+            throw err;
+          }
+          // coercion-ok: absence of an index degrades latency, never correctness
+          console.warn(
+            "[resources] could not ensure resources_path_pattern_idx; prefix reads such as the jobs/ fingerprint will full-scan:",
+            (err as Error)?.message ?? err,
+          );
+        });
+      },
+    },
+  ],
+});
 
-  await widenIntColumnsToBigInt("resources", [
-    "created_at",
-    "updated_at",
-    "expires_at",
-  ]);
+let _defaultResourcesSeed: Promise<void> | undefined;
+let _sharedLearnSharedMigration: Promise<void> | undefined;
 
-  await ensureIndexExists(
-    "resources_visibility_expires_idx",
-    `CREATE INDEX IF NOT EXISTS resources_visibility_expires_idx ON resources (visibility, expires_at)`,
+export async function ensureTable(): Promise<void> {
+  await resourcesStore.ready();
+  // Kept out of the store ledger: the seed's marker is versioned by
+  // RESOURCE_SEED_VERSION so a bump re-seeds, which a one-time ledger entry
+  // would never do.
+  _defaultResourcesSeed ??= retainRequestDbPoolScope(
+    seedDefaultResources(getDbExec()),
   ).catch((err) => {
-    // An index is an optimization, not a correctness requirement: a
-    // concurrent creator or a permissions edge must not fail table init and
-    // take the app down with it. The scan it avoids is slow, not wrong — but
-    // say so, because "silently slow forever" is the outcome nobody notices.
-    // coercion-ok: absence of an index degrades latency, never correctness
-    console.warn(
-      "[resources] could not ensure resources_visibility_expires_idx; scratch cleanup will full-scan:",
-      (err as Error)?.message ?? err,
-    );
+    _defaultResourcesSeed = undefined;
+    throw err;
   });
+  await _defaultResourcesSeed;
+  // Also kept out of the ledger: it has its own durable marker, and a failure
+  // must leave resources usable and retry in a later process.
+  _sharedLearnSharedMigration ??= retainRequestDbPoolScope(
+    migrateSharedLearnSharedDefault(getDbExec()),
+  );
+  await _sharedLearnSharedMigration;
+}
 
-  // The (path, owner) unique index uses the default operator class, which a
-  // prefix LIKE cannot use under a non-C collation; the trigger dispatcher
-  // reads jobs/ by prefix every few seconds.
-  //
-  // NOT built CONCURRENTLY: this ensure path runs at release over the pooled
-  // Neon endpoint, where a transaction-pooled connection returns from
-  // `CREATE INDEX CONCURRENTLY` without creating anything (see the matching
-  // note in chat-threads/store.ts). A plain build is the form that lands.
-  await ensureIndexExists(
-    "resources_path_pattern_idx",
-    `CREATE INDEX IF NOT EXISTS resources_path_pattern_idx ON resources (path text_pattern_ops)`,
-  ).catch((err) => {
-    // coercion-ok: absence of an index degrades latency, never correctness
-    console.warn(
-      "[resources] could not ensure resources_path_pattern_idx; prefix reads such as the jobs/ fingerprint will full-scan:",
-      (err as Error)?.message ?? err,
-    );
-  });
-
-  // Migrate both shipped paths without touching edited copies. The legacy
-  // path wins duplicate-name resolution in existing workspaces.
-  // This marker stays separate from the shared seed version so it cannot
-  // resurrect deleted defaults or rerun personal seeding.
+// Migrate both shipped paths without touching edited copies. The legacy
+// path wins duplicate-name resolution in existing workspaces.
+// This marker stays separate from the shared seed version so it cannot
+// resurrect deleted defaults or rerun personal seeding.
+async function migrateSharedLearnSharedDefault(client: DbExec): Promise<void> {
   try {
     if (!(await alreadySeeded(SHARED_LEARN_SHARED_APPROVAL_MIGRATION_KEY))) {
       let migrationComplete = true;
@@ -1278,11 +1338,13 @@ async function _doEnsureTable(): Promise<void> {
       (err as Error)?.message ?? err,
     );
   }
+}
 
+async function seedDefaultResources(client: DbExec): Promise<void> {
   // Seed default shared resources if they don't exist (INSERT OR IGNORE to avoid
   // race conditions).
   //
-  // Guarded by a durable marker: `_doEnsureTable` runs once per PROCESS, which on
+  // Guarded by a durable marker: this seed used to run once per PROCESS, which on
   // serverless is once per cold start, so this block was issuing ~10 writes and
   // 2 migration scans per container to insert rows that had existed since day
   // one (53,785 of them in one production sample). The marker makes it once per
@@ -1664,40 +1726,203 @@ export async function resourceGetByPath(
   return workspace ? grantedWorkspaceResourceByPath(path, options) : null;
 }
 
-export async function resourcePut(
+export async function ensureResourceStoreReady(): Promise<void> {
+  await ensureTable();
+}
+
+/**
+ * Write through an existing SQL transaction. The caller must initialize the
+ * resource store before opening the transaction and invoke notifyAfterCommit
+ * only after that transaction commits.
+ */
+export function prepareResourceCreate(
+  input: PrepareResourceCreateInput,
+): PreparedResourceMutation<Resource> {
+  const now = input.now ?? Date.now();
+  const mimeType = input.mimeType || "text/markdown";
+  const size = Buffer.byteLength(input.content, "utf8");
+  const createdBy = normalizeCreatedBy(input.options?.createdBy);
+  const visibility = normalizeVisibility(input.options?.visibility);
+  const threadId = input.options?.threadId ?? null;
+  const runId = input.options?.runId ?? null;
+  let expiresAt = input.options?.expiresAt ?? null;
+  if (visibility === "agent_scratch" && expiresAt === null) {
+    expiresAt = now + AGENT_SCRATCH_TTL_MS;
+  }
+  const metadata = serializeMetadata(input.options?.metadata) ?? null;
+  const resource: Resource = {
+    id: input.id,
+    path: input.path,
+    owner: input.owner,
+    content: input.content,
+    mimeType,
+    size,
+    createdAt: now,
+    updatedAt: now,
+    createdBy,
+    visibility,
+    threadId,
+    runId,
+    expiresAt,
+    metadata,
+  };
+  return {
+    value: resource,
+    statements: [
+      {
+        sql: `INSERT INTO resources (id, path, owner, content, mime_type, size, created_at, updated_at, created_by, visibility, thread_id, run_id, expires_at, metadata) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM resources WHERE owner = ? AND path = ?)`,
+        args: [
+          input.id,
+          input.path,
+          input.owner,
+          input.content,
+          mimeType,
+          size,
+          now,
+          now,
+          createdBy,
+          visibility,
+          threadId,
+          runId,
+          expiresAt,
+          metadata,
+          input.owner,
+          input.path,
+        ],
+      },
+    ],
+    notifyAfterCommit: () =>
+      emitResourceChange(
+        input.id,
+        input.path,
+        input.owner,
+        input.options?.requestSource,
+      ),
+  };
+}
+
+export function prepareResourceBatchAssertion(condition: {
+  sql: string;
+  args: readonly unknown[];
+}): {
+  statements: DbExecStatement[];
+  cleanupStatement: DbExecStatement;
+} {
+  const guard = prepareResourceCreate({
+    id: crypto.randomUUID(),
+    owner: "__automation_atomic_guard__",
+    path: `guards/${crypto.randomUUID()}`,
+    content: "",
+  });
+  const resource = guard.value;
+  return {
+    statements: [
+      ...guard.statements,
+      {
+        sql: `INSERT INTO resources (id, path, owner, content, mime_type, size, created_at, updated_at, created_by, visibility, thread_id, run_id, expires_at, metadata) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT (${condition.sql})`,
+        args: [
+          resource.id,
+          resource.path,
+          resource.owner,
+          resource.content,
+          resource.mimeType,
+          resource.size,
+          resource.createdAt,
+          resource.updatedAt,
+          resource.createdBy,
+          resource.visibility,
+          resource.threadId,
+          resource.runId,
+          resource.expiresAt,
+          resource.metadata,
+          ...condition.args,
+        ],
+      },
+    ],
+    cleanupStatement: {
+      sql: "DELETE FROM resources WHERE id = ?",
+      args: [resource.id],
+    },
+  };
+}
+
+export function prepareResourceUpdate(input: {
+  current: Resource;
+  content: string;
+  mimeType?: string;
+  now?: number;
+}): PreparedResourceMutation<Resource> {
+  const now = Math.max(input.now ?? Date.now(), input.current.updatedAt + 1);
+  const mimeType = input.mimeType || input.current.mimeType;
+  const size = Buffer.byteLength(input.content, "utf8");
+  const resource: Resource = {
+    ...input.current,
+    content: input.content,
+    mimeType,
+    size,
+    updatedAt: now,
+  };
+  return {
+    value: resource,
+    statements: [
+      {
+        sql: `UPDATE resources SET content = ?, mime_type = ?, size = ?, updated_at = ? WHERE owner = ? AND path = ? AND id = ? AND updated_at = ? AND content = ?`,
+        args: [
+          input.content,
+          mimeType,
+          size,
+          now,
+          input.current.owner,
+          input.current.path,
+          input.current.id,
+          input.current.updatedAt,
+          input.current.content,
+        ],
+      },
+    ],
+    notifyAfterCommit: () =>
+      emitResourceChange(
+        input.current.id,
+        input.current.path,
+        input.current.owner,
+      ),
+  };
+}
+
+export function prepareResourceDelete(
+  resource: Resource,
+): PreparedResourceMutation<boolean> {
+  return {
+    value: true,
+    statements: [
+      {
+        sql: `DELETE FROM resources WHERE id = ? AND owner = ? AND path = ? AND updated_at = ? AND content = ?`,
+        args: [
+          resource.id,
+          resource.owner,
+          resource.path,
+          resource.updatedAt,
+          resource.content,
+        ],
+      },
+    ],
+    notifyAfterCommit: () =>
+      emitResourceDelete(resource.id, resource.path, resource.owner),
+  };
+}
+
+export async function resourcePutWithDb(
+  client: DbExec,
   owner: string,
   path: string,
   content: string,
   mimeType?: string,
   options?: ResourceWriteOptions,
-): Promise<Resource> {
+): Promise<TransactionScopedResourceWrite<Resource>> {
   assertResourcePayloadIsSqlSafe(content, mimeType, options?.metadata);
-  await ensureTable();
-  if (
-    isBareWorkspaceResourceOwner(owner) &&
-    (await shouldHandleWorkspaceResourceAsLocal(path))
-  ) {
-    const written = await writeLocalWorkspaceResource({ path, content });
-    const resource = localWorkspaceResourceToResource({
-      ...written,
-      content,
-    });
-    emitResourceChange(
-      resource.id,
-      resource.path,
-      resource.owner,
-      options?.requestSource,
-    );
-    return resource;
-  }
-  if (isBareWorkspaceResourceOwner(owner)) {
-    await assertWritableWorkspaceResourcePath(path);
-  }
-  const client = getDbExec();
   const now = Date.now();
   const size = Buffer.byteLength(content, "utf8");
   const mime = mimeType || "text/markdown";
-
   const isJobFile = path.startsWith("jobs/");
   const { rows: existing } = await client.execute({
     sql: `SELECT id, created_at, created_by, visibility, thread_id, run_id, expires_at, metadata${isJobFile ? ", content" : ""} FROM resources WHERE owner = ? AND path = ?`,
@@ -1717,8 +1942,7 @@ export async function resourcePut(
       }
     | undefined;
 
-  const id =
-    existing.length > 0 ? (existingRow?.id as string) : crypto.randomUUID();
+  const id = existingRow?.id ?? crypto.randomUUID();
   const createdAt = existingRow ? Number(existingRow.created_at) : now;
   const createdBy = normalizeCreatedBy(
     hasOption(options, "createdBy")
@@ -1771,19 +1995,7 @@ export async function resourcePut(
     ],
   });
 
-  if (typeof existingRow?.content === "string") {
-    await noteJobFrontmatterWrite({
-      owner,
-      orgId: organizationIdFromResourceOwner(owner),
-      path,
-      before: existingRow.content,
-      after: content,
-      writer: "resourcePut",
-    });
-  }
-  emitResourceChange(id, path, owner, options?.requestSource);
-
-  return {
+  const resource: Resource = {
     id,
     path,
     owner,
@@ -1799,6 +2011,62 @@ export async function resourcePut(
     expiresAt,
     metadata,
   };
+  return {
+    value: resource,
+    notifyAfterCommit: async () => {
+      if (typeof existingRow?.content === "string") {
+        await noteJobFrontmatterWrite({
+          owner,
+          orgId: organizationIdFromResourceOwner(owner),
+          path,
+          before: existingRow.content,
+          after: content,
+          writer: "resourcePut",
+        });
+      }
+      emitResourceChange(id, path, owner, options?.requestSource);
+    },
+  };
+}
+
+export async function resourcePut(
+  owner: string,
+  path: string,
+  content: string,
+  mimeType?: string,
+  options?: ResourceWriteOptions,
+): Promise<Resource> {
+  await ensureTable();
+  if (
+    owner === WORKSPACE_OWNER &&
+    (await shouldHandleWorkspaceResourceAsLocal(path))
+  ) {
+    const written = await writeLocalWorkspaceResource({ path, content });
+    const resource = localWorkspaceResourceToResource({
+      ...written,
+      content,
+    });
+    emitResourceChange(
+      resource.id,
+      resource.path,
+      resource.owner,
+      options?.requestSource,
+    );
+    return resource;
+  }
+  if (owner === WORKSPACE_OWNER) {
+    await assertWritableWorkspaceResourcePath(path);
+  }
+  const write = await resourcePutWithDb(
+    getDbExec(),
+    owner,
+    path,
+    content,
+    mimeType,
+    options,
+  );
+  await write.notifyAfterCommit();
+  return write.value;
 }
 
 export async function resourcePutIfAbsent(
@@ -1984,6 +2252,42 @@ async function writeResourceIfCurrent(
   if (rows.length === 0) return null;
   const resource = rowToResource(rows[0]);
   return resource;
+}
+
+/**
+ * Delete through an existing SQL transaction. The caller must await
+ * notifyAfterCommit only after that transaction commits.
+ */
+export async function resourceDeleteWithDb(
+  client: DbExec,
+  id: string,
+): Promise<TransactionScopedResourceWrite<boolean>> {
+  if (isLocalWorkspaceResourceId(id)) {
+    throw new Error(
+      "Transaction-scoped deletes do not support workspace files.",
+    );
+  }
+  const { rows } = await client.execute({
+    sql: `SELECT path, owner FROM resources WHERE id = ?`,
+    args: [id],
+  });
+  if (rows.length === 0) {
+    return { value: false, notifyAfterCommit: () => {} };
+  }
+
+  const result = await client.execute({
+    sql: `DELETE FROM resources WHERE id = ?`,
+    args: [id],
+  });
+  const deleted = result.rowsAffected > 0;
+  const path = String(rows[0].path);
+  const owner = String(rows[0].owner);
+  return {
+    value: deleted,
+    notifyAfterCommit: () => {
+      if (deleted) emitResourceDelete(id, path, owner);
+    },
+  };
 }
 
 function resourceSnapshotMatch(resource: Resource) {
@@ -2384,23 +2688,10 @@ export async function resourceDelete(id: string): Promise<boolean> {
     }
     return deleted;
   }
-  const client = getDbExec();
 
-  const { rows } = await client.execute({
-    sql: `SELECT path, owner FROM resources WHERE id = ?`,
-    args: [id],
-  });
-  if (rows.length === 0) return false;
-
-  const result = await client.execute({
-    sql: `DELETE FROM resources WHERE id = ?`,
-    args: [id],
-  });
-  const deleted = result.rowsAffected > 0;
-  if (deleted) {
-    emitResourceDelete(id, rows[0].path as string, rows[0].owner as string);
-  }
-  return deleted;
+  const write = await resourceDeleteWithDb(getDbExec(), id);
+  await write.notifyAfterCommit();
+  return write.value;
 }
 
 export async function resourceDeleteByPath(

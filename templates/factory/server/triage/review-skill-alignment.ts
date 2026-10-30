@@ -1,71 +1,25 @@
-export const FACTORY_ALIGNMENT_REVISION = 3;
+export const FACTORY_ALIGNMENT_REVISION = 5;
 
 const ALIGNMENT_START = "<!-- factory-skill-alignment:start -->";
 const ALIGNMENT_END = "<!-- factory-skill-alignment:end -->";
 
-const FEEDBACK_ALIGNMENT = `## Current review-latest-feedback contract
-
-The repository's \`.agents/skills/review-latest-feedback/SKILL.md\` is
-authoritative. Re-read it in the Builder worktree before acting. Its current
-contract is evidence-first and reply-producing:
-
-- Recheck answered clarifications and open In progress ownership before newer
-  work. Keep the newest unhandled item as the cursor, read older duplicates
-  into one verified cluster, and leave an auditable disposition for every
-  inspected Slack, GitHub issue, and Sentry item.
-- Read the complete parent/thread, reactions, attachments, linked artifacts,
-  and newer follow-ups before asking anything or dispatching. An unavailable
-  source is unavailable evidence, never a no-results result.
-- Keep one specific unanswered clarification per thread. Re-read the whole
-  thread when the requested detail is answered, try the fix first, and use the
-  task-scoped clarification ledger with a stable scheduler identity for
-  recurring rechecks. Do not claim scheduled coverage without stable durable
-  state.
-- Check the existing Slack reaction marker before any write. Preserve an
-  existing marker; if reactions cannot be read, do not guess or add one. If
-  the parent already has eyes 👀, call \`dispatch-factory-item\` with
-  \`alreadyClaimed: true\` (\`clearBug\` may be omitted or \`false\`), omit
-  reaction, and do not start Builder work.
-- Classify \`risk\` and \`confidence\` on every item, including skips.
-  \`dispatch-factory-item\` only tags Builder for eligible Slack feedback
-  (\`clearBug\` true, \`risk\` low, and \`confidence\` high); everything else
-  is a skip regardless of how clear the bug looks. Eligible GitHub issue and
-  Sentry findings are posted as one grouped \`report-factory-findings\` message
-  to #qa-agent-native and never create or comment on
-  GitHub issues.
-- For a dispatch-eligible repo-owned Slack item (\`clearBug\` true, \`risk\`
-  low, \`confidence\` high) with no existing eyes 👀, you MUST pass
-  \`reaction: eyes\` 👀 on \`dispatch-factory-item\` — never dispatch without
-  it. Every parent this run marks must later
-  receive a verified @agent-native Fixed, In progress, or Clarification needed
-  reply; a reaction, forward, generic acknowledgement, or another person's
-  reply is not a disposition. Group only genuinely repeated symptoms and
-  dispatch one Builder thread for the cluster.
-- Choose the smallest owning seam: local regression for one symptom, shared
-  contract for repeated cross-surface evidence, discovery/action wiring for a
-  missing capability, and release/deployment diagnosis for source-versus-live
-  mismatches. Do not turn one report into a global prompt rule.
-- Keep source-tested, built, published/deployed, and observed-live evidence
-  separate. Do not claim a fix, PR, reply, or deployment without confirmation
-  from the relevant action or runtime evidence.
-
-After classifying every processed item, call \`dispatch-factory-item\` to record
-skips and Slack dispatches: \`alreadyClaimed: true\` (\`clearBug\` may be
-omitted or \`false\`) when the parent already has eyes 👀, otherwise
-\`clearBug\`, \`risk\`, \`confidence\`, and a concise evidence-grounded reason.
-For eligible GitHub issue or Sentry findings, do not call
-\`dispatch-factory-item\`; collect the complete eligible batch and call
-\`report-factory-findings\` exactly once per run. Pass \`reaction: eyes\` only
-for eligible Slack feedback.`;
-
 const PR_ALIGNMENT = `## Current review-prs contract
 
 The repository's \`.agents/skills/review-prs/SKILL.md\` is authoritative.
-Before selecting work, ignore drafts and ordinary pull requests with a
-current-head, non-dismissed APPROVED review, including bot approvals; do not
-inspect or recap those excluded items. Eligible Liam PRs with only older-head
-approvals remain candidates so the current head can be approved. For every
-remaining PR, read the complete title,
+Ignore drafts, bot-authored pull requests, and PRs authored by the exact login
+\`steve8708\` completely. Verify the current BuilderIO organization membership
+for every other author before applying the existing-approval filter. Any fork
+PR assigned to a verified current BuilderIO member must stop
+completely under \`community-prs\`: do
+not review, reply, call the governance action, merge, or recap it. For every
+other confirmed external PR, call \`govern-factory-pull-request\` to record a
+manual disposition even if it already has a current-head approval; never
+approve it or use the manual external-scope or reply path. For verified
+internal authors, only an eligible current-head approval with no newer event
+can suppress duplicate code review; it does not remove the PR from the readiness
+pass or recap. Eligible Liam PRs with only older-head approvals remain
+candidates so the current head can be approved. For every remaining PR, read
+the complete title,
 body, links, changed-file diff (including generated and migration files), all
 review summaries/comments/replies, actual check conclusions, and ownership
 boundary. Verify current BuilderIO organization membership through GitHub's
@@ -75,7 +29,10 @@ bot label.
 Never approve external or unverified authors. The internal-author exception
 allows ordinary failed, pending, skipped, or unknown checks and ordinary
 unresolved feedback for a verified BuilderIO member; record those exact states
-and never call them clean. The ultra-scary gate always remains manual for auth,
+and never call them clean. Include the exact check and actionable-feedback
+states in every approval recap, even when ordinary gates are overridden, and
+distinguish approval from readiness. The ultra-scary gate always remains manual
+for auth,
 permissions, tenant isolation, secrets, destructive data loss or migrations,
 remote code execution, MCP iframe sandboxing, CSP, HTML sanitization, SSRF,
 payments, deployment, or unexplained dependency and infrastructure risk. Active
@@ -114,42 +71,12 @@ trust decision only - never auto-merge. Never claim ignored checks or feedback
 are resolved, and record one concise disposition for every PR that entered the
 evidence sweep.`;
 
-const BABYSIT_ALIGNMENT = `## PR babysit contract
-
-Follow the fixed poll → list → propose → babysit path only. Read
-\`recommendation\` and \`because\` from propose-pr-babysit-status and match
-the babysit decision unless the briefing clearly contradicts them.
-
-Allowed decisions: ping, defer, already_asked, stuck. Unresolved bot review
-threads count as work unless closed by reply, GitHub resolve, outdated status,
-or a structured coverage comment. Factory-only duplicate detection ignores human
-copies of the template comment. Defer while Builder is active within the 20-minute
-quiet window. Mark stuck when bot errors after a ping, or Required — not fixing
-on a thread, make another ask useless.
-
-Do not review diffs, call govern-factory-pull-request, or use ad-hoc GitHub
-tools. Never approve or merge.`;
-
-export type FactoryAutomationName =
-  | "factory-slack-feedback"
-  | "factory-sentry-errors"
-  | "factory-github-issues"
-  | "factory-pr-governance"
-  | "factory-pr-babysit";
+export type FactoryAutomationName = "factory-pr-governance";
 
 export function managedReviewSkillAlignment(
   name: FactoryAutomationName,
 ): string | undefined {
-  if (
-    name === "factory-slack-feedback" ||
-    name === "factory-sentry-errors" ||
-    name === "factory-github-issues"
-  ) {
-    return FEEDBACK_ALIGNMENT;
-  }
-  if (name === "factory-pr-governance") return PR_ALIGNMENT;
-  if (name === "factory-pr-babysit") return BABYSIT_ALIGNMENT;
-  return undefined;
+  return name === "factory-pr-governance" ? PR_ALIGNMENT : undefined;
 }
 
 export function syncManagedReviewSkillAlignment(

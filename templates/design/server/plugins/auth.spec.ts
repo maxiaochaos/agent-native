@@ -11,6 +11,8 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@agent-native/core/server", () => ({
   createAuthPlugin: mocks.createAuthPlugin,
   registerAuthPublicPaths: mocks.registerAuthPublicPaths,
+  registerBuilderBranchProject: vi.fn(),
+  registerDelegatedBuilderCredentials: vi.fn(),
 }));
 
 import authPlugin from "./auth.js";
@@ -67,5 +69,29 @@ describe("design auth plugin", () => {
         "/_agent-native/actions/delete-review-comment",
       ]),
     );
+  });
+
+  it("adds Builder identity without replacing Design's own sessions", async () => {
+    vi.resetModules();
+    vi.stubEnv("BUILDER_IDENTITY", "1");
+    mocks.createAuthPlugin.mockClear();
+    try {
+      const { getBuilderIdentitySession } =
+        await import("../lib/builder-identity.js");
+      await import("./auth.js");
+      const options = mocks.createAuthPlugin.mock.calls[0]?.[0];
+      // A custom getSession would take over every session and the sign-in
+      // routes, locking out everyone who is not a Builder user.
+      expect(options.getSession).toBeUndefined();
+      expect(options.getBrowserSession).toBeUndefined();
+      expect(options.getAdditionalSession).toBe(getBuilderIdentitySession);
+      expect(options.getAdditionalBrowserSession).toBe(
+        getBuilderIdentitySession,
+      );
+      expect(options.clearAdditionalSession).toBeTypeOf("function");
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 });

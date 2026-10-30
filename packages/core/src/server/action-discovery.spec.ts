@@ -12,6 +12,7 @@ import {
   ALWAYS_ON_CORE_ACTIONS,
   autoDiscoverActions,
   CORE_ACTION_GROUPS,
+  listDevActionFiles,
   loadActionsFromStaticRegistry,
   mergeCoreSharingActions,
 } from "./action-discovery.js";
@@ -432,6 +433,21 @@ describe("action discovery", () => {
     expect(registry["send-email"].allowPersistentApproval).toBe(false);
   });
 
+  it("preserves the zone an approval summary gives zoneless times", () => {
+    const registry = loadActionsFromStaticRegistry({
+      "create-event": {
+        default: {
+          tool: { description: "Create an event", parameters: {} },
+          needsApproval: true,
+          zonelessTimes: "calendar",
+          run: async () => ({ ok: true }),
+        },
+      },
+    });
+
+    expect(registry["create-event"].zonelessTimes).toBe("calendar");
+  });
+
   it("threads the http config through named and default static entries", () => {
     const registry = loadActionsFromStaticRegistry({
       "named-get": {
@@ -568,6 +584,49 @@ describe("action discovery", () => {
     CORE_ACTION_DISCOVERY_TIMEOUT_MS,
   );
 
+  it(
+    "keeps persistInBrowser:false on merged core actions that read private data",
+    async () => {
+      // action-routes.ts reads the flag from the registry entry; without it
+      // these reads are let into the browser's persisted query cache.
+      const registry: Record<string, any> = {};
+      await mergeCoreSharingActions(registry);
+
+      for (const name of [
+        "list-api-keys",
+        "get-email-log-body",
+        "get-infrastructure-status",
+        "list-chatgpt-subscription-accounts",
+        "list-workspace-user-groups",
+        "list-workspace-connection-scopes",
+      ]) {
+        expect(registry[name], `${name} should be merged`).toBeDefined();
+        expect(registry[name].persistInBrowser, name).toBe(false);
+      }
+    },
+    CORE_ACTION_DISCOVERY_TIMEOUT_MS,
+  );
+
+  it(
+    "merges invite-organization-member as an approval-gated agent and MCP tool",
+    async () => {
+      const registry: Record<string, any> = {};
+      await mergeCoreSharingActions(registry);
+
+      const invite = registry["invite-organization-member"];
+      expect(invite).toBeDefined();
+      expect(invite.needsApproval).toBe(true);
+      expect(invite.allowPersistentApproval).toBe(false);
+      expect(invite.toolCallable).toBe(false);
+      expect(invite.agentTool).not.toBe(false);
+      expect(invite.mcpTool).not.toBe(false);
+      expect(registry["list-organization-members"].http).toEqual({
+        method: "GET",
+      });
+    },
+    CORE_ACTION_DISCOVERY_TIMEOUT_MS,
+  );
+
   it("preserves WebMCP capability scopes in the action registry", () => {
     const registry = loadActionsFromStaticRegistry({
       "visual-edit": {
@@ -615,6 +674,31 @@ describe("action discovery", () => {
       "Template share override",
     );
     expect(registry["unshare-resource"]).toBeDefined();
+  });
+
+  it("merges automation editor actions without exposing them as agent tools", async () => {
+    const registry: Record<string, any> = {};
+    await mergeCoreSharingActions(registry);
+
+    for (const name of [
+      "list-recurring-jobs",
+      "manage-recurring-job",
+      "run-automation-now",
+      "list-automation-runs",
+      "list-automations",
+      "list-automation-events",
+      "manage-automation",
+      "search-automation-accounts",
+    ]) {
+      expect(registry[name], `${name} should be merged`).toBeDefined();
+      expect(registry[name].agentTool).toBe(false);
+    }
+    expect(registry["list-automation-events"].http).toEqual({ method: "GET" });
+    expect(registry["list-automation-events"].readOnly).toBe(true);
+    expect(registry["search-automation-accounts"].http).toEqual({
+      method: "GET",
+    });
+    expect(registry["search-automation-accounts"].readOnly).toBe(true);
   });
 
   it("merges localization preference actions", async () => {
@@ -710,6 +794,11 @@ describe("action discovery", () => {
     expect(registry["restore-resource-version"].frameworkGroup).toBe("history");
     expect(registry["set-feature-flag"].frameworkGroup).toBe("featureFlags");
     expect(registry["change-password"].frameworkGroup).toBe("userProfile");
+    expect(registry["search-automation-accounts"].frameworkGroup).toBe(
+      "automation",
+    );
+    expect(registry.decide?.readOnly).toBe(true);
+    expect(registry["decisions-status"]?.readOnly).toBe(true);
     expect(registry["upload-image"].frameworkGroup).toBeUndefined();
     expect(registry["call-mcp-tool"].frameworkGroup).toBeUndefined();
   });
@@ -757,5 +846,42 @@ describe("action discovery", () => {
         group,
       ).toBe(false);
     }
+  });
+});
+
+describe("listDevActionFiles", () => {
+  it("lists runnable action files from actions/ and never from scripts/", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "an-dev-actions-"));
+    tmpDirs.push(cwd);
+    fs.mkdirSync(path.join(cwd, "actions"));
+    fs.mkdirSync(path.join(cwd, "scripts"));
+    for (const name of [
+      "actions/list-things.ts",
+      "actions/_private.ts",
+      "actions/_utils.ts",
+      "actions/run.ts",
+      "actions/migrate-production.ts",
+      "actions/list-things.spec.ts",
+      "actions/list-things.test.ts",
+      "actions/helpers.ts",
+      "actions/list-things.ts.bak",
+      "actions/notes.md",
+      "scripts/takedown.ts",
+    ]) {
+      fs.writeFileSync(path.join(cwd, name), "export {};\n");
+    }
+
+    expect(await listDevActionFiles(cwd)).toEqual([
+      path.join(cwd, "actions", "list-things.ts"),
+    ]);
+  });
+
+  it("returns nothing for an app without an actions directory", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "an-dev-actions-"));
+    tmpDirs.push(cwd);
+    fs.mkdirSync(path.join(cwd, "scripts"));
+    fs.writeFileSync(path.join(cwd, "scripts", "takedown.ts"), "export {};\n");
+
+    expect(await listDevActionFiles(cwd)).toEqual([]);
   });
 });

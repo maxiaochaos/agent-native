@@ -1,7 +1,6 @@
 import {
   setAgentChatContextItem,
   removeAgentChatContextItem,
-  useAgentChatContext,
 } from "@agent-native/core/client/agent-chat";
 import type { ReviewComment } from "@agent-native/core/review";
 import { type PromptComposerSubmitOptions } from "@agent-native/toolkit/app/chat/composer/index";
@@ -14,9 +13,9 @@ import {
   removeCodeLayerNodeFromHtml,
 } from "@shared/code-layer";
 import { getOverviewScreenFileIds } from "@shared/design-files";
+import { pruneDeletedNativeEffects } from "@shared/native-effect-pruning";
 import {
   setPenNodeCornerRadius,
-  translatePenPath,
   type PenGeometry,
   type PenPath,
 } from "@shared/pen-path";
@@ -31,28 +30,48 @@ import { isKeyboardShortcutsDialogTarget } from "@/components/design/KeyboardSho
 import type {
   CanvasPrimitiveInsert,
   MultiScreenCanvasTool,
+  PrimitiveCreateOptions,
+  PrimitiveCreateResult,
   ScreenProjectionNodeIdentity,
   VectorEditOverlayState,
 } from "@/components/design/multi-screen/types";
 import { reviewThreadIdFromHash } from "@/components/design/review-link";
-import { type ReviewCommentsPanelProps } from "@/components/design/ReviewCommentsPanel";
+import {
+  type ReviewCommentsPanelProps,
+  type ReviewCommentsPanelScreen,
+} from "@/components/design/ReviewCommentsPanel";
 import type { ElementSelectionIntent } from "@/components/design/types";
 import type { UploadedFile } from "@/components/editor/PromptDialog";
 import { type DrawAnnotation } from "@/components/visual-editor/DrawOverlay";
+import { createReviewActiveThreadReporter } from "@/components/visual-editor/review-active-thread-reporter";
+import { useReviewFocusRequest } from "@/hooks/use-review-focus-request";
 import {
   isDesignHotkeyEditableTarget,
   isNativeKeyboardActivationTarget,
 } from "@/hooks/useDesignHotkeys";
 import { sendToDesignAgentChat } from "@/lib/agent-chat";
+import type { ReviewAgentController } from "@/lib/review-agent/use-review-agent-requests";
+import {
+  buildReviewThreadAgentContext,
+  buildReviewThreadAgentDispatch,
+  isReviewThreadEngineAction,
+  reviewAgentModeForMenuAction,
+  type ReviewThreadAgentAction,
+} from "@/lib/review-thread-agent-actions";
 
 import { uniqueLayerId } from "../canvas-primitive-insert";
 import { createPrimitiveInsertFromSpec } from "../canvas-primitives";
 import {
+  penPathForVectorEditCommit,
   writeBackPrimitiveAsVector,
   writeBackVectorEditedPenPath,
+  type PenPathVectorEditSourceMapping,
 } from "../clone-and-pen-edit";
 import { runCreatePrimitive } from "../commands/create-primitive";
-import { runPrimitiveCreated } from "../commands/primitive-created";
+import {
+  runPrimitiveCreated,
+  type PrimitiveCreatedHistorySelectionArgs,
+} from "../commands/primitive-created";
 import { runScaleSelection } from "../commands/scale-selection";
 import { runSendOverviewAnnotations } from "../commands/send-overview-annotations";
 import { runTweakPromptSubmit } from "../commands/tweak-prompt-submit";
@@ -60,6 +79,7 @@ import {
   clearOverviewInteractTarget,
   getCreatedScreenNavigationPlan,
 } from "../created-screen-navigation";
+import { resolveUrlScreen } from "../derive/url-screen";
 import {
   EMPTY_TEXT_CLEANUP_MAX_ATTEMPTS,
   EMPTY_TEXT_CLEANUP_RETRY_MS,
@@ -68,6 +88,14 @@ import { buildSignInHrefForComment } from "../editor-helpers";
 import { runMirrorSelectionToAgentChat } from "../effects/mirror-selection-to-agent-chat";
 import { runPublishAgentSelectionContext } from "../effects/publish-agent-selection-context";
 import { loadDesignSystemGenerationContext } from "../generation-prompt-directives";
+import {
+  captureContentUndoStackTop,
+  captureYjsUndoHistoryUpdate,
+  captureYjsUndoStackTop,
+  stampContentHistorySelectionAfterEntry,
+  type ContentUndoStackTop,
+} from "../history";
+import { resolveScreenTitle } from "../interact-routes";
 import { getScreenFrameOriginCanvas } from "../overview-camera";
 import { blurActiveDesignEditableTarget } from "../png-export-render";
 import {
@@ -75,8 +103,10 @@ import {
   computeOverviewScreenPickSelectionIds,
   getSelectedScreenIdsForEditorState,
   overviewScreenSelectionForPendingEcho,
+  reconcileSelectedLayerIdsForOverviewScreens,
   sameStringIds,
   shouldClearSelectionForReviewThreadTarget,
+  shouldResetBreakpointAfterOverviewSelectionClear,
   updateExplicitOverviewScreenSelection,
 } from "../selection-state";
 import { endedTextEditMatchesPendingCreation } from "../text-edit-utils";
@@ -94,6 +124,22 @@ import type { EditorGenerationAndAccess } from "./use-editor-generation-and-acce
 import type { EditorHistory } from "./use-editor-history";
 import type { EditorLiveEditsAndPresence } from "./use-editor-live-edits-and-presence";
 
+type VectorEditingState = {
+  screenId: string;
+  nodeId: string;
+  layerId: string;
+  path: PenPath;
+  lastAcceptedPath: PenPath;
+  selectedAnchorIndex: number | null;
+  sourceOffset: { x: number; y: number };
+  sourceMapping: PenPathVectorEditSourceMapping | null;
+  pendingCommit?: boolean;
+  primitiveSource: {
+    geometry: PenGeometry;
+    fill: string;
+  } | null;
+};
+
 export function useEditorToolsAndVectors({
   editorCore,
   editorHistory,
@@ -103,6 +149,7 @@ export function useEditorToolsAndVectors({
   editorCanvasAndScreens,
   editorLiveEditsAndPresence,
   editorContentAndComponents,
+  reviewAgent,
 }: {
   editorCore: EditorCore;
   editorHistory: EditorHistory;
@@ -112,6 +159,8 @@ export function useEditorToolsAndVectors({
   editorCanvasAndScreens: EditorCanvasAndScreens;
   editorLiveEditsAndPresence: EditorLiveEditsAndPresence;
   editorContentAndComponents: EditorContentAndComponents;
+  /** Starts the background runs behind the card menu's Suggest, Reply and Apply items. */
+  reviewAgent: ReviewAgentController | null;
 }) {
   const {
     t,
@@ -122,6 +171,7 @@ export function useEditorToolsAndVectors({
     shellMode,
     embedded,
     embedChromeRequested,
+    widgetEmbed,
     mode,
     setMode,
     activeTool,
@@ -158,9 +208,13 @@ export function useEditorToolsAndVectors({
     activeBreakpointWidthState,
     activeBreakpointWidthStateRef,
     selectedLayerIdsStateRef,
+    localContentUndoStackRef,
     overviewSelectedScreenIdsRef,
     explicitOverviewScreenSelectionRef,
     prepareTextCreationFinalization,
+    captureCurrentSelection,
+    contentUndoStackRef,
+    undoManagerRef,
   } = editorHistory;
   const {
     persistedSelectionStateRef,
@@ -170,7 +224,6 @@ export function useEditorToolsAndVectors({
     designSelectionOwnerIdRef,
     setDrawMode,
     setPinMode,
-    resetAgentGenerating,
     pendingQuestions,
     design,
     canEditDesign,
@@ -227,35 +280,51 @@ export function useEditorToolsAndVectors({
     motionPlaybackMode,
     motionTimelineId,
   } = editorLiveEditsAndPresence;
-  const { applyLocalContentUpdate, applyFileContentUpdate } =
-    editorContentAndComponents;
+  const {
+    applyLocalContentUpdate,
+    applyFileContentUpdate,
+    contentHistorySelectionAfterRef,
+  } = editorContentAndComponents;
 
   const [shapeTool, setShapeTool] = useState<ShapeTool>("rect");
-  const [vectorEditingState, setVectorEditingState] = useState<{
-    screenId: string;
-    nodeId: string;
-    layerId: string;
-    path: PenPath;
-    selectedAnchorIndex: number | null;
-    sourceOffset: { x: number; y: number };
-    primitiveSource: {
-      geometry: PenGeometry;
-      fill: string;
-    } | null;
-  } | null>(null);
+  const [vectorEditingState, setVectorEditingState] =
+    useState<VectorEditingState | null>(null);
+  const vectorCommitOutcomeRef = useRef<"accepted" | "deferred" | "refused">(
+    "accepted",
+  );
+  const setVectorEditingStateFromMode = useCallback(
+    (next: Omit<VectorEditingState, "lastAcceptedPath"> | null) => {
+      if (vectorEditingState?.pendingCommit) {
+        toast.info(t("visualEditor.saving"), {
+          id: `design-source-linked-edit-pending:${vectorEditingState.screenId}`,
+        });
+        return false;
+      }
+      setVectorEditingState(
+        next ? { ...next, lastAcceptedPath: next.path } : null,
+      );
+      return true;
+    },
+    [t, vectorEditingState],
+  );
   const runtimeStructureInsertRevisionRef = useRef(0);
-  const [reviewFocusRequest, setReviewFocusRequest] = useState<{
-    nonce: number;
-    anchor: unknown;
-    targetId?: string | null;
-    threadId?: string;
-  } | null>(null);
-  const reviewFocusNonceRef = useRef(0);
+  const [reviewFocusRequest, issueReviewFocusRequest] = useReviewFocusRequest();
+  // Reported by the canvas comment overlays; null when no thread card is open.
+  const [openReviewThreadId, publishOpenReviewThreadId] = useState<
+    string | null
+  >(null);
+  // Several overlays report here, so each report names its owner.
+  const [setOpenReviewThreadId] = useState(() =>
+    createReviewActiveThreadReporter(publishOpenReviewThreadId),
+  );
   const openedReviewHashRef = useRef<string | null>(null);
   const layersRevealedForFirstCreateRef = useRef(false);
   const [activeCodeFile, setActiveCodeFile] =
     useState<CodeWorkbenchActiveFile | null>(null);
   const pendingTextEditNodeIdRef = useRef<string | null>(null);
+  const overviewPrimitiveHistoryByScreenRef = useRef(
+    new Map<string, Map<string, { entry?: ContentUndoStackTop }>>(),
+  );
   const pendingEmptyTextEditRef = useRef<{
     screenId: string | null;
     nodeId: string;
@@ -286,20 +355,13 @@ export function useEditorToolsAndVectors({
   const dispatchReviewFeedbackToAgent = useCallback(
     (root: ReviewComment, replies: ReviewComment[] = []) => {
       if (!id) return;
-      const replyText = replies
-        .map((reply) => `${reply.authorName ?? "Reviewer"}: ${reply.body}`)
-        .join("\n");
       sendToDesignAgentChat({
         message: "Apply this selected design review thread only.", // i18n-ignore agent dispatch prompt
-        context: [
-          `Design id: ${id}`,
-          `Review thread id: ${root.threadId}`,
-          `Screen id: ${root.targetId ?? "unknown"}`,
-          `Feedback: ${root.body}`,
-          replyText ? `Replies:\n${replyText}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n"),
+        context: buildReviewThreadAgentContext({
+          designId: id,
+          root,
+          replies,
+        }),
         submit: true,
         openSidebar: true,
         newTab: true,
@@ -317,7 +379,7 @@ export function useEditorToolsAndVectors({
   );
 
   const handleSendReviewThreadToAgent = useCallback(
-    (thread: ReviewThread) => {
+    (thread: ReviewThread, action: ReviewThreadAgentAction) => {
       if (
         !id ||
         !canEditDesign ||
@@ -326,6 +388,26 @@ export function useEditorToolsAndVectors({
       ) {
         return;
       }
+      if (isReviewThreadEngineAction(action)) {
+        void reviewAgent?.start({
+          threadId: thread.root.threadId,
+          mode: reviewAgentModeForMenuAction(action),
+        });
+        return;
+      }
+      const { message, context, submit } = buildReviewThreadAgentDispatch({
+        designId: id,
+        thread,
+      });
+      const openChat = () =>
+        sendToDesignAgentChat({
+          message,
+          context,
+          contextLabel: t("review.threadTitle"),
+          submit,
+          openSidebar: true,
+          newTab: true,
+        });
       setReviewSendingThreadId(thread.root.threadId);
       sendReviewThreadToAgent.mutate(
         {
@@ -334,9 +416,7 @@ export function useEditorToolsAndVectors({
           threadId: thread.root.threadId,
         },
         {
-          onSuccess: () => {
-            dispatchReviewFeedbackToAgent(thread.root, thread.replies);
-          },
+          onSuccess: openChat,
           onError: () => {
             setReviewSendingThreadId(null);
             toast.error(t("review.sendToAgentFailed"));
@@ -346,8 +426,8 @@ export function useEditorToolsAndVectors({
     },
     [
       canEditDesign,
-      dispatchReviewFeedbackToAgent,
       id,
+      reviewAgent,
       reviewSendingThreadId,
       sendReviewThreadToAgent,
       t,
@@ -384,9 +464,7 @@ export function useEditorToolsAndVectors({
         setMode("edit");
       }
       setActiveLeftPanel("threads");
-      reviewFocusNonceRef.current += 1;
-      setReviewFocusRequest({
-        nonce: reviewFocusNonceRef.current,
+      issueReviewFocusRequest({
         anchor: thread.root.anchor,
         targetId,
         threadId: thread.root.threadId,
@@ -415,6 +493,17 @@ export function useEditorToolsAndVectors({
     reviewResult.isLoading,
   ]);
 
+  const reviewPanelScreens = useMemo<ReviewCommentsPanelScreen[]>(
+    () =>
+      overviewScreens.map((screen) => ({
+        id: screen.id,
+        name: resolveScreenTitle(screen),
+        // A markup screen has no route, so resolveUrlScreen returns null for it.
+        route: resolveUrlScreen({ screen, fallbackSourceType: "inline" })
+          ?.route,
+      })),
+    [overviewScreens],
+  );
   const reviewCommentsPanelProps = useMemo<
     ReviewCommentsPanelProps | undefined
   >(
@@ -426,28 +515,19 @@ export function useEditorToolsAndVectors({
             currentUserEmail: session?.email,
             currentTargetId:
               activeFile?.id === boardFileId ? null : activeFile?.id,
-            canResolve: canEditDesign,
-            canDeleteComment: (comment) =>
-              canEditDesign ||
-              ("canDelete" in comment && comment.canDelete === true) ||
-              comment.authorEmail === session?.email,
+            screens: reviewPanelScreens,
             signInHref: signInToCommentHref,
-            canDispatchToAgent: canEditDesign,
-            sendingThreadId: reviewSendingThreadId,
-            onSendThreadToAgent: canEditDesign
-              ? handleSendReviewThreadToAgent
-              : undefined,
             onSelectThread: handleReviewThreadSelect,
+            activeThreadId: openReviewThreadId,
           }
         : undefined,
     [
       canCommentDesign,
-      canEditDesign,
       activeFile?.id,
       handleReviewThreadSelect,
-      handleSendReviewThreadToAgent,
       id,
-      reviewSendingThreadId,
+      openReviewThreadId,
+      reviewPanelScreens,
       session?.email,
       signInToCommentHref,
     ],
@@ -460,8 +540,9 @@ export function useEditorToolsAndVectors({
       options?: {
         reparentTargetIdentity?: ScreenProjectionNodeIdentity;
       },
-    ) =>
-      runCreatePrimitive(
+    ) => {
+      if (!activeFile) return false;
+      return runCreatePrimitive(
         {
           activeBreakpointWidthState,
           activeFile,
@@ -483,7 +564,8 @@ export function useEditorToolsAndVectors({
         screenId,
         primitive,
         options,
-      ),
+      );
+    },
     [
       activeBreakpointWidthState,
       activeFile?.id,
@@ -523,8 +605,9 @@ export function useEditorToolsAndVectors({
       if (!node) return "node-absent";
       const hasContent = (node.textSnippet ?? "").trim().length > 0;
       if (hasContent) return "kept-has-content";
-      const nextContent = removeCodeLayerNodeFromHtml(content, node);
-      if (!nextContent || nextContent === content) return "remove-failed";
+      const removedContent = removeCodeLayerNodeFromHtml(content, node);
+      if (!removedContent || removedContent === content) return "remove-failed";
+      const nextContent = pruneDeletedNativeEffects(content, removedContent);
       const finalizedCreation = prepareTextCreationFinalization(
         screenId,
         [nodeId, node.id, node.dataAttributes["data-agent-native-node-id"]],
@@ -547,8 +630,8 @@ export function useEditorToolsAndVectors({
     [
       applyFileContentUpdate,
       codeLayerSourceForScreen,
-      prepareTextCreationFinalization,
       getScreenContent,
+      prepareTextCreationFinalization,
     ],
   );
 
@@ -575,6 +658,14 @@ export function useEditorToolsAndVectors({
     [removeEmptyTextNodeIfUntouched],
   );
 
+  const removeEmptyTextNodeWithRetryRef = useRef(removeEmptyTextNodeWithRetry);
+  removeEmptyTextNodeWithRetryRef.current = removeEmptyTextNodeWithRetry;
+  const removeEmptyTextNodeWithRetryLatest = useCallback(
+    (screenId: string | null, nodeId: string) =>
+      removeEmptyTextNodeWithRetryRef.current(screenId, nodeId),
+    [],
+  );
+
   const handlePrimitiveCreated = useCallback(
     (
       screenId: string,
@@ -583,6 +674,7 @@ export function useEditorToolsAndVectors({
         nextTool?: "move" | "pen";
         preserveActiveTool?: boolean;
       },
+      historySelection?: PrimitiveCreatedHistorySelectionArgs,
     ) =>
       runPrimitiveCreated(
         {
@@ -594,7 +686,7 @@ export function useEditorToolsAndVectors({
           pendingOverviewScreenSelectionRef,
           pendingTextEditNodeIdRef,
           layersRevealedForFirstCreateRef,
-          removeEmptyTextNodeWithRetry,
+          removeEmptyTextNodeWithRetry: removeEmptyTextNodeWithRetryLatest,
           setActiveFileId,
           setActiveLeftPanel,
           setActiveTool,
@@ -608,13 +700,115 @@ export function useEditorToolsAndVectors({
         screenId,
         nodeId,
         options,
+        historySelection,
       ),
     [
       activeLeftPanel,
       boardFileId,
       clearPendingOverviewLayerSelectionTimer,
-      removeEmptyTextNodeWithRetry,
+      removeEmptyTextNodeWithRetryLatest,
     ],
+  );
+
+  const handleOverviewCreatePrimitive = useCallback(
+    (
+      screenId: string,
+      primitive: CanvasPrimitiveInsert,
+      options?: PrimitiveCreateOptions,
+    ): PrimitiveCreateResult => {
+      const topBefore = captureContentUndoStackTop(contentUndoStackRef.current);
+      const result = handleCreatePrimitive(screenId, primitive, options);
+      if (result && screenId !== boardFileId && screenId !== "__board__") {
+        const nodeId =
+          typeof result === "string"
+            ? result
+            : typeof result === "object"
+              ? result.nodeId
+              : primitive.nodeId;
+        if (nodeId) {
+          const topAfter = captureContentUndoStackTop(
+            contentUndoStackRef.current,
+          );
+          const byNodeId =
+            overviewPrimitiveHistoryByScreenRef.current.get(screenId) ??
+            new Map<string, { entry?: ContentUndoStackTop }>();
+          byNodeId.set(nodeId, {
+            entry: topAfter !== topBefore ? topAfter : undefined,
+          });
+          overviewPrimitiveHistoryByScreenRef.current.set(screenId, byNodeId);
+        }
+      }
+      return result;
+    },
+    [boardFileId, contentUndoStackRef, handleCreatePrimitive],
+  );
+
+  const handleOverviewPrimitivesCreated = useCallback(
+    (
+      created: ReadonlyArray<{ screenId: string; nodeId: string }>,
+      selected?: { screenId: string; nodeId: string },
+      options?: {
+        nextTool?: "move" | "pen";
+        preserveActiveTool?: boolean;
+      },
+    ) => {
+      const pendingEntries = created.flatMap(({ screenId, nodeId }) => {
+        const byNodeId =
+          overviewPrimitiveHistoryByScreenRef.current.get(screenId);
+        const pending = byNodeId?.get(nodeId);
+        byNodeId?.delete(nodeId);
+        if (byNodeId?.size === 0) {
+          overviewPrimitiveHistoryByScreenRef.current.delete(screenId);
+        }
+        return pending?.entry
+          ? [{ screenId, nodeId, entry: pending.entry }]
+          : [];
+      });
+      const finalSelection = selected ?? created[created.length - 1];
+      if (!finalSelection) return;
+
+      handlePrimitiveCreated(
+        finalSelection.screenId,
+        finalSelection.nodeId,
+        options,
+      );
+      const finalSnapshot = captureCurrentSelection();
+      for (const { screenId, nodeId, entry } of pendingEntries) {
+        stampContentHistorySelectionAfterEntry(
+          contentHistorySelectionAfterRef.current,
+          entry,
+          {
+            ...finalSnapshot,
+            activeFileId: screenId,
+            overviewSelectedScreenIds: [],
+            selectedLayerIds: [nodeId],
+          },
+        );
+      }
+    },
+    [
+      captureCurrentSelection,
+      contentHistorySelectionAfterRef,
+      handlePrimitiveCreated,
+    ],
+  );
+
+  const handleOverviewPrimitiveCreated = useCallback(
+    (
+      screenId: string,
+      nodeId: string,
+      options?: {
+        nextTool?: "move" | "pen";
+        preserveActiveTool?: boolean;
+      },
+    ) => {
+      handleOverviewPrimitivesCreated(
+        [{ screenId, nodeId }],
+        { screenId, nodeId },
+        options,
+      );
+    },
+    [handleOverviewPrimitivesCreated],
   );
 
   useEffect(() => {
@@ -636,6 +830,9 @@ export function useEditorToolsAndVectors({
       },
     ) => {
       if (!boardFileId || !canEditDesign) return false;
+      const contentUndoStackTopBefore = captureContentUndoStackTop(
+        contentUndoStackRef.current,
+      );
       const result = handleCreatePrimitive(
         boardFileId,
         primitive,
@@ -651,7 +848,12 @@ export function useEditorToolsAndVectors({
             ? result.nodeId
             : primitive.nodeId;
       if (nodeId) {
-        handlePrimitiveCreated(boardFileId, nodeId, options);
+        handlePrimitiveCreated(boardFileId, nodeId, options, {
+          contentUndoStackRef,
+          contentHistorySelectionAfterRef,
+          contentUndoStackTopBefore,
+          captureCurrentSelection,
+        });
       }
 
       return typeof result === "object"
@@ -660,7 +862,15 @@ export function useEditorToolsAndVectors({
           ? result
           : true;
     },
-    [boardFileId, canEditDesign, handleCreatePrimitive, handlePrimitiveCreated],
+    [
+      boardFileId,
+      canEditDesign,
+      captureCurrentSelection,
+      contentHistorySelectionAfterRef,
+      contentUndoStackRef,
+      handleCreatePrimitive,
+      handlePrimitiveCreated,
+    ],
   );
 
   const handleSingleScreenCreatePrimitive = useCallback(
@@ -669,20 +879,71 @@ export function useEditorToolsAndVectors({
       const nodeId = uniqueLayerId(spec.tool === "pen" ? "path" : spec.tool);
       const primitive = createPrimitiveInsertFromSpec(spec, nodeId);
       if (!primitive) return false;
-      const result = handleCreatePrimitive(activeFile.id, primitive);
+      const yjsUndoStackTopBefore = captureYjsUndoStackTop(
+        undoManagerRef.current,
+      );
+      const yjsSelectionBefore = {
+        selectedElement,
+        selectedLayerIds: selectedLayerIdsState,
+      };
+      const contentUndoStackTopBefore = captureContentUndoStackTop(
+        contentUndoStackRef.current,
+      );
+      const localContentUndoStackTopBefore =
+        localContentUndoStackRef.current[
+          localContentUndoStackRef.current.length - 1
+        ];
+      const yjsHistoryUpdate = captureYjsUndoHistoryUpdate(
+        undoManagerRef.current,
+        () => handleCreatePrimitive(activeFile.id, primitive),
+      );
+      const result = yjsHistoryUpdate.result;
       if (!result) return false;
       const resultNodeId = typeof result === "string" ? result : nodeId;
-      handlePrimitiveCreated(activeFile.id, resultNodeId, {
-        nextTool:
-          spec.nextTool ??
-          (spec.tool === "pen" && spec.preserveActiveTool !== false
-            ? "pen"
-            : undefined),
-        preserveActiveTool: spec.preserveActiveTool,
-      });
+      handlePrimitiveCreated(
+        activeFile.id,
+        resultNodeId,
+        {
+          nextTool:
+            spec.nextTool ??
+            (spec.tool === "pen" && spec.preserveActiveTool !== false
+              ? "pen"
+              : undefined),
+          preserveActiveTool: spec.preserveActiveTool,
+        },
+        {
+          contentUndoStackRef,
+          contentHistorySelectionAfterRef,
+          contentUndoStackTopBefore,
+          captureCurrentSelection,
+          yjsUndoSelection: {
+            undoManagerRef,
+            undoStackTopBefore: yjsUndoStackTopBefore,
+            selectionBefore: yjsSelectionBefore,
+            recorded: yjsHistoryUpdate.recorded,
+          },
+          localContentUndoSelection: {
+            undoStackRef: localContentUndoStackRef,
+            undoStackTopBefore: localContentUndoStackTopBefore,
+            selectionBefore: yjsSelectionBefore,
+          },
+        },
+      );
       return resultNodeId;
     },
-    [activeFile, canEditDesign, handleCreatePrimitive, handlePrimitiveCreated],
+    [
+      activeFile,
+      canEditDesign,
+      captureCurrentSelection,
+      contentHistorySelectionAfterRef,
+      contentUndoStackRef,
+      handleCreatePrimitive,
+      handlePrimitiveCreated,
+      localContentUndoStackRef,
+      selectedElement,
+      selectedLayerIdsState,
+      undoManagerRef,
+    ],
   );
 
   const handleUpdatePenPath = useCallback(
@@ -713,16 +974,28 @@ export function useEditorToolsAndVectors({
       if (!current) return false;
       let primitiveSource = current.primitiveSource;
       if (phase === "commit") {
+        vectorCommitOutcomeRef.current = "accepted";
         const baseContent = getScreenContent(current.screenId);
         if (!baseContent) {
+          vectorCommitOutcomeRef.current = "refused";
           toast.error(t("designEditor.toasts.vectorEditUnsupported"));
+          setVectorEditingState((latest) =>
+            latest?.layerId === current.layerId &&
+            latest.screenId === current.screenId
+              ? {
+                  ...latest,
+                  path: latest.lastAcceptedPath,
+                  pendingCommit: false,
+                }
+              : latest,
+          );
           return false;
         }
 
-        const sourcePath = translatePenPath(
+        const sourcePath = penPathForVectorEditCommit(
           nextPath,
-          -current.sourceOffset.x,
-          -current.sourceOffset.y,
+          current.sourceOffset,
+          current.sourceMapping,
         );
         const nextContent = current.primitiveSource
           ? writeBackPrimitiveAsVector(
@@ -738,21 +1011,61 @@ export function useEditorToolsAndVectors({
               sourcePath,
             );
         if (nextContent === null) {
+          vectorCommitOutcomeRef.current = "refused";
           toast.error(t("designEditor.toasts.vectorEditUnsupported"));
+          setVectorEditingState((latest) =>
+            latest?.layerId === current.layerId &&
+            latest.screenId === current.screenId
+              ? {
+                  ...latest,
+                  path: latest.lastAcceptedPath,
+                  pendingCommit: false,
+                }
+              : latest,
+          );
           return false;
         }
         if (nextContent !== baseContent) {
           const result = applyFileContentUpdate(current.screenId, nextContent, {
             skipPreview: current.screenId !== activeFile?.id,
             historyBeforeContent: baseContent,
+            deferWhenLinkedMutationPending: true,
           });
-          if (result.status !== "accepted") return false;
+          if (result.status !== "accepted") {
+            vectorCommitOutcomeRef.current = result.status;
+            if (result.status === "refused") {
+              toast.error(t("editPanel.shaders.saveFailed"));
+            }
+            setVectorEditingState((latest) =>
+              latest?.layerId === current.layerId &&
+              latest.screenId === current.screenId
+                ? {
+                    ...latest,
+                    path:
+                      result.status === "refused"
+                        ? latest.lastAcceptedPath
+                        : nextPath,
+                    primitiveSource,
+                    pendingCommit: result.status === "deferred",
+                  }
+                : latest,
+            );
+            return false;
+          }
           if (current.primitiveSource) primitiveSource = null;
         }
       }
       setVectorEditingState((latest) =>
-        latest?.layerId === current.layerId
-          ? { ...latest, path: nextPath, primitiveSource }
+        latest?.layerId === current.layerId &&
+        latest.screenId === current.screenId
+          ? {
+              ...latest,
+              path: nextPath,
+              lastAcceptedPath:
+                phase === "commit" ? nextPath : latest.lastAcceptedPath,
+              primitiveSource,
+              pendingCommit: phase === "commit" ? false : latest.pendingCommit,
+            }
           : latest,
       );
       return true;
@@ -767,8 +1080,16 @@ export function useEditorToolsAndVectors({
   );
 
   const handleVectorEditExit = useCallback(() => {
+    if (
+      vectorEditingState?.pendingCommit &&
+      !handleVectorEditChange(vectorEditingState.path, "commit")
+    ) {
+      if (vectorCommitOutcomeRef.current === "deferred") return;
+      setVectorEditingState(null);
+      return;
+    }
     setVectorEditingState(null);
-  }, []);
+  }, [handleVectorEditChange, vectorEditingState]);
 
   const handleVectorAnchorSelection = useCallback(
     (selectedAnchorIndex: number | null) => {
@@ -780,63 +1101,123 @@ export function useEditorToolsAndVectors({
   );
 
   const handleVectorCornerRadiusChange = useCallback(
-    (radius: number, phase: "preview" | "commit") => {
-      setVectorEditingState((current) => {
-        if (!current || current.selectedAnchorIndex === null) return current;
-        const nextPath = setPenNodeCornerRadius(
-          current.path,
-          current.selectedAnchorIndex,
-          radius,
-        );
-        if (!nextPath) return current;
-        if (
-          (current.path.nodes[current.selectedAnchorIndex]?.cornerRadius ??
-            0) ===
+    (radius: number, phase: "preview" | "commit" | "cancel") => {
+      const current = vectorEditingState;
+      if (!current || current.selectedAnchorIndex === null) return;
+      const nextPath = setPenNodeCornerRadius(
+        current.path,
+        current.selectedAnchorIndex,
+        radius,
+      );
+      if (!nextPath) return;
+      if (
+        phase !== "commit" &&
+        (current.path.nodes[current.selectedAnchorIndex]?.cornerRadius ?? 0) ===
           (nextPath.nodes[current.selectedAnchorIndex]?.cornerRadius ?? 0)
-        ) {
-          return current;
+      ) {
+        return;
+      }
+
+      const updatePath = (
+        path: PenPath,
+        options?: { pendingCommit?: boolean; accepted?: boolean },
+      ) => {
+        setVectorEditingState((latest) =>
+          latest?.layerId === current.layerId &&
+          latest.screenId === current.screenId
+            ? {
+                ...latest,
+                path,
+                ...(options?.pendingCommit === undefined
+                  ? {}
+                  : { pendingCommit: options.pendingCommit }),
+                ...(options?.accepted ? { lastAcceptedPath: path } : {}),
+              }
+            : latest,
+        );
+      };
+
+      if (phase === "cancel") {
+        updatePath(nextPath);
+        return;
+      }
+
+      if (phase === "commit") {
+        vectorCommitOutcomeRef.current = "accepted";
+        const baseContent = getScreenContent(current.screenId);
+        if (!baseContent) {
+          vectorCommitOutcomeRef.current = "refused";
+          toast.error(t("designEditor.toasts.vectorEditUnsupported"));
+          updatePath(current.lastAcceptedPath, { pendingCommit: false });
+          return;
         }
-        if (phase === "commit") {
-          const baseContent = getScreenContent(current.screenId);
-          if (!baseContent) {
-            toast.error(t("designEditor.toasts.vectorEditUnsupported"));
-            return current;
-          }
-          const sourcePath = translatePenPath(
-            nextPath,
-            -current.sourceOffset.x,
-            -current.sourceOffset.y,
-          );
-          const nextContent = writeBackVectorEditedPenPath(
-            baseContent,
-            current.nodeId,
-            sourcePath,
-          );
-          if (nextContent === null) {
-            toast.error(t("designEditor.toasts.vectorEditUnsupported"));
-            return current;
-          }
-          if (nextContent !== baseContent) {
-            applyFileContentUpdate(current.screenId, nextContent, {
+        const sourcePath = penPathForVectorEditCommit(
+          nextPath,
+          current.sourceOffset,
+          current.sourceMapping,
+        );
+        const nextContent = writeBackVectorEditedPenPath(
+          baseContent,
+          current.nodeId,
+          sourcePath,
+        );
+        if (nextContent === null) {
+          vectorCommitOutcomeRef.current = "refused";
+          toast.error(t("designEditor.toasts.vectorEditUnsupported"));
+          updatePath(current.lastAcceptedPath, { pendingCommit: false });
+          return;
+        }
+        if (nextContent !== baseContent) {
+          const publication = applyFileContentUpdate(
+            current.screenId,
+            nextContent,
+            {
               skipPreview: current.screenId !== activeFile?.id,
               historyBeforeContent: baseContent,
-            });
+              deferWhenLinkedMutationPending: true,
+            },
+          );
+          vectorCommitOutcomeRef.current = publication.status;
+          if (publication.status === "refused") {
+            toast.error(t("editPanel.shaders.saveFailed"));
+          }
+          if (publication.status !== "accepted") {
+            updatePath(
+              publication.status === "refused"
+                ? current.lastAcceptedPath
+                : nextPath,
+              { pendingCommit: publication.status === "deferred" },
+            );
+            return;
           }
         }
-        return { ...current, path: nextPath };
+      }
+
+      updatePath(nextPath, {
+        ...(phase === "commit" ? { pendingCommit: false, accepted: true } : {}),
       });
     },
-    [activeFile?.id, applyFileContentUpdate, getScreenContent, t],
+    [
+      activeFile?.id,
+      applyFileContentUpdate,
+      getScreenContent,
+      t,
+      vectorEditingState,
+    ],
   );
 
   useEffect(() => {
-    if (
-      vectorEditingState &&
-      !selectedLayerIdsState.includes(vectorEditingState.layerId)
-    ) {
+    if (!vectorEditingState) return;
+    const screenStillExists = files.some(
+      (file) => file.id === vectorEditingState.screenId,
+    );
+    const layerWasDeselected =
+      !vectorEditingState.pendingCommit &&
+      !selectedLayerIdsState.includes(vectorEditingState.layerId);
+    if (!screenStillExists || layerWasDeselected) {
       setVectorEditingState(null);
     }
-  }, [selectedLayerIdsState, vectorEditingState]);
+  }, [files, selectedLayerIdsState, vectorEditingState]);
 
   const vectorEditOverlayState = useMemo<VectorEditOverlayState | null>(() => {
     if (!vectorEditingState) return null;
@@ -1100,6 +1481,13 @@ export function useEditorToolsAndVectors({
           return owner ? [owner.fileId] : [];
         }),
       );
+      setSelectedLayerIdsState((current) =>
+        reconcileSelectedLayerIdsForOverviewScreens({
+          selectedLayerIds: current,
+          screenFileIds: fileIds,
+          selectedScreenIds: nextIds,
+        }),
+      );
       if (
         intent?.source === "marquee" &&
         (intent.metaKey === true || intent.ctrlKey === true)
@@ -1134,26 +1522,14 @@ export function useEditorToolsAndVectors({
       setOverviewSelectedScreenIds((current) =>
         sameStringIds(current, nextIds) ? current : nextIds,
       );
-      // BP-DEEP item 5 — Framer click-to-target: a click on EMPTY overview
-      // canvas clears the screen selection (ids === []); that gesture also
-      // returns the active edit scope to Base, mirroring clicking the base
-      // frame itself. Two guards keep this from over-firing:
-      // - viewModeRef: the selection-clear that fires while entering
-      //   single-screen mode (enterSingleScreen flips the ref to "single"
-      //   synchronously before any state settles) must not reset a
-      //   breakpoint the user is about to keep editing in the focused view.
-      // - overviewSelectedScreenIdsRef (still holding the PRE-update
-      //   selection when this callback runs — it's re-assigned during
-      //   render): MultiScreenCanvas's selection-report effect fires once on
-      //   mount with [] before its prop sync, and an []→[] "transition" is
-      //   that mount echo, not a user's empty-canvas click; without this
-      //   guard every overview (re)mount would clobber a persisted/agent-set
-      //   active breakpoint back to auto.
       if (
-        ids.length === 0 &&
-        overviewSelectedScreenIdsRef.current.length > 0 &&
-        viewModeRef.current === "overview" &&
-        activeBreakpointWidthStateRef.current !== undefined
+        shouldResetBreakpointAfterOverviewSelectionClear({
+          selectedScreenIds: nextIds,
+          previousSelectedScreenIds: overviewSelectedScreenIdsRef.current,
+          viewMode: viewModeRef.current,
+          activeBreakpointWidth: activeBreakpointWidthStateRef.current,
+          intent,
+        })
       ) {
         handleBreakpointBarSelect(undefined);
       }
@@ -1260,10 +1636,6 @@ export function useEditorToolsAndVectors({
     ],
   );
 
-  useEffect(() => {
-    if (files.length > 0) resetAgentGenerating();
-  }, [files.length, resetAgentGenerating]);
-
   const handleTweakPromptSubmit = useCallback(
     (
       prompt: string,
@@ -1335,6 +1707,7 @@ export function useEditorToolsAndVectors({
         persistedSelectionStateRef,
         persistedSelectionWriteTimerRef,
         responsiveEditScope,
+        reviewThreadId: openReviewThreadId,
         selectedElement,
         selectedScreenIds,
         selectedStateId,
@@ -1368,6 +1741,7 @@ export function useEditorToolsAndVectors({
       designDataJson,
       layoutGrids,
       selectedStateId,
+      openReviewThreadId,
       isSignedIn,
       interactDeviceName,
       interactDeviceSize.width,
@@ -1380,14 +1754,6 @@ export function useEditorToolsAndVectors({
   const mirroredExcerptRef = useRef<string | null>(null);
   const sentSelectionIdRef = useRef<string | null>(null);
   const composerContextHasOurKeyRef = useRef(true);
-
-  const composerContextItemsForBookkeeping =
-    useAgentChatContext(isSignedIn).items;
-  useEffect(() => {
-    const key = "design:selected-element";
-    composerContextHasOurKeyRef.current =
-      composerContextItemsForBookkeeping.some((item) => item.key === key);
-  }, [composerContextItemsForBookkeeping]);
 
   useEffect(
     () =>
@@ -1518,6 +1884,7 @@ export function useEditorToolsAndVectors({
                 height: geometry.height as number,
               },
             }).camera,
+            revealOnly: !widgetEmbed,
             nonce: cameraCommandNonceRef.current,
           });
         }
@@ -1534,6 +1901,7 @@ export function useEditorToolsAndVectors({
       overviewInteractScreenIdRef,
       setOverviewInteractScreenId,
       setCameraCommand,
+      widgetEmbed,
     ],
   );
 
@@ -1548,11 +1916,13 @@ export function useEditorToolsAndVectors({
   );
 
   return {
+    composerContextHasOurKeyRef,
     shapeTool,
     vectorEditingState,
-    setVectorEditingState,
+    setVectorEditingState: setVectorEditingStateFromMode,
     runtimeStructureInsertRevisionRef,
     reviewFocusRequest,
+    setOpenReviewThreadId,
     activeCodeFile,
     setActiveCodeFile,
     selectionRevisionRef,
@@ -1566,6 +1936,9 @@ export function useEditorToolsAndVectors({
     reviewCommentsPanelProps,
     handleCreatePrimitive,
     handlePrimitiveCreated,
+    handleOverviewCreatePrimitive,
+    handleOverviewPrimitiveCreated,
+    handleOverviewPrimitivesCreated,
     handleBoardDrawPrimitive,
     handleSingleScreenCreatePrimitive,
     handleUpdatePenPath,

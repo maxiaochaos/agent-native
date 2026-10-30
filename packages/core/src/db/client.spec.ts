@@ -139,7 +139,34 @@ describe("PGlite dev reloads", () => {
     }
   });
 
-  it.each(["execute", "transaction", "atomicBatch"] as const)(
+  it("drops capabilities the initialized adapter does not have", async () => {
+    vi.stubEnv("DATABASE_URL", "pglite:memory");
+    vi.stubEnv("DATABASE_URL_UNPOOLED", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "");
+    vi.stubEnv("NETLIFY_DATABASE_URL_UNPOOLED", "");
+    vi.doMock("@electric-sql/pglite", () => ({
+      PGlite: {
+        create: vi.fn(async () => ({
+          query: vi.fn(async () => ({ rows: [] })),
+          close: vi.fn(async () => {}),
+        })),
+      },
+    }));
+
+    const { closeDbExec, getDbExec } = await import("./client.js");
+    const proxy = getDbExec();
+    try {
+      await proxy.execute("SELECT 1");
+      // The proxy is shared, so feature detection must see what the adapter
+      // supports: PGlite has transactions but no atomic batches.
+      expect(proxy.atomicBatch).toBeUndefined();
+      expect(typeof proxy.transaction).toBe("function");
+    } finally {
+      await closeDbExec();
+    }
+  });
+
+  it.each(["execute", "transaction"] as const)(
     "rejects a retained database proxy during %s when shutdown wins its initialization continuation",
     async (method) => {
       vi.stubEnv("DATABASE_URL", "pglite:memory");
@@ -174,10 +201,7 @@ describe("PGlite dev reloads", () => {
         });
         const staleOperation = Promise.resolve().then(() => {
           if (method === "execute") return retainedProxy.execute("SELECT 2");
-          if (method === "transaction") {
-            return retainedProxy.transaction!(async () => undefined);
-          }
-          return retainedProxy.atomicBatch!(["SELECT 2"]);
+          return retainedProxy.transaction!(async () => undefined);
         });
 
         await expect(staleOperation).rejects.toMatchObject({
@@ -247,6 +271,21 @@ describe("db/client Postgres URL handling", () => {
     const { getDatabaseUrl } = await import("./client.js");
     expect(getDatabaseUrl("postgres://fallback.example/db")).toBe(
       "postgres://netlify.example/db",
+    );
+  });
+
+  it("uses only DATABASE_URL when an explicit database is required", async () => {
+    vi.stubEnv("APP_NAME", "plan");
+    vi.stubEnv("DATABASE_URL", "");
+    vi.stubEnv("PLAN_DATABASE_URL", "postgres://plan.example/db");
+    vi.stubEnv("NETLIFY_DATABASE_URL", "postgres://netlify.example/db");
+    const { getDatabaseUrl } = await import("./client.js");
+
+    expect(getDatabaseUrl("", { explicitOnly: true })).toBe("");
+
+    vi.stubEnv("DATABASE_URL", "postgres://selected.example/db");
+    expect(getDatabaseUrl("", { explicitOnly: true })).toBe(
+      "postgres://selected.example/db",
     );
   });
 
@@ -1296,6 +1335,18 @@ describe("initClient hosted-runtime local database guard", () => {
 });
 
 describe("toPostgresParams", () => {
+  it("rewrites only generated SQL fragment bind markers", async () => {
+    const { toPostgresParams } = await import("./client.js");
+    const { getSqlFragmentParameterOffsets, sql } = await import("./sql.js");
+    const fragment = sql`SELECT payload ? 'key', payload ?| ARRAY['tag'], payload ?& ARRAY['tag'] FROM records WHERE id = ${sql.value("thread-1")}`;
+
+    expect(
+      toPostgresParams(fragment.sql, getSqlFragmentParameterOffsets(fragment)),
+    ).toBe(
+      "SELECT payload ? 'key', payload ?| ARRAY['tag'], payload ?& ARRAY['tag'] FROM records WHERE id = $1",
+    );
+  });
+
   it("converts placeholders while preserving question marks inside SQL literals", async () => {
     const { toPostgresParams } = await import("./client.js");
 
@@ -1320,6 +1371,16 @@ describe("toPostgresParams", () => {
     );
   });
 
+  it("does not treat dollar delimiters inside identifiers as dollar quotes", async () => {
+    const { toPostgresParams } = await import("./client.js");
+    const { getSqlFragmentParameterOffsets, sql } = await import("./sql.js");
+    const fragment = sql`SELECT foo$bar$col FROM records WHERE id = ${sql.value("record-1")}`;
+
+    expect(
+      toPostgresParams(fragment.sql, getSqlFragmentParameterOffsets(fragment)),
+    ).toBe("SELECT foo$bar$col FROM records WHERE id = $1");
+  });
+
   it("converts placeholders after a backslash SQL string literal", async () => {
     const { toPostgresParams } = await import("./client.js");
 
@@ -1330,6 +1391,16 @@ describe("toPostgresParams", () => {
     ).toBe(
       "SELECT * FROM org_members WHERE email LIKE $1 ESCAPE '\\' AND role = $2 LIMIT $3 OFFSET $4",
     );
+  });
+
+  it("converts fragment bind markers after escaped quotes in PostgreSQL E strings", async () => {
+    const { toPostgresParams } = await import("./client.js");
+    const { getSqlFragmentParameterOffsets, sql } = await import("./sql.js");
+    const fragment = sql`SELECT E'it\'s' WHERE id = ${sql.value("member-1")}`;
+
+    expect(
+      toPostgresParams(fragment.sql, getSqlFragmentParameterOffsets(fragment)),
+    ).toBe("SELECT E'it\\'s' WHERE id = $1");
   });
 });
 

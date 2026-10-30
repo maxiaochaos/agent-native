@@ -10,6 +10,7 @@ import {
   setCookie,
   deleteCookie,
   getHeader,
+  normalizeRoute,
 } from "h3";
 import type { H3Event } from "h3";
 
@@ -19,11 +20,12 @@ import {
   newOrgSelection,
   ORG_SELECTION_COOKIE,
 } from "../org/request-org-cache.js";
-import { checkWorkspaceAppAccessForRequest } from "../org/workspace-app-access-request.js";
 import {
-  WORKSPACE_APP_ACCESS_UNAVAILABLE,
-  WORKSPACE_APP_ACCESS_UNAVAILABLE_MESSAGE,
-} from "../org/workspace-app-access.js";
+  isWorkspaceAppAccessUnavailable,
+  workspaceAppAccessUnavailableBody,
+} from "../org/workspace-app-access-outcome.js";
+import { checkWorkspaceAppAccessForRequest } from "../org/workspace-app-access-request.js";
+import { CONSENT_PATH, CONSENT_REGION_PATH } from "../shared/consent.js";
 import {
   EMBED_SESSION_COOKIE,
   EMBED_START_PATH,
@@ -34,6 +36,7 @@ import {
   FIRST_RUN_ONBOARDING_COOKIE,
   FIRST_RUN_ONBOARDING_MAX_AGE,
 } from "../shared/first-run-onboarding.js";
+import { FIRST_TOUCH_SERVER_PATH } from "../shared/first-touch-persistence.js";
 import { isGoogleProfileImageUrl } from "../shared/google-profile-image.js";
 import {
   EMBED_TRANSPLANT_HEADER,
@@ -41,6 +44,11 @@ import {
   MCP_EMBED_CORS_ALLOW_HEADERS,
   shouldAllowMcpEmbedCredentials,
 } from "../shared/mcp-embed-headers.js";
+import {
+  createConsentHandler,
+  createConsentRegionHandler,
+  requestAllowsConsentCategory,
+} from "./consent-route.js";
 import { readDevActionDiscoveryFile } from "./dev-action-discovery.js";
 import { devLoopbackAuthHint } from "./dev-origin-hint.js";
 import {
@@ -58,6 +66,7 @@ import {
   resolveEmbedSessionFromRequest,
   verifyEmbedSessionToken,
 } from "./embed-session.js";
+import { createFirstTouchHandler } from "./first-touch-route.js";
 import { getPublicFrameworkPathname } from "./framework-request-context.js";
 import type { H3AppShim } from "./framework-request-handler.js";
 import {
@@ -99,7 +108,7 @@ function toWebRequest(event: H3Event): Request {
 type H3App = H3AppShim;
 import { getDbExec, describeDbError, type DbExec } from "../db/client.js";
 import { ensureColumnExists, ensureTableExists } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
 import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import { resolveLocaleFromRequest } from "../localization/server.js";
 import { readMcpOAuthFlowCookiePayload } from "../mcp-client/oauth-flow-cookie.js";
@@ -176,6 +185,7 @@ import { getAppProductionUrl } from "./app-url.js";
 import {
   addSignupAttributionHeader,
   readAnalyticsAnonymousId,
+  readAnalyticsSessionId,
   signupAttributionContextFromCookieHeader,
   signupAttributionFromCookieHeader,
   type SignupAttributionContext,
@@ -268,6 +278,12 @@ import {
   encodeMagicLinkSignupAttribution,
   MAGIC_LINK_ATTRIBUTION_PARAM,
 } from "./magic-link-attribution.js";
+import {
+  filterMcpSignupAttributionByConsent,
+  hasMcpSignupAttributionCookie,
+  MCP_SIGNUP_ATTRIBUTION_COOKIE_NAME,
+  readMcpSignupContextFromCookieHeader,
+} from "./mcp-signup-attribution.js";
 import { safeOAuthReturnUrl } from "./oauth-return-url.js";
 import {
   getDeploySettingsRequiredHtml,
@@ -279,6 +295,7 @@ import { queryEchoSafeRedirect } from "./query-echo-safe-redirect.js";
 import {
   getRequestContext,
   markRequestIdentityAuthenticatedAtMs,
+  markVerifiedMcpCredentialForEvent,
   markVerifiedServiceIdentityForEvent,
   hasContinuationLocalRequestContext,
   hasExplicitPersonalOrgScope,
@@ -287,6 +304,11 @@ import {
 } from "./request-context.js";
 import { getForwardedRequestOrigin } from "./request-origin.js";
 import { captureAuthError } from "./sentry.js";
+import {
+  isSessionResolutionUnavailable,
+  markSessionResolutionUnavailable,
+  reportSessionResolutionUnavailable,
+} from "./session-resolution-unavailable.js";
 import { isTestIdentity } from "./test-identity.js";
 import { isWorkspaceOAuthCallbackRelayEnabled } from "./workspace-oauth.js";
 
@@ -389,8 +411,39 @@ export interface AuthOptions {
   maxAge?: number;
   getSession?: (event: H3Event) => Promise<AuthSession | null>;
   /**
-   * Set only when the custom provider independently verifies email ownership.
-   * Without this opt-in, an omitted `emailVerified` value remains unknown.
+   * With custom authentication, resolve browser identity from cookies only.
+   * Never accept bearer tokens, query tokens, or other request headers here.
+   */
+  getBrowserSession?: (event: H3Event) => Promise<AuthSession | null>;
+  /**
+   * An extra identity source, consulted before the built-in sessions. Unlike
+   * `getSession`, it does not replace them: a request it does not recognize
+   * (returns `null`) resolves exactly as it would without it, and the built-in
+   * sign-in routes stay mounted. Use it to let a host product vouch for its
+   * own users on a deployment that also serves everyone else. If it throws, the
+   * request is refused as session-unavailable (503) rather than falling
+   * through, so a browser holding two identities cannot silently become the
+   * other one. Ignored when `getSession` is set, which already takes over every
+   * session.
+   */
+  getAdditionalSession?: (event: H3Event) => Promise<AuthSession | null>;
+  /**
+   * The cookie-only counterpart of `getAdditionalSession`, for browser UI
+   * capabilities and approvals. Never accept bearer tokens, query tokens, or
+   * other request headers here.
+   */
+  getAdditionalBrowserSession?: (event: H3Event) => Promise<AuthSession | null>;
+  /**
+   * Called on sign-out to end the additional provider's own session (clear its
+   * cookie, drop any server-side state), which the built-in sign-out knows
+   * nothing about. Without it a user would still resolve as signed in on the
+   * next request.
+   */
+  clearAdditionalSession?: (event: H3Event) => void | Promise<void>;
+  /**
+   * Set only when the custom provider (`getSession` or
+   * `getAdditionalSession`) independently verifies email ownership. Without
+   * this opt-in, an omitted `emailVerified` value remains unknown.
    */
   trustCustomEmailVerification?: boolean;
   publicPaths?: string[];
@@ -577,9 +630,17 @@ async function enrichLegacySessionIdentity(
       // coercion-ok: preserve the valid legacy session when optional profile enrichment is unreadable.
       .catch(() => null);
   }
-  if (!existing) return session;
+  if (
+    !existing ||
+    existing.user.email.trim().toLowerCase() !==
+      session.email.trim().toLowerCase()
+  ) {
+    return session;
+  }
   return {
     ...session,
+    authUserId: session.authUserId ?? existing.user.id,
+    userId: session.userId ?? existing.user.id,
     ...(!session.name?.trim() && existing.user.name?.trim()
       ? { name: existing.user.name.trim() }
       : {}),
@@ -868,8 +929,7 @@ export function getConfiguredLoginHtml(
   const requestPath = `${rawPath}${search}`;
   const setupRequiredHtml = config.getSetupRequiredHtml?.(event, requestPath);
   if (setupRequiredHtml) return { html: setupRequiredHtml, status: 503 };
-  const loginHtml =
-    config.getLoginHtml?.(event, requestPath) ?? config.loginHtml ?? null;
+  const loginHtml = config.getLoginHtml(event, requestPath);
   if (!loginHtml) return null;
 
   const appOriginConfigScript = getAppOriginClientConfigScript();
@@ -1201,14 +1261,25 @@ export async function getMcpOAuthBearerSession(
   const bearerToken = getBearerSessionToken(event);
   if (!bearerToken) return null;
 
+  let identityVerificationUnavailableErrorClass:
+    | typeof import("../mcp/build-server.js").McpIdentityVerificationUnavailableError
+    | undefined;
+  let identityVerificationRefusedErrorClass:
+    | typeof import("../mcp/build-server.js").McpIdentityVerificationRefusedError
+    | undefined;
+  let connectUrl: string | undefined;
   try {
-    const [
-      { getMcpConnectUrl, getMcpOAuthAudiences },
-      { verifyAuth, resolveMcpIdentityOrgId },
-    ] = await Promise.all([
+    const [oauthRoute, mcp] = await Promise.all([
       import("../mcp/oauth-route.js"),
       import("../mcp/build-server.js"),
     ]);
+    connectUrl = oauthRoute.getMcpConnectUrl(event);
+    identityVerificationUnavailableErrorClass =
+      mcp.McpIdentityVerificationUnavailableError;
+    identityVerificationRefusedErrorClass =
+      mcp.McpIdentityVerificationRefusedError;
+    const { getMcpOAuthAudiences } = oauthRoute;
+    const { verifyAuth, resolveMcpIdentityOrgId } = mcp;
     const result = await verifyAuth(authHeader, undefined, {
       resourceUrl: getMcpOAuthAudiences(event),
       allowDevOpen: false,
@@ -1220,11 +1291,7 @@ export async function getMcpOAuthBearerSession(
     }
     if (!result.authed) {
       if (result.refusal) {
-        markBearerCredentialRefused(
-          event,
-          result.refusal,
-          getMcpConnectUrl(event),
-        );
+        markBearerCredentialRefused(event, result.refusal, connectUrl);
       }
       return null;
     }
@@ -1232,6 +1299,12 @@ export async function getMcpOAuthBearerSession(
     if (!identity?.userEmail) return null;
     if (identity.orgId === null) markExplicitPersonalOrgScope(event);
     const orgId = await resolveMcpIdentityOrgId(identity);
+    markVerifiedMcpCredentialForEvent(event, {
+      userEmail: identity.userEmail,
+      ...(identity.oauthClientId
+        ? { oauthClientId: identity.oauthClientId }
+        : {}),
+    });
     if (
       identity.identityAssurance === "service" &&
       identity.orgId &&
@@ -1248,6 +1321,20 @@ export async function getMcpOAuthBearerSession(
       ...(orgId ? { orgId } : {}),
     };
   } catch (e) {
+    if (
+      identityVerificationRefusedErrorClass &&
+      e instanceof identityVerificationRefusedErrorClass
+    ) {
+      markBearerCredentialRefused(event, "invalid", connectUrl);
+      return null;
+    }
+    if (
+      identityVerificationUnavailableErrorClass &&
+      e instanceof identityVerificationUnavailableErrorClass
+    ) {
+      markCredentialMembershipUnavailable(event);
+      return null;
+    }
     console.error("[auth] MCP OAuth bearer verification error:", e);
     return null;
   }
@@ -1915,39 +2002,40 @@ export function isExpectedAuthFailure(error: unknown): boolean {
   return EXPECTED_AUTH_FAILURE_PATTERNS.some((re) => re.test(msg));
 }
 
-let _sessionInitPromise: Promise<void> | undefined;
 let sessionMaxAge = DEFAULT_MAX_AGE;
 
-export async function ensureSessionTable(): Promise<void> {
-  if (!_sessionInitPromise) {
-    const _sessionInitPromiseWithRequestDbPoolScope = (async () => {
-      const createSql = `
+export const authSessionsStore = defineStore({
+  id: "auth_sessions",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createSql = `
           CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
             email TEXT,
             created_at BIGINT NOT NULL
           )
         `;
-
-      {
         await ensureTableExists("sessions", createSql);
         await ensureColumnExists(
           "sessions",
           "email",
           `ALTER TABLE sessions ADD COLUMN IF NOT EXISTS email TEXT`,
         );
+      },
+    },
+    {
+      name: "widen-bigint",
+      run: async () => {
         await widenIntColumnsToBigInt("sessions", ["created_at"]);
-        return;
-      }
-    })().catch((err) => {
-      _sessionInitPromise = undefined;
-      throw err;
-    });
-    _sessionInitPromise = retainRequestDbPoolScope(
-      _sessionInitPromiseWithRequestDbPoolScope,
-    );
-  }
-  return _sessionInitPromise;
+      },
+    },
+  ],
+});
+
+export function ensureSessionTable(): Promise<void> {
+  return authSessionsStore.ready();
 }
 
 async function retryIfSessionsMissing<T>(op: () => Promise<T>): Promise<T> {
@@ -1957,7 +2045,7 @@ async function retryIfSessionsMissing<T>(op: () => Promise<T>): Promise<T> {
     if (e?.code !== "42P01") throw e;
     const msg = String(e?.message ?? "");
     if (!msg.includes("sessions")) throw e;
-    _sessionInitPromise = undefined;
+    authSessionsStore.reset();
     await ensureSessionTable();
     return await op();
   }
@@ -2107,6 +2195,17 @@ async function performLogout(
     clearIdentityGoogleAuthCookie(event);
     clearFirstRunOnboardingCookie(event);
     optOutOfAuthDisabledSession(event);
+
+    if (additionalClearSession) {
+      try {
+        await additionalClearSession(event);
+      } catch (error) {
+        // The user would still resolve as signed in through the additional
+        // provider, so sign-out has not worked.
+        revocationFailed = true;
+        captureAuthError(error, { route: "logout" });
+      }
+    }
 
     if (auth) {
       try {
@@ -2278,11 +2377,17 @@ async function mapLegacySession(
 
 let customGetSession: ((event: H3Event) => Promise<AuthSession | null>) | null =
   null;
+let customGetBrowserSession: AuthOptions["getBrowserSession"] | null = null;
+let additionalGetSession: AuthOptions["getAdditionalSession"] | null = null;
+let additionalGetBrowserSession:
+  | AuthOptions["getAdditionalBrowserSession"]
+  | null = null;
+let additionalClearSession: AuthOptions["clearAdditionalSession"] | null = null;
+let warnedMissingBrowserSession = false;
 let trustCustomEmailVerification = false;
 
 interface AuthGuardConfig {
-  loginHtml: string;
-  getLoginHtml?: (event: H3Event, rawPath: string) => string;
+  getLoginHtml: (event: H3Event, rawPath: string) => string;
   /**
    * The page served instead of sign-in, or null when sign-in can work. Set
    * only where the framework's own accounts sign people in; a custom
@@ -2306,15 +2411,7 @@ let _authGuardConfig: AuthGuardConfig | null = null;
 const AUTH_PUBLIC_PATHS_REGISTRY_KEY = Symbol.for(
   "@agent-native/core/auth.publicPaths",
 );
-const SESSION_RESOLUTION_ERROR_CONTEXT_KEY = "__anSessionResolutionError";
-
-export function isSessionResolutionUnavailable(event: H3Event): boolean {
-  return (
-    (event.context as Record<string, unknown> | undefined)?.[
-      SESSION_RESOLUTION_ERROR_CONTEXT_KEY
-    ] === true
-  );
-}
+export { isSessionResolutionUnavailable };
 
 async function getLegacyCookieSessionSafely(
   event: H3Event,
@@ -2323,9 +2420,7 @@ async function getLegacyCookieSessionSafely(
     return await getLegacyCookieSession(event);
   } catch (error) {
     console.error("[auth] legacy cookie session resolution error:", error);
-    (event.context as Record<string, unknown>)[
-      SESSION_RESOLUTION_ERROR_CONTEXT_KEY
-    ] = true;
+    markSessionResolutionUnavailable(event, "legacy-cookie", error);
     return null;
   }
 }
@@ -2363,7 +2458,10 @@ const _genericGoogleOAuthRoutesEnabled = new WeakMap<object, boolean>();
  * Allow framework routes with their own non-cookie authentication to reach
  * the handler. The handler remains responsible for verifying the credential.
  *
- * Registered paths are exact matches. This is registered separately from
+ * Registered paths are exact matches, where a `:name` segment stands for any
+ * one segment: `/x/:id` admits `/x/abc`, never `/x` or `/x/abc/more`.
+ * `/x/:id(uuidv4)` restricts that segment to a lowercase UUID v4.
+ * These are registered separately from
  * template auth options because framework routes can be mounted after the auth
  * plugin and must also work in custom workspace deployments that do not own a
  * template auth file.
@@ -2491,24 +2589,22 @@ function getOnboardingLoginHtmlConfig(
   authMode?: OnboardingHtmlOptions["authMode"],
 ): Pick<
   AuthGuardConfig,
-  | "loginHtml"
-  | "getLoginHtml"
-  | "getSetupRequiredHtml"
-  | "authMode"
-  | "rootAuth"
+  "getLoginHtml" | "getSetupRequiredHtml" | "authMode" | "rootAuth"
 > {
-  if (options.loginHtml) {
+  const { loginHtml } = options;
+  if (loginHtml) {
     return {
-      loginHtml: options.loginHtml,
+      getLoginHtml: () => loginHtml,
       getSetupRequiredHtml: getDeploySettingsRequiredPage,
       authMode,
       rootAuth: options.rootAuth ?? true,
     };
   }
+  // Rendered only for a request that shows it: rendering a copy up front cost
+  // every cold instance's first request.
   return {
     authMode,
     rootAuth: options.rootAuth ?? options.marketing !== undefined,
-    loginHtml: getAuthOnboardingHtml(options, undefined, undefined, authMode),
     getLoginHtml: (event, rawPath) =>
       getAuthOnboardingHtml(options, event, rawPath, authMode),
     getSetupRequiredHtml: getDeploySettingsRequiredPage,
@@ -3175,11 +3271,9 @@ function getRequestPathAndSearch(event: H3Event): {
   if (typeof mountedPathname === "string" && mountedPathname) {
     return { rawPath: mountedPathname, search: event.url?.search || "" };
   }
-  const url = event.node?.req?.url ?? event.path ?? "/";
-  const queryStart = url.indexOf("?");
   return {
-    rawPath: queryStart >= 0 ? url.slice(0, queryStart) : url,
-    search: queryStart >= 0 ? url.slice(queryStart) : "",
+    rawPath: event.url.pathname,
+    search: event.url.search,
   };
 }
 
@@ -3806,7 +3900,7 @@ function loginHtmlResponse(
   if (setupRequiredHtml) return setupRequiredResponse(setupRequiredHtml);
   const { search } = getRequestPathAndSearch(event);
   const appOriginConfigScript = getAppOriginClientConfigScript();
-  let html = config.getLoginHtml?.(event, requestPath) ?? config.loginHtml;
+  let html = config.getLoginHtml(event, requestPath);
   if (
     appOriginConfigScript &&
     !html.includes("data-agent-native-app-origin-config")
@@ -3857,21 +3951,49 @@ function isHtmlDocumentRequest(event: H3Event, pathname: string): boolean {
   return !accept || accept.includes("text/html") || accept.includes("*/*");
 }
 
+export function getAuthGuardPath(event: H3Event): string | null {
+  const rawUrl = event.node?.req?.url;
+  if (rawUrl !== undefined) {
+    const rawPath = rawUrl.split("?")[0]!;
+    // Encoded separators are opaque route-parameter data; URL parsing must
+    // not change the path's structure before any public-route decision.
+    if (
+      !rawPath.startsWith("/") ||
+      rawPath.startsWith("//") ||
+      rawPath.includes("\\") ||
+      new URL(`http://agent-native.invalid${rawPath}`).pathname !== rawPath
+    ) {
+      return null;
+    }
+  }
+  return stripAppBasePath(canonicalFrameworkPathname(event.url.pathname));
+}
+
+function isBrowserNavigationRequest(event: H3Event): boolean {
+  const fetchDest = getHeader(event, "sec-fetch-dest")?.toLowerCase();
+  if (fetchDest === "document" || fetchDest === "iframe") return true;
+  const accept = getHeader(event, "accept")?.toLowerCase();
+  return accept !== undefined && accept.includes("text/html");
+}
+
 function createAuthGuardFn(
   app?: object,
 ): (event: H3Event) => Promise<Response | object | string | void> {
   return async (event: H3Event) => {
     const config = _authGuardConfig;
     if (!config) return;
+    const p = getAuthGuardPath(event);
+    if (p === null) return new Response(null, { status: 400 });
     const publicPaths = resolveAuthPublicPaths(config.publicPaths);
     const exactPublicPaths = resolveAuthExactPublicPaths(app);
 
-    const url = event.node?.req?.url ?? event.path ?? "/";
-    const queryStart = url.indexOf("?");
-    const rawPath = queryStart >= 0 ? url.slice(0, queryStart) : url;
-    const requestPath = queryStart >= 0 ? url : rawPath;
-    const p = stripAppBasePath(canonicalFrameworkPathname(rawPath));
-    const normalizedUrl = queryStart >= 0 ? `${p}${url.slice(queryStart)}` : p;
+    // h3 mounts can mutate both event.url and the Node request's parsed URL.
+    const requestUrl = new URL(
+      event.node?.req?.url ?? event.req.url,
+      "http://agent-native.invalid",
+    );
+    const url = `${normalizeRoute(requestUrl.pathname)}${requestUrl.search}`;
+    const requestPath = url;
     const previewCallbackRelay =
       await netlifyPreviewGoogleOAuthCallbackRelayResponse(event);
     if (previewCallbackRelay) return previewCallbackRelay;
@@ -4155,9 +4277,7 @@ function createAuthGuardFn(
 
     if (p === SIGN_IN_ENTRY_PATH || p === SIGN_IN_LEGACY_ENTRY_PATH) {
       if (getMethod(event) === "GET") {
-        const query = new URLSearchParams(
-          queryStart >= 0 ? url.slice(queryStart + 1) : "",
-        );
+        const query = event.url.searchParams;
         const { resumeHref } = signInJourney({
           at: url,
           continuation: query.get(SIGN_IN_CONTINUATION_PARAM),
@@ -4251,7 +4371,7 @@ function createAuthGuardFn(
       ) {
         return;
       }
-    } else if (isPublicPath(normalizedUrl, publicPaths, exactPublicPaths)) {
+    } else if (isPublicPath(p, publicPaths, exactPublicPaths)) {
       return;
     }
     if (shouldBypassAuthForBuilderConnect(event, p)) return;
@@ -4298,9 +4418,9 @@ function createAuthGuardFn(
           email: session.email,
           orgId: session.orgId,
         });
-        if (workspaceAppAccess === WORKSPACE_APP_ACCESS_UNAVAILABLE) {
+        if (isWorkspaceAppAccessUnavailable(workspaceAppAccess)) {
           setResponseStatus(event, 503);
-          return { error: WORKSPACE_APP_ACCESS_UNAVAILABLE_MESSAGE };
+          return workspaceAppAccessUnavailableBody(workspaceAppAccess);
         }
         if (workspaceAppAccess === false) {
           setResponseStatus(event, 403);
@@ -4638,6 +4758,12 @@ function createLocalDevAuthHandler(config?: BetterAuthConfig) {
  *    source-code-known credential. After logout the auto-flow won't refire
  *    (dev row exists); use normal signup or reset the local DB to start over.
  *  - **NODE_ENV.** Still gated on development/test.
+ *  - **Browser navigations only.** A probe (curl, a health check, an agent
+ *    polling for the dev server) accepts any content type and sends no
+ *    Sec-Fetch headers. Letting it claim the one-time account would leave
+ *    the first real browser on the sign-in form, so only document
+ *    navigations and requests that ask for HTML create it, and never
+ *    while `AUTH_DISABLED` is on.
  *
  * Set `AGENT_NATIVE_DISABLE_AUTO_DEV_ACCOUNT=1` to opt out entirely
  * (useful for tests that exercise the unauthenticated branch).
@@ -4649,6 +4775,10 @@ async function maybeAutoCreateDevSession(
   if (!isDevEnvironment()) return null;
   if (process.env.AGENT_NATIVE_DISABLE_AUTO_DEV_ACCOUNT === "1") return null;
   if (!isLoopbackRequest(event)) return null;
+  if (!isBrowserNavigationRequest(event)) return null;
+  // Every request already runs as the dev account; creating it now would
+  // spend the one-time sign-in before AUTH_DISABLED is removed.
+  if (isAuthDisabled()) return null;
 
   try {
     const db = getDbExec();
@@ -4728,6 +4858,7 @@ export async function getSession(event: H3Event): Promise<AuthSession | null> {
     ctx.__anSessionCache = (async () => {
       const identityResolutionStartedAtMs = Date.now();
       const session = await resolveSessionUncached(event);
+      if (!session?.email) reportSessionResolutionUnavailable(event);
       if (session?.email) {
         // A logout racing any credential lookup must win over work using its result.
         const embedCredential = verifyEmbedSessionToken(session.token);
@@ -4757,6 +4888,116 @@ export async function getSession(event: H3Event): Promise<AuthSession | null> {
   return ctx.__anSessionCache;
 }
 
+/**
+ * The browser's signed-in user, read only from the session cookies sign-in
+ * sets: Better Auth's and the framework's own. No other credential counts:
+ * not a bearer or embed token, a query token, a generic custom resolver, or the
+ * desktop fallback, nor any credential `getSession` accepts in future. For
+ * pages whose decisions only the person may make. An app with a custom
+ * resolver must supply the explicit cookie-only `getBrowserSession` hook,
+ * since the framework can't tell which credentials `getSession` reads.
+ * The framework cookie takes a raw login
+ * token, so a desktop or mobile app can present its own login here; that app
+ * is the user. With AUTH_DISABLED every request is the dev account, here too.
+ */
+export async function getBrowserCookieSession(
+  event: H3Event,
+): Promise<AuthSession | null> {
+  const session = await resolveBrowserCookieSession(event);
+  if (!session?.email) {
+    reportSessionResolutionUnavailable(event);
+    return null;
+  }
+  const resolved = await backfillSessionOrg(session, event);
+  await resumeIdentityRekeyForSession(resolved.email);
+  return resolved;
+}
+
+export function getBrowserSessionConfigurationError(): string | undefined {
+  if (customGetSession && !customGetBrowserSession) {
+    return "Custom authentication requires AuthOptions.getBrowserSession for browser UI capabilities and approvals.";
+  }
+  return undefined;
+}
+
+/** The additional provider could not answer; the request must not resolve at all. */
+const ADDITIONAL_SESSION_FAILED = Symbol("additional-session-failed");
+
+/**
+ * The additional provider's verdict: a session, null to fall through to the
+ * built-in sessions, or a failure. A provider that cannot answer (a store
+ * outage, unreadable state) is not "no session": falling through would let a
+ * browser holding two identities silently become the other one, so the
+ * request is marked unavailable (503) instead.
+ */
+async function resolveAdditionalSession(
+  event: H3Event,
+  resolve: ((event: H3Event) => Promise<AuthSession | null>) | null | undefined,
+): Promise<AuthSession | null | typeof ADDITIONAL_SESSION_FAILED> {
+  if (!resolve || customGetSession) return null;
+  try {
+    const session = await resolve(event);
+    return session ? normalizeCustomSession(session) : null;
+  } catch (error) {
+    markSessionResolutionUnavailable(event, "additional-session", error);
+    return ADDITIONAL_SESSION_FAILED;
+  }
+}
+
+function hasBearerAuthorization(event: H3Event): boolean {
+  return /^bearer\s/i.test(getHeader(event, "authorization") ?? "");
+}
+
+async function resolveBrowserCookieSession(
+  event: H3Event,
+): Promise<AuthSession | null> {
+  if (additionalGetBrowserSession && getHeader(event, "cookie")) {
+    const additional = await resolveAdditionalSession(
+      event,
+      additionalGetBrowserSession,
+    );
+    if (additional === ADDITIONAL_SESSION_FAILED) return null;
+    if (additional) return additional;
+  }
+  if (customGetSession) {
+    if (!customGetBrowserSession) {
+      if (!warnedMissingBrowserSession) {
+        console.warn(`[auth] ${getBrowserSessionConfigurationError()}`);
+        warnedMissingBrowserSession = true;
+      }
+      return null;
+    }
+    if (!getHeader(event, "cookie")) return null;
+    const session = await customGetBrowserSession(event);
+    return session ? normalizeCustomSession(session) : null;
+  }
+  const cookie = getHeader(event, "cookie");
+  if (cookie) {
+    try {
+      const ba = getBetterAuthSync() ?? (await getBetterAuth());
+      const baSession = await ba.api.getSession({
+        headers: new Headers({ cookie: decodeCookieHeader(cookie) }),
+      });
+      if (baSession?.user.email) return mapBetterAuthSession(baSession);
+    } catch (e) {
+      console.error("[auth] ba.api.getSession error:", e);
+      markSessionResolutionUnavailable(event, "better-auth", e);
+    }
+    const cookieSession = await getLegacyCookieSessionSafely(event);
+    if (cookieSession) return cookieSession;
+  }
+  return getAuthDisabledSession(event);
+}
+
+function normalizeCustomSession(session: AuthSession): AuthSession {
+  const safeSession = { ...session };
+  delete safeSession.authUserId;
+  if (trustCustomEmailVerification && session.emailVerified === undefined) {
+    return { ...safeSession, emailVerified: true };
+  }
+  return safeSession;
+}
+
 async function resolveSessionUncached(
   event: H3Event,
   options: { ignoreEmbedSession?: boolean } = {},
@@ -4781,6 +5022,16 @@ async function resolveSessionUncached(
     }
   }
 
+  // First, like the browser-cookie resolver, so a request carrying both an
+  // additional-provider session and a legacy cookie resolves to the same owner
+  // in every check. Not when the request names an explicit bearer credential:
+  // that is the caller's choice and wins over a cookie.
+  const additionalSession = hasBearerAuthorization(event)
+    ? null
+    : await resolveAdditionalSession(event, additionalGetSession);
+  if (additionalSession === ADDITIONAL_SESSION_FAILED) return null;
+  if (additionalSession) return additionalSession;
+
   const accessTokens = getAccessTokens();
   if (accessTokens.length > 0) {
     const cookieSession = await getLegacyCookieSessionSafely(event);
@@ -4790,12 +5041,7 @@ async function resolveSessionUncached(
   if (customGetSession) {
     const session = await customGetSession(event);
     if (session) {
-      const safeSession = { ...session };
-      delete safeSession.authUserId;
-      if (trustCustomEmailVerification && session.emailVerified === undefined) {
-        return { ...safeSession, emailVerified: true };
-      }
-      return safeSession;
+      return normalizeCustomSession(session);
     }
 
     const bearerSession = await getBearerSession(event);
@@ -4822,9 +5068,7 @@ async function resolveSessionUncached(
       }
     } catch (e) {
       console.error("[auth] ba.api.getSession error:", e);
-      (event.context as Record<string, unknown>)[
-        SESSION_RESOLUTION_ERROR_CONTEXT_KEY
-      ] = true;
+      markSessionResolutionUnavailable(event, "better-auth", e);
     }
 
     const cookieSession = await getLegacyCookieSessionSafely(event);
@@ -4860,10 +5104,7 @@ function isMcpDirectoryWidgetCapabilityApplicationStateRequest(
 ): boolean {
   if (!isMcpDirectoryWidgetCapabilityScope(scope)) return false;
 
-  const rawUrl = event.node?.req?.url ?? event.path ?? "/";
-  const base = "http://agent-native.invalid";
-  if (!URL.canParse(rawUrl, base)) return false;
-  const pathname = new URL(rawUrl, base).pathname;
+  const { rawPath: pathname } = getRequestPathAndSearch(event);
 
   const canonicalPath = canonicalFrameworkPathname(pathname);
   const statePath = `${FRAMEWORK_INTERNAL_ROUTE_PREFIX}/application-state`;
@@ -4958,6 +5199,9 @@ function identitySsoEnabledForRequest(event: H3Event): boolean {
 }
 
 export const authSessionHandler = defineEventHandler(async (event: H3Event) => {
+  if (getAuthGuardPath(event) === null) {
+    return new Response(null, { status: 400 });
+  }
   setResponseHeader(event, "Cache-Control", "no-store");
   if (!isReadMethod(event)) {
     setResponseStatus(event, 405);
@@ -5016,15 +5260,40 @@ export function redirectWithStagedCookies(
 export { isHttpsRequest };
 
 function isPublicPath(
-  url: string,
+  path: string,
   publicPaths: string[],
   exactPublicPaths: string[] = [],
 ): boolean {
-  const p = url.split("?")[0];
-  if (exactPublicPaths.some((candidate) => normalizePath(candidate) === p)) {
+  if (
+    exactPublicPaths.some((candidate) => matchesPathPattern(path, candidate))
+  ) {
     return true;
   }
-  return matchesPathList(p, publicPaths);
+  return matchesPathList(path, publicPaths);
+}
+
+/** `path` is `pattern`, where a `:name` segment stands for any one segment. */
+function matchesPathPattern(path: string, pattern: string): boolean {
+  const expectedSegments = normalizePath(pattern).split("/");
+  const actualSegments = path.split("/");
+  return (
+    expectedSegments.length === actualSegments.length &&
+    expectedSegments.every((segment, index) => {
+      const parameter = /^:[A-Za-z][A-Za-z0-9_]*(\(uuidv4\))?$/.exec(segment);
+      if (parameter) {
+        const value = actualSegments.at(index);
+        return (
+          value !== undefined &&
+          (parameter[1]
+            ? /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+                value,
+              )
+            : value.length > 0)
+        );
+      }
+      return segment === actualSegments[index];
+    })
+  );
 }
 
 function normalizePath(path: string): string {
@@ -5034,19 +5303,7 @@ function normalizePath(path: string): string {
 function matchesPathList(path: string, paths: string[]): boolean {
   return paths.some((candidate) => {
     const normalized = normalizePath(candidate);
-    if (normalized.includes("/:")) {
-      const expectedSegments = normalized.split("/");
-      const actualSegments = path.split("/");
-      return (
-        expectedSegments.length === actualSegments.length &&
-        expectedSegments.every((segment, index) => {
-          if (/^:[A-Za-z][A-Za-z0-9_]*$/.test(segment)) {
-            return Boolean(actualSegments[index]);
-          }
-          return segment === actualSegments[index];
-        })
-      );
-    }
+    if (normalized.includes("/:")) return matchesPathPattern(path, normalized);
     return path === normalized || path.startsWith(normalized + "/");
   });
 }
@@ -5255,11 +5512,33 @@ async function mountBetterAuthRoutes(
               })
             : "/";
         const returnUrl = validated !== "/" ? validated : undefined;
-        const signupAttribution = signupAttributionFromCookieHeader(
-          getHeader(event, "cookie") ?? null,
+        const signupCookieHeader = getHeader(event, "cookie") ?? null;
+        const targetingAllowed = requestAllowsConsentCategory(
+          event,
+          "targeting",
         );
-        const signupAnonymousId = readAnalyticsAnonymousId(
-          getHeader(event, "cookie") ?? null,
+        const performanceAllowed = requestAllowsConsentCategory(
+          event,
+          "performance",
+        );
+        const signupAttribution = targetingAllowed
+          ? signupAttributionFromCookieHeader(signupCookieHeader)
+          : undefined;
+        const signupAnonymousId = performanceAllowed
+          ? readAnalyticsAnonymousId(signupCookieHeader)
+          : undefined;
+        const signupSessionId = performanceAllowed
+          ? readAnalyticsSessionId(signupCookieHeader)
+          : undefined;
+        const mcpSignupAttribution = filterMcpSignupAttributionByConsent(
+          hasMcpSignupAttributionCookie(signupCookieHeader)
+            ? readMcpSignupContextFromCookieHeader(
+                signupCookieHeader,
+                getAuthSecret(),
+              )
+            : undefined,
+          signupCookieHeader,
+          { performance: performanceAllowed, targeting: targetingAllowed },
         );
         const state = encodeOAuthState({
           redirectUri,
@@ -5273,7 +5552,19 @@ async function mountBetterAuthRoutes(
           desktopBrowserBindingHash,
           signupAttribution,
           signupAnonymousId,
+          signupSessionId,
+          mcpSignupAttribution: mcpSignupAttribution ?? undefined,
         });
+        const mcpSignupCookie = hasMcpSignupAttributionCookie(
+          signupCookieHeader,
+        )
+          ? (() => {
+              deleteCookie(event, MCP_SIGNUP_ATTRIBUTION_COOKIE_NAME, {
+                path: "/",
+              });
+              return event.res.headers.getSetCookie().at(-1);
+            })()
+          : undefined;
         const oauthState = wrapNetlifyPreviewGoogleOAuthState(event, state);
         logGoogleOAuthDebug(event, "auth-url", {
           flowId,
@@ -5305,9 +5596,11 @@ async function mountBetterAuthRoutes(
           // 200 status (no Location header), which broke the popup-based
           // Google sign-in in production. Web `Response` is the proven idiom
           // here — `oauthCallbackResponse`/`oauthErrorPage` use it and work.
+          const headers = new Headers({ Location: authUrl });
+          if (mcpSignupCookie) headers.append("Set-Cookie", mcpSignupCookie);
           return new Response(null, {
             status: 302,
-            headers: { Location: authUrl },
+            headers,
           });
         }
         return { url: authUrl };
@@ -5355,6 +5648,8 @@ async function mountBetterAuthRoutes(
             desktopBrowserBindingHash,
             signupAttribution,
             signupAnonymousId,
+            signupSessionId,
+            mcpSignupAttribution,
           } = state;
           callbackFlowId = flowId;
           callbackDesktop = desktop ?? false;
@@ -5508,6 +5803,8 @@ async function mountBetterAuthRoutes(
               name: typeof user.name === "string" ? user.name : undefined,
               attribution: signupAttribution,
               signupAnonymousId,
+              signupSessionId,
+              mcpSignupAttribution: mcpSignupAttribution ?? undefined,
               isNewUser: isNewGoogleUser,
             },
           });
@@ -6801,12 +7098,61 @@ async function mountBetterAuthRoutes(
           callbackPath = withDesktopMagicLinkFlow(callbackPath, desktopFlow);
         }
         const callbackURL = betterAuthCallbackURL(callbackPath, true, event);
-        const signupContext = signupAttributionContextFromCookieHeader(
-          getHeader(event, "cookie") ?? null,
+        const signupCookieHeader = getHeader(event, "cookie") ?? null;
+        const performanceAllowed = requestAllowsConsentCategory(
+          event,
+          "performance",
         );
-        const attributionToken = signupContext
-          ? encodeMagicLinkSignupAttribution(signupContext, getAuthSecret())
+        const targetingAllowed = requestAllowsConsentCategory(
+          event,
+          "targeting",
+        );
+        const browserSignupContext =
+          signupAttributionContextFromCookieHeader(signupCookieHeader);
+        const signupContext = browserSignupContext
+          ? {
+              ...(performanceAllowed
+                ? {
+                    ...(browserSignupContext.anonymousId
+                      ? { anonymousId: browserSignupContext.anonymousId }
+                      : {}),
+                    ...(browserSignupContext.sessionId
+                      ? { sessionId: browserSignupContext.sessionId }
+                      : {}),
+                  }
+                : {}),
+              ...(targetingAllowed
+                ? { attribution: browserSignupContext.attribution }
+                : {}),
+            }
           : undefined;
+        const hasSignupContext =
+          signupContext && Object.keys(signupContext).length > 0;
+        const hasMcpSignupCookie =
+          hasMcpSignupAttributionCookie(signupCookieHeader);
+        const mcpSignupAttribution = hasMcpSignupCookie
+          ? filterMcpSignupAttributionByConsent(
+              readMcpSignupContextFromCookieHeader(
+                signupCookieHeader,
+                getAuthSecret(),
+              ),
+              signupCookieHeader,
+              {
+                performance: performanceAllowed,
+                targeting: targetingAllowed,
+              },
+            )
+          : undefined;
+        const attributionToken =
+          hasSignupContext || mcpSignupAttribution
+            ? encodeMagicLinkSignupAttribution(
+                {
+                  ...(hasSignupContext ? signupContext : {}),
+                  ...(mcpSignupAttribution ? { mcpSignupAttribution } : {}),
+                },
+                getAuthSecret(),
+              )
+            : undefined;
         const newUserCallbackUrl = new URL(
           `${getAppBasePath()}${publicFrameworkPath("/_agent-native/auth/magic-link/new-user")}?return=${encodeURIComponent(callbackPath)}`,
           getOrigin(event),
@@ -6829,6 +7175,11 @@ async function mountBetterAuthRoutes(
           },
           headers: event.headers,
         });
+        if (hasMcpSignupCookie) {
+          deleteCookie(event, MCP_SIGNUP_ATTRIBUTION_COOKIE_NAME, {
+            path: "/",
+          });
+        }
         return {
           ok: true,
           ...(desktopFlow ?? {}),
@@ -6972,6 +7323,8 @@ async function mountBetterAuthRoutes(
             });
           }
         });
+        // The additional provider's own session ends with the rest.
+        if (additionalClearSession) await additionalClearSession(event);
         clearFrameworkSessionCookies(event);
         clearFirstRunOnboardingCookie(event);
         optOutOfAuthDisabledSession(event);
@@ -7191,6 +7544,14 @@ export async function autoMountAuth(
     }
     if (options.getSession) {
       customGetSession = options.getSession;
+      customGetBrowserSession = options.getBrowserSession ?? null;
+      trustCustomEmailVerification =
+        options.trustCustomEmailVerification === true;
+    }
+    if (options.getAdditionalSession) {
+      additionalGetSession = options.getAdditionalSession;
+      additionalGetBrowserSession = options.getAdditionalBrowserSession ?? null;
+      additionalClearSession = options.clearAdditionalSession ?? null;
       trustCustomEmailVerification =
         options.trustCustomEmailVerification === true;
     }
@@ -7205,7 +7566,6 @@ export async function autoMountAuth(
           options,
           _authGuardConfig.authMode,
         );
-        _authGuardConfig.loginHtml = loginHtmlConfig.loginHtml;
         _authGuardConfig.getLoginHtml = loginHtmlConfig.getLoginHtml;
       }
       if (options.rootAuth !== undefined) {
@@ -7256,6 +7616,10 @@ export async function autoMountAuth(
   if (!app) {
     if (isDevEnvironment()) {
       customGetSession = null;
+      customGetBrowserSession = null;
+      additionalGetSession = null;
+      additionalGetBrowserSession = null;
+      additionalClearSession = null;
       trustCustomEmailVerification = false;
       return false;
     }
@@ -7265,16 +7629,38 @@ export async function autoMountAuth(
   }
 
   customGetSession = null;
+  customGetBrowserSession = null;
+  additionalGetSession = null;
+  additionalGetBrowserSession = null;
+  additionalClearSession = null;
   trustCustomEmailVerification = false;
   sessionMaxAge = options.maxAge ?? DEFAULT_MAX_AGE;
   const publicPaths = resolveAuthPublicPaths(options.publicPaths);
   const workspaceAppAudience = resolveWorkspaceAppAudience(options);
   const workspaceAppRouteAccess = resolveWorkspaceAppRouteAccess(options);
 
+  app.use(
+    "",
+    defineEventHandler((event) => {
+      if (getAuthGuardPath(event) === null) {
+        return new Response(null, { status: 400 });
+      }
+    }),
+  );
   mountAuthCorsMiddleware(app);
+  app.use(FIRST_TOUCH_SERVER_PATH, createFirstTouchHandler());
+  app.use(CONSENT_REGION_PATH, createConsentRegionHandler());
+  app.use(CONSENT_PATH, createConsentHandler());
 
   if (options.getSession) {
     customGetSession = options.getSession;
+    customGetBrowserSession = options.getBrowserSession ?? null;
+    trustCustomEmailVerification =
+      options.trustCustomEmailVerification === true;
+  } else if (options.getAdditionalSession) {
+    additionalGetSession = options.getAdditionalSession;
+    additionalGetBrowserSession = options.getAdditionalBrowserSession ?? null;
+    additionalClearSession = options.clearAdditionalSession ?? null;
     trustCustomEmailVerification =
       options.trustCustomEmailVerification === true;
   }
@@ -7292,14 +7678,11 @@ export async function autoMountAuth(
       }),
     );
 
-    const byoaLoginHtml = options.loginHtml ?? getCustomAuthRequiredHtml();
+    const { loginHtml } = options;
     _authGuardConfig = {
-      loginHtml: byoaLoginHtml,
-      ...(options.loginHtml
-        ? {}
-        : {
-            getLoginHtml: () => getCustomAuthRequiredHtml(),
-          }),
+      getLoginHtml: loginHtml
+        ? () => loginHtml
+        : () => getCustomAuthRequiredHtml(),
       rootAuth: options.rootAuth ?? Boolean(options.loginHtml),
       publicPaths,
       publicPathsWithQueryToken: options.publicPathsWithQueryToken ?? [],

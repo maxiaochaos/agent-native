@@ -1,9 +1,14 @@
+import {
+  getEngineCredentialOwner,
+  getEngineLlmConnectionSource,
+} from "../agent/engine/credential-owner.js";
 import { credentialStateTrackingProperties } from "../agent/engine/credential-state.js";
 import { runErrorTelemetryProperties } from "../agent/engine/error-telemetry.js";
 import type {
   AgentLoopOutcome,
   AgentLoopUsage,
 } from "../agent/production-agent.js";
+import { IncompleteAgentRunError } from "../agent/run-errors.js";
 import { isToolDoneFailure } from "../agent/tool-done-error.js";
 import type { AgentChatEvent, AgentToolInput } from "../agent/types.js";
 import { captureError } from "../server/capture-error.js";
@@ -11,6 +16,10 @@ import {
   getRequestContext,
   getRequestOrgId,
 } from "../server/request-context.js";
+import {
+  hostedModelExperimentVariant,
+  singleNonHostedAssignment,
+} from "./hosted-model-experiment.js";
 import {
   MAX_AI_CONTENT_BYTES,
   MAX_AI_SPANS_PER_RUN,
@@ -31,6 +40,7 @@ import {
   redactSensitiveFields,
 } from "./trace-redaction.js";
 export { redactSensitiveFields } from "./trace-redaction.js";
+import { llmConnectionTrackingProperties } from "../shared/llm-connection.js";
 import {
   recordAgentToolCall,
   recordGenAiChat,
@@ -277,8 +287,46 @@ type GenerationToolCall = {
   started_offset_ms: number;
   duration_ms: number;
   status: "success" | "error";
-  error_class: "tool_error" | "legacy_inferred_error" | "interrupted" | null;
+  error_class:
+    | "input_invalid"
+    | "rejected"
+    | "tool_error"
+    | "legacy_inferred_error"
+    | "interrupted"
+    | null;
+  /** What the call did: nothing, a write, or possibly a write. */
+  outcome: "no_side_effect" | "unknown" | "completed";
+  /** Failing argument paths of an `input_invalid` call; absent otherwise. */
+  invalid_paths?: string[];
 };
+
+type ToolCallTracking = Pick<
+  GenerationToolCall,
+  "error_class" | "outcome" | "invalid_paths"
+>;
+
+/** Failure class, effect and failing fields of one tool call, for tools[] and its tool span. */
+function toolCallTracking(
+  event: Extract<AgentChatEvent, { type: "tool_done" }>,
+  isError: boolean,
+): ToolCallTracking {
+  const explicitError = event.isError === true;
+  return {
+    error_class: !isError
+      ? null
+      : explicitError
+        ? (event.errorClass ?? "tool_error")
+        : "legacy_inferred_error",
+    outcome: event.outcomeUnknown
+      ? "unknown"
+      : event.completedSideEffect === true
+        ? "completed"
+        : "no_side_effect",
+    ...(event.invalidPaths?.length
+      ? { invalid_paths: event.invalidPaths }
+      : {}),
+  };
+}
 
 function prepareCapturedModelInput(messages: unknown): unknown {
   return redactSensitiveFields(toPostHogMessages(messages));
@@ -297,6 +345,7 @@ export function httpStatusFromError(err: unknown): number | undefined {
 function emitLlmGenerationTrackingEvent(args: {
   runId: string;
   threadId: string | null;
+  turnId?: string;
   userId: string | null;
   parentSpanId: string;
   llmSpanId: string;
@@ -341,6 +390,10 @@ function emitLlmGenerationTrackingEvent(args: {
     experimentId: string;
     variantId: string;
   }>;
+  singularExperimentAssignment?: {
+    experimentId: string;
+    variantId: string;
+  };
   modelSelectionSource?: string;
   aiInput?: unknown;
   aiOutputChoices?: unknown;
@@ -373,6 +426,7 @@ function emitLlmGenerationTrackingEvent(args: {
     span_type: "llm_call",
     run_id: args.runId,
     thread_id: args.threadId,
+    turn_id: args.turnId,
     parent_span_id: args.parentSpanId,
     span_id: args.llmSpanId,
     model: args.model,
@@ -455,11 +509,18 @@ function emitLlmGenerationTrackingEvent(args: {
     properties.experiment_variants = args.experimentAssignments
       .map((assignment) => assignment.variantId)
       .join(",");
-    if (args.experimentAssignments.length === 1) {
-      properties.experiment_id = args.experimentAssignments[0].experimentId;
-      properties.experiment_variant = args.experimentAssignments[0].variantId;
+    const singular = singleNonHostedAssignment(
+      args.experimentAssignments,
+      args.singularExperimentAssignment,
+    );
+    if (singular) {
+      properties.experiment_id = singular.experimentId;
+      properties.experiment_variant = singular.variantId;
     }
   }
+  properties.hosted_model_experiment_variant = hostedModelExperimentVariant(
+    args.experimentAssignments,
+  );
 
   for (const key of Object.keys(properties)) {
     if (properties[key] === undefined) delete properties[key];
@@ -558,6 +619,7 @@ export async function instrumentAgentLoop(opts: {
     send: (event: AgentChatEvent) => void;
     signal: AbortSignal;
     onModelInput?: (messages: readonly unknown[]) => void | Promise<void>;
+    onModelDispatchStarted?: () => void;
     onUsage?: (usage: AgentLoopUsage) => void;
     onOutcome?: (outcome: AgentLoopOutcome) => void;
     providerOptions?: any;
@@ -573,6 +635,7 @@ export async function instrumentAgentLoop(opts: {
     send: (event: AgentChatEvent) => void;
     signal: AbortSignal;
     onModelInput?: (messages: readonly unknown[]) => void | Promise<void>;
+    onModelDispatchStarted?: () => void;
     onUsage?: (usage: AgentLoopUsage) => void;
     onOutcome?: (outcome: AgentLoopOutcome) => void;
     providerOptions?: any;
@@ -580,6 +643,8 @@ export async function instrumentAgentLoop(opts: {
   };
   runId: string;
   threadId: string | null;
+  /** The agent turn this run serves; omitted from events when unknown. */
+  turnId?: string;
   userId: string | null;
   config: ObservabilityConfig;
   spanName?: string;
@@ -588,6 +653,10 @@ export async function instrumentAgentLoop(opts: {
     experimentId: string;
     variantId: string;
   }>;
+  singularExperimentAssignment?: {
+    experimentId: string;
+    variantId: string;
+  };
   modelSelectionSource?: string;
   delegation?: {
     protocol: "a2a" | "mcp" | "agent-team";
@@ -607,11 +676,13 @@ export async function instrumentAgentLoop(opts: {
     | null
     | undefined;
 }): Promise<AgentLoopUsage> {
-  const { runAgentLoop, loopOpts, runId, threadId, userId, config } = opts;
+  const { runAgentLoop, loopOpts, runId, threadId, turnId, userId, config } =
+    opts;
   const engineName =
     typeof loopOpts.engine?.name === "string"
       ? loopOpts.engine.name
       : undefined;
+  const engineCredentialOwner = getEngineCredentialOwner(loopOpts.engine);
   const engineSupportedModels: readonly string[] | undefined = Array.isArray(
     loopOpts.engine?.supportedModels,
   )
@@ -635,6 +706,10 @@ export async function instrumentAgentLoop(opts: {
 
   const browserSessionId =
     opts.browserSessionId ?? getRequestContext()?.browserSessionId;
+  const singularExperimentAssignment = singleNonHostedAssignment(
+    opts.experimentAssignments,
+    opts.singularExperimentAssignment,
+  );
 
   const otelRunSpanPromise = startAgentSpan("invoke_agent", {
     "gen_ai.operation.name": "invoke_agent",
@@ -644,14 +719,11 @@ export async function instrumentAgentLoop(opts: {
     "agent.run_id": runId,
     "agent.user_id": userId ?? undefined,
     "agent.model_selection_source": opts.modelSelectionSource,
-    "agent.experiment_id":
-      opts.experimentAssignments?.length === 1
-        ? opts.experimentAssignments[0].experimentId
-        : undefined,
-    "agent.experiment_variant":
-      opts.experimentAssignments?.length === 1
-        ? opts.experimentAssignments[0].variantId
-        : undefined,
+    "agent.experiment_id": singularExperimentAssignment?.experimentId,
+    "agent.experiment_variant": singularExperimentAssignment?.variantId,
+    "agent.hosted_model_experiment_variant": hostedModelExperimentVariant(
+      opts.experimentAssignments,
+    ),
   });
   let otelRunSpan: AgentSpan | null = null;
 
@@ -683,6 +755,7 @@ export async function instrumentAgentLoop(opts: {
     spanId: string;
     start: number;
     end: number;
+    dispatchStarted: boolean;
     usage?: AgentLoopUsage;
     stopReason?: string;
     errorCode?: string;
@@ -690,7 +763,17 @@ export async function instrumentAgentLoop(opts: {
     input?: unknown[];
     assistantText: BoundedAssistantText;
   }> = [];
+  let modelDispatchCount = 0;
+  let pendingModelInputDispatched = false;
   const currentRoundTrip = () => modelRoundTrips[modelRoundTrips.length - 1];
+  const inferModelDispatchFromOutput = () => {
+    if (pendingModelInputDispatched) return;
+    if (pendingModelInputStartedAt === undefined && modelDispatchCount > 0) {
+      return;
+    }
+    modelDispatchCount += 1;
+    pendingModelInputDispatched = true;
+  };
   let pendingModelInput: unknown[] | undefined;
   let pendingModelInputStartedAt: number | undefined;
   type CostCalculator = (
@@ -812,6 +895,7 @@ export async function instrumentAgentLoop(opts: {
       spanId: spanId(),
       start,
       end,
+      dispatchStarted: true,
       stopReason: "error",
       errorMessage,
       ...(input !== undefined ? { input } : {}),
@@ -863,6 +947,7 @@ export async function instrumentAgentLoop(opts: {
   const toolSpanRoundTrip = new Map<string, number>();
   const toolCounterRoundTrip = new Map<number, number>();
   const toolSpanErrorClass = new Map<string, string>();
+  const toolSpanTracking = new Map<string, ToolCallTracking>();
   const toolSpanCallId = new Map<string, string>();
 
   const openOtelToolSpans = new Set<AgentSpan>();
@@ -911,6 +996,9 @@ export async function instrumentAgentLoop(opts: {
 
   const instrumentedSend = (event: AgentChatEvent): void => {
     try {
+      if (event.type === "text" || event.type === "tool_start") {
+        inferModelDispatchFromOutput();
+      }
       if (config.capturePrompts && event.type === "text") {
         appendBoundedAssistantText(assistantTextCapture, event.text);
         const roundTrip = currentRoundTrip();
@@ -957,11 +1045,14 @@ export async function instrumentAgentLoop(opts: {
               spanId: spanId(),
               start: modelStreamOpenedAt,
               end: modelStreamOpenedAt,
+              dispatchStarted: true,
               ...(pendingModelInput ? { input: pendingModelInput } : {}),
               assistantText: createBoundedAssistantText(),
             });
+            if (!pendingModelInputDispatched) modelDispatchCount += 1;
             pendingModelInput = undefined;
             pendingModelInputStartedAt = undefined;
+            pendingModelInputDispatched = true;
             startOtelModelSpan(tripIndex);
           }
         } else if (modelStreamOpenedAt !== null) {
@@ -978,6 +1069,7 @@ export async function instrumentAgentLoop(opts: {
             modelSpansAwaitingFinalError.add(tripIndex);
           }
           modelStreamOpenedAt = null;
+          pendingModelInputDispatched = false;
         }
       }
 
@@ -1082,6 +1174,7 @@ export async function instrumentAgentLoop(opts: {
           ? (toolErrorMessage ?? toolErrorSignature(event.result))
           : null;
 
+        const tracking = toolCallTracking(event, isError);
         if (
           counter !== undefined &&
           counter < MAX_TRACKED_GENERATION_TOOL_CALLS &&
@@ -1092,11 +1185,7 @@ export async function instrumentAgentLoop(opts: {
             started_offset_ms: Math.max(0, pending.startMs - runStart),
             duration_ms: Math.max(0, finishedAt - pending.startMs),
             status: isError ? "error" : "success",
-            error_class: !isError
-              ? null
-              : explicitError
-                ? "tool_error"
-                : "legacy_inferred_error",
+            ...tracking,
           });
         }
 
@@ -1152,6 +1241,7 @@ export async function instrumentAgentLoop(opts: {
             explicitError ? "tool_error" : "legacy_inferred_error",
           );
         }
+        toolSpanTracking.set(toolSpanId, tracking);
         const span: TraceSpan = {
           id: toolSpanId,
           runId,
@@ -1192,7 +1282,10 @@ export async function instrumentAgentLoop(opts: {
         onOutcome: instrumentedOutcome,
         onModelInput: (messages: readonly unknown[]) => {
           const attemptStartedAt = Date.now();
-          if (pendingModelInputStartedAt !== undefined) {
+          if (
+            pendingModelInputStartedAt !== undefined &&
+            pendingModelInputDispatched
+          ) {
             recordPreStreamModelFailure(
               pendingModelInputStartedAt,
               attemptStartedAt,
@@ -1207,9 +1300,21 @@ export async function instrumentAgentLoop(opts: {
             ? capturedMessages
             : undefined;
           pendingModelInputStartedAt = attemptStartedAt;
+          pendingModelInputDispatched = false;
           return loopOpts.onModelInput?.(messages);
         },
+        onModelDispatchStarted: () => {
+          modelDispatchCount += 1;
+          pendingModelInputDispatched = true;
+          try {
+            loopOpts.onModelDispatchStarted?.();
+          } catch {
+            // coercion-ok: telemetry observers cannot change model dispatch.
+            // A telemetry observer cannot alter whether a model request runs.
+          }
+        },
         onUsage: (callUsage: AgentLoopUsage) => {
+          inferModelDispatchFromOutput();
           const trip = currentRoundTrip();
           if (trip) trip.usage = callUsage;
           loopOpts.onUsage?.(callUsage);
@@ -1217,6 +1322,7 @@ export async function instrumentAgentLoop(opts: {
       }),
     );
   } catch (err: any) {
+    if (err instanceof IncompleteAgentRunError) usage = err.usage;
     const classification = opts.classifyError?.(err) ?? null;
     runStatus = classification?.status ?? "error";
     errorMessage = redactCapturedError(
@@ -1235,6 +1341,10 @@ export async function instrumentAgentLoop(opts: {
   } finally {
     try {
       const runEnd = Date.now();
+      modelDispatchCount = Math.max(
+        modelDispatchCount,
+        usage?.llmCalls ?? (usage?.usageReported === true ? 1 : 0),
+      );
       const totalDurationMs = runEnd - runStart;
 
       const failedInsideModelCall = modelStreamOpenedAt !== null;
@@ -1255,7 +1365,9 @@ export async function instrumentAgentLoop(opts: {
       }
       finishAwaitingOtelModelSpans(errorMessage);
       const pendingModelCallFailed =
-        runStatus === "error" && pendingModelInputStartedAt !== undefined;
+        runStatus === "error" &&
+        pendingModelInputStartedAt !== undefined &&
+        pendingModelInputDispatched;
       if (pendingModelCallFailed) {
         recordPreStreamModelFailure(
           pendingModelInputStartedAt!,
@@ -1265,6 +1377,7 @@ export async function instrumentAgentLoop(opts: {
         );
         pendingModelInput = undefined;
         pendingModelInputStartedAt = undefined;
+        pendingModelInputDispatched = false;
       }
       const measuredModelDurationMs = modelStreamIntervals.length
         ? coveredDurationMs(modelStreamIntervals)
@@ -1283,6 +1396,11 @@ export async function instrumentAgentLoop(opts: {
             ? interruptedMessage
             : null;
           toolSpanErrorClass.set(pending.spanId, "interrupted");
+          const interruptedTracking: ToolCallTracking = {
+            error_class: "interrupted",
+            outcome: "unknown",
+          };
+          toolSpanTracking.set(pending.spanId, interruptedTracking);
           recordAgentToolCall({
             toolName: pending.toolName,
             errorType: "interrupted",
@@ -1293,7 +1411,7 @@ export async function instrumentAgentLoop(opts: {
               started_offset_ms: Math.max(0, pending.startMs - runStart),
               duration_ms: Math.max(0, runEnd - pending.startMs),
               status: "error",
-              error_class: "interrupted",
+              ...interruptedTracking,
             });
           }
           if (pending.otelSpan) {
@@ -1390,13 +1508,14 @@ export async function instrumentAgentLoop(opts: {
       const modelCallFailed =
         failedInsideModelCall ||
         pendingModelCallFailed ||
-        (modelRoundTrips.length === 0 &&
+        (modelDispatchCount > 0 &&
+          modelRoundTrips.length === 0 &&
           cutOffReason === null &&
           reportedToolFailures === 0);
 
       let llmCallCount = 0;
       if (usage || runStatus === "error") {
-        llmCallCount = usage?.llmCalls ?? Math.max(1, modelRoundTrips.length);
+        llmCallCount = usage?.llmCalls ?? modelDispatchCount;
         const runUsage = usage ?? {
           inputTokens: 0,
           outputTokens: 0,
@@ -1418,9 +1537,12 @@ export async function instrumentAgentLoop(opts: {
               coveredDurationMs(spanIntervals(emittedToolSpans)),
           );
 
+        const dispatchedRoundTrips = modelRoundTrips
+          .map((trip, index) => ({ trip, index }))
+          .filter(({ trip }) => trip.dispatchStarted);
         const generations =
-          modelRoundTrips.length > 0
-            ? modelRoundTrips.map((trip, index) => ({
+          dispatchedRoundTrips.length > 0
+            ? dispatchedRoundTrips.map(({ trip, index }, generationIndex) => ({
                 spanId: trip.spanId,
                 model: trip.usage?.model ?? runUsage.model,
                 createdAt: trip.start,
@@ -1442,35 +1564,37 @@ export async function instrumentAgentLoop(opts: {
                   )
                   .sort(([a], [b]) => a - b)
                   .map(([, detail]) => detail),
-                isFirst: index === 0,
-                isLast: index === modelRoundTrips.length - 1,
+                isFirst: generationIndex === 0,
+                isLast: generationIndex === dispatchedRoundTrips.length - 1,
               }))
-            : [
-                {
-                  spanId: spanId(),
-                  model: runUsage.model,
-                  createdAt: runStart,
-                  endedAt: runStart + derivedLlmDurationMs,
-                  latencyMs: derivedLlmDurationMs,
-                  callUsage: usage,
-                  stopReason: undefined as string | undefined,
-                  tokensKnown: usageReported,
-                  input:
-                    pendingModelInput ??
-                    (config.capturePrompts
-                      ? prepareCapturedModelInput(requestMessages)
-                      : requestMessages),
-                  assistantText: assistantTextCapture.parts.join(""),
-                  assistantTextTruncated: assistantTextCapture.truncated,
-                  errorMessage: undefined,
-                  toolSpans: collectedToolSpans,
-                  toolDetails: [...generationToolCalls.entries()]
-                    .sort(([a], [b]) => a - b)
-                    .map(([, detail]) => detail),
-                  isFirst: true,
-                  isLast: true,
-                },
-              ];
+            : modelDispatchCount > 0
+              ? [
+                  {
+                    spanId: spanId(),
+                    model: runUsage.model,
+                    createdAt: runStart,
+                    endedAt: runStart + derivedLlmDurationMs,
+                    latencyMs: derivedLlmDurationMs,
+                    callUsage: usage,
+                    stopReason: undefined as string | undefined,
+                    tokensKnown: usageReported,
+                    input:
+                      pendingModelInput ??
+                      (config.capturePrompts
+                        ? prepareCapturedModelInput(requestMessages)
+                        : requestMessages),
+                    assistantText: assistantTextCapture.parts.join(""),
+                    assistantTextTruncated: assistantTextCapture.truncated,
+                    errorMessage: undefined,
+                    toolSpans: collectedToolSpans,
+                    toolDetails: [...generationToolCalls.entries()]
+                      .sort(([a], [b]) => a - b)
+                      .map(([, detail]) => detail),
+                    isFirst: true,
+                    isLast: true,
+                  },
+                ]
+              : [];
 
         for (const generation of generations) {
           const callUsage = generation.callUsage;
@@ -1559,6 +1683,7 @@ export async function instrumentAgentLoop(opts: {
           emitLlmGenerationTrackingEvent({
             runId,
             threadId,
+            turnId,
             userId,
             parentSpanId,
             llmSpanId: generation.spanId,
@@ -1606,6 +1731,7 @@ export async function instrumentAgentLoop(opts: {
             createdAt: generation.createdAt,
             endedAt: generation.endedAt,
             experimentAssignments: opts.experimentAssignments,
+            singularExperimentAssignment: opts.singularExperimentAssignment,
             modelSelectionSource: opts.modelSelectionSource,
             browserSessionId,
             ...generationContent,
@@ -1688,10 +1814,23 @@ export async function instrumentAgentLoop(opts: {
           browserSessionId,
           extraProperties: {
             ...trackingIdentityProperties(),
+            ...llmConnectionTrackingProperties(
+              typeof loopOpts.engine?.name === "string"
+                ? {
+                    configured: true,
+                    engine: loopOpts.engine.name,
+                    model: usage?.model ?? loopOpts.model,
+                    source:
+                      getEngineLlmConnectionSource(loopOpts.engine) ??
+                      "unknown",
+                  }
+                : null,
+            ),
             source: "agent_observability",
             run_id: runId,
             thread_id: threadId,
-            llm_calls: llmCallCount || undefined,
+            turn_id: turnId,
+            llm_calls: llmCallCount,
             follow_up_ms: usage?.followUpMs,
             follow_up_input_tokens: usage?.followUpInputTokens,
             receipt_unverified_count: usage?.receiptUnverifiedCount,
@@ -1757,6 +1896,7 @@ export async function instrumentAgentLoop(opts: {
               ...trackingIdentityProperties(),
               source: "agent_observability",
               span_type: "tool_call",
+              ...toolSpanTracking.get(span.id),
             },
           });
         }
@@ -1798,6 +1938,7 @@ export async function instrumentAgentLoop(opts: {
           recordGenAiChat({
             requestModel: loopOpts.model,
             providerName: engineName,
+            credentialOwner: engineCredentialOwner,
             supportedModels: engineSupportedModels,
             durationMs: trip.end - trip.start,
             failed:
@@ -1820,6 +1961,7 @@ export async function instrumentAgentLoop(opts: {
           recordGenAiChat({
             requestModel: loopOpts.model,
             providerName: engineName,
+            credentialOwner: engineCredentialOwner,
             supportedModels: engineSupportedModels,
             inputTokens: usage.inputTokens,
             outputTokens: usage.outputTokens,

@@ -2,14 +2,12 @@ import type { EventEmitter } from "node:events";
 
 import { getDbExec, type DbExec } from "../db/client.js";
 import { ensureIndexExists, ensureTableExists } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
 import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import { captureError } from "../server/capture-error.js";
 import { getRequestContext } from "../server/request-context.js";
 import { assertNoInlineImageBytes } from "../shared/inline-bytes.js";
 import { createEventEmitter } from "../shared/optional-node-builtins.js";
-
-let _initPromise: Promise<void> | undefined;
 
 const _requestSettingsCache = new WeakMap<object, Map<string, string | null>>();
 
@@ -39,31 +37,42 @@ function settingsTable(): string {
   return "public.settings";
 }
 
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const table = settingsTable();
-      const createSql = `
-        CREATE TABLE IF NOT EXISTS ${table} (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at BIGINT NOT NULL
-        )
-      `;
+export const settingsStore = defineStore({
+  id: "settings",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createSql = `
+          CREATE TABLE IF NOT EXISTS ${settingsTable()} (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at BIGINT NOT NULL
+          )
+        `;
+        await ensureTableExists("settings", createSql);
+      },
+    },
+    {
+      name: "widen-bigint",
+      run: async () => {
+        await widenIntColumnsToBigInt("settings", ["updated_at"]);
+      },
+    },
+    {
+      name: "indexes",
+      run: async () => {
+        await ensureIndexExists(
+          "settings_updated_at_idx",
+          `CREATE INDEX IF NOT EXISTS settings_updated_at_idx ON ${settingsTable()} (updated_at)`,
+        );
+      },
+    },
+  ],
+});
 
-      await ensureTableExists("settings", createSql);
-      await widenIntColumnsToBigInt("settings", ["updated_at"]);
-      await ensureIndexExists(
-        "settings_updated_at_idx",
-        `CREATE INDEX IF NOT EXISTS settings_updated_at_idx ON ${table} (updated_at)`,
-      );
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+export function ensureTable(): Promise<void> {
+  return settingsStore.ready();
 }
 
 export interface StoreReadOptions {
@@ -72,15 +81,12 @@ export interface StoreReadOptions {
   transaction?: DbExec;
 }
 
-export async function getSetting(
+async function readSettingRaw(
   key: string,
   options?: StoreReadOptions,
-): Promise<Record<string, unknown> | null> {
+): Promise<string | null> {
   const cache = options?.transaction ? null : requestSettingsCache();
-  if (!options?.bypassCache && cache?.has(key)) {
-    const cached = cache.get(key);
-    return cached == null ? null : JSON.parse(cached);
-  }
+  if (!options?.bypassCache && cache?.has(key)) return cache.get(key) ?? null;
   if (!options?.transaction) await ensureTable();
   const client = options?.transaction ?? getDbExec();
   const table = settingsTable();
@@ -90,7 +96,28 @@ export async function getSetting(
   });
   const raw = rows.length === 0 ? null : (rows[0].value as string);
   if (!options?.bypassCache) cache?.set(key, raw);
+  return raw;
+}
+
+export async function getSetting(
+  key: string,
+  options?: StoreReadOptions,
+): Promise<Record<string, unknown> | null> {
+  const raw = await readSettingRaw(key, options);
   return raw == null ? null : JSON.parse(raw);
+}
+
+export type SettingEntry = { found: false } | { found: true; value: unknown };
+
+/** Like `getSetting`, but a stored JSON `null` is found, not missing. */
+export async function getSettingEntry(
+  key: string,
+  options?: StoreReadOptions,
+): Promise<SettingEntry> {
+  const raw = await readSettingRaw(key, options);
+  return raw == null
+    ? { found: false }
+    : { found: true, value: JSON.parse(raw) };
 }
 
 const SETTINGS_IN_LIST_CHUNK_SIZE = 500;

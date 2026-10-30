@@ -7,7 +7,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createToolkitI18nCatalog } from "../i18n.js";
-import { ShareButton } from "./ShareButton.js";
+import { ShareButton, type ShareButtonActionHandle } from "./ShareButton.js";
 
 const toolkitI18nCatalog = createToolkitI18nCatalog({ messages: {} });
 
@@ -981,6 +981,7 @@ describe("ShareButton", () => {
   });
 
   it("renders optional share tabs and switches to custom tab content", async () => {
+    const actionRef = React.createRef<ShareButtonActionHandle>();
     await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
@@ -988,6 +989,7 @@ describe("ShareButton", () => {
             resourceType="design"
             resourceId="design-1"
             shareUrl="https://design.agent-native.com/design/design-1"
+            actionRef={actionRef}
             shareTabs={{
               tabs: [
                 {
@@ -1033,7 +1035,7 @@ describe("ShareButton", () => {
         ?.getAttribute("aria-labelledby"),
     ).toBe(tabs[0].id);
 
-    pressTab(tabs[1]);
+    act(() => actionRef.current?.open("export"));
 
     expect(tabs[1].getAttribute("aria-selected")).toBe("true");
     expect(container.textContent).toContain("Export body");
@@ -1296,6 +1298,40 @@ describe("ShareButton", () => {
     );
     expect(String(loadMoreCall?.[0])).toContain("offset=25");
     expect(container.textContent).toContain("second@builder.io");
+  });
+
+  it("keeps links placed at the bottom after the people and access sections in the tabbed layout", async () => {
+    await act(async () => {
+      root.render(
+        <TooltipProvider>
+          <QueryClientProvider client={queryClient}>
+            <ShareButton
+              resourceType="deck"
+              resourceId="deck-1"
+              defaultOpen
+              shareUrl="https://slides.agent-native.com/deck/deck-1"
+              shareUrlLabel="Editor link"
+              secondaryShareUrl="https://slides.agent-native.com/p/deck-1"
+              secondaryShareUrlLabel="Presentation link"
+              shareUrlPlacement="bottom"
+              peopleTabLabel="People"
+              agentsTabLabel="Agents"
+              agentTabContent={<button type="button">Copy agent prompt</button>}
+            />
+          </QueryClientProvider>
+        </TooltipProvider>,
+      );
+    });
+
+    const links = Array.from(
+      document.body.querySelectorAll<HTMLElement>("div.order-3"),
+    ).find((el) => el.textContent?.includes("Editor link"));
+    expect(links).toBeDefined();
+    expect(links!.textContent).toContain("Presentation link");
+    // The sections the links must follow carry lower orders in the same column.
+    const column = links!.parentElement!;
+    expect(column.querySelector(":scope > .order-1")).not.toBeNull();
+    expect(column.querySelector(":scope > .order-2")).not.toBeNull();
   });
 
   it("keeps quick copy separate from People and Agents tabs", async () => {

@@ -27,10 +27,13 @@ import type {
   SelectedCanvasLayerSnapshot,
 } from "@/pages/design-editor/command-types";
 import type { OverviewScreen } from "@/pages/design-editor/derive/overview-screens";
+import { getAllScreenFrameEntries } from "@/pages/design-editor/overview-camera";
+import { clipboardSourceCanvasRect } from "@/pages/design-editor/paste-placement";
 import { shouldUseRuntimeLayerProjection } from "@/pages/design-editor/pending-edits";
 import type { DesignFile } from "@/pages/design-editor/types";
 
 export interface CopySelectionArgs {
+  boardFileId?: string;
   canvasFrameGeometryById: CanvasFrameGeometryById;
   copiedLayerEntriesRef: RefObject<CanvasLayerClipboardEntry[]>;
   copiedLayerHtmlRef: RefObject<string | null>;
@@ -82,6 +85,7 @@ function portableStylesForClipboard(
 }
 
 export async function runCopySelection({
+  boardFileId,
   canvasFrameGeometryById,
   copiedLayerEntriesRef,
   copiedLayerHtmlRef,
@@ -104,13 +108,43 @@ export async function runCopySelection({
 }: CopySelectionArgs) {
   const snapshots = getSelectedLayerSnapshots();
   const entries: CanvasLayerClipboardEntry[] = snapshots.map((snapshot) => ({
-    html: preserveClipboardLayerName(snapshot.html, snapshot.node.layerName),
+    html: preserveClipboardLayerName(
+      snapshot.html,
+      snapshot.node.layerNameSource === "text"
+        ? undefined
+        : snapshot.node.layerName,
+    ),
     rootNodeId: snapshot.rootNodeId,
     sourceParentNodeId: snapshot.sourceParentNodeId,
     sourceFileId: snapshot.sourceFileId,
+    ...(snapshot.sourceRelativeOffset !== undefined
+      ? { sourceRelativeOffset: snapshot.sourceRelativeOffset }
+      : {}),
     ...portableStylesForClipboard(snapshot, readPortableStyleSnapshot),
     managedStyleSnapshot: snapshot.managedStyleSnapshot,
   }));
+  const canvas = {
+    getContent: getScreenContent,
+    frames: getAllScreenFrameEntries({
+      overviewScreens,
+      canvasFrameGeometryById,
+    }),
+    boardFileId,
+  };
+  entries.forEach((entry, index) => {
+    const rect = clipboardSourceCanvasRect(entry, index, canvas);
+    if (
+      !rect ||
+      ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite)
+    )
+      return;
+    entry.sourceCanvasRect = {
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    };
+  });
   const screens: DesignClipboardPayload["screens"] =
     entries.length === 0 && viewModeRef.current === "overview"
       ? overviewSelectedScreenIds

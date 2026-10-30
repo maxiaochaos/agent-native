@@ -4,16 +4,16 @@ import {
   ensureTableExists,
   ensureIndexExists,
 } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
 import { AGENT_AUDIT_CALLERS } from "./config.js";
 import type {
   AuditActorKind,
+  AuditApproval,
   AuditEvent,
+  AuditIdentityAssurance,
   AuditQueryFilters,
   AuditVisibility,
 } from "./types.js";
-
-let _initPromise: Promise<void> | undefined;
 
 export const AGENT_AUDIT_LOG_CREATE_SQL = `
   CREATE TABLE IF NOT EXISTS agent_audit_log (
@@ -49,23 +49,25 @@ export const AGENT_AUDIT_LOG_CREATE_SQL = `
   )
 `;
 
-export async function ensureAuditTables(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const lineageColumns = [
-        "run_id",
-        "task_id",
-        "parent_task_id",
-        "source_kind",
-        "source_platform",
-        "source_id",
-        "source_url",
-        "network_protocol",
-        "network_id",
-        "network_peer",
-      ];
+export const auditStore = defineStore({
+  id: "audit",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const lineageColumns = [
+          "run_id",
+          "task_id",
+          "parent_task_id",
+          "source_kind",
+          "source_platform",
+          "source_id",
+          "source_url",
+          "network_protocol",
+          "network_id",
+          "network_peer",
+        ];
 
-      {
         await ensureTableExists("agent_audit_log", AGENT_AUDIT_LOG_CREATE_SQL);
         // `app` is added here rather than in the base CREATE, which org
         // migration 1032 replays verbatim.
@@ -104,15 +106,37 @@ export async function ensureAuditTables(): Promise<void> {
           "idx_audit_created",
           `CREATE INDEX IF NOT EXISTS idx_audit_created ON agent_audit_log (created_at)`,
         );
-        return;
-      }
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+      },
+    },
+    {
+      // Not in the base CREATE either, for the same reason as `app`.
+      name: "mcp-client-attribution",
+      sql: [
+        "ALTER TABLE agent_audit_log ADD COLUMN IF NOT EXISTS reported_client_name TEXT",
+        "ALTER TABLE agent_audit_log ADD COLUMN IF NOT EXISTS reported_client_version TEXT",
+        "ALTER TABLE agent_audit_log ADD COLUMN IF NOT EXISTS oauth_client_id TEXT",
+        "ALTER TABLE agent_audit_log ADD COLUMN IF NOT EXISTS approval TEXT",
+      ],
+    },
+    {
+      name: "a2a-identity-assurance",
+      sql: [
+        "ALTER TABLE agent_audit_log ADD COLUMN IF NOT EXISTS identity_assurance TEXT",
+      ],
+    },
+  ],
+});
+
+export function ensureAuditTables(): Promise<void> {
+  return auditStore.ready();
+}
+
+// PostgreSQL text cannot hold NUL. One in any value, such as a summary built
+// from the call's arguments, would fail the insert and lose the whole row.
+function storableText(value: unknown): unknown {
+  return typeof value === "string"
+    ? value.replaceAll("\u0000", "\uFFFD")
+    : value;
 }
 
 export async function insertAuditEvent(event: AuditEvent): Promise<void> {
@@ -124,8 +148,9 @@ export async function insertAuditEvent(event: AuditEvent): Promise<void> {
        thread_id, turn_id, target_type, target_id, status, summary, input,
        error_code, owner_email, visibility, run_id, task_id, parent_task_id,
        source_kind, source_platform, source_id, source_url, network_protocol,
-       network_id, network_peer, app)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       network_id, network_peer, app, reported_client_name,
+       reported_client_version, oauth_client_id, approval, identity_assurance)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       event.id,
       event.createdAt,
@@ -155,7 +180,12 @@ export async function insertAuditEvent(event: AuditEvent): Promise<void> {
       event.networkId ?? null,
       event.networkPeer ?? null,
       event.app ?? null,
-    ],
+      event.reportedClientName ?? null,
+      event.reportedClientVersion ?? null,
+      event.oauthClientId ?? null,
+      event.approval ?? null,
+      event.identityAssurance ?? null,
+    ].map(storableText),
   });
 }
 
@@ -226,6 +256,12 @@ function mapRow(row: any): AuditEvent {
     networkId: row.network_id ?? null,
     networkPeer: row.network_peer ?? null,
     app: row.app ?? null,
+    reportedClientName: row.reported_client_name ?? null,
+    reportedClientVersion: row.reported_client_version ?? null,
+    oauthClientId: row.oauth_client_id ?? null,
+    approval: (row.approval ?? null) as AuditApproval | null,
+    identityAssurance: (row.identity_assurance ??
+      null) as AuditIdentityAssurance | null,
   };
 }
 
@@ -295,7 +331,8 @@ const LIST_COLUMNS =
   "thread_id, turn_id, target_type, target_id, status, summary, " +
   "error_code, owner_email, visibility, app, run_id, task_id, " +
   "parent_task_id, source_kind, source_platform, source_id, source_url, " +
-  "network_protocol, network_id, network_peer";
+  "network_protocol, network_id, network_peer, reported_client_name, " +
+  "reported_client_version, oauth_client_id, approval, identity_assurance";
 
 function clampLimit(limit: number | undefined): number {
   return Math.min(Math.max(1, Math.floor(limit ?? DEFAULT_LIMIT)), MAX_LIMIT);
@@ -443,5 +480,5 @@ export async function deleteOldAuditEvents(cutoffMs: number): Promise<number> {
 }
 
 export function __resetAuditInitForTests(): void {
-  _initPromise = undefined;
+  auditStore.reset();
 }

@@ -1,11 +1,13 @@
-import {
-  type APIRequestContext,
-  type Locator,
-  type Page,
-} from "@playwright/test";
+import { type APIRequestContext, type Page } from "@playwright/test";
 
 import { e2eBaseURL } from "./base-url";
-import { appPath, frameToolButton, gotoEditor, pickFrameMode } from "./helpers";
+import {
+  appPath,
+  frameToolButton,
+  gotoEditor,
+  panTargetIntoUnobscuredCanvas,
+  pickFrameMode,
+} from "./helpers";
 import { expect, test, type App } from "./rails";
 
 const BASE_URL = process.env.E2E_BASE_URL ?? e2eBaseURL();
@@ -159,128 +161,14 @@ async function designFileIds(
   return result.files.map((file: { id: string }) => file.id);
 }
 
-async function panTargetIntoUnobscuredCanvas(
-  page: Page,
-  target: Locator,
-  targetName: string,
-) {
-  const edgeInset = 24;
-  const maxPanStep = 200;
-
-  for (let step = 0; step < 16; step += 1) {
-    const box = await target.boundingBox();
-    expect(box, `${targetName} should have rendered bounds`).not.toBeNull();
-    const geometry = await page.evaluate(
-      ({ target, inset, panStep }) => {
-        const surface = document.querySelector<HTMLElement>(
-          "[data-multi-screen-canvas-surface]",
-        );
-        if (!surface) return null;
-        const bounds = (selector: string) => {
-          const element = document.querySelector<HTMLElement>(selector);
-          if (!element || getComputedStyle(element).display === "none") {
-            return null;
-          }
-          const rect = element.getBoundingClientRect();
-          return rect.width && rect.height
-            ? {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-              }
-            : null;
-        };
-        const surfaceRect = surface.getBoundingClientRect();
-        const leftShell = bounds('[data-design-chrome-region="left-shell"]');
-        const rightPanel = bounds('[data-design-chrome-region="right-panel"]');
-        const topBar = bounds('[data-design-chrome-region="top-bar"]');
-        const visible = {
-          left: Math.max(0, surfaceRect.left, leftShell?.right ?? 0) + inset,
-          top: Math.max(0, surfaceRect.top, topBar?.bottom ?? 0) + inset,
-          right:
-            Math.min(
-              innerWidth,
-              surfaceRect.right,
-              rightPanel?.left ?? innerWidth,
-            ) - inset,
-          bottom: Math.min(innerHeight, surfaceRect.bottom) - inset,
-        };
-        const inside =
-          target.x >= visible.left &&
-          target.x + target.width <= visible.right &&
-          target.y >= visible.top &&
-          target.y + target.height <= visible.bottom;
-        const delta = {
-          x:
-            target.x + target.width > visible.right
-              ? panStep
-              : target.x < visible.left
-                ? -panStep
-                : 0,
-          y:
-            target.y + target.height > visible.bottom
-              ? panStep
-              : target.y < visible.top
-                ? -panStep
-                : 0,
-        };
-        const wheelPoint = [
-          { x: visible.left + 16, y: visible.top + 64 },
-          { x: visible.left + 32, y: visible.top + 112 },
-          { x: visible.left + 64, y: visible.top + 64 },
-          { x: visible.left + 16, y: (visible.top + visible.bottom) / 2 },
-          { x: (visible.left + visible.right) / 2, y: visible.top + 64 },
-        ].find((point) => {
-          const hit = document.elementFromPoint(point.x, point.y);
-          return Boolean(
-            hit && surface.contains(hit) && !hit.closest("iframe"),
-          );
-        });
-        return { visible, inside, delta, wheelPoint: wheelPoint ?? null };
-      },
-      { target: box!, inset: edgeInset, panStep: maxPanStep },
-    );
-    expect(
-      geometry,
-      "the overview canvas surface should be mounted",
-    ).not.toBeNull();
-    expect(
-      geometry!.visible.right - geometry!.visible.left,
-    ).toBeGreaterThanOrEqual(box!.width);
-    expect(
-      geometry!.visible.bottom - geometry!.visible.top,
-    ).toBeGreaterThanOrEqual(box!.height);
-    if (geometry!.inside) return;
-    expect(
-      Math.abs(geometry!.delta.x) + Math.abs(geometry!.delta.y),
-      `${targetName} should be reachable by panning inside the canvas`,
-    ).toBeGreaterThan(0);
-    expect(
-      geometry!.wheelPoint,
-      "a clear point on the overview canvas should be available for panning",
-    ).not.toBeNull();
-
-    await page.mouse.move(geometry!.wheelPoint!.x, geometry!.wheelPoint!.y);
-    await page.mouse.wheel(geometry!.delta.x, geometry!.delta.y);
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) =>
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-        ),
-    );
-  }
-
-  throw new Error(
-    `${targetName} did not move inside the unobscured canvas after 16 wheel pans`,
-  );
-}
-
 function breakpointRules(html: string) {
-  const block =
-    /<style data-agent-native-breakpoints>([\s\S]*?)<\/style>/.exec(
-      html,
-    )?.[1] ?? "";
+  const block = [
+    ...html.matchAll(
+      /<style data-agent-native-breakpoint(?:s|-range="[^"]*")>([\s\S]*?)<\/style>/g,
+    ),
+  ]
+    .map(([, css]) => css)
+    .join("\n");
   return [
     ...block.matchAll(
       /@media ([^{]+?)\s*\{\s*([^{]+?)\s*\{\s*([^}]*?)\s*\}\s*\}/g,
@@ -329,8 +217,7 @@ async function renderedOffset(
   };
 }
 
-// fixme: product bug: Canvas and saved file disagree: the saved file holds only the max-width 767px rule and the base inline left:40px, but the Desktop and
-test.fixme("responsive frame previews preserve content fit and scope selection", async ({
+test("responsive frame previews preserve content fit and scope selection", async ({
   app,
   page,
   request,
@@ -390,10 +277,13 @@ test.fixme("responsive frame previews preserve content fit and scope selection",
   await expect(scope).toHaveText("This breakpoint and smaller");
   const mobileHeroBox = await mobileHero.boundingBox();
   expect(mobileHeroBox).not.toBeNull();
+  // Cmd+click reaches the hero inside <main>; a plain click takes main.
+  await page.keyboard.down("ControlOrMeta");
   await page.mouse.click(
     mobileHeroBox!.x + mobileHeroBox!.width / 2,
     mobileHeroBox!.y + mobileHeroBox!.height / 2,
   );
+  await page.keyboard.up("ControlOrMeta");
   await expect
     .poll(
       async () =>
@@ -407,14 +297,13 @@ test.fixme("responsive frame previews preserve content fit and scope selection",
   await app.settled();
   expect(
     breakpointRules(await designFileContent(request, designId, fileId!)),
-  ).toEqual([["(max-width: 767px)", "hero", "left: 137px;"]]);
+  ).toEqual([["(max-width: 767px)", "hero", "left: 137px !important;"]]);
   await expect
     .poll(() => heroXByFrame(page, fileId!))
     .toEqual({ desktop: 40, tablet: 40, mobile: 137 });
 });
 
-// fixme: product bug: The 'This breakpoint only' edit saves @media (max-width: 1279px) hero left:155px, which ignores the scope and covers Mobile too (masked
-test.fixme("after a Mobile edit, a 'This breakpoint only' X edit at Tablet adds exactly one tablet-range rule and moves only the Tablet frame", async ({
+test("after a Mobile edit, a 'This breakpoint only' X edit at Tablet adds exactly one tablet-range rule and moves only the Tablet frame", async ({
   app,
   page,
   request,
@@ -450,10 +339,13 @@ test.fixme("after a Mobile edit, a 'This breakpoint only' X edit at Tablet adds 
   await expect(scope).toHaveText("This breakpoint and smaller");
   const mobileHeroBox = await mobileHero.boundingBox();
   expect(mobileHeroBox).not.toBeNull();
+  // Cmd+click reaches the hero inside <main>; a plain click takes main.
+  await page.keyboard.down("ControlOrMeta");
   await page.mouse.click(
     mobileHeroBox!.x + mobileHeroBox!.width / 2,
     mobileHeroBox!.y + mobileHeroBox!.height / 2,
   );
+  await page.keyboard.up("ControlOrMeta");
   await expect
     .poll(
       async () =>
@@ -467,7 +359,7 @@ test.fixme("after a Mobile edit, a 'This breakpoint only' X edit at Tablet adds 
   await app.settled();
   expect(
     breakpointRules(await designFileContent(request, designId, fileId!)),
-  ).toEqual([["(max-width: 767px)", "hero", "left: 137px;"]]);
+  ).toEqual([["(max-width: 767px)", "hero", "left: 137px !important;"]]);
 
   const tabletHero = page
     .locator(`iframe[data-screen-iframe-id="${fileId}::bp-768"]`)
@@ -495,10 +387,13 @@ test.fixme("after a Mobile edit, a 'This breakpoint only' X edit at Tablet adds 
   await panTargetIntoUnobscuredCanvas(page, tabletHero, "tablet hero");
   const tabletHeroBox = await tabletHero.boundingBox();
   expect(tabletHeroBox).not.toBeNull();
+  // Cmd+click reaches the hero inside <main>; a plain click takes main.
+  await page.keyboard.down("ControlOrMeta");
   await page.mouse.click(
     tabletHeroBox!.x + tabletHeroBox!.width / 2,
     tabletHeroBox!.y + tabletHeroBox!.height / 2,
   );
+  await page.keyboard.up("ControlOrMeta");
   await expect(xInput).toBeVisible();
   await expect
     .poll(
@@ -512,8 +407,12 @@ test.fixme("after a Mobile edit, a 'This breakpoint only' X edit at Tablet adds 
   expect(
     breakpointRules(await designFileContent(request, designId, fileId!)),
   ).toEqual([
-    ["(max-width: 767px)", "hero", "left: 137px;"],
-    ["(min-width: 768px) and (max-width: 1279px)", "hero", "left: 155px;"],
+    ["(max-width: 767px)", "hero", "left: 137px !important;"],
+    [
+      "(min-width: 768px) and (max-width: 1279px)",
+      "hero",
+      "left: 155px !important;",
+    ],
   ]);
   await expect
     .poll(() => heroXByFrame(page, fileId!))
@@ -704,8 +603,7 @@ test("screen deletion explicitly includes and removes responsive variants", asyn
   expect(Object.keys(data.canvasFrames ?? {})).toEqual([fileIds[1]]);
 });
 
-// fixme: intermittent: Passed in its worker run and in a solo re-run, failed once in the full confirmation run (2 of 3).
-test.fixme("generated variation groups reserve non-overlapping breakpoint rows, and custom screen positions survive a reopen", async ({
+test("generated variation groups reserve non-overlapping breakpoint rows, and custom screen positions survive a reopen", async ({
   app,
   page,
   request,
@@ -889,8 +787,7 @@ test("adding a breakpoint reflows screen rows before their previews overlap", as
   await expect.poll(overlappingPairs).toEqual([]);
 });
 
-// fixme: product bug: After Cmd+D the selected 'Screen 4 copy' card sits at page x 1341–2006, entirely under the right inspector (visible canvas ends at 1259)
-test.fixme("overview screen creation and duplicate undo/redo keep screens selected and visible", async ({
+test("overview screen creation and duplicate undo/redo keep screens selected and visible", async ({
   app,
   page,
   request,

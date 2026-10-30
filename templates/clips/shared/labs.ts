@@ -30,7 +30,7 @@ export const CLIPS_MEETINGS = defineLab({
   keywords: "meetings meeting transcription notes",
 });
 
-export const CLIPS_WISPRFLOW = defineLab({
+export const CLIPS_VOICE_DICTATION = defineLab({
   key: "clips.wisprflow",
   displayName: "Voice dictation",
   description: "Show or hide voice dictation in Clips Desktop.",
@@ -58,14 +58,23 @@ export const CLIPS_LOOKBACK_CONTEXT = defineLab({
   displayName: "Include earlier screen time",
   description:
     "Attach up to five minutes of screen time from before a recording as passive context.",
-  defaultEnabled: true,
+  defaultEnabled: false,
   keywords: "rewind lookback context history earlier screen before recording",
+});
+
+export const CLIPS_SCREENSHOTS = defineLab({
+  key: "clips.screenshots",
+  displayName: "Screenshots",
+  description: "Take screenshots.",
+  defaultEnabled: false,
+  keywords: "screenshots screenshot capture image",
 });
 
 export const CLIPS_LABS = defineLabs([
   CLIPS_VIDEO_EDITING,
   CLIPS_MEETINGS,
-  CLIPS_WISPRFLOW,
+  CLIPS_VOICE_DICTATION,
   CLIPS_RESILIENT_RECORDING,
   CLIPS_LOOKBACK_CONTEXT,
+  CLIPS_SCREENSHOTS,
 ]);

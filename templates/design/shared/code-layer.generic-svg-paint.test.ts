@@ -29,8 +29,9 @@ describe("generic inline SVG fill edits", () => {
     expect(result.content).toContain('data-agent-native-node-id="second"');
     expect(result.content).toContain('fill="#16a34a"');
     expect(result.content).toContain('fill="#111111"');
+    expect(result.content).not.toContain('fill="#f97316"');
     expect(result.content).toMatch(
-      /<path[^>]*data-agent-native-node-id="first"[^>]*fill="#f97316"[^>]*style="[^"]*fill: #3b82f6/,
+      /<path[^>]*data-agent-native-node-id="first"[^>]*style="[^"]*fill: #3b82f6/,
     );
   });
 
@@ -63,7 +64,7 @@ describe("generic inline SVG fill edits", () => {
 
     expect(result.result.status).toBe("applied");
     expect(result.content).toMatch(
-      /<path[^>]*fill="#f97316"[^>]*style="[^\"]*fill: #3b82f6/,
+      /<path(?![^>]*fill="#f97316")[^>]*style="[^\"]*fill: #3b82f6/,
     );
     expect(result.content).not.toMatch(/<svg[^>]*style="[^\"]*fill: #3b82f6/);
   });
@@ -79,7 +80,7 @@ describe("generic inline SVG fill edits", () => {
 
     expect(result.result.status).toBe("applied");
     expect(result.content).toMatch(
-      /<path[^>]*fill="#f97316"[^>]*style="[^\"]*fill: #3b82f6/,
+      /<path(?![^>]*fill="#f97316")[^>]*style="[^\"]*fill: #3b82f6/,
     );
     expect(result.content).not.toMatch(/<svg[^>]*style="[^\"]*fill: #3b82f6/);
   });
@@ -103,6 +104,42 @@ describe("generic inline SVG fill edits", () => {
         expect(result.result.status).toBe("unsupported");
         expect(result.content).toBe(html);
       }
+    }
+  });
+
+  it("moves a use element by its translate", () => {
+    const html = `<svg data-agent-native-node-id="pasted" data-an-primitive="pasted-svg" viewBox="0 0 20 10"><defs><path id="source" d="M0 0h20v10z"/></defs><use id="instance" href="#source"/></svg>`;
+    const useNode = buildCodeLayerProjection(html).nodes.find(
+      (node) => node.tag === "use",
+    );
+    if (!useNode) throw new Error("use node not projected");
+
+    const result = applyVisualEdit(html, {
+      kind: "style",
+      target: { nodeId: useNode.id },
+      property: "translate",
+      value: "4px 2px",
+    });
+
+    expect(result.result.status).toBe("applied");
+    expect(result.content).toContain(
+      '<use id="instance" href="#source" style="translate: 4px 2px"',
+    );
+  });
+
+  it("still moves and resizes a pasted SVG whose paint is ambiguous", () => {
+    const html = `<div data-agent-native-node-id="wrap"><svg data-agent-native-node-id="pasted" data-an-primitive="pasted-svg" viewBox="0 0 20 10"><path d="M0 0h20v10z"/><circle cx="5" cy="5" r="2"/></svg></div>`;
+    for (const [property, value] of [
+      ["left", "20px"],
+      ["width", "300px"],
+    ] as const) {
+      const result = applyVisualEdit(html, {
+        kind: "style",
+        target: { nodeId: "pasted" },
+        property,
+        value,
+      });
+      expect(result.result.status).toBe("applied");
     }
   });
 
@@ -244,7 +281,7 @@ describe("generic inline SVG fill edits", () => {
 
     expect(result.result.status).toBe("applied");
     expect(result.content).toMatch(
-      /<circle[^>]*fill="#f97316"[^>]*style="[^"]*fill: #3b82f6/,
+      /<circle(?![^>]*fill="#f97316")[^>]*style="[^"]*fill: #3b82f6/,
     );
     expect(result.content).toContain('stroke="#111827"');
     expect(result.content).not.toMatch(/<svg[^>]*style="[^"]*fill: #3b82f6/);
@@ -304,6 +341,6 @@ describe("imported SVG paint through <g> wrappers", () => {
     expect(result.result.status).toBe("applied");
     expect(result.content).toMatch(/<circle[^>]*style="[^"]*fill: #abcdef/);
     expect(result.content).toContain('fill="#111111"');
-    expect(result.content).toContain('fill="#222222"');
+    expect(result.content).not.toContain('fill="#222222"');
   });
 });

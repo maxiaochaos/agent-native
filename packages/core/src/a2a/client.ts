@@ -13,6 +13,7 @@ import {
 } from "../shared/test-traffic.js";
 import { canonicalA2AAudience } from "./audience.js";
 import { sanitizeA2ACorrelationMetadata } from "./correlation.js";
+import { A2A_ORG_MEMBER_DELEGATION_TYPE } from "./organization-identity.js";
 import { RemoteAgentCredentialRejectedError } from "./remote-agent-auth.js";
 import type {
   A2ACorrelationMetadata,
@@ -21,6 +22,7 @@ import type {
   AgentCard,
   A2AProtocolVersion,
   Artifact,
+  FilePart,
   JsonRpcRequest,
   JsonRpcResponse,
   Message,
@@ -284,6 +286,36 @@ export async function signA2AOrganizationToken(
     .setExpirationTime(options?.expiresIn ?? "5m");
   if (options?.audience) jwt.setAudience(options.audience);
   return jwt.sign(new TextEncoder().encode(secret));
+}
+
+export async function signA2AOrgMemberDelegationToken(
+  email: string,
+  orgDomain: string,
+  orgSecret: string,
+  audience: string | string[],
+): Promise<string> {
+  const normalizedEmail = email.trim().toLowerCase();
+  const normalizedDomain = orgDomain.trim().toLowerCase();
+  const secret = orgSecret.trim();
+  if (!normalizedEmail || !normalizedDomain || !secret || !audience) {
+    throw new Error(
+      "A member email, organization domain, organization secret, and audience are required.",
+    );
+  }
+
+  const appUrl = getAppConfig().app.url ?? "http://localhost:3000";
+  return new jose.SignJWT({
+    typ: A2A_ORG_MEMBER_DELEGATION_TYPE,
+    sub: normalizedEmail,
+    org_domain: normalizedDomain,
+  })
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuer(appUrl)
+    .setIssuedAt()
+    .setJti(randomUUID())
+    .setExpirationTime("5m")
+    .setAudience(audience)
+    .sign(new TextEncoder().encode(secret));
 }
 
 export function shouldPreferGlobalA2ASecret(orgSecret?: string): boolean {
@@ -1920,6 +1952,7 @@ export async function callAgent(
     pollIntervalMs?: number;
     returnRecoverableArtifactsOnTimeout?: boolean;
     onUpdate?: (task: Task) => void;
+    files?: FilePart["file"][];
   },
 ): Promise<string> {
   const metadata: Record<string, unknown> = { ...opts?.metadata };
@@ -1934,7 +1967,10 @@ export async function callAgent(
     opts?.idempotencyKey ?? (opts?.taskId ? undefined : `auto:${randomUUID()}`);
   const message: Message = {
     role: "user",
-    parts: [{ type: "text", text }],
+    parts: [
+      { type: "text", text },
+      ...(opts?.files ?? []).map((file) => ({ type: "file" as const, file })),
+    ],
   };
 
   const apiKeyAttempts = await buildA2AApiKeyAttempts(
@@ -2138,8 +2174,11 @@ async function buildA2AApiKeyAttempts(
   };
 
   const globalSecret = getGlobalA2ASecret();
+  const isOrgMemberDelegation =
+    getRequestContext()?.a2aIdentityAssurance === "org-member";
   if (
     opts?.userEmail &&
+    !isOrgMemberDelegation &&
     globalSecret &&
     (!opts.orgId || opts.orgDomain?.trim())
   ) {
@@ -2148,6 +2187,17 @@ async function buildA2AApiKeyAttempts(
         preferGlobalSecret: true,
         audience,
       }),
+    );
+  }
+
+  if (opts?.userEmail && opts.orgDomain && opts.orgSecret && audience) {
+    add(
+      await signA2AOrgMemberDelegationToken(
+        opts.userEmail,
+        opts.orgDomain,
+        opts.orgSecret,
+        audience,
+      ),
     );
   }
 

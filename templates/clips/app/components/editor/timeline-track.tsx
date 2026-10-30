@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 
 export type TrackSelection =
   | { kind: "clip"; anchorMs: number }
+  | { kind: "range"; startMs: number; endMs: number }
   | { kind: "gap"; cutId: string }
   /** A red line with no gap behind it yet — selected so it can be deleted. */
   | { kind: "split"; splitId: string };
@@ -39,6 +40,7 @@ export const MIN_PIECE_MS = 80;
 const DRAG_THRESHOLD_PX = 3;
 const EDGE_HANDLE_PX = 13;
 const RESTORE_BUTTON_MIN_PX = 26;
+const RANGE_EDGE_PX = 6;
 
 export type EdgeSide = "clip-start" | "clip-end";
 
@@ -59,7 +61,8 @@ export interface DragTarget {
   newCutId: string;
 }
 
-interface DragState {
+interface EdgeDragState {
+  kind: "edge";
   pointerId: number;
   startClientX: number;
   base: EditsJson;
@@ -68,8 +71,59 @@ interface DragState {
   moved: boolean;
 }
 
+interface RangeDragState {
+  kind: "range";
+  pointerId: number;
+  startClientX: number;
+  /** "new" and "resize" grow from `startMs`; "move" slides `from` by the pointer delta. */
+  mode: "new" | "resize" | "move";
+  startMs: number;
+  /** Where the pointer went down; `startMs` is the far edge when resizing. */
+  pressMs: number;
+  from: { startMs: number; endMs: number } | null;
+  /** Set when the drag began on a removed section, so a plain click selects it. */
+  gapCutId: string | null;
+  moved: boolean;
+}
+
+type DragState = EdgeDragState | RangeDragState;
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function dragRange(drag: RangeDragState, ms: number, durationMs: number) {
+  if (drag.mode !== "move" || !drag.from) {
+    return selectionRange(drag.startMs, ms);
+  }
+  const length = drag.from.endMs - drag.from.startMs;
+  const startMs = clamp(
+    drag.from.startMs + ms - drag.startMs,
+    0,
+    Math.max(0, durationMs - length),
+  );
+  return selectionRange(startMs, startMs + length);
+}
+
+function rangeZone(
+  range: { startMs: number; endMs: number },
+  atMs: number,
+  toX: (ms: number) => number,
+): "edge" | "inside" | "outside" {
+  const x = toX(atMs);
+  const left = toX(range.startMs);
+  const right = toX(range.endMs);
+  const edge = Math.min(RANGE_EDGE_PX, (right - left) / 3);
+  if (Math.abs(x - left) <= edge || Math.abs(x - right) <= edge) return "edge";
+  return x > left && x < right ? "inside" : "outside";
+}
+
+function selectionRange(startMs: number, endMs: number): TrackSelection {
+  return {
+    kind: "range",
+    startMs: Math.min(startMs, endMs),
+    endMs: Math.max(startMs, endMs),
+  };
 }
 
 export function trackBoundaries(pieces: TimelinePiece[]): TrackBoundary[] {
@@ -198,6 +252,7 @@ export function TimelineTrack({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragState | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [rangeCursor, setRangeCursor] = useState<string | null>(null);
 
   const pieces = useMemo(
     () => buildTimelinePieces(durationMs, edits),
@@ -230,7 +285,7 @@ export function TimelineTrack({
       if (selection.kind === "gap") {
         return piece.kind === "gap" && piece.cutId === selection.cutId;
       }
-      if (selection.kind === "split") return false;
+      if (selection.kind !== "clip") return false;
       return (
         piece.kind === "clip" &&
         selection.anchorMs >= piece.startMs &&
@@ -243,15 +298,32 @@ export function TimelineTrack({
   const handleMove = useCallback(
     (e: React.PointerEvent) => {
       const drag = dragRef.current;
-      if (!drag || drag.pointerId !== e.pointerId) return;
+      if (!drag) {
+        if (selection?.kind !== "range" || disabled) {
+          setRangeCursor(null);
+          return;
+        }
+        const zone = rangeZone(selection, toMs(e.clientX), toX);
+        setRangeCursor(
+          zone === "edge" ? "ew-resize" : zone === "inside" ? "grab" : null,
+        );
+        return;
+      }
+      if (drag.pointerId !== e.pointerId) return;
       if (!drag.moved) {
         if (Math.abs(e.clientX - drag.startClientX) < DRAG_THRESHOLD_PX) return;
         drag.moved = true;
         setDragging(true);
       }
-      onPreview(applyDrag(drag.base, durationMs, drag.target, toMs(e.clientX)));
+      if (drag.kind === "range") {
+        onSelectionChange(dragRange(drag, toMs(e.clientX), durationMs));
+      } else {
+        onPreview(
+          applyDrag(drag.base, durationMs, drag.target, toMs(e.clientX)),
+        );
+      }
     },
-    [durationMs, onPreview, toMs],
+    [disabled, durationMs, onPreview, onSelectionChange, selection, toMs, toX],
   );
 
   const endDrag = useCallback(
@@ -260,8 +332,19 @@ export function TimelineTrack({
       if (!drag || drag.pointerId !== e.pointerId) return;
       dragRef.current = null;
       setDragging(false);
-      onPreview(null);
+      if (drag.kind === "edge") onPreview(null);
       if (!commit) return;
+      if (drag.kind === "range") {
+        if (drag.moved) {
+          onSelectionChange(dragRange(drag, toMs(e.clientX), durationMs));
+        } else if (drag.gapCutId) {
+          onSelectionChange({ kind: "gap", cutId: drag.gapCutId });
+        } else {
+          onSelectionChange({ kind: "clip", anchorMs: drag.pressMs });
+          onSeek?.(drag.pressMs);
+        }
+        return;
+      }
       if (!drag.moved) {
         if (drag.splitId) {
           onSelectionChange({ kind: "split", splitId: drag.splitId });
@@ -270,8 +353,44 @@ export function TimelineTrack({
       }
       onCommit(applyDrag(drag.base, durationMs, drag.target, toMs(e.clientX)));
     },
-    [durationMs, onCommit, onPreview, onSelectionChange, toMs],
+    [durationMs, onCommit, onPreview, onSeek, onSelectionChange, toMs],
   );
+
+  const beginRangeDrag = (
+    e: React.PointerEvent,
+    at: number,
+    gapCutId: string | null,
+  ) => {
+    rootRef.current?.setPointerCapture?.(e.pointerId);
+    let mode: RangeDragState["mode"] = "new";
+    let startMs = at;
+    let from: RangeDragState["from"] = null;
+    if (selection?.kind === "range") {
+      const zone = rangeZone(selection, at, toX);
+      if (zone === "edge") {
+        mode = "resize";
+        startMs =
+          Math.abs(toX(at) - toX(selection.startMs)) <=
+          Math.abs(toX(at) - toX(selection.endMs))
+            ? selection.endMs
+            : selection.startMs;
+      } else if (zone === "inside") {
+        mode = "move";
+        from = { startMs: selection.startMs, endMs: selection.endMs };
+      }
+    }
+    dragRef.current = {
+      kind: "range",
+      pointerId: e.pointerId,
+      startClientX: e.clientX,
+      mode,
+      startMs,
+      pressMs: at,
+      from,
+      gapCutId,
+      moved: false,
+    };
+  };
 
   const beginDrag = (
     e: React.PointerEvent,
@@ -280,6 +399,7 @@ export function TimelineTrack({
   ) => {
     rootRef.current?.setPointerCapture?.(e.pointerId);
     dragRef.current = {
+      kind: "edge",
       pointerId: e.pointerId,
       startClientX: e.clientX,
       base: edits,
@@ -293,7 +413,11 @@ export function TimelineTrack({
     <div
       ref={rootRef}
       className={cn("relative select-none", className)}
-      style={{ width, height }}
+      style={{
+        width,
+        height,
+        cursor: dragging ? undefined : (rangeCursor ?? undefined),
+      }}
       onPointerMove={handleMove}
       onPointerUp={(e) => endDrag(e, true)}
       onPointerCancel={(e) => endDrag(e, false)}
@@ -327,11 +451,15 @@ export function TimelineTrack({
                   : "cursor-pointer hover:bg-rose-500/15",
                 selected && "bg-rose-500/20 ring-2 ring-inset ring-rose-400",
               )}
-              style={{ left, width: pieceWidth }}
+              style={{
+                left,
+                width: pieceWidth,
+                cursor: rangeCursor ?? undefined,
+              }}
               onPointerDown={(e) => {
                 if (disabled || e.button !== 0) return;
                 e.preventDefault();
-                onSelectionChange({ kind: "gap", cutId: piece.cutId });
+                beginRangeDrag(e, toMs(e.clientX), piece.cutId);
               }}
             >
               {pieceWidth >= RESTORE_BUTTON_MIN_PX ? (
@@ -373,17 +501,30 @@ export function TimelineTrack({
                 ? "border-primary bg-primary/15 ring-2 ring-inset ring-primary"
                 : "border-transparent hover:border-primary/50 hover:bg-primary/5",
             )}
-            style={{ left, width: pieceWidth }}
+            style={{
+              left,
+              width: pieceWidth,
+              cursor: rangeCursor ?? undefined,
+            }}
             onPointerDown={(e) => {
               if (disabled || e.button !== 0) return;
               e.preventDefault();
-              const at = toMs(e.clientX);
-              onSelectionChange({ kind: "clip", anchorMs: at });
-              onSeek?.(at);
+              beginRangeDrag(e, toMs(e.clientX), null);
             }}
           />
         );
       })}
+
+      {selection?.kind === "range" ? (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute top-0 h-full rounded-[3px] border border-primary bg-primary/20 ring-2 ring-inset ring-primary"
+          style={{
+            left: toX(selection.startMs),
+            width: Math.max(1, toX(selection.endMs) - toX(selection.startMs)),
+          }}
+        />
+      ) : null}
 
       {/*
         Where the clip starts and where it stops: the same marker at both ends,

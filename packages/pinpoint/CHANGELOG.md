@@ -1,5 +1,133 @@
 # @agent-native/pinpoint
 
+## 0.1.105
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.104
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.103
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.102
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- 2e8f454: Compile with `noImplicitOverride` and `noFallthroughCasesInSwitch`, and, where the code already passes them, `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`. Optional fields that legitimately hold `undefined` are now typed `T | undefined`. No runtime behavior changes.
+
+## 0.1.101
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.100
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.99
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.98
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.97
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.96
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.95
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.94
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.93
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.92
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.91
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.90
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.89
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.88
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.87
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+- 0cfbd4d: Include the MIT license text in the published package.
+
+## 0.1.86
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
+## 0.1.85
+
+### Patch Changes
+
+- Release all public npm packages with a patch version bump.
+
 ## 0.1.84
 
 ### Patch Changes
@@ -494,24 +622,4 @@
 
 - 3107f96: Preserve MCP tool error and read-only metadata through action execution, and allow Pinpoint's empty test suite to pass intentionally.
 
-## 0.1.5
-
-### Patch Changes
-
-- 1ba9738: Keep the pinpoint toolbar inside the viewport when the agent sidebar is open by tracking the visible sidebar width via MutationObserver + ResizeObserver and clamping toolbar position + drag bounds.
-
-## 0.1.4
-
-### Patch Changes
-
-- Updated dependencies [bcb2069]
-- Updated dependencies [e375642]
-  - @agent-native/core@0.8.0
-
-## 0.1.3
-
-### Patch Changes
-
-- 4e3631b: Add `publishConfig.provenance: true` so `pnpm publish` (called by `changeset publish` from the auto-publish workflow) requests an OIDC token from GitHub Actions and publishes via npm trusted publisher. Without this, `pnpm publish` looked for token-based auth and failed with `ENEEDAUTH`.
-- Updated dependencies [4e3631b]
-  - @agent-native/core@0.7.85
+For the full list of releases, see the [changelog archive](./changelog/archive/CHANGELOG.md).
