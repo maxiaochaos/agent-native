@@ -32,13 +32,22 @@ export {
   useSession,
   type AuthSession,
 } from "../use-session.js";
-export { signOut, type SignOutOptions } from "../sign-out.js";
+export {
+  registerSignOutCleanup,
+  signOut,
+  SignOutCleanupError,
+  type SignOutCleanup,
+  type SignOutOptions,
+} from "../sign-out.js";
 export {
   ACTION_KEEPALIVE_BODY_BUDGET_BYTES,
   actionErrorMessage,
   callAction,
   callActionBlob,
   callActionWithRetry,
+  currentActionQueryCacheBinding,
+  prepareUiActionCapability,
+  recordActionQueryBrowserPersist,
   tryCallActionKeepalive,
   useActionQuery,
   useActionMutation,

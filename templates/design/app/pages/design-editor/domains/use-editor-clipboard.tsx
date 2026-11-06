@@ -9,6 +9,10 @@ import {
   buildCodeLayerProjection,
   type CodeLayerNode,
 } from "@shared/code-layer";
+import {
+  resolveSourceEquivalentSelector,
+  SOURCE_EQUIVALENT_SELECTOR_PREFIX,
+} from "@shared/source-equivalent-selector";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { toast } from "sonner";
 
@@ -19,6 +23,10 @@ import type {
 } from "@/components/design/design-canvas/iframe-events";
 import { DESIGN_FILE_STORAGE_REQUIRED_EVENT } from "@/components/design/editor/DesignBottomToolbar";
 import { FigmaPasteImagesNotice } from "@/components/design/FigmaPasteImagesNotice";
+import {
+  findCanvasIframeForScreen,
+  readCanvasPreviewMeasurementContext,
+} from "@/components/design/multi-screen/iframe-targeting";
 import { getCurrentBoardSelectionWorldBounds } from "@/components/design/multi-screen/overview-layout";
 import { readPortableStyleSnapshot } from "@/components/design/multi-screen/read-portable-style-snapshot";
 import type {
@@ -26,12 +34,17 @@ import type {
   Point,
   VisibleCanvasRect,
 } from "@/components/design/multi-screen/types";
-import type { ElementInfo } from "@/components/design/types";
+import type {
+  ElementInfo,
+  PortableStyleSnapshot,
+} from "@/components/design/types";
 import {
+  type DesignClipboardRefreshStatus,
   getDesignClipboardLayerEntries,
   readDesignClipboardPayloadFromSystem,
   readSystemClipboard,
 } from "@/lib/design-clipboard";
+import type { DesignClipboardManagedStyleSnapshot } from "@/lib/design-clipboard-managed-styles";
 import {
   type DesignClipboardPayload,
   type DesignClipboardScreenEntry,
@@ -43,6 +56,7 @@ import {
   figmaPasteImageNoticeDismissed,
 } from "@/lib/figma-paste-image-notice";
 
+import { measurePreparedCloneVisualOffset } from "../clone-and-pen-edit";
 import {
   bridgeSourceIdForCodeLayerNode,
   elementInfoFromCodeLayerNode,
@@ -52,7 +66,11 @@ import { runCopySelection } from "../commands/copy-selection";
 import { runCutSelection } from "../commands/cut-selection";
 import { runDeleteSelection } from "../commands/delete-selection";
 import { runDuplicateSelection } from "../commands/duplicate-selection";
-import { runEditorPaste } from "../commands/editor-paste";
+import {
+  adoptDesignClipboardPayloadIntoRefs,
+  runCanvasClipboardRelayPaste,
+  runEditorPaste,
+} from "../commands/editor-paste";
 import { runGetSelectedLayerSnapshots } from "../commands/get-selected-layer-snapshots";
 import { runGroupSelection } from "../commands/group-selection";
 import {
@@ -62,7 +80,11 @@ import {
 import { runInsertFigmaPasteLayers } from "../commands/insert-figma-paste-layers";
 import { runPasteCopiedScreens } from "../commands/paste-copied-screens";
 import { runPasteOverSelection } from "../commands/paste-over-selection";
-import { runPasteSelection } from "../commands/paste-selection";
+import {
+  runPasteSelection,
+  type PasteSelectionArgs,
+  type PastedClipboardLayerSource,
+} from "../commands/paste-selection";
 import { runPastedSvgLayer } from "../commands/paste-svg-layer";
 import { runPasteToReplace } from "../commands/paste-to-replace";
 import {
@@ -78,6 +100,7 @@ import {
 } from "../commands/system-clipboard-paste";
 import { runUngroupSelection } from "../commands/ungroup-selection";
 import { withMeasuredGeometry } from "../editor-helpers";
+import { isStandaloneHttpUrl } from "../editor-state";
 import { resolveFigmaPasteScene } from "../figma-paste-scene";
 import {
   autoHeightScreenIds,
@@ -87,6 +110,11 @@ import {
   getBoardSelectionFitBounds,
 } from "../overview-camera";
 import { resolvePastePlacementForSelection } from "../paste-placement";
+import { positionCoordinateRenderOffsetForWindow } from "../position-coordinate-context";
+import {
+  cancelPendingPastedMediaAbsentFromContent as cancelPendingPastedMediaAbsentFromContentInMap,
+  type PendingPastedMediaByScreen,
+} from "./pending-pasted-media";
 import type { EditorActiveScreenAndGeometry } from "./use-editor-active-screen-and-geometry";
 import type { EditorCanvasAndScreens } from "./use-editor-canvas-and-screens";
 import type { EditorContentAndComponents } from "./use-editor-content-and-components";
@@ -139,6 +167,7 @@ export function useEditorClipboard({
     setSelectedElement,
     setRuntimeStructureInsertRequest,
     setActiveFileId,
+    activeFileIdRef,
   } = editorCore;
   const {
     setActiveLeftPanel,
@@ -162,6 +191,7 @@ export function useEditorClipboard({
     activeBreakpointWidthStateRef,
     undoManagerRef,
     contentUndoStackRef,
+    localContentUndoStackRef,
     historyOrderRef,
     clearRedoStacks,
     captureCurrentSelection,
@@ -172,6 +202,7 @@ export function useEditorClipboard({
     pendingLocalFileContentsRef,
     createFileMutation,
     publishAuthoritativeClipboardMutation,
+    leaseSources,
   } = editorGenerationAndAccess;
   const {
     navigate,
@@ -221,7 +252,52 @@ export function useEditorClipboard({
     applyLocalContentUpdate,
     applyFileContentUpdate,
   } = editorContentAndComponents;
-  const { runtimeStructureInsertRevisionRef } = editorToolsAndVectors;
+  const applyFileContentUpdateRef = useRef(applyFileContentUpdate);
+  applyFileContentUpdateRef.current = applyFileContentUpdate;
+  const pendingPastedMediaRef = useRef<PendingPastedMediaByScreen>(new Map());
+  const registerPendingPastedMedia = useCallback(
+    (screenId: string, nodeId: string) => {
+      let pending = pendingPastedMediaRef.current.get(screenId);
+      if (!pending) {
+        pending = new Map();
+        pendingPastedMediaRef.current.set(screenId, pending);
+      }
+      pending.set(nodeId, false);
+    },
+    [],
+  );
+  const isPendingPastedMediaCancelled = useCallback(
+    (screenId: string, nodeId: string) =>
+      pendingPastedMediaRef.current.get(screenId)?.get(nodeId) === true,
+    [],
+  );
+  const clearPendingPastedMedia = useCallback(
+    (screenId: string, nodeId: string) => {
+      const pending = pendingPastedMediaRef.current.get(screenId);
+      pending?.delete(nodeId);
+      if (pending?.size === 0) pendingPastedMediaRef.current.delete(screenId);
+    },
+    [],
+  );
+  const cancelPendingPastedMedia = useCallback(
+    (screenId: string, nodeId: string) => {
+      const pending = pendingPastedMediaRef.current.get(screenId);
+      if (pending?.has(nodeId)) pending.set(nodeId, true);
+    },
+    [],
+  );
+  const cancelPendingPastedMediaForHistoryReplay = useCallback(
+    (screenId: string, _previousContent: string, replayedContent: string) => {
+      cancelPendingPastedMediaAbsentFromContentInMap(
+        pendingPastedMediaRef.current,
+        screenId,
+        replayedContent,
+      );
+    },
+    [],
+  );
+  const { runtimeStructureInsertRevisionRef, selectionRevisionRef } =
+    editorToolsAndVectors;
   const {
     selectedLayerTargetsRef,
     lastDuplicateTransformRef,
@@ -230,6 +306,127 @@ export function useEditorClipboard({
     getFreshActiveContent,
   } = editorSelectionAndStyles;
   const { recordPendingLiveStructureEdit } = editorScreenChangeHandlers;
+
+  const getRenderedElementInfoForSelector = useCallback(
+    (selector: string): ElementInfo | null | undefined => {
+      if (!activeFile) return undefined;
+      const content = getFreshActiveContent();
+      if (isStandaloneHttpUrl(activeFile.content ?? content)) return undefined;
+      const projection = buildCodeLayerProjection(content, {
+        source: { kind: "design-file", fileId: activeFile.id },
+      });
+      const node = projection.nodes.find((candidate) =>
+        candidate.selectors.includes(selector),
+      );
+      if (!node) return null;
+      const frame = findCanvasIframeForScreen(
+        canvasContainerRef.current,
+        activeFile.id,
+        boardFileId,
+        viewModeRef.current === "overview"
+          ? activeBreakpointWidthStateRef.current
+          : undefined,
+      );
+      if (!frame) return null;
+      const measured = withMeasuredGeometry(
+        elementInfoFromCodeLayerNode(node),
+        activeFile.id,
+        { measureAbsoluteSiblingVisualOrigin: true, previewIframe: frame },
+      );
+      return measured.absoluteSiblingVisualOrigin ? measured : null;
+    },
+    [
+      activeFile,
+      activeBreakpointWidthStateRef,
+      boardFileId,
+      canvasContainerRef,
+      getFreshActiveContent,
+      viewModeRef,
+    ],
+  );
+  const getPreparedCloneVisualOffset = useCallback(
+    (
+      selector: string,
+      layerHtml: string,
+      styleSnapshot?: PortableStyleSnapshot,
+      managedStyleSnapshot?: DesignClipboardManagedStyleSnapshot,
+      sourceFileId?: string,
+      placement: "before" | "after" | "inside" = "before",
+      targetFileId: string | undefined = activeFile?.id,
+    ):
+      | { x: number; y: number; styleSnapshot?: PortableStyleSnapshot }
+      | null
+      | undefined => {
+      if (!targetFileId || typeof document === "undefined") return undefined;
+      const breakpointWidth =
+        viewModeRef.current === "overview"
+          ? activeBreakpointWidthStateRef.current
+          : undefined;
+      const frame = findCanvasIframeForScreen(
+        canvasContainerRef.current,
+        targetFileId,
+        boardFileId,
+        breakpointWidth,
+      );
+      const expectedBreakpointPreview =
+        breakpointWidth !== undefined && targetFileId !== boardFileId;
+      try {
+        const preview = readCanvasPreviewMeasurementContext(
+          frame,
+          expectedBreakpointPreview,
+        );
+        if (!preview) return preview;
+        const { view, doc } = preview;
+        const target = selector.startsWith(SOURCE_EQUIVALENT_SELECTOR_PREFIX)
+          ? resolveSourceEquivalentSelector(doc, selector)
+          : doc.querySelector(selector);
+        const renderOffset = positionCoordinateRenderOffsetForWindow(view);
+        if (!target || !renderOffset) return null;
+        return measurePreparedCloneVisualOffset(target, layerHtml, {
+          styleSnapshot,
+          managedStyleSnapshot,
+          placement,
+          preserveSourceAuthoredRootStyles:
+            sourceFileId !== undefined && sourceFileId === targetFileId,
+          view,
+          renderOffset,
+        });
+      } catch {
+        // coercion-ok: inaccessible preview geometry makes paste fail visibly.
+        return null;
+      }
+    },
+    [
+      activeFile?.id,
+      activeBreakpointWidthStateRef,
+      boardFileId,
+      canvasContainerRef,
+      viewModeRef,
+    ],
+  );
+
+  const getPreparedPasteVisualOffset = useCallback<
+    NonNullable<PasteSelectionArgs["getPreparedPasteVisualOffset"]>
+  >(
+    ({
+      targetFileId,
+      targetSelector,
+      placement,
+      layerHtml,
+      styleSnapshot,
+      managedStyleSnapshot,
+    }) =>
+      getPreparedCloneVisualOffset(
+        targetSelector ?? "body",
+        layerHtml,
+        styleSnapshot,
+        managedStyleSnapshot,
+        undefined,
+        placement,
+        targetFileId,
+      ),
+    [getPreparedCloneVisualOffset],
+  );
 
   const canUploadDesignMedia =
     fileUploadStatus.isSuccess && fileUploadStatus.data.configured === true;
@@ -251,6 +448,9 @@ export function useEditorClipboard({
   const lastWrittenClipboardMarkerRef = useRef<string | null>(null);
   const lastWrittenClipboardPlainTextRef = useRef<string | null>(null);
   const pasteCascadeRef = useRef(0);
+  const pastedClipboardLayerSourcesRef = useRef(
+    new Map<string, PastedClipboardLayerSource>(),
+  );
   const figmaPasteImportingRef = useRef(false);
   const [figmaHydrationOpen, setFigmaHydrationOpen] = useState(false);
   const [figmaHydrationFileIds, setFigmaHydrationFileIds] = useState<string[]>(
@@ -259,13 +459,12 @@ export function useEditorClipboard({
   const visibleCanvasRectRef = useRef<(() => VisibleCanvasRect | null) | null>(
     null,
   );
-  const getFreshActivePreviewContent = useCallback(
-    () =>
-      livePreviewContentRef.current?.fileId === activeFile?.id
-        ? livePreviewContentRef.current.content
-        : null,
-    [activeFile?.id],
-  );
+  const getFreshActivePreviewContent = useCallback(() => {
+    const livePreviewContent = livePreviewContentRef.current;
+    return livePreviewContent && livePreviewContent.fileId === activeFile?.id
+      ? livePreviewContent.content
+      : null;
+  }, [activeFile?.id]);
 
   const getSelectedLayerSnapshots = useCallback(
     (
@@ -362,34 +561,39 @@ export function useEditorClipboard({
       markerText: string,
       plainText?: string,
     ) => {
-      copiedLayerEntriesRef.current = payload.entries;
-      copiedLayerHtmlRef.current = markerText;
-      copiedScreenEntriesRef.current = payload.screens ?? [];
-      lastWrittenClipboardMarkerRef.current = markerText;
-      if (plainText !== undefined) {
-        lastWrittenClipboardPlainTextRef.current = plainText;
-      }
       setHasCanvasClipboard(
-        payload.entries.length > 0 || (payload.screens?.length ?? 0) > 0,
+        adoptDesignClipboardPayloadIntoRefs(
+          {
+            copiedLayerEntriesRef,
+            copiedLayerHtmlRef,
+            copiedScreenEntriesRef,
+            lastWrittenClipboardMarkerRef,
+            lastWrittenClipboardPlainTextRef,
+            pasteCascadeRef,
+          },
+          payload,
+          markerText,
+          plainText,
+        ),
       );
     },
     [],
   );
 
-  const refreshClipboardFromSystemClipboard = useCallback(async () => {
-    const result = await readDesignClipboardPayloadFromSystem();
-    if (
-      result.status !== "found" ||
-      result.value.markerText === lastWrittenClipboardMarkerRef.current
-    ) {
-      return;
-    }
-    adoptDesignClipboardPayload(
-      result.value.payload,
-      result.value.markerText,
-      result.value.plainText,
-    );
-  }, [adoptDesignClipboardPayload]);
+  const refreshClipboardFromSystemClipboard =
+    useCallback(async (): Promise<DesignClipboardRefreshStatus> => {
+      const result = await readDesignClipboardPayloadFromSystem();
+      if (result.status !== "found") return result.status;
+      if (result.value.markerText === lastWrittenClipboardMarkerRef.current) {
+        return "unchanged";
+      }
+      adoptDesignClipboardPayload(
+        result.value.payload,
+        result.value.markerText,
+        result.value.plainText,
+      );
+      return "adopted";
+    }, [adoptDesignClipboardPayload]);
 
   const selectInsertedLayers = useCallback(
     (screenId: string, content: string, rootNodeIds: string[]) => {
@@ -441,6 +645,7 @@ export function useEditorClipboard({
   const handleCopySelection = useCallback(
     async () =>
       runCopySelection({
+        boardFileId,
         canvasFrameGeometryById,
         copiedLayerEntriesRef,
         copiedLayerHtmlRef,
@@ -527,7 +732,10 @@ export function useEditorClipboard({
   );
 
   const handlePasteSelection = useCallback(
-    async (position?: { x: number; y: number }) =>
+    async (
+      position?: { x: number; y: number; fileId?: string },
+      options?: { payloadFromPasteEvent?: boolean },
+    ) =>
       runPasteSelection(
         {
           activeFile,
@@ -547,6 +755,7 @@ export function useEditorClipboard({
           getCanvasClipboardEntries,
           getCanvasScreenClipboardEntries,
           getFreshActiveContent,
+          getPreparedPasteVisualOffset,
           getScreenContent,
           getVisibleCanvasRect: () => visibleCanvasRectRef.current?.() ?? null,
           historyOrderRef,
@@ -554,6 +763,7 @@ export function useEditorClipboard({
           overviewScreens,
           overviewSelectedScreenIds,
           pasteCascadeRef,
+          pastedClipboardLayerSourcesRef,
           pasteCopiedScreens,
           pendingLocalFileContentsRef,
           publishAuthoritativeClipboardMutation,
@@ -571,6 +781,7 @@ export function useEditorClipboard({
           zoom,
         },
         position,
+        options,
       ),
     [
       applyLinkedComponentEdit,
@@ -585,6 +796,7 @@ export function useEditorClipboard({
       getCanvasClipboardEntries,
       getCanvasScreenClipboardEntries,
       getFreshActiveContent,
+      getPreparedPasteVisualOffset,
       getScreenContent,
       historyOrderRef,
       files,
@@ -809,6 +1021,20 @@ export function useEditorClipboard({
         void importFigmaClipboardIntoDesign(content);
         return;
       }
+      if (
+        runCanvasClipboardRelayPaste(
+          {
+            adoptDesignClipboardPayload,
+            canEditDesign,
+            handlePasteSelection,
+            lastWrittenClipboardMarkerRef,
+            t,
+          },
+          { html, text },
+        )
+      ) {
+        return;
+      }
       if (svg) {
         handlePastedSvg(svg, sourceScreenId);
         return;
@@ -826,7 +1052,14 @@ export function useEditorClipboard({
         description: t("designEditor.import.figmaPasteUnreadable"),
       });
     },
-    [canEditDesign, handlePastedSvg, importFigmaClipboardIntoDesign, t],
+    [
+      adoptDesignClipboardPayload,
+      canEditDesign,
+      handlePastedSvg,
+      handlePasteSelection,
+      importFigmaClipboardIntoDesign,
+      t,
+    ],
   );
 
   const readFileAsDataUrl = useCallback((file: File) => {
@@ -888,7 +1121,9 @@ export function useEditorClipboard({
       return runPastedImageFiles(
         {
           activeFile,
+          activeFileIdRef,
           applyFileContentUpdate,
+          applyFileContentUpdateRef,
           applyLocalContentUpdate,
           boardFileId,
           canEditDesign,
@@ -901,7 +1136,11 @@ export function useEditorClipboard({
           overviewScreens,
           overviewSelectedScreenIds,
           pasteCascadeRef,
+          registerPendingPastedMedia,
+          isPendingPastedMediaCancelled,
+          clearPendingPastedMedia,
           replacePreviewContent,
+          selectionRevisionRef,
           selectInsertedLayers,
           t,
           uploadMediaFileForHtml,
@@ -914,6 +1153,7 @@ export function useEditorClipboard({
     },
     [
       activeFile?.id,
+      activeFileIdRef,
       applyFileContentUpdate,
       applyLocalContentUpdate,
       boardFileId,
@@ -926,6 +1166,10 @@ export function useEditorClipboard({
       overviewScreens,
       overviewSelectedScreenIds,
       replacePreviewContent,
+      registerPendingPastedMedia,
+      isPendingPastedMediaCancelled,
+      clearPendingPastedMedia,
+      selectionRevisionRef,
       selectInsertedLayers,
       t,
       requestFileStorageSetup,
@@ -986,7 +1230,9 @@ export function useEditorClipboard({
       return runPastedImageFiles(
         {
           activeFile,
+          activeFileIdRef,
           applyFileContentUpdate,
+          applyFileContentUpdateRef,
           applyLocalContentUpdate,
           boardFileId,
           canEditDesign,
@@ -999,7 +1245,11 @@ export function useEditorClipboard({
           overviewScreens,
           overviewSelectedScreenIds,
           pasteCascadeRef,
+          registerPendingPastedMedia,
+          isPendingPastedMediaCancelled,
+          clearPendingPastedMedia,
           replacePreviewContent,
+          selectionRevisionRef,
           selectInsertedLayers,
           t,
           uploadMediaFileForHtml,
@@ -1012,6 +1262,7 @@ export function useEditorClipboard({
     },
     [
       activeFile?.id,
+      activeFileIdRef,
       applyFileContentUpdate,
       applyLocalContentUpdate,
       boardFileId,
@@ -1025,6 +1276,10 @@ export function useEditorClipboard({
       overviewScreens,
       overviewSelectedScreenIds,
       replacePreviewContent,
+      registerPendingPastedMedia,
+      isPendingPastedMediaCancelled,
+      clearPendingPastedMedia,
+      selectionRevisionRef,
       selectInsertedLayers,
       t,
       requestFileStorageSetup,
@@ -1149,6 +1404,7 @@ export function useEditorClipboard({
         getCanvasClipboardEntries,
         getFreshActiveContent,
         handlePasteSelection,
+        refreshClipboardFromSystemClipboard,
         selectedElement,
         selectInsertedLayers,
         t,
@@ -1159,6 +1415,7 @@ export function useEditorClipboard({
       getCanvasClipboardEntries,
       getFreshActiveContent,
       handlePasteSelection,
+      refreshClipboardFromSystemClipboard,
       selectInsertedLayers,
       selectedElement,
       t,
@@ -1169,6 +1426,7 @@ export function useEditorClipboard({
     (point?: CanvasContextMenuPoint) =>
       runContextMenuPaste(
         {
+          boardFileId,
           canEditDesign,
           clipboardFiles: menuClipboardFilesRef.current,
           handlePasteSelection,
@@ -1182,6 +1440,7 @@ export function useEditorClipboard({
         point,
       ),
     [
+      boardFileId,
       canEditDesign,
       handlePasteSelection,
       handlePastedImageFiles,
@@ -1196,9 +1455,17 @@ export function useEditorClipboard({
           {
             activeFile,
             applyLocalContentUpdate,
+            cancelPendingPastedMediaAbsentFromContent: (screenId, content) =>
+              cancelPendingPastedMediaAbsentFromContentInMap(
+                pendingPastedMediaRef.current,
+                screenId,
+                content,
+              ),
             canEditDesign,
             getCanvasClipboardEntries,
             getFreshActiveContent,
+            getRenderedElementInfoForSelector,
+            getPreparedCloneVisualOffset,
             runtimeStructureInsertRevisionRef,
             selectInsertedLayers,
             selectedCanvasSelector,
@@ -1231,6 +1498,8 @@ export function useEditorClipboard({
       uploadImageFileForHtml,
       getCanvasClipboardEntries,
       getFreshActiveContent,
+      getRenderedElementInfoForSelector,
+      getPreparedCloneVisualOffset,
       selectedCanvasSelector,
       selectInsertedLayers,
       selectedElement?.boundingRect,
@@ -1242,60 +1511,61 @@ export function useEditorClipboard({
     ],
   );
 
-  const handleDuplicateSelection = useCallback(
-    () =>
-      runDuplicateSelection({
-        activeFile,
-        applyLinkedComponentEdit,
-        selectionBefore: captureCurrentSelection(),
-        designId: id,
-        applyFileContentUpdate,
-        applyLocalContentUpdate,
-        canEditDesign,
-        canEditLiveScreen: canEditActiveVisualScreen,
-        files,
-        getFreshActiveContent,
-        getScreenContent,
-        getSelectedLayerSnapshots,
-        handleDuplicateScreen,
-        clearExplicitOverviewScreenSelection: () => {
-          explicitOverviewScreenSelectionRef.current = [];
-        },
-        lastDuplicateTransformRef,
-        overviewSelectedScreenIds,
-        remapMotionTracksForClone,
-        runtimeStructureInsertRevisionRef,
-        selectedCanvasSelector,
-        selectedElement,
-        selectedLayerIdsState,
-        setRuntimeStructureInsertRequest,
-        setOverviewSelectedScreenIds,
-        setSelectedElement,
-        setSelectedLayerIdsState,
-        t,
-        undoManagerRef,
-        viewModeRef,
-      }),
-    [
-      applyLinkedComponentEdit,
+  const duplicateSelectionRef = useRef<
+    (loadUnloadedScreens?: (screenIds: string[]) => void) => void
+  >(() => {});
+  duplicateSelectionRef.current = (loadUnloadedScreens) =>
+    runDuplicateSelection({
       activeFile,
-      id,
+      applyLinkedComponentEdit,
+      selectionBefore: captureCurrentSelection(),
+      designId: id,
       applyFileContentUpdate,
       applyLocalContentUpdate,
       canEditDesign,
-      canEditActiveVisualScreen,
+      canEditLiveScreen: canEditActiveVisualScreen,
       files,
       getFreshActiveContent,
       getScreenContent,
       getSelectedLayerSnapshots,
       handleDuplicateScreen,
+      clearExplicitOverviewScreenSelection: () => {
+        explicitOverviewScreenSelectionRef.current = [];
+      },
+      lastDuplicateTransformRef,
+      contentHistorySelectionAfterRef,
+      contentUndoStackRef,
+      localContentUndoStackRef,
       overviewSelectedScreenIds,
       remapMotionTracksForClone,
       runtimeStructureInsertRevisionRef,
       selectedCanvasSelector,
       selectedElement,
+      selectedLayerIdsState,
+      setRuntimeStructureInsertRequest,
+      setOverviewSelectedScreenIds,
+      setSelectedElement,
+      setSelectedLayerIdsState,
       t,
-    ],
+      undoManagerRef,
+      viewModeRef,
+      loadUnloadedScreens,
+    });
+  const handleDuplicateSelection = useCallback(
+    () =>
+      duplicateSelectionRef.current((screenIds) => {
+        void leaseSources(screenIds).then(
+          (release) => {
+            try {
+              duplicateSelectionRef.current();
+            } finally {
+              release();
+            }
+          },
+          () => toast.error(t("designEditor.sourceLoadFailed")),
+        );
+      }),
+    [leaseSources, t],
   );
 
   const handleDeleteSelection = useCallback(
@@ -1323,6 +1593,7 @@ export function useEditorClipboard({
         previousMotionFileIdRef,
         pruneMotionTracksByNodeId,
         recordPendingLiveStructureEdit,
+        onPendingPastedMediaDelete: cancelPendingPastedMedia,
         responsiveEditScopeRef,
         selectedElement,
         selectedLayerIdsState,
@@ -1345,6 +1616,7 @@ export function useEditorClipboard({
       canEditDesign,
       canEditActiveVisualScreen,
       deleteRuntimeElement,
+      cancelPendingPastedMedia,
       recordPendingLiveStructureEdit,
       files,
       getFreshActiveContent,
@@ -1397,6 +1669,7 @@ export function useEditorClipboard({
         codeLayerOwnerByNodeIdRef,
         contentHistorySelectionAfterRef,
         contentUndoStackRef,
+        localContentUndoStackRef,
         files,
         getFreshActiveContent,
         overviewSelectedScreenIds,
@@ -1416,6 +1689,7 @@ export function useEditorClipboard({
       canEditDesign,
       files,
       getFreshActiveContent,
+      localContentUndoStackRef,
       overviewSelectedScreenIds,
       selectedLayerIdsState,
       sendRuntimeLayerSemanticHandoff,
@@ -1605,6 +1879,7 @@ export function useEditorClipboard({
 
   return {
     hasCanvasClipboard,
+    cancelPendingPastedMediaForHistoryReplay,
     menuClipboardFilesRef,
     lastWrittenClipboardMarkerRef,
     figmaHydrationOpen,

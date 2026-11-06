@@ -18,7 +18,8 @@ The pipeline runs without a UI. Codex does all four steps from the terminal:
 2. Run the capture CLI from the agent-native checkout:
    `pnpm --filter analytics journey:capture --tree tree.json --out ./frames`
    (`--per-node 2 --concurrency 3`, `--min-aspect` / `--max-aspect`, `--dry-run`
-   to print the plan, `--upload` for private `attachmentRef`s).
+   to print the plan, `--upload` for private `attachmentRef`s, or
+   `--upload --upload-target cdn` for standard Builder CDN URLs).
 3. Call Design's `create-journey-canvas` with
    `{ title, tree, frames: [{ nodeKey, exampleIndex, imageUrl?, attachmentRef?, width, height, capturedAt }], designId? }`
    -> `{ designId, url, nodeCount, frameCount }`. Build `frames` from
@@ -31,12 +32,18 @@ The pipeline runs without a UI. Codex does all four steps from the terminal:
 
 `estimate-onboarding-journey-cost` dry-runs the same access-scoped BigQuery
 event-page SQL as `get-onboarding-journey`. Pass matching dates, app,
-email filter, follow-up mode, and event row budget. It returns estimated bytes
-per possible page, their sum in `possiblePagesEstimatedBytes`, the unchanged
-per-query cap, and `within_cap` or `over_cap`. Page two is estimated when the
-row budget permits it; production reads it only when page one fills. The sum
-is a possible-pages estimate, not executed or billed bytes. Data-dependent
-follow-up queries are excluded. An unavailable estimate fails explicitly.
+email filter, follow-up mode, event row budget, and `maxTotalBytesBilled`. It
+reports requested and allowed page counts, then dry-runs each allowed 4,000-row
+page, including the one-row overflow check when within budget. `maxTotalBytesBilled`
+defaults to 275 GB, reserving the full 25 GB per-query cap for each of 11 pages;
+raise it deliberately to allow more pages, up to 1.275 TB and 51 pages. Match
+this value when calling `get-onboarding-journey`. A 45-second deadline or a
+per-page dry-run timeout can return `status: "incomplete"`, the count of
+unestimated allowed pages, and `possiblePagesEstimatedBytes: null`. Read
+`pageBudgetLimited` and the requested/allowed counts before interpreting an
+estimate. The sum is a possible-pages estimate, not executed or billed bytes.
+Data-dependent follow-up queries are excluded. An unavailable estimate fails
+explicitly.
 
 `get-onboarding-journey` returns `JourneyTree`; `format: "summary"` returns the
 same event-derived journey and follow-up counts as an indented `outline` with no
@@ -48,12 +55,12 @@ To include the bounded cross-session estimate from the repository root, run:
 `pnpm --filter analytics action get-onboarding-journey --dateFrom=2026-08-01 --dateTo=2026-08-31 --app=all --emailFilter=exclude_builder --followUpMode=person --format=summary`.
 
 ```ts
-type JourneyExample = { sessionId: string; recordingId: string | null; ts: string; offsetMs: number | null; viewport: { width: number; height: number } | null; viewportReason?: string; replayUrl?: string };
+type JourneyExample = { sessionId: string; recordingId?: string | null; ts: string; offsetMs: number | null; viewport: { width: number; height: number } | null; viewportReason?: string; replayUrl?: string };
 type JourneyNode = { key: string; keyTruncated?: boolean; label: string; labelTruncated?: boolean; parentKey: string | null; depth: number; kind: "step" | "other"; n: number; pctOfRoot: number; pctOfParent: number; dropoffN: number; dropoffPct: number; deeperN: number; examples: JourneyExample[]; otherBranchCount?: number; otherBranchSummariesPartial?: true; otherBranches?: { path: string[]; pathTruncated?: boolean; key: string; keyTruncated?: boolean; sourceStepKey?: string; sourceStepKeyTruncated?: boolean; n: number; pctOfParent: number }[] };
 type JourneyFollowup = { status: "complete" | "incomplete"; incompleteReason?: "journey_event_read_truncated" | "journey_event_read_invalid" | "journey_event_read_may_have_shifted" | "terminal_cohort_query_too_large" | "followup_aggregate_truncated" | "followup_aggregate_invalid" | "followup_aggregate_cost_limited" | "followup_aggregate_query_timeout" | "followup_aggregate_query_failed" | "terminal_cohort_mismatch"; observationCutoff: string; observationFollowupDurationMs: { min: number; max: number; mean: number } | null; rightCensoredAtWindowEnd: true; coverage: { journeyEventRead: { rows: number; pages: number; truncated: boolean; paginationConsistency: "stable" | "may_have_shifted" }; followupAggregateRead: { rows: number | null; queries: number; truncated: boolean; status?: "incomplete"; backendStatus?: number | null; backendReason?: string | null; backendOperation?: "submit" | "poll" | "job" | null }; cohortSessions: number | null }; laterRecordedActivityWithinWindow: { total: number | null; byTerminalStepKey: Record<string, number> | null }; noLaterRecordedActivityWithinWindow: { total: number | null; byTerminalStepKey: Record<string, number> | null } };
 type JourneyPersonFollowupCounts = { canonicalPeople: number; laterActivityInSelectedSession: number; laterActivityOutsideSelectedSessionOrApp: number; laterActivityInBothSelectedAndOutside: number; laterActivityObservedAnywhere: number; noActivityObservedWithinHorizon: number; rightCensoredHorizon: number; fullyObservedCanonicalPeople: number; noActivityObservedWithinHorizonPctOfFullyObservedCanonicalPeople: number | null; identityUnavailableSessions: number; identityUnavailableSessionEvidence: { laterActivityInSelectedSession: number; laterActivityOutsideSelectedSessionOrApp: number } };
 type JourneyPersonFollowup = { status: "complete" | "incomplete"; incompleteReason?: "journey_event_read_truncated" | "journey_event_read_invalid" | "journey_event_read_may_have_shifted" | "terminal_cohort_too_large" | "terminal_cohort_invalid" | "person_followup_aggregate_truncated" | "person_followup_query_cost_limited" | "person_followup_query_timeout" | "person_followup_query_failed" | "person_followup_aggregate_invalid" | "person_followup_terminal_cohort_mismatch"; horizonDays: 30; horizonMs: number; observationWatermark: string; observationFollowupDurationMs: { min: number; max: number; mean: number } | null; coverage: { journeyEventRead: { rows: number; pages: number; truncated: boolean; paginationConsistency: "stable" | "may_have_shifted" }; followupAggregateRead: { status: "complete" | "truncated" | "incomplete" | "not_run"; rows: number | null; queries: number; truncated: boolean; backendStatus?: number | null; backendReason?: string | null; backendOperation?: "submit" | "poll" | "job" | null }; terminalSessions: number | null; sessionsWithoutSelectedStep: number | null; identityJoin: { status: "complete" | "partial" | "unavailable" | "not_applicable" | "unknown"; terminalSessions: number | null; sessionsWithCanonicalIdentity: number | null; sessionsWithoutCanonicalIdentity: number | null; uniqueCanonicalPeople: number | null; coveragePct: number | null } }; total: JourneyPersonFollowupCounts | null; byTerminalStepKey: Record<string, JourneyPersonFollowupCounts> | null };
-type JourneyTree = { window: { from: string; to: string }; app: string; rootN: number; coverage: { sessionsWithEvents: number; sessionsWithReplay: number; truncated: boolean }; nodes: JourneyNode[]; followUp: JourneyFollowup; personFollowUp?: JourneyPersonFollowup; standaloneSetup?: { rootN: number; coverage: { sessionsWithEvents: number; sessionsWithReplay: number; truncated: boolean }; nodes: JourneyNode[] }; notes?: string[] };
+type JourneyTree = { window: { from: string; to: string }; app: string; rootN: number; coverage: { sessionsWithEvents: number; sessionsWithReplay: number | null; truncated: boolean }; nodes: JourneyNode[]; followUp: JourneyFollowup; personFollowUp?: JourneyPersonFollowup; standaloneSetup?: { rootN: number; coverage: { sessionsWithEvents: number; sessionsWithReplay: number | null; truncated: boolean }; nodes: JourneyNode[] }; notes?: string[] };
 ```
 
 Analytics returns cohort nodes with counts. When extending a Design storyboard
@@ -132,8 +139,15 @@ top-level tree to `journey:capture`; the capture CLI reads top-level `nodes`.
   session IDs or member identity keys used internally. The consistency field
   reports `may_have_shifted` when the event read uses multiple `OFFSET` pages;
   a late-arriving event can change page membership inside a historical window
-  too. The action caps event reads at two 4,000-row BigQuery pages to bound
-  total query cost. If either read truncates, page boundaries may have shifted,
+  too. The action reads 4,000-row pages up to `maxEventRows` (at most 200,000),
+  plus one overflow row to detect truncation. Each BigQuery page keeps a 25 GB
+  billed-byte cap; by default, `maxTotalBytesBilled` reserves that cap for 11
+  pages (275 GB), and can be raised deliberately to 1.275 TB (51 pages). Event
+  page reads also stop at a 45-second deadline. If the aggregate budget or
+  deadline cuts a read, `coverage.truncated` and `notes` identify why; read them
+  before interpreting counts. A truncated event sample skips replay reads and
+  returns `sessionsWithReplay: null` because replay availability is unknown. If
+  a read truncates, page boundaries may have shifted,
   or the terminal cohort cannot be covered in one query under the
   800,000-character SQL limit or 50,000-token parser limit, `status` is
   `incomplete` and all new cohort counts and follow-up duration are `null`;
@@ -191,15 +205,17 @@ top-level tree to `journey:capture`; the capture CLI reads top-level `nodes`.
 - A session is an analytics session id. One that began before `dateFrom`
   starts mid-journey, so start the window a day early.
 - Read `coverage` before using the numbers. `truncated: true` means the event
-  read hit `maxEventRows`, a session went past `maxDepth`, or the node list hit
-  `maxNodes`; `notes` says which.
+  read hit `maxEventRows`, `maxTotalBytesBilled`, or its 45-second deadline, a
+  session went past `maxDepth`, or the node list hit `maxNodes`; `notes` says
+  which.
   Never report a truncated tree as the whole window.
 - The event row cap is shared by onboarding and standalone setup. If it is hit,
   `standaloneSetup` may be an empty, truncated tree because standalone events
   were beyond the read boundary; do not interpret that as zero standalone use.
-- An example with `recordingId: null` has no replay the caller can open, and
+- An example with `recordingId: null` has no replay the caller can open; an
+  omitted `recordingId` means replay availability was not checked. Its
   `viewportReason` says why the viewport is unknown (`no_recording`,
-  `not_captured` for recordings before viewport capture, `unreadable`).
+  `recording_unknown`, `not_captured`, `unreadable`).
 - `offsetMs` is milliseconds from the recording's `startedAt`, not the first
   rrweb event.
 - `replayUrl` uses that same offset in `atMs`; the session page converts it to
@@ -300,12 +316,14 @@ extraction time. Each snapshot also says whether its frame capture or upload
 succeeded and includes the failure reason when it did not. This is visible
 user-role text at the seek, not proof of an exact source event or attempt-ID
 relationship. Unsupported transform, mask, or rounded clipping geometry fails
-the extraction explicitly. It is never uploaded, including when `--upload` stores PNGs
-through the private attachment action.
+the extraction explicitly. The prompt sidecar itself is never uploaded; PNG
+screenshots can use the private attachment action or the explicitly selected
+`cdn.builder.io` upload target.
 
 Keep recorded URLs and CSS intact for rrweb playback; network controls belong
 at the capture boundary. `--upload` stores PNGs through the private upload
-action, which checks recording access again. Design's own sandboxed template
+action by default; `--upload-target cdn` uses `upload-image` and accepts only
+HTTPS `cdn.builder.io` URLs. Design's own sandboxed template
 previews opt into the cooperative iframe recorder, so their child DOM can be
 replayed without granting the parent access to the preview document or
 credentials.
@@ -313,3 +331,18 @@ credentials.
 Viewport comes from the recording's first rrweb Meta event, stored by replay
 ingest in `session_recordings.metadata.viewport` (`first` and `last`). Older
 recordings have none.
+
+## Weekly snapshot CLI
+
+Use the cached weekly pipeline when generating or refreshing app storyboards:
+
+```bash
+pnpm --filter analytics journey:snapshot --week 2026-10-19 --apps clips,design,slides
+pnpm --filter analytics journey:snapshot --week 2026-10-19 --apps design --experiment first_run_builder_credits
+```
+
+`--week` is a closed UTC Monday week. The query starts the previous day to include sessions already underway. Without `--week`, the CLI selects the last full week. It runs the pinned cost preflight and reads one tree per missing app/week/cohort from deployed Analytics; complete trees are cached by app, dates, preset, app URL, and authenticated principal. `--dry-run` prints the request without network access. `--refresh` bypasses existing tree, screenshot, and Design caches and should be used only for an intentional refresh.
+
+The output lives under `.tmp/onboarding-journey-snapshots/runs/<week>/`: each app with captured session frames has a Design canvas, and each app has a per-app tree cache and screenshot manifests; the shared `summary.md` includes the cohort trees. Each canvas has a 36 screenshot-backed frame ceiling allocated across its cohort bands. Multi-band canvases place independent trees side by side and keep each band's own root denominator. Same-app cohort trees use `app::cohort::step` node keys so the source app and band denominator stay distinct. Canvas cache keys include the experiment and cohort layout so different runs cannot overwrite one another. The optional experiment accepts `first_run_builder_credits` and `first_run_builder_credits_v2`; control and credits share one canvas, and `summary.md` reports per-arm forks and matching-step week-over-week changes from the full Analytics trees, including cohorts with zero screenshot frames. The canvas contains only screenshot-backed cohorts. Clips first output is `recording_ready`.
+
+Design cohorts split web, `/mcp/oauth`, and unknown signup paths. Sessionless MCP OAuth signup events appear as a separate event-grain cohort in `summary.md`, with a week-over-week event-count delta; they have no web replay and must not be represented as screenshot steps. Captured PNGs use `journey:capture --upload-target cdn`; the CLI verifies each result is an HTTPS `cdn.builder.io` URL before passing it to Design. Capture failures remain explicit in the run summary, and the pipeline does not create screenshotless cards.

@@ -26,6 +26,7 @@ import {
 import { useLocation, useNavigation } from "react-router";
 import { toast } from "sonner";
 
+import { GitHubLinkDialogHost } from "@/components/editor/database/GitHubLinkDialog";
 import { DocumentEditor } from "@/components/editor/DocumentEditor";
 import { DocumentEditorSkeleton } from "@/components/editor/DocumentEditorSkeleton";
 import { DocumentSidebar } from "@/components/sidebar/DocumentSidebar";
@@ -45,6 +46,7 @@ import {
   isDocumentCreationConfirmed,
   isDocumentCreationPending,
 } from "@/lib/optimistic-document";
+import { addressDatabaseViewId } from "@/lib/page-open-collection";
 import { retirePageOpenReads } from "@/lib/page-open-reads";
 import {
   readPageIconRowHint,
@@ -186,10 +188,15 @@ export function Layout({ children }: LayoutProps) {
   useEffect(() => {
     if (!showPendingDocumentSkeleton || !pendingDocumentId) return;
     const search = new URLSearchParams(pendingSearch);
-    startPageOpenDocumentReads(queryClient, pendingDocumentId, {
-      databaseId: search.get("databaseId"),
-      databaseDocumentId: search.get("databaseDocumentId"),
-    });
+    startPageOpenDocumentReads(
+      queryClient,
+      pendingDocumentId,
+      {
+        databaseId: search.get("databaseId"),
+        databaseDocumentId: search.get("databaseDocumentId"),
+      },
+      { databaseViewId: addressDatabaseViewId(pendingSearch) },
+    );
   }, [
     pendingDocumentId,
     pendingSearch,
@@ -497,6 +504,7 @@ export function Layout({ children }: LayoutProps) {
           </>
         )}
       </div>
+      <GitHubLinkDialogHost />
     </HeaderActionsProvider>
   );
 }

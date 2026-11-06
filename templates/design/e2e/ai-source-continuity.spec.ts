@@ -28,6 +28,7 @@ const AI_SOURCE = readFileSync(
 );
 const PRIMARY_DECLARATION = "--primary: #0f766e;";
 
+const MOD = process.platform === "darwin" ? "Meta" : "Control";
 const AI_BRIDGE_SOURCE = `<!doctype html>
 <html lang="en">
   <head><meta charset="utf-8"><title>AI bridge replay</title></head>
@@ -107,13 +108,18 @@ async function readPrimaryPaintSourceState(page: Page, designId: string) {
   }, source);
 }
 
-function layerRow(page: Page, name: string) {
+function layerRowButton(page: Page, name: string) {
   return page
     .getByRole("tree", { name: "Layers" })
     .locator("[data-layer-row-button][data-layer-node-id]")
     .filter({ has: page.locator(`span[title="${name}"]`) })
-    .first()
-    .locator('xpath=ancestor::*[@role="treeitem"][1]');
+    .first();
+}
+
+function layerRow(page: Page, name: string) {
+  return layerRowButton(page, name).locator(
+    'xpath=ancestor::*[@role="treeitem"][1]',
+  );
 }
 
 function idByLayerName(nodes: Map<string, SavedNode>, name: string) {
@@ -124,8 +130,7 @@ function idByLayerName(nodes: Map<string, SavedNode>, name: string) {
   return node.id;
 }
 
-// fixme: fails in CI on current main: expect(locator).toHaveAttribute(expected) failed
-test.fixme("Layers-first editing preserves identity in the AI-generated Orbit source", async ({
+test("Layers-first editing preserves identity in the AI-generated Orbit source", async ({
   app,
 }) => {
   const sourceWithoutEditorIds = stripEditorOnlyAttributes(AI_SOURCE);
@@ -142,7 +147,7 @@ test.fixme("Layers-first editing preserves identity in the AI-generated Orbit so
   await app.open(designId);
   await expandAllLayers(app.page);
   const titleLayer = layerRow(app.page, "Launch overview");
-  await titleLayer.click();
+  await layerRowButton(app.page, "Launch overview").click();
   await expect(titleLayer).toHaveAttribute("aria-selected", "true");
   const size = app.page.locator('input[aria-label="Size" i]').first();
   await size.fill("38");
@@ -218,7 +223,10 @@ async function dragByCenter(
     rect.x + rect.width / 2,
     rect.y + rect.height / 2,
   );
+  // Cmd+click selects the nested layer; a plain click takes its top-level frame.
+  await app.page.keyboard.down(MOD);
   await app.page.mouse.click(from.x, from.y);
+  await app.page.keyboard.up(MOD);
   const to = await app.pagePoint(toX, toY);
   await app.page.mouse.move(from.x, from.y);
   await app.page.mouse.down();
@@ -252,8 +260,7 @@ test("moving a layer in AI-generated source keeps its node ID and lands where it
   });
 });
 
-// fixme: product bug: The reparent and the drop position are right (left 160px, top 156px), but the save rewrites the dropped layer's background #f97316 as rgb(249, 115, 22).
-test.fixme("dropping a layer from AI-generated source into a panel keeps its node ID and its drop position", async ({
+test("dropping a layer from AI-generated source into a panel keeps its node ID and its drop position", async ({
   app,
 }) => {
   const { designId, before, ids } = await openGeneratedDashboard(app);
@@ -292,8 +299,7 @@ test.fixme("dropping a layer from AI-generated source into a panel keeps its nod
   expectOnlyChanged(after, await app.savedNodes(designId), []);
 });
 
-// fixme: fails in CI on current main: expect(locator).toHaveAttribute(expected) failed
-test.fixme("duplicate authored IDs are repaired before Layers-first edits and persist after reload", async ({
+test("duplicate authored IDs are repaired before Layers-first edits and persist after reload", async ({
   app,
   page,
 }) => {
@@ -335,11 +341,16 @@ test.fixme("duplicate authored IDs are repaired before Layers-first edits and pe
       .filter({ has: page.locator(`span[title="${name}"]`) })
       .first()
       .locator('xpath=ancestor::*[@role="treeitem"][1]');
+  const taskLayerButton = (name: string) =>
+    layers
+      .locator("[data-layer-row-button][data-layer-node-id]")
+      .filter({ has: page.locator(`span[title="${name}"]`) })
+      .first();
   const firstTaskLayer = taskLayer("Refine onboarding flow");
   const secondTaskLayer = taskLayer("Prepare launch brief");
   await expect(firstTaskLayer).toBeVisible();
   await expect(secondTaskLayer).toBeVisible();
-  await secondTaskLayer.click();
+  await taskLayerButton("Prepare launch brief").click();
   await expect(secondTaskLayer).toHaveAttribute("aria-selected", "true");
 
   await expect
@@ -506,8 +517,7 @@ test("stylesheet-backed Fill stays editable after Layers reselection and undo", 
     });
 });
 
-// fixme: fails in CI on current main: expect(locator).toHaveAttribute(expected) failed
-test.fixme("edit-design rejects malformed AI CSS without changing the styled canvas", async ({
+test("edit-design rejects malformed AI CSS without changing the styled canvas", async ({
   app,
   page,
 }) => {
@@ -579,7 +589,7 @@ test.fixme("edit-design rejects malformed AI CSS without changing the styled can
     .first()
     .locator('xpath=ancestor::*[@role="treeitem"][1]');
   await expect(titleLayer).toBeVisible();
-  await titleLayer.click();
+  await titleLayer.locator("[data-layer-row-button]").click();
   await expect(titleLayer).toHaveAttribute("aria-selected", "true");
 
   const titleSize = page.locator('input[aria-label="Size" i]').first();

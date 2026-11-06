@@ -32,6 +32,7 @@ type CurrentSlideFitMeasurement = DeckFitState["slides"][string] & {
 };
 
 const CURRENT_SLIDE_COMMENT_LIMIT = 100;
+const HOME_DECK_LIST_LIMIT = 20;
 
 function getCurrentSlideFitMeasurement(
   value: unknown,
@@ -355,6 +356,21 @@ export default defineAction({
         }
       }
 
+      const panels = (await readAppStateForCurrentTab("slides-panels", {
+        fallbackToGlobal: false,
+      })) as { layersOpen?: boolean; animationsOpen?: boolean } | null;
+      const openPanels = [
+        panels?.layersOpen ? "layers" : null,
+        panels?.animationsOpen ? "animations" : null,
+      ].filter(Boolean);
+      lines.push(``);
+      lines.push(`### Editor panels`);
+      lines.push(
+        panels
+          ? `openPanels: ${openPanels.join(", ") || "none"}`
+          : `openPanels: unknown`,
+      );
+
       const selection = (await readAppStateForCurrentTab("slides-selection", {
         fallbackToGlobal: false,
       })) as {
@@ -376,6 +392,23 @@ export default defineAction({
           style?: Record<string, unknown>;
         }>;
       } | null;
+      const openPanel = (await readAppStateForCurrentTab("slides-open-panel", {
+        fallbackToGlobal: false,
+      })) as {
+        slideId?: string;
+        panel?: string | null;
+        notesOpen?: boolean;
+      } | null;
+      if (openPanel?.panel && openPanel.slideId === currentSlide?.id) {
+        lines.push(``);
+        lines.push(`### Open side panel`);
+        lines.push(`openPanel: ${openPanel.panel}`);
+      }
+      if (openPanel?.notesOpen && openPanel.slideId === currentSlide?.id) {
+        lines.push(``);
+        lines.push(`### Speaker notes panel`);
+        lines.push(`notesOpen: true`);
+      }
       const selectionSlide =
         selection?.slideId &&
         (selection.deckId ? selection.deckId === rows[0].id : true)
@@ -600,8 +633,14 @@ export default defineAction({
     if (filteredRows.length === 0) {
       lines.push(`(no decks — use create-deck to make one)`);
     } else {
-      for (const row of filteredRows) {
+      const shownRows = filteredRows.slice(0, HOME_DECK_LIST_LIMIT);
+      for (const row of shownRows) {
         lines.push(`- id=${row.id}  title="${row.title ?? "(untitled)"}"`);
+      }
+      if (shownRows.length < filteredRows.length) {
+        lines.push(
+          `showing ${shownRows.length} of ${filteredRows.length} decks, most recent first; use list-decks for more.`,
+        );
       }
       lines.push(``);
       lines.push(

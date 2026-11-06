@@ -1,6 +1,8 @@
 import { z } from "zod";
 
+import { SOURCE_HEAD_SHA256_PATTERN } from "../../shared/source-fingerprint.js";
 import { RECORDING_TITLE_SOURCES } from "../../shared/title-source.js";
+import { MAX_UPLOAD_BYTES } from "../../shared/upload-limits.js";
 
 const cliBoolean = z
   .union([z.boolean(), z.enum(["true", "false"])])
@@ -33,10 +35,10 @@ export const createRecordingSchema = z.object({
     .optional()
     .describe("Recorder platform"),
   recordingSource: z
-    .enum(["recorder", "file_upload", "local_copy_upload"])
+    .enum(["recorder", "file_upload", "local_copy_upload", "agent_upload"])
     .optional()
     .describe(
-      "How the clip reached Clips: a live recording, an uploaded file, or a local copy recorded without storage. Analytics only.",
+      "How the clip reached Clips: a live recording, an uploaded file, a local copy recorded without storage, or a file an agent uploaded. Analytics only.",
     ),
   recordingAttemptId: z
     .string()
@@ -94,6 +96,15 @@ export const createRecordingSchema = z.object({
     .describe(
       "MIME type the browser will record (e.g. video/webm, video/mp4). Used to initialize the resumable session with the correct content type.",
     ),
+  sizeBytes: z
+    .number()
+    .int()
+    .positive()
+    .max(MAX_UPLOAD_BYTES)
+    .optional()
+    .describe(
+      "Size in bytes of a file uploaded whole, when known. On free hosted storage, a file over the hosted limit is refused before a hosted grant is reserved or the recording is created.",
+    ),
   requestStreaming: z
     .boolean()
     .optional()
@@ -107,6 +118,13 @@ export const createRecordingSchema = z.object({
     .optional()
     .describe(
       "Refuse to create the recording unless the signed-in account is this one. Recorders pass the account a local copy was recorded under, so it never uploads into another account.",
+    ),
+  sourceHeadSha256: z
+    .string()
+    .regex(SOURCE_HEAD_SHA256_PATTERN)
+    .optional()
+    .describe(
+      "Lowercase hex SHA-256 of the file's first 1 MiB (the whole file when shorter). Pass it when retrying a saved file automatically: if the signed-in account already has an uploaded clip of that file, nothing is created and that clip comes back with existingRecording: true.",
     ),
   streamingUploadClient: z
     .enum(["desktop-native"])

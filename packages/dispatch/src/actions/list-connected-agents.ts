@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core/action";
+import { defineAction, fail } from "@agent-native/core/action";
 import {
   REMOTE_AGENT_RESOURCE_PREFIXES,
   parseRemoteAgentManifest,
@@ -11,41 +11,42 @@ import {
 import { getRequestUserEmail } from "@agent-native/core/server";
 import {
   discoverAgents,
-  getBuiltinAgents,
   isBuiltinAgentCatalogId,
-  loadWorkspaceAppsManifest,
   normalizeAgentId,
   shouldIncludeRemoteAgentManifest,
 } from "@agent-native/core/server/agent-discovery";
 import { z } from "zod";
 
+import {
+  readHostedAppsSettings,
+  listHostedApps,
+} from "../server/lib/hosted-apps-settings.js";
+
 export default defineAction({
   description:
-    "List agents available to dispatch for A2A delegation, including built-in apps and connected remote agents.",
+    "List agents available to dispatch for A2A delegation, including built-in apps and connected remote agents. When get-hosted-apps-settings reports showHostedApps false, built-in (hosted) apps are still listed but marked hiddenFromLaunchers: true.",
   schema: z.object({}),
   http: { method: "GET" },
   run: async () => {
     const { hiddenAgentIds = [] } = await import("../server/index.js").then(
       (m) => m.getDispatchConfig(),
     );
-    const [discovered, workspaceApps] = await Promise.all([
+    const [discovered, hosted, hostedAppsSettings] = await Promise.all([
       discoverAgents("dispatch"),
-      loadWorkspaceAppsManifest(),
+      listHostedApps(),
+      readHostedAppsSettings(),
     ]);
-    // A mounted workspace app with a built-in's id is a workspace app; the
-    // built-in config never applies to it.
-    const workspaceIds = new Set(
-      (workspaceApps ?? []).map((app) => normalizeAgentId(app.id)),
-    );
-    const builtins = getBuiltinAgents("dispatch");
-    const builtinIds = new Set(
-      builtins.map((agent) => agent.id).filter((id) => !workspaceIds.has(id)),
-    );
+    const builtinIds = new Set(hosted.map((agent) => agent.id));
     const builtinHomeUrls = new Map(
-      builtins.map((agent) => [agent.id, agent.url]),
+      hosted.map((agent) => [agent.id, agent.url]),
     );
     const ownerEmail = getRequestUserEmail();
-    if (!ownerEmail) throw new Error("no authenticated user");
+    if (!ownerEmail) {
+      fail("Sign in to list connected agents.", {
+        errorCode: "dispatch_user_identity_missing",
+        statusCode: 401,
+      });
+    }
     const resources: Array<{ id: string; path: string; owner: string }> = [];
     for (const prefix of [...REMOTE_AGENT_RESOURCE_PREFIXES].reverse()) {
       resources.push(...(await resourceListAccessible(ownerEmail, prefix)));
@@ -92,6 +93,9 @@ export default defineAction({
       return {
         ...agent,
         ...(homeUrl ? { homeUrl } : {}),
+        ...(isBuiltin && !hostedAppsSettings.showHostedApps
+          ? { hiddenFromLaunchers: true }
+          : {}),
         source: isBuiltin ? "builtin" : custom ? "custom" : "workspace",
         resourceId: custom?.resourceId,
         path: custom?.path,

@@ -61,22 +61,16 @@ import { cn } from "@agent-native/toolkit/utils";
 import {
   IconArrowUpRight,
   IconBriefcase,
-  IconChartBar,
   IconCheck,
   IconChevronLeft,
   IconChevronRight,
   IconCoin,
-  IconDownload,
   IconExternalLink,
   IconAlertCircle,
   IconKey,
   IconLoader2,
-  IconLogout,
-  IconPlus,
   IconPresentation,
   IconSelector,
-  IconSettings,
-  IconUsersGroup,
 } from "@tabler/icons-react";
 import {
   useEffect,
@@ -87,6 +81,7 @@ import {
   type ReactNode,
 } from "react";
 import { Link, useNavigate } from "react-router";
+import { toast } from "sonner";
 
 export interface OrgSwitcherUtilityLink {
   id: string;
@@ -476,6 +471,7 @@ export function OrgSwitcher({
   const { enabled: demoModeEnabled } = useDemoModeStatus();
   const t = useT();
   const [open, setOpen] = useState(false);
+  const [compactTooltipOpen, setCompactTooltipOpen] = useState(false);
   const pendingOrgSwitchRef = useRef<
     | { kind: "explicit"; orgId: string; closedEarly: boolean }
     | { kind: "personal-recovery"; orgId: string }
@@ -589,7 +585,13 @@ export function OrgSwitcher({
   const handleSignOut = async () => {
     if (signingOut) return;
     setSigningOut(true);
-    await signOut();
+    try {
+      await signOut();
+    } catch {
+      toast.error(t("agentChat.auth.logOutFailed"));
+    } finally {
+      setSigningOut(false);
+    }
   };
 
   const handleCreateSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -769,7 +771,6 @@ export function OrgSwitcher({
             className={ITEM_CLASS}
             onSelect={() => setBrowserDemoModeEnabled(false)}
           >
-            <IconPresentation className={ITEM_ICON_CLASS} />
             <span className="flex-1">
               {t("agentChat.accountMenu.turnOffDemoMode")}
             </span>
@@ -827,7 +828,6 @@ export function OrgSwitcher({
               }}
             >
               <span className="flex items-center gap-2">
-                <IconUsersGroup className={ITEM_ICON_CLASS} />
                 <span className="min-w-0 flex-1 truncate">{inv.orgName}</span>
                 {acceptInvitation.isPending ? (
                   <IconLoader2
@@ -874,7 +874,6 @@ export function OrgSwitcher({
                   });
                 }}
               >
-                <IconUsersGroup className={ITEM_ICON_CLASS} />
                 <span className="min-w-0 flex-1 truncate">{match.orgName}</span>
                 {isJoining ? (
                   <IconLoader2
@@ -895,7 +894,6 @@ export function OrgSwitcher({
         {workspaceUrl && (
           <DropdownMenuItem asChild className={ITEM_CLASS}>
             <a href={workspaceUrl}>
-              <IconExternalLink className={ITEM_ICON_CLASS} />
               <span className="flex-1">
                 {t("agentChat.accountMenu.yourWorkspace")}
               </span>
@@ -913,7 +911,6 @@ export function OrgSwitcher({
             setCreateOpen(true);
           }}
         >
-          <IconPlus className={ITEM_ICON_CLASS} />
           <span className="flex-1">
             {t("agentChat.accountMenu.createOrganization")}
           </span>
@@ -926,7 +923,6 @@ export function OrgSwitcher({
           className={ITEM_CLASS}
           onSelect={() => void navigate(buildSettingsRoute("account"))}
         >
-          <IconSettings className={ITEM_ICON_CLASS} />
           <span className="flex-1">{t("agentChat.common.settings")}</span>
           <DropdownMenuShortcut className="tracking-normal">
             {settingsShortcut}
@@ -936,7 +932,6 @@ export function OrgSwitcher({
           className={ITEM_CLASS}
           onSelect={() => void navigate(buildSettingsRoute("usage"))}
         >
-          <IconChartBar className={ITEM_ICON_CLASS} />
           <span className="flex-1">{t("agentChat.accountMenu.usage")}</span>
         </DropdownMenuItem>
         {links.length > 0 && (
@@ -947,7 +942,6 @@ export function OrgSwitcher({
               showView("apps");
             }}
           >
-            <IconDownload className={ITEM_ICON_CLASS} />
             <span className="flex-1">{t("agentChat.accountMenu.getApps")}</span>
             <IconChevronRight
               className={cn(ITEM_ICON_CLASS, "rtl:-scale-x-100")}
@@ -965,12 +959,10 @@ export function OrgSwitcher({
           void handleSignOut();
         }}
       >
+        <span className="flex-1">{t("agentChat.auth.logOut")}</span>
         {signingOut ? (
           <IconLoader2 className={cn(ITEM_ICON_CLASS, "animate-spin")} />
-        ) : (
-          <IconLogout className={cn(ITEM_ICON_CLASS, "rtl:-scale-x-100")} />
-        )}
-        <span className="flex-1">{t("agentChat.auth.logOut")}</span>
+        ) : null}
       </DropdownMenuItem>
 
       {menuError && (
@@ -1041,13 +1033,27 @@ export function OrgSwitcher({
         {!hideBuilderCreditNotice && <BuilderCreditNotice compact={compact} />}
         <DropdownMenu open={open} onOpenChange={handleOpenChange}>
           {compact ? (
-            // The menu trigger has to sit directly on the button: both Radix
-            // slots merge their props into the same DOM node, and a provider
-            // between them would swallow the click that opens the menu.
             <TooltipProvider delayDuration={0}>
-              <Tooltip>
+              <Tooltip
+                open={compactTooltipOpen}
+                onOpenChange={setCompactTooltipOpen}
+              >
                 <TooltipTrigger asChild>
-                  <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
+                  <span
+                    className="inline-flex"
+                    onFocusCapture={() => setCompactTooltipOpen(true)}
+                    onBlurCapture={(event) => {
+                      if (
+                        !event.currentTarget.contains(
+                          event.relatedTarget as Node | null,
+                        )
+                      ) {
+                        setCompactTooltipOpen(false);
+                      }
+                    }}
+                  >
+                    <DropdownMenuTrigger asChild>{trigger}</DropdownMenuTrigger>
+                  </span>
                 </TooltipTrigger>
                 <TooltipContent side="right">
                   <span className="block font-medium">{displayName}</span>

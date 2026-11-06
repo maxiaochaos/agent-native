@@ -1,5 +1,6 @@
 import { openCommandMenu } from "@agent-native/toolkit/app/shared";
 import { isBoardFile } from "@shared/board-file";
+import type { MotionPrototypeTransitionDecodeResult } from "@shared/motion-prototype-transition";
 import { isRunningAppSourceType } from "@shared/source-mode";
 import { useState, useEffect, useCallback } from "react";
 import { toast } from "sonner";
@@ -43,6 +44,10 @@ import {
   resolveOverviewScreenSourceType,
   shouldUseRuntimeLayerProjection,
 } from "../pending-edits";
+import {
+  getPrototypeDestinationFrameId,
+  runPrototypeNavigationTransition,
+} from "../prototype-navigation-transition";
 import { findInteractLinkTarget } from "../screen-command-utils";
 import {
   getContentSignature,
@@ -176,7 +181,6 @@ export function useEditorScreenRendering({
     lockedLayerIds,
     hiddenLayerIds,
     motionDockOpen,
-    shaderFillPreview,
     activeBreakpointWidthState,
     setActiveBreakpointWidthState,
     activeBreakpointWidthStateRef,
@@ -187,6 +191,7 @@ export function useEditorScreenRendering({
     design,
     designAccessRole,
     canEditDesign,
+    sourceMetadata,
     publicVisualEdit,
     canCommentDesign,
     liveCollaborationEnabled,
@@ -261,7 +266,10 @@ export function useEditorScreenRendering({
     selectedCanvasSelector,
     canEditLiveScreen,
     designFusionUrl,
+    fusionAppStarting,
     motionTracksWire,
+    motionPathTargetNodeId,
+    motionPathTrackId,
     motionSelectedTarget,
     motionOriginEditing,
   } = editorLiveEditsAndPresence;
@@ -273,6 +281,7 @@ export function useEditorScreenRendering({
   } = editorContentAndComponents;
   const {
     reviewFocusRequest,
+    setOpenReviewThreadId,
     selectionRevisionRef,
     handleDispatchCommentToAgent,
     handleSendReviewThreadToAgent,
@@ -450,19 +459,38 @@ export function useEditorScreenRendering({
   // A link to another screen in the Interact preview switches the previewed
   // screen, keeping Interact and its device, the same hop the screen picker makes.
   const handleInteractLinkNavigate = useCallback(
-    (screen: string) => {
+    (
+      screen: string,
+      _href: string,
+      transition: MotionPrototypeTransitionDecodeResult,
+      sourceFrame: HTMLIFrameElement,
+    ) => {
       const target = findInteractLinkTarget(
-        files,
+        sourceMetadata.length ? sourceMetadata : files,
         screen,
         activeFileIdRef.current,
       );
       if (!target) return;
-      handleModeChange("interact", {
-        targetFileId: target.id,
-        keepInteractDevice: true,
-      });
+      runPrototypeNavigationTransition(
+        transition.status === "valid" ? transition.transition : undefined,
+        () => {
+          handleModeChange("interact", {
+            targetFileId: target.id,
+            keepInteractDevice: true,
+            fromPrototypeNavigation: true,
+          });
+        },
+        undefined,
+        {
+          sourceFrame,
+          destinationFrameId: getPrototypeDestinationFrameId(
+            target.id,
+            sourceFrame,
+          ),
+        },
+      );
     },
-    [files, handleModeChange],
+    [files, sourceMetadata, handleModeChange],
   );
 
   const handleKScaleStyleBatchChange = useCallback(
@@ -526,17 +554,17 @@ export function useEditorScreenRendering({
       if (patch.status !== "applied") {
         toast.error(
           codeLayerPatchMessage(
-            patch.reason,
+            patch.status === "failed" ? patch.reason : null,
             t("designEditor.patchProof.selectorMissing"),
           ),
         );
         return false;
       }
       if (patch.content === content) return true;
-      applyFileContentUpdate(screenId, patch.content, {
+      const publication = applyFileContentUpdate(screenId, patch.content, {
         skipPreview: true,
       });
-      return true;
+      return publication.status === "accepted";
     },
     [
       activeCanvasSourceType,
@@ -954,6 +982,7 @@ export function useEditorScreenRendering({
               : undefined
           }
           fusionUrl={designFusionUrl}
+          appStarting={fusionAppStarting}
           onComponentSourceJump={handleComponentSourceJump}
           motionTracks={screenIsActive ? motionTracksWire : NO_MOTION_TRACKS}
           motionEasingVariables={motionEasingVariables}
@@ -964,7 +993,8 @@ export function useEditorScreenRendering({
             motionDockOpen &&
             (canEditDesign || canEditLiveScreen(screen.id))
           }
-          motionPathTargetNodeId={motionSelectedTarget?.nodeId ?? null}
+          motionPathTargetNodeId={motionPathTargetNodeId}
+          motionPathTrackId={motionPathTrackId}
           motionOriginEditingEnabled={
             screenIsActive &&
             motionOriginEditing &&
@@ -977,7 +1007,6 @@ export function useEditorScreenRendering({
               ? handleMotionCanvasPathTracksChange
               : undefined
           }
-          shaderFillPreview={screenIsActive ? shaderFillPreview : null}
           gradientEditTarget={
             inScreenGradientEditTarget?.screenId === screen.id
               ? inScreenGradientEditTarget
@@ -1000,6 +1029,7 @@ export function useEditorScreenRendering({
               : getEmbeddedFrame(screen.id, geometry.width, geometry.height)
           }
           fitRootBodyToFrame={metadata.heightMode !== "hug"}
+          screenHeightMode={metadata.heightMode}
           editorChromeScaleX={overviewCanvasZoom / 100}
           editorChromeScaleY={overviewCanvasZoom / 100}
           editMode={
@@ -1137,6 +1167,7 @@ export function useEditorScreenRendering({
           reviewCanResolve={canEditDesign}
           reviewCurrentUserEmail={session?.email}
           reviewFocusRequest={reviewFocusRequest}
+          onReviewActiveThreadChange={setOpenReviewThreadId}
           onDispatchCommentToAgent={handleDispatchCommentToAgent}
           onSendThreadToAgent={handleSendReviewThreadToAgent}
           reviewSendingThreadId={reviewSendingThreadId}
@@ -1190,8 +1221,11 @@ export function useEditorScreenRendering({
       getScreenRootComputedStylesCallback,
       getRuntimeVerificationSnapshotCallback,
       designFusionUrl,
+      fusionAppStarting,
       handleComponentSourceJump,
       motionTracksWire,
+      motionPathTargetNodeId,
+      motionPathTrackId,
       motionSelectedTarget,
       motionOriginEditing,
       motionDockOpen,
@@ -1199,7 +1233,6 @@ export function useEditorScreenRendering({
       motionDefaultEase,
       motionEasingVariables,
       motionDurationMs,
-      shaderFillPreview,
       inScreenGradientEditTarget,
       handleInScreenGradientEditChange,
       statePreviewTarget,
@@ -1259,6 +1292,7 @@ export function useEditorScreenRendering({
       design?.title,
       session?.email,
       reviewFocusRequest,
+      setOpenReviewThreadId,
       handleDispatchCommentToAgent,
       handleSendReviewThreadToAgent,
       reviewSendingThreadId,

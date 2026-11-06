@@ -1,6 +1,7 @@
 import { getBrowserTabId } from "@agent-native/core/client/hooks";
 import { buildSignInReturnHref } from "@agent-native/core/client/sign-in-return";
 import { buildCodeLayerProjection } from "@shared/code-layer";
+import { resolveSourceEquivalentSelector } from "@shared/source-equivalent-selector";
 
 import type { ElementInfo } from "@/components/design/types";
 import { designSelectionStateKeysForTab } from "@/hooks/use-navigation-state";
@@ -9,6 +10,7 @@ import type {
   RuntimeLayerSnapshot,
 } from "@/pages/design-editor/command-types";
 import {
+  measureAbsoluteSiblingVisualOrigin,
   measurePositionCoordinateContext,
   positionCoordinateRenderOffsetForWindow,
 } from "@/pages/design-editor/position-coordinate-context";
@@ -171,18 +173,68 @@ export function reloadRunningAppPreviewFrames(): void {
   }
 }
 
+function pxOffset(raw: string | undefined): number | undefined {
+  if (!raw || !/^-?(?:\d+(?:\.\d*)?|\.\d+)(?:px)?$/u.test(raw.trim())) {
+    return undefined;
+  }
+  return Number.parseFloat(raw);
+}
+
+// The bridge writes a dragged layer's left/top on every move tick, and the
+// inspector adds that live offset to this measurement. Measuring the moved
+// layer counts the offset twice, so mid-drag the rect is taken back to the
+// left/top the selection was captured at.
+function activeMoveDragOffset(
+  view: Window,
+  node: HTMLElement,
+  info: ElementInfo,
+  transform: ElementInfo["positionContainingBlockTransform"],
+): { x: number; y: number } | null {
+  if (
+    !(view as Window & { __agentNativeLayerMoveActive?: boolean })
+      .__agentNativeLayerMoveActive
+  ) {
+    return null;
+  }
+  const capturedLeft =
+    pxOffset(info.computedStyles.left) ?? pxOffset(info.inlineStyles?.left);
+  const capturedTop =
+    pxOffset(info.computedStyles.top) ?? pxOffset(info.inlineStyles?.top);
+  const liveLeft = pxOffset(node.style.left);
+  const liveTop = pxOffset(node.style.top);
+  if (
+    capturedLeft === undefined ||
+    capturedTop === undefined ||
+    liveLeft === undefined ||
+    liveTop === undefined
+  ) {
+    return null;
+  }
+  const dLeft = liveLeft - capturedLeft;
+  const dTop = liveTop - capturedTop;
+  if (dLeft === 0 && dTop === 0) return null;
+  const { a, b, c, d } = transform ?? { a: 1, b: 0, c: 0, d: 1 };
+  return { x: a * dLeft + c * dTop, y: b * dLeft + d * dTop };
+}
+
 export function withMeasuredGeometry(
   info: ElementInfo,
   screenId?: string,
+  options?: {
+    measureAbsoluteSiblingVisualOrigin?: boolean;
+    previewIframe?: HTMLIFrameElement;
+  },
 ): ElementInfo {
   if (typeof document === "undefined") return info;
   const selector = info.runtimeSelector ?? info.selector;
   if (!selector) return info;
-  const owning = screenId
-    ? document.querySelector<HTMLIFrameElement>(
-        `iframe[data-design-preview-iframe][data-screen-iframe-id="${CSS.escape(screenId)}"]`,
-      )
-    : null;
+  const owning =
+    options?.previewIframe ??
+    (screenId
+      ? document.querySelector<HTMLIFrameElement>(
+          `iframe[data-design-preview-iframe][data-screen-iframe-id="${CSS.escape(screenId)}"]`,
+        )
+      : null);
   if (screenId && !owning) return info;
   const frames = owning
     ? [owning]
@@ -194,7 +246,10 @@ export function withMeasuredGeometry(
   for (const frame of frames) {
     let node: Element | null = null;
     try {
-      node = frame.contentDocument?.querySelector(selector) ?? null;
+      const frameDocument = frame.contentDocument;
+      node = frameDocument
+        ? resolveSourceEquivalentSelector(frameDocument, selector)
+        : null;
     } catch {
       node = null;
     }
@@ -233,7 +288,13 @@ export function withMeasuredGeometry(
         };
       }
     }
-    if (box.width <= 0 && box.height <= 0) continue;
+    if (
+      !options?.measureAbsoluteSiblingVisualOrigin &&
+      box.width <= 0 &&
+      box.height <= 0
+    ) {
+      continue;
+    }
     const parent =
       node.getAttribute("data-an-primitive") === "boolean-operand"
         ? (node.closest('svg[data-an-primitive="boolean"]') ??
@@ -248,7 +309,23 @@ export function withMeasuredGeometry(
       view && renderOffset
         ? measurePositionCoordinateContext(node, view, renderOffset)
         : undefined;
-    if (!positionCoordinateContext) return info;
+    const absoluteSiblingVisualOrigin =
+      options?.measureAbsoluteSiblingVisualOrigin && view && renderOffset
+        ? measureAbsoluteSiblingVisualOrigin(node, view, renderOffset)
+        : undefined;
+    if (!positionCoordinateContext && !absoluteSiblingVisualOrigin) return info;
+    const moveOffset =
+      view && node instanceof (view as Window & typeof globalThis).HTMLElement
+        ? activeMoveDragOffset(
+            view,
+            node,
+            info,
+            positionCoordinateContext?.positionContainingBlockTransform,
+          )
+        : null;
+    if (moveOffset) {
+      box = { ...box, x: box.x - moveOffset.x, y: box.y - moveOffset.y };
+    }
     const scrollX = view?.scrollX ?? 0;
     const scrollY = view?.scrollY ?? 0;
     const computed = frame.contentWindow?.getComputedStyle(node);
@@ -269,6 +346,7 @@ export function withMeasuredGeometry(
           }
         : undefined,
       ...(positionCoordinateContext ?? {}),
+      ...(absoluteSiblingVisualOrigin ? { absoluteSiblingVisualOrigin } : {}),
       computedStyles: computed
         ? {
             color: computed.color,

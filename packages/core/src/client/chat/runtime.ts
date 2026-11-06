@@ -1,5 +1,11 @@
 import { AgentKitRunSlotBusyError } from "@agent-native/agentkit/client";
-import type { AgentSuggestion } from "@agent-native/agentkit/protocol";
+import {
+  parseAgentQueuedSubmissionReceipt,
+  type AgentRunOptions,
+  type AgentSubmissionReference,
+  type AgentQueuedSubmissionReceipt,
+  type AgentSuggestion,
+} from "@agent-native/agentkit/protocol";
 
 import type { ActionChatUIConfig } from "../../action-ui.js";
 import {
@@ -22,11 +28,18 @@ import { agentChatStreamingUrl, agentNativePath } from "../api-path.js";
 import { CHAT_REQUEST_TOO_LARGE_MESSAGE } from "../error-format.js";
 import {
   appendMissingFinalResponseWarning,
+  clearAssistantDraftContent,
   findApprovalToolCallIndex,
   type ContentPart,
   type SSEEvent,
 } from "../sse-event-processor.js";
 import { runOutcomeForCode, type ServerRunState } from "./run-outcome.js";
+import {
+  acceptedPromptForMetadata,
+  DEFAULT_TURN_SURFACE,
+  type TurnInitiator,
+  type TurnSubmittedReport,
+} from "./turn-submitted.js";
 
 export type { ServerRunState } from "./run-outcome.js";
 
@@ -57,6 +70,7 @@ export interface AgentChatRuntimeContentPartBase<
 > {
   readonly type: TType;
   readonly id?: string;
+  readonly omitFromPersistedHistory?: true;
   readonly metadata?: AgentChatRuntimeMetadata;
 }
 
@@ -153,6 +167,7 @@ export interface AgentChatRuntimeAttachment {
   readonly contentType?: string;
   readonly data?: string;
   readonly url?: string;
+  readonly referenceUrl?: string;
   readonly text?: string;
   readonly metadata?: AgentChatRuntimeMetadata;
 }
@@ -310,6 +325,9 @@ export interface AgentChatRuntimeSessionSnapshot extends AgentChatRuntimeSession
 export interface AgentChatRuntimeTurnInput {
   readonly prompt?: string;
   readonly messages?: readonly AgentChatRuntimeMessage[];
+  readonly submissionPayload?: unknown;
+  readonly options?: AgentRunOptions;
+  readonly references?: readonly AgentSubmissionReference[];
   readonly queuePromotion?: {
     readonly messageId: string;
     readonly claimId: string;
@@ -414,6 +432,11 @@ export interface AgentChatRuntimeMessageDoneEvent extends AgentChatRuntimeEventB
   readonly message: AgentChatRuntimeMessage;
 }
 
+/** Replaces a streaming message's content without finishing it. */
+export interface AgentChatRuntimeMessageReplaceEvent extends AgentChatRuntimeEventBase<"message-replace"> {
+  readonly message: AgentChatRuntimeMessage;
+}
+
 export interface AgentChatRuntimeToolStartEvent extends AgentChatRuntimeEventBase<"tool-start"> {
   readonly toolCall: AgentChatRuntimeToolCall;
 }
@@ -446,6 +469,8 @@ export interface AgentChatRuntimeApprovalRequestEvent extends AgentChatRuntimeEv
   readonly message: string;
   readonly input?: unknown;
   readonly allowPersistentApproval?: false;
+  /** The server's approval row, when the agent-native store created one. */
+  readonly askId?: string;
 }
 
 export interface AgentChatRuntimeApprovalResolvedEvent extends AgentChatRuntimeEventBase<"approval-resolved"> {
@@ -722,6 +747,7 @@ export type AgentChatRuntimeKnownEvent =
   | AgentChatRuntimeMessageStartEvent
   | AgentChatRuntimeMessageDeltaEvent
   | AgentChatRuntimeMessageDoneEvent
+  | AgentChatRuntimeMessageReplaceEvent
   | AgentChatRuntimeToolStartEvent
   | AgentChatRuntimeToolDeltaEvent
   | AgentChatRuntimeToolDoneEvent
@@ -755,10 +781,20 @@ export interface AgentChatRuntimeTurn<
   TEvent extends AgentChatRuntimeEventBase = AgentChatRuntimeKnownEvent,
 > {
   readonly id?: AgentChatRuntimeTurnId;
+  /**
+   * The turn the server stored the run under (its `X-Turn-Id`), else the one
+   * the request carried; absent for a replay the server did not name the turn
+   * of. A continuation sends the turn it continues, and an approval resume
+   * runs under its pending approval's turn, so this is not always `id`.
+   */
+  readonly requestTurnId?: AgentChatRuntimeTurnId;
   readonly sessionId: AgentChatRuntimeSessionId;
   readonly runId?: string;
   readonly metadata?: AgentChatRuntimeMetadata;
+  readonly queuedSubmission?: AgentQueuedSubmissionReceipt;
   readonly events: AsyncIterable<TEvent>;
+  /** Close the local event stream without cancelling the underlying run. */
+  closeEvents?(): Promise<void> | void;
   cancel?(
     input?: AgentChatRuntimeCancelInput,
   ): Promise<AgentChatRuntimeCancelResult>;
@@ -775,6 +811,11 @@ export interface AgentChatRuntimeSubscribeInput {
   readonly after?: number;
   readonly metadata?: AgentChatRuntimeMetadata;
   readonly abortSignal?: AbortSignal;
+}
+
+export interface AgentChatRuntimeReadRunStateInput extends AgentChatRuntimeSubscribeInput {
+  /** Include the durable request id when checking whether a restored request is pending. */
+  readonly includePendingConnectionRequest?: boolean;
 }
 
 export interface AgentChatRuntimeResumeInput extends AgentChatRuntimeSubscribeInput {
@@ -839,7 +880,9 @@ export interface AgentChatRuntime<
    * that provides it owns run outcome: a closed `subscribe` stream is then only
    * a connection fact. Rejects when the record cannot be read.
    */
-  readRunState?(input: AgentChatRuntimeSubscribeInput): Promise<ServerRunState>;
+  readRunState?(
+    input: AgentChatRuntimeReadRunStateInput,
+  ): Promise<ServerRunState>;
   cancel?(
     input: AgentChatRuntimeCancelInput,
   ): Promise<AgentChatRuntimeCancelResult>;
@@ -876,7 +919,25 @@ export interface CreateHttpAgentChatRuntimeOptions<
     session: AgentChatRuntimeSessionSummary;
     turn: AgentChatRuntimeTurnInput;
     turnId: AgentChatRuntimeTurnId;
+    requestTurnId: AgentChatRuntimeTurnId;
   }) => unknown;
+  /** The turn id a turn's request carries; the runtime's own id by default. */
+  readonly requestTurnId?: (input: {
+    turn: AgentChatRuntimeTurnInput;
+    turnId: AgentChatRuntimeTurnId;
+  }) => AgentChatRuntimeTurnId;
+  /**
+   * Told once the endpoint accepts a turn, before its events are read. It is
+   * not awaited and anything it throws is ignored.
+   */
+  readonly onTurnAccepted?: (input: {
+    session: AgentChatRuntimeSessionSummary;
+    turn: AgentChatRuntimeTurnInput;
+    turnId: AgentChatRuntimeTurnId;
+    /** The turn the server stored the run under, as on the returned turn. */
+    requestTurnId: AgentChatRuntimeTurnId;
+    runId: string;
+  }) => void;
   /** Called at the final client boundary before a new turn reaches the endpoint. */
   readonly beforeStartTurn?: (input: {
     session: AgentChatRuntimeSessionSummary;
@@ -1248,6 +1309,9 @@ function defaultHttpRuntimeRequest(input: {
     prompt: input.turn.prompt,
     messages: input.turn.messages,
     attachments: input.turn.attachments,
+    submissionPayload: input.turn.submissionPayload,
+    options: input.turn.options,
+    references: input.turn.references,
     tools: input.turn.tools,
     model: input.turn.model,
     reasoningEffort: input.turn.reasoningEffort,
@@ -1329,6 +1393,12 @@ async function readHttpRuntimeError(response: Response): Promise<Error> {
       : payload && "activeRunId" in payload
         ? payload.activeRunId
         : nestedError?.activeRunId;
+  const submittedRunId =
+    data && "submittedRunId" in data
+      ? data.submittedRunId
+      : payload && "submittedRunId" in payload
+        ? payload.submittedRunId
+        : nestedError?.submittedRunId;
   const hasActiveRunId =
     (data !== null && "activeRunId" in data) ||
     (payload !== undefined && "activeRunId" in payload) ||
@@ -1339,7 +1409,12 @@ async function readHttpRuntimeError(response: Response): Promise<Error> {
   const runSlotBusy =
     status === 409 &&
     (explicitCode === "run_slot_busy" ||
-      (explicitCode === undefined && activeRunIdValue));
+      (explicitCode === "queued_message_already_submitted" &&
+        typeof submittedRunId === "string" &&
+        submittedRunId.length > 0) ||
+      (explicitCode === undefined &&
+        (activeRunIdValue ||
+          (typeof submittedRunId === "string" && submittedRunId.length > 0))));
   const errorCode =
     explicitCode ?? (runSlotBusy ? "run_slot_busy" : fallbackCode);
   const error = runSlotBusy
@@ -1347,11 +1422,17 @@ async function readHttpRuntimeError(response: Response): Promise<Error> {
         activeRunIdValue && typeof activeRunId === "string"
           ? activeRunId
           : undefined,
+        typeof submittedRunId === "string" && submittedRunId.length > 0
+          ? submittedRunId
+          : undefined,
       )
     : new Error(runtimeErrorMessage(text, response.status));
   Object.assign(error, {
     code: runSlotBusy ? "run_slot_busy" : errorCode,
     ...(hasActiveRunId ? { activeRunId } : {}),
+    ...(typeof submittedRunId === "string" && submittedRunId.length > 0
+      ? { submittedRunId }
+      : {}),
     ...(data?.details === undefined &&
     payload?.details === undefined &&
     nestedError?.details === undefined
@@ -1370,12 +1451,17 @@ async function readHttpRuntimeError(response: Response): Promise<Error> {
 }
 
 /**
- * A turn that failed to start keeps its id: the server records a turn it
- * refused under that id, and the client reports the failure with it.
+ * A turn that failed to start keeps its ids: the server records a turn it
+ * refused under the request's turn id, and the client reports the failure
+ * with both.
  */
-function withTurnId(error: unknown, turnId: string): unknown {
+function withTurnId(
+  error: unknown,
+  turnId: string,
+  requestTurnId: string,
+): unknown {
   if (error !== null && typeof error === "object" && !("turnId" in error)) {
-    Object.assign(error, { turnId });
+    Object.assign(error, { turnId, requestTurnId });
   }
   return error;
 }
@@ -1436,6 +1522,7 @@ export function createHttpAgentChatRuntime<
       turn: AgentChatRuntimeTurnInput,
     ): Promise<AgentChatRuntimeTurn<TEvent>> => {
       const turnId = turn.queuePromotion?.turnId ?? createRuntimeId("turn");
+      const requestTurnId = options.requestTurnId?.({ turn, turnId }) ?? turnId;
       const { controller, cleanup } = createAbortController(turn.abortSignal);
       latestTurn = turn;
       previousTurns.set(turnId, turn);
@@ -1458,8 +1545,17 @@ export function createHttpAgentChatRuntime<
           credentials: options.credentials,
           body: JSON.stringify(
             options.mapRequest
-              ? options.mapRequest({ session: summary, turn, turnId })
-              : defaultHttpRuntimeRequest({ session: summary, turn, turnId }),
+              ? options.mapRequest({
+                  session: summary,
+                  turn,
+                  turnId,
+                  requestTurnId,
+                })
+              : defaultHttpRuntimeRequest({
+                  session: summary,
+                  turn,
+                  turnId: requestTurnId,
+                }),
           ),
           signal: controller.signal,
         });
@@ -1468,7 +1564,7 @@ export function createHttpAgentChatRuntime<
         if (!isRetryableRuntimeFailure(error)) {
           forgetTurnContext(turnId, turn);
         }
-        throw withTurnId(error, turnId);
+        throw withTurnId(error, turnId, requestTurnId);
       }
       if (!response.ok) {
         cleanup();
@@ -1476,10 +1572,87 @@ export function createHttpAgentChatRuntime<
         if (!isRetryableRuntimeFailure(error)) {
           forgetTurnContext(turnId, turn);
         }
-        throw withTurnId(error, turnId);
+        throw withTurnId(error, turnId, requestTurnId);
+      }
+
+      if (response.status === 202) {
+        let queuedSubmission: AgentQueuedSubmissionReceipt;
+        try {
+          if (
+            !response.headers
+              .get("Content-Type")
+              ?.toLowerCase()
+              .includes("application/json")
+          ) {
+            throw new TypeError("Expected a JSON queued submission receipt.");
+          }
+          queuedSubmission = parseAgentQueuedSubmissionReceipt(
+            await response.json(),
+          );
+          const submission = asRecord(turn.submissionPayload);
+          const expectedThreadId = summary.threadId ?? sessionId;
+          if (
+            queuedSubmission.message.threadId !== expectedThreadId ||
+            (typeof submission?.id === "string" &&
+              queuedSubmission.message.id !== submission.id)
+          ) {
+            throw new TypeError(
+              "The queued submission receipt does not match this session turn.",
+            );
+          }
+        } catch (cause) {
+          cleanup();
+          throw withTurnId(
+            Object.assign(
+              new Error(
+                cause instanceof Error
+                  ? `Invalid queued submission response: ${cause.message}`
+                  : "Invalid queued submission response.",
+                { cause },
+              ),
+              {
+                code: "invalid_queued_submission_response",
+                status: response.status,
+                retryable: true,
+              },
+            ),
+            turnId,
+            requestTurnId,
+          );
+        }
+        cleanup();
+        forgetTurnContext(turnId, turn);
+        return {
+          id: turnId,
+          sessionId,
+          queuedSubmission,
+          events: (async function* () {})(),
+        };
       }
 
       const runId = response.headers.get("X-Run-Id") ?? undefined;
+      const replay = response.headers.get("X-Dispatch-Mode") === "replay";
+      // The server can store the run under another turn than the one asked
+      // for: an approval resume runs under its pending approval's turn. A
+      // replay streams a run an earlier request started, so without the
+      // server's turn its turn is unknown, not this request's.
+      const storedTurnId = response.headers.get("X-Turn-Id") || undefined;
+      const runTurnId = storedTurnId ?? (replay ? undefined : requestTurnId);
+      try {
+        // A replay streams a turn the server already finished, and a stream
+        // with no run id is a refusal (no model connected), not new work.
+        if (runId && !replay) {
+          options.onTurnAccepted?.({
+            session: summary,
+            turn,
+            turnId,
+            requestTurnId: storedTurnId ?? requestTurnId,
+            runId,
+          });
+        }
+      } catch {
+        // coercion-ok: an observer of a started turn must not stop it.
+      }
       const events = (async function* () {
         let retryableFailure = false;
         try {
@@ -1507,14 +1680,20 @@ export function createHttpAgentChatRuntime<
           cleanup();
         }
       })();
+      const closeEvents = () => {
+        controller.abort();
+        cleanup();
+      };
 
       return {
         id: turnId,
+        requestTurnId: runTurnId,
         sessionId,
         runId,
         events,
+        closeEvents,
         cancel: async (cancelInput) => {
-          controller.abort();
+          closeEvents();
           if (!options.cancelEndpoint) return { status: "cancelled" };
           const endpoint =
             typeof options.cancelEndpoint === "function"
@@ -1841,6 +2020,19 @@ function isUnstartedNativeHistoryMessage(
   return custom?.[RUN_NOT_STARTED_METADATA_KEY] === true;
 }
 
+function isOmittedFromPersistedHistory(
+  message: AgentChatRuntimeMessage,
+): boolean {
+  if (message.role !== "assistant") return false;
+  const custom = asRecord(asRecord(message.metadata)?.custom);
+  return (
+    custom?.omitFromPersistedHistory === true ||
+    message.content.some(
+      (part) => asRecord(part)?.omitFromPersistedHistory === true,
+    )
+  );
+}
+
 function nativeHistorySourceMessages(
   messages: readonly AgentChatRuntimeMessage[] | undefined,
   currentPrompt: string,
@@ -1861,8 +2053,9 @@ function nativeHistorySourceMessages(
   }
   return source.filter(
     (message, index) =>
-      index === currentPromptMessageIndex ||
-      !isUnstartedNativeHistoryMessage(message),
+      !isOmittedFromPersistedHistory(message) &&
+      (index === currentPromptMessageIndex ||
+        !isUnstartedNativeHistoryMessage(message)),
   );
 }
 
@@ -1970,6 +2163,7 @@ export function loadedSkillSlugsFromMessages(
   const slugByCallId = new Map<string, string>();
   const loaded: string[] = [];
   for (const message of messages ?? []) {
+    if (isOmittedFromPersistedHistory(message)) continue;
     for (const part of message.content) {
       if (part.type === "tool-call" && part.toolName === "docs-search") {
         const slug = (part.input as { slug?: unknown } | undefined)?.slug;
@@ -3571,8 +3765,13 @@ interface AgentNativeMessageProjectionState {
     content: AgentNativeMessageContentState[];
     started: boolean;
     approvalPending: boolean;
-    pendingApprovalToolCallId?: string;
+    pendingApprovalToolCallId?: string | undefined;
     connectionPending: boolean;
+    omitFromPersistedHistory?: boolean;
+    /** Delegated calls that streamed an activity row, which reports their end. */
+    activityParticipants?: Set<string>;
+    /** Ids given to tool input that streamed without one, by tool name. */
+    pendingToolInputIds?: Map<string, string>;
   };
 }
 
@@ -3682,6 +3881,10 @@ function pendingApprovalRuntimeMessages(
         {
           type: "tool-result",
           toolCallId: part.toolCallId,
+          ...(part.omitFromPersistedHistory === true ||
+          state.message.omitFromPersistedHistory === true
+            ? { omitFromPersistedHistory: true }
+            : {}),
           ...(part.approval?.askId
             ? { approvalAskId: part.approval.askId }
             : {}),
@@ -3703,6 +3906,10 @@ function pendingApprovalRuntimeMessages(
           toolName: part.toolName,
           input: part.args,
           approval: part.approval,
+          ...(part.omitFromPersistedHistory === true ||
+          state.message.omitFromPersistedHistory === true
+            ? { omitFromPersistedHistory: true }
+            : {}),
           ...(isApprovedPendingCall ? { approvedReplay: true } : {}),
         },
       ],
@@ -3862,6 +4069,74 @@ function agentNativeActivityStatus(
   return "running";
 }
 
+function steeredUserMessageEvent(raw: unknown):
+  | {
+      seq?: number;
+      continuationMessageId: string;
+      message: { id: string; text: string; createdAt?: string };
+      attachments: AgentChatRuntimeFilePart[];
+    }
+  | undefined {
+  const event = asRecord(raw);
+  if (event?.type !== "user_message") return undefined;
+  const message = asRecord(event.message);
+  if (
+    typeof event.continuationMessageId !== "string" ||
+    !event.continuationMessageId ||
+    typeof message?.id !== "string" ||
+    !message.id ||
+    typeof message.text !== "string"
+  ) {
+    throw new TypeError(
+      "Agent chat user_message event requires a message and a continuation id.",
+    );
+  }
+  const attachments = Array.isArray(message.attachments)
+    ? message.attachments.flatMap((value): AgentChatRuntimeFilePart[] => {
+        const attachment = asRecord(value);
+        if (typeof attachment?.url !== "string") return [];
+        const mediaType =
+          typeof attachment.mediaType === "string"
+            ? attachment.mediaType
+            : typeof attachment.contentType === "string"
+              ? attachment.contentType
+              : undefined;
+        return [
+          {
+            type: "file",
+            url: attachment.url,
+            ...(mediaType ? { mediaType } : {}),
+            ...(typeof attachment.name === "string"
+              ? { filename: attachment.name }
+              : {}),
+          },
+        ];
+      })
+    : [];
+  return {
+    ...(typeof event.seq === "number" ? { seq: event.seq } : {}),
+    continuationMessageId: event.continuationMessageId,
+    message: {
+      id: message.id,
+      text: message.text,
+      ...(typeof message.createdAt === "string"
+        ? { createdAt: message.createdAt }
+        : {}),
+    },
+    attachments,
+  };
+}
+
+function pendingToolInputId(
+  message: { pendingToolInputIds?: Map<string, string> },
+  tool: string,
+): string {
+  const pending = (message.pendingToolInputIds ??= new Map<string, string>());
+  const id = pending.get(tool) ?? createRuntimeId("tool");
+  pending.set(tool, id);
+  return id;
+}
+
 function mapAgentNativeEvent(
   raw: unknown,
   input: {
@@ -3872,8 +4147,11 @@ function mapAgentNativeEvent(
       content: AgentNativeMessageContentState[];
       started: boolean;
       approvalPending: boolean;
-      pendingApprovalToolCallId?: string;
+      pendingApprovalToolCallId?: string | undefined;
       connectionPending: boolean;
+      omitFromPersistedHistory?: boolean;
+      activityParticipants?: Set<string>;
+      pendingToolInputIds?: Map<string, string>;
     };
   },
 ): AgentChatRuntimeKnownEvent[] {
@@ -3885,10 +4163,47 @@ function mapAgentNativeEvent(
   > = {
     sessionId: input.sessionId,
     turnId: input.turnId,
-    ...(ev.seq !== undefined ? { metadata: { seq: ev.seq } } : {}),
+    ...(ev.seq !== undefined || input.message.omitFromPersistedHistory
+      ? {
+          metadata: {
+            ...(ev.seq !== undefined ? { seq: ev.seq } : {}),
+            ...(input.message.omitFromPersistedHistory
+              ? { omitFromPersistedHistory: true }
+              : {}),
+          },
+        }
+      : {}),
   };
   if (ev.type === "auto_continue") {
     return [{ type: "continuation", ...base }];
+  }
+  // Skipping this leaves the saved reply as a suffix of the live one, and
+  // reload renders it as a second reply.
+  if (ev.type === "clear") {
+    clearAssistantDraftContent(input.message.content, ev.allText === true);
+    if (!input.message.started) return [];
+    const content: AgentChatRuntimeKnownContentPart[] = input.message.content
+      .filter(
+        (
+          part,
+        ): part is Exclude<
+          AgentNativeMessageContentState,
+          { type: "tool-call" }
+        > => part.type === "text" || part.type === "reasoning",
+      )
+      .map((part) => ({ ...part }));
+    // Text the retry writes after a kept tool call is a new paragraph. The
+    // replacement carries no tool calls, so an empty part marks that break.
+    if (input.message.content.at(-1)?.type === "tool-call") {
+      content.push({ type: "text", text: "" });
+    }
+    return [
+      {
+        type: "message-replace",
+        ...base,
+        message: { id: input.messageId, role: "assistant", content },
+      },
+    ];
   }
   if (ev.type === "text" || ev.type === "thinking" || ev.type === "reasoning") {
     const text = ev.text ?? "";
@@ -3925,11 +4240,17 @@ function mapAgentNativeEvent(
           ? {
               type: "reasoning",
               text: "",
+              ...(input.message.omitFromPersistedHistory
+                ? { omitFromPersistedHistory: true }
+                : {}),
               ...(partId ? { id: partId } : {}),
             }
           : {
               type: "text",
               text: "",
+              ...(input.message.omitFromPersistedHistory
+                ? { omitFromPersistedHistory: true }
+                : {}),
               ...(partId ? { id: partId } : {}),
             };
       input.message.content.push(nextPart);
@@ -3937,6 +4258,9 @@ function mapAgentNativeEvent(
     }
     if (part.type === "text" || part.type === "reasoning") {
       part.text += text;
+      if (input.message.omitFromPersistedHistory) {
+        part.omitFromPersistedHistory = true;
+      }
     }
     if (part.type === "reasoning" && extended.signature) {
       part.signature = extended.signature;
@@ -3999,8 +4323,32 @@ function mapAgentNativeEvent(
       },
     ];
   }
+  if (ev.type === "tool_input_delta") {
+    // Arguments stream long before the tool runs; generation previews render
+    // them as they arrive, so dropping these leaves a preview with nothing.
+    if (!ev.text) return [];
+    // An engine may stream input without a call id. Give that call one id
+    // for all its deltas and the tool_start that follows, so the preview and
+    // the finished tool are the same call.
+    const toolCallId =
+      ev.id || pendingToolInputId(input.message, ev.tool ?? "");
+    return [
+      {
+        type: "tool-delta",
+        ...base,
+        toolCallId,
+        ...(ev.tool ? { toolName: ev.tool } : {}),
+        inputTextDelta: ev.text,
+      },
+    ];
+  }
   if (ev.type === "tool_start") {
-    const toolCallId = ev.id ?? createRuntimeId("tool");
+    const pendingInputIds = input.message.pendingToolInputIds;
+    const pendingInputId =
+      pendingInputIds?.get(ev.tool ?? "") ?? pendingInputIds?.get("");
+    pendingInputIds?.delete(ev.tool ?? "");
+    pendingInputIds?.delete("");
+    const toolCallId = ev.id ?? pendingInputId ?? createRuntimeId("tool");
     const toolName = ev.tool ?? "unknown";
     const structuredMeta = agentNativeStructuredMeta(ev);
     const toolCall = input.message.content.find(
@@ -4018,6 +4366,9 @@ function mapAgentNativeEvent(
       }
       toolCall.args = ev.input ?? {};
       toolCall.argsText = JSON.stringify(toolCall.args);
+      if (input.message.omitFromPersistedHistory) {
+        toolCall.omitFromPersistedHistory = true;
+      }
       if (structuredMeta) toolCall.structuredMeta = structuredMeta;
       delete toolCall.approvalPauseCandidate;
     } else {
@@ -4027,6 +4378,9 @@ function mapAgentNativeEvent(
         toolName,
         argsText: JSON.stringify(ev.input ?? {}),
         args: ev.input ?? {},
+        ...(input.message.omitFromPersistedHistory
+          ? { omitFromPersistedHistory: true }
+          : {}),
         ...(structuredMeta ? { structuredMeta } : {}),
       });
     }
@@ -4067,6 +4421,9 @@ function mapAgentNativeEvent(
       (storedToolCall?.type === "tool-call" ? storedToolCall.toolCallId : "");
     const structuredMeta = agentNativeStructuredMeta(ev);
     if (storedToolCall?.type === "tool-call") {
+      if (input.message.omitFromPersistedHistory) {
+        storedToolCall.omitFromPersistedHistory = true;
+      }
       const resultText = agentNativeToolResultText(ev.result);
       storedToolCall.result = resultText;
       const legacyApprovalPause =
@@ -4208,6 +4565,7 @@ function mapAgentNativeEvent(
         ...(ev.allowPersistentApproval === false
           ? { allowPersistentApproval: false }
           : {}),
+        ...(ev.askId ? { askId: ev.askId } : {}),
       },
     ];
   }
@@ -4255,6 +4613,11 @@ function mapAgentNativeEvent(
           : ev.status === "done"
             ? "completed"
             : "failed";
+    // A call that streamed an activity row already shows "Finished" there;
+    // a second "finished" row would repeat it.
+    const reportedByActivity =
+      interactionKind === "completed" &&
+      input.message.activityParticipants?.has(participantId) === true;
     const events: AgentChatRuntimeKnownEvent[] = [
       {
         type: "participant",
@@ -4262,7 +4625,9 @@ function mapAgentNativeEvent(
         operation: ev.status === "start" ? "register" : "update",
         participant,
       },
-      {
+    ];
+    if (!reportedByActivity) {
+      events.push({
         type: "interaction",
         ...base,
         interaction: {
@@ -4279,8 +4644,8 @@ function mapAgentNativeEvent(
                 : undefined,
           }),
         },
-      },
-    ];
+      });
+    }
     if (ev.taskId) {
       events.push({
         type: "task",
@@ -4360,6 +4725,7 @@ function mapAgentNativeEvent(
   if (ev.type === "agent_call_activity" && ev.snapshot) {
     const agent = ev.agent ?? "agent";
     const participantId = agentNativeParticipantId(ev);
+    (input.message.activityParticipants ??= new Set()).add(participantId);
     const status = agentNativeActivityStatus(ev.snapshot);
     return [
       {
@@ -4369,8 +4735,15 @@ function mapAgentNativeEvent(
         activity: {
           id: `${participantId}:activity`,
           kind: "agent",
-          label: AGENT_CALL_ACTIVITY_LABEL,
-          detail: ev.snapshot.activePhase,
+          // "processing" renders as "Working"; a finished run must not keep
+          // saying so.
+          label:
+            status === "running"
+              ? AGENT_CALL_ACTIVITY_LABEL
+              : status === "failed"
+                ? "failed"
+                : "finished",
+          detail: summarizeDelegatedActivity(ev.snapshot),
           status,
           participantId,
           scope: "external",
@@ -4479,6 +4852,9 @@ function mapAgentNativeEvent(
               > => part.type === "text" || part.type === "reasoning",
             )
             .map((part) => ({ ...part })),
+          ...(input.message.omitFromPersistedHistory
+            ? { metadata: { custom: { omitFromPersistedHistory: true } } }
+            : {}),
         },
       });
     }
@@ -4520,6 +4896,9 @@ function mapAgentNativeEvent(
               > => part.type === "text" || part.type === "reasoning",
             )
             .map((part) => ({ ...part })),
+          ...(input.message.omitFromPersistedHistory
+            ? { metadata: { custom: { omitFromPersistedHistory: true } } }
+            : {}),
         },
       });
     }
@@ -4553,6 +4932,9 @@ function mapAgentNativeEvent(
       id: input.messageId,
       role: "assistant",
       content: messageContent.map((part) => ({ ...part })),
+      ...(input.message.omitFromPersistedHistory
+        ? { metadata: { custom: { omitFromPersistedHistory: true } } }
+        : {}),
     };
     if (
       !userStoppedRun &&
@@ -4617,13 +4999,16 @@ function mapAgentNativeEvent(
           > => part.type === "text" || part.type === "reasoning",
         )
         .map((part) => ({ ...part })),
-      ...(warning
+      ...(warning || input.message.omitFromPersistedHistory
         ? {
             metadata: {
               ...message.metadata,
               custom: {
                 ...asRecord(message.metadata?.custom),
-                runWarning: warning,
+                ...(input.message.omitFromPersistedHistory
+                  ? { omitFromPersistedHistory: true }
+                  : {}),
+                ...(warning ? { runWarning: warning } : {}),
               },
             },
           }
@@ -4688,6 +5073,46 @@ function metadataStringList(
   return strings.length > 0 ? strings : undefined;
 }
 
+/** The turn a continuation continues; a queued turn keeps its queue id. */
+function agentNativeRequestTurnId(input: {
+  turn: AgentChatRuntimeTurnInput;
+  turnId: AgentChatRuntimeTurnId;
+}): AgentChatRuntimeTurnId {
+  return (
+    metadataString(
+      input.turn.metadata,
+      AGENT_NATIVE_CONTINUATION_TURN_ID_METADATA_KEY,
+    ) ??
+    input.turn.queuePromotion?.turnId ??
+    input.turnId
+  );
+}
+
+function agentNativeTurnInitiator(
+  metadata: AgentChatRuntimeMetadata | undefined,
+): TurnInitiator {
+  const custom = asRecord(metadata?.custom);
+  const startedByChat =
+    metadata?.[AGENT_NATIVE_INTERNAL_CONTINUATION_METADATA_KEY] === true ||
+    metadata?.trackInRunsTray === true ||
+    metadata?.hideUserMessage === true ||
+    [
+      AGENT_NATIVE_CONTINUATION_TURN_ID_METADATA_KEY,
+      AGENT_NATIVE_APPROVED_TOOL_CALLS_METADATA_KEY,
+      "approvedToolCalls",
+      AUTO_CONTINUE_OF_RUN_METADATA_KEY,
+      CONTINUE_OF_RUN_METADATA_KEY,
+    ].some((key) => metadata?.[key] !== undefined) ||
+    custom?.agentNativeRecoveryAction !== undefined ||
+    custom?.agentNativeResumeAfterSetup === true;
+  if (startedByChat) return "system";
+  // A send deferred while the thread restored is still the sender's own.
+  const fromApp =
+    metadataString(metadata, "submitMessageId") !== undefined ||
+    custom?.agentNativeDeferredFromApp === true;
+  return fromApp ? "app" : "user";
+}
+
 function terminalRuntimeTurn(input: {
   sessionId: AgentChatRuntimeSessionId;
   turnId?: AgentChatRuntimeTurnId;
@@ -4702,8 +5127,17 @@ function terminalRuntimeTurn(input: {
   };
 }
 
+/**
+ * Where the runtime reports telemetry. It is injected rather than imported so
+ * the runtime stays loadable without the browser analytics module.
+ */
+export interface AgentNativeChatRuntimeTelemetry {
+  readonly onTurnSubmitted?: (report: TurnSubmittedReport) => void;
+}
+
 export function createAgentNativeChatRuntime(
   options: CreateAgentNativeChatRuntimeOptions = {},
+  telemetry: AgentNativeChatRuntimeTelemetry = {},
 ): AgentChatRuntime<AgentChatRuntimeKnownEvent> {
   const apiUrl = options.apiUrl ?? agentNativePath("/_agent-native/agent-chat");
   const runtimeId = options.id ?? "agent-native";
@@ -4791,6 +5225,37 @@ export function createAgentNativeChatRuntime(
       options.description ?? "Agent-Native's built-in chat transport.",
     endpoint: apiUrl,
     fetch: runtimeFetch,
+    requestTurnId: agentNativeRequestTurnId,
+    onTurnAccepted: ({ session, turn, requestTurnId, runId }) => {
+      const metadata = turn.metadata;
+      const custom = asRecord(metadata?.custom) ?? undefined;
+      const initiator = agentNativeTurnInitiator(metadata);
+      const requestMode =
+        metadataString(metadata, "requestMode") ??
+        metadataString(metadata, "mode") ??
+        options.mode;
+      const promptForMetadata = acceptedPromptForMetadata({
+        initiator,
+        ...(turn.prompt !== undefined ? { prompt: turn.prompt } : {}),
+        ...(turn.messages ? { messages: turn.messages } : {}),
+      });
+      telemetry.onTurnSubmitted?.({
+        turnId: requestTurnId,
+        threadId: session.threadId ?? options.threadId,
+        runId,
+        surface:
+          metadataString(metadata, "agentNativeSurface") ??
+          DEFAULT_TURN_SURFACE,
+        initiator,
+        submitMessageId: metadataString(metadata, "submitMessageId"),
+        recoveryOfRunId:
+          metadataString(custom, "agentNativeRecoveryOfRunId") ??
+          metadataString(metadata, CONTINUE_OF_RUN_METADATA_KEY) ??
+          metadataString(metadata, AUTO_CONTINUE_OF_RUN_METADATA_KEY),
+        requestMode,
+        ...(promptForMetadata ? { promptForMetadata } : {}),
+      });
+    },
     beforeStartTurn: async ({ session, turn, turnId }) => {
       const metadata = turn.metadata;
       const isAdmittedContinuation =
@@ -4851,7 +5316,7 @@ export function createAgentNativeChatRuntime(
         connectionRequests: true,
       },
     },
-    mapRequest: ({ session, turn, turnId }) => {
+    mapRequest: ({ session, turn, turnId, requestTurnId }) => {
       const latestUserMessage = [...(turn.messages ?? [])]
         .reverse()
         .find((message) => message.role === "user");
@@ -4947,8 +5412,13 @@ export function createAgentNativeChatRuntime(
         history,
         ...(structuredHistory?.length ? { structuredHistory } : {}),
         ...(loadedSkillSlugs.length ? { loadedSkillSlugs } : {}),
-        turnId: continuationTurnId ?? turn.queuePromotion?.turnId ?? turnId,
+        turnId: requestTurnId,
         threadId: session.threadId ?? options.threadId,
+        ...(turn.submissionPayload !== undefined
+          ? { submissionPayload: turn.submissionPayload }
+          : {}),
+        ...(turn.references?.length ? { references: turn.references } : {}),
+        ...(turn.options ? { options: turn.options } : {}),
         ...(turn.queuePromotion
           ? {
               queuedMessageId: turn.queuePromotion.messageId,
@@ -5002,6 +5472,68 @@ export function createAgentNativeChatRuntime(
         };
         messageStates.set(stateKey, state);
       }
+      const steered = steeredUserMessageEvent(event);
+      if (steered) {
+        const base = {
+          sessionId: context.sessionId,
+          ...(context.turnId === undefined ? {} : { turnId: context.turnId }),
+          ...(steered.seq !== undefined
+            ? { metadata: { seq: steered.seq } }
+            : {}),
+        };
+        const userMessage: AgentChatRuntimeMessage = {
+          id: steered.message.id,
+          role: "user",
+          content: [
+            { type: "text", text: steered.message.text },
+            ...steered.attachments,
+          ],
+          ...(steered.message.createdAt === undefined
+            ? {}
+            : { createdAt: steered.message.createdAt }),
+          status: "complete",
+        };
+        const mappedSteer: AgentChatRuntimeKnownEvent[] = [
+          ...(state.message.started
+            ? [
+                {
+                  type: "message-done" as const,
+                  ...base,
+                  message: {
+                    id: state.messageId,
+                    role: "assistant" as const,
+                    content: [],
+                    ...(state.message.omitFromPersistedHistory
+                      ? {
+                          metadata: {
+                            custom: { omitFromPersistedHistory: true },
+                          },
+                        }
+                      : {}),
+                    status: "complete" as const,
+                  },
+                },
+              ]
+            : []),
+          { type: "message-start", ...base, message: userMessage },
+          { type: "message-done", ...base, message: userMessage },
+        ];
+        // The run's output after the delivered message is a new reply, under
+        // the id the server saves it with.
+        state.messageId = steered.continuationMessageId;
+        state.message.content = [];
+        state.message.started = false;
+        state.message.omitFromPersistedHistory = false;
+        return mappedSteer;
+      }
+      if (
+        event &&
+        typeof event === "object" &&
+        (event as { omitFromPersistedHistory?: unknown })
+          .omitFromPersistedHistory === true
+      ) {
+        state.message.omitFromPersistedHistory = true;
+      }
       const mapped = mapAgentNativeEvent(event, {
         sessionId: context.sessionId,
         turnId: context.turnId,
@@ -5029,6 +5561,11 @@ export function createAgentNativeChatRuntime(
         ...previousMetadata
       } = previousTurn?.metadata ?? {};
       const continuationMetadata = { ...continuation.metadata };
+      const continuationTurnId =
+        metadataString(
+          previousTurn?.metadata,
+          AGENT_NATIVE_CONTINUATION_TURN_ID_METADATA_KEY,
+        ) ?? continuation.turnId;
       delete continuationMetadata[
         AGENT_NATIVE_APPROVED_TOOL_CALLS_METADATA_KEY
       ];
@@ -5038,6 +5575,8 @@ export function createAgentNativeChatRuntime(
       const turnToContinue = continuation.attachments?.length
         ? { ...previousTurn, attachments: continuation.attachments }
         : previousTurn;
+      const { submissionPayload: _submissionPayload, ...continuationTurn } =
+        turnToContinue ?? {};
       const approval = continuation.approval;
       const connection = continuation.connection;
       const messageStateKey = continuation.turnId ?? session.id;
@@ -5053,7 +5592,7 @@ export function createAgentNativeChatRuntime(
         const messageState = messageStates.get(messageStateKey);
         if (messageState) messageState.message.connectionPending = false;
         return startTurn({
-          ...turnToContinue,
+          ...continuationTurn,
           prompt:
             continuation.prompt ??
             `The ${connection.id} connection is now available. Continue the requested work.`,
@@ -5061,7 +5600,7 @@ export function createAgentNativeChatRuntime(
             ...previousMetadata,
             ...continuationMetadata,
             [AGENT_NATIVE_CONTINUATION_TURN_ID_METADATA_KEY]:
-              continuation.turnId,
+              continuationTurnId,
             [AGENT_NATIVE_INTERNAL_CONTINUATION_METADATA_KEY]: true,
           },
           abortSignal: continuation.abortSignal,
@@ -5076,25 +5615,59 @@ export function createAgentNativeChatRuntime(
         const messageState = messageStates.get(messageStateKey);
         if (messageState) messageState.message.approvalPending = false;
         return startTurn({
-          ...turnToContinue,
+          ...continuationTurn,
           prompt: continuation.prompt,
           metadata: {
             ...previousMetadata,
             ...continuationMetadata,
             [AGENT_NATIVE_CONTINUATION_TURN_ID_METADATA_KEY]:
-              continuation.turnId,
+              continuationTurnId,
             [AGENT_NATIVE_INTERNAL_CONTINUATION_METADATA_KEY]: true,
           },
           abortSignal: continuation.abortSignal,
         });
       }
       if (!approval.approved) {
-        messageStates.delete(messageStateKey);
-        return terminalRuntimeTurn({
-          sessionId: session.id,
-          turnId: continuation.turnId,
-          reason: "complete",
-        });
+        return (async () => {
+          const threadId = session.threadId ?? options.threadId ?? session.id;
+          const headers = await resolveHeaders(options.headers, {
+            sessionId: session.id,
+            turnId: continuation.turnId,
+          });
+          if (!headers.has("Content-Type")) {
+            headers.set("Content-Type", "application/json");
+          }
+          const response = await fetchImpl(
+            `${apiUrl.replace(/\/+$/, "")}/threads/${encodeURIComponent(threadId)}/approval-resolution`,
+            {
+              method: "POST",
+              headers,
+              credentials: "same-origin",
+              body: JSON.stringify({
+                approvalId: approval.id,
+                decision: "deny",
+              }),
+            },
+          );
+          let denialResolved = response.ok;
+          if (!denialResolved && response.status === 409) {
+            try {
+              const body = asRecord(await response.clone().json());
+              denialResolved = body?.code === "approval_not_pending";
+            } catch {
+              // coercion-ok: Preserve the original HTTP failure when conflict details are unreadable.
+            }
+          }
+          if (!denialResolved) {
+            throw new Error(await readErrorText(response));
+          }
+          messageStates.delete(messageStateKey);
+          return terminalRuntimeTurn({
+            sessionId: session.id,
+            turnId: continuation.turnId,
+            reason: "complete",
+          });
+        })();
       }
       const messageState = messageStates.get(messageStateKey);
       const approvalParts = [
@@ -5131,10 +5704,10 @@ export function createAgentNativeChatRuntime(
       }
       if (messageState) messageState.message.approvalPending = false;
       return startTurn({
-        ...turnToContinue,
+        ...continuationTurn,
         prompt:
           continuation.prompt ??
-          "Approved. Go ahead and run the requested action.",
+          "The approved action has run. Do not repeat it; use its result in your reply.",
         metadata: {
           ...previousMetadata,
           ...continuationMetadata,
@@ -5146,7 +5719,7 @@ export function createAgentNativeChatRuntime(
                 ],
               }
             : {}),
-          [AGENT_NATIVE_CONTINUATION_TURN_ID_METADATA_KEY]: continuation.turnId,
+          [AGENT_NATIVE_CONTINUATION_TURN_ID_METADATA_KEY]: continuationTurnId,
           [AGENT_NATIVE_INTERNAL_CONTINUATION_METADATA_KEY]: true,
         },
         abortSignal: continuation.abortSignal,
@@ -5163,7 +5736,7 @@ export function createAgentNativeChatRuntime(
   });
 
   const readRunState = async (
-    input: AgentChatRuntimeSubscribeInput,
+    input: AgentChatRuntimeReadRunStateInput,
   ): Promise<ServerRunState> => {
     // Asking again cannot change these answers, so they are not retryable.
     const unreadable = (message: string, status?: number) =>
@@ -5181,6 +5754,9 @@ export function createAgentNativeChatRuntime(
     const query = new URLSearchParams({ threadId });
     if (input.runId) query.set("runId", input.runId);
     if (input.turnId) query.set("turnId", input.turnId);
+    if (input.includePendingConnectionRequest) {
+      query.set("includePendingConnectionRequest", "true");
+    }
     const headers = await resolveHeaders(options.headers, input);
     headers.set("x-agent-native-surface", options.surface ?? "app");
     const response = await runtimeFetch(
@@ -5192,7 +5768,14 @@ export function createAgentNativeChatRuntime(
         signal: input.abortSignal,
       },
     );
-    if (response.status === 404) return { status: "missing" };
+    if (response.status === 404) {
+      return {
+        status: "missing",
+        ...(input.includePendingConnectionRequest
+          ? { pendingConnectionRequestId: null }
+          : {}),
+      };
+    }
     if (!response.ok) throw await readHttpRuntimeError(response);
     let body: unknown;
     try {
@@ -5218,12 +5801,44 @@ export function createAgentNativeChatRuntime(
         response.status,
       );
     }
+    const pendingConnectionRequestId = value?.pendingConnectionRequestId;
+    const startMessageId = value?.startMessageId;
+    if (
+      input.includePendingConnectionRequest &&
+      (!value || !Object.hasOwn(value, "pendingConnectionRequestId"))
+    ) {
+      throw unreadable(
+        "Agent chat run state is unreadable (pending connection request was not returned).",
+        response.status,
+      );
+    }
+    if (
+      startMessageId !== undefined &&
+      (typeof startMessageId !== "string" || !startMessageId.trim())
+    ) {
+      throw unreadable(
+        "Agent chat run state is unreadable (start message ID is invalid).",
+        response.status,
+      );
+    }
+    if (
+      pendingConnectionRequestId !== undefined &&
+      pendingConnectionRequestId !== null &&
+      (typeof pendingConnectionRequestId !== "string" ||
+        !pendingConnectionRequestId.trim())
+    ) {
+      throw unreadable(
+        "Agent chat run state is unreadable (pending connection request ID is invalid).",
+        response.status,
+      );
+    }
     return {
       status,
       runId,
       ...(typeof value?.turnId === "string" && value.turnId
         ? { turnId: value.turnId }
         : {}),
+      ...(typeof startMessageId === "string" ? { startMessageId } : {}),
       ...(typeof value?.startedAt === "number" &&
       Number.isFinite(value.startedAt)
         ? { startedAt: value.startedAt }
@@ -5233,6 +5848,9 @@ export function createAgentNativeChatRuntime(
         : {}),
       terminalReason:
         typeof value?.terminalReason === "string" ? value.terminalReason : null,
+      ...(pendingConnectionRequestId === undefined
+        ? {}
+        : { pendingConnectionRequestId }),
     };
   };
 
@@ -5304,4 +5922,52 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+/**
+ * One line for a delegated agent's live work: the tool it is running (and on
+ * what), or the tail of what it is saying, so a remote coding agent's progress
+ * reads as progress instead of a bare phase name.
+ */
+function summarizeDelegatedActivity(snapshot: {
+  activePhase?: string;
+  toolCalls?: Array<{ name?: string; status?: string; input?: string }>;
+  reasoning?: string[];
+  responseText?: string;
+}): string | undefined {
+  const tools = snapshot.toolCalls ?? [];
+  const lastTool = tools[tools.length - 1];
+  const doneCount = tools.filter((tool) => tool.status !== "running").length;
+  const toolTarget = (input?: string) => {
+    if (!input) return "";
+    try {
+      const parsed = JSON.parse(input) as Record<string, unknown>;
+      const target =
+        parsed.file ??
+        parsed.file_path ??
+        parsed.filePath ??
+        parsed.path ??
+        parsed.command;
+      return typeof target === "string" ? ` ${target}` : "";
+    } catch {
+      // coercion-ok: tool input is free text when it is not JSON.
+      return "";
+    }
+  };
+  if (snapshot.activePhase === "complete") {
+    return tools.length
+      ? `Done · ${tools.length} step${tools.length === 1 ? "" : "s"}`
+      : "Done";
+  }
+  if (snapshot.activePhase === "tool" && lastTool?.name) {
+    return `${lastTool.name}${toolTarget(lastTool.input)} · ${doneCount}/${tools.length}`;
+  }
+  const text =
+    snapshot.responseText ??
+    snapshot.reasoning?.[snapshot.reasoning.length - 1];
+  if (text) {
+    const oneLine = text.replace(/\s+/g, " ").trim();
+    return oneLine.length > 90 ? `${oneLine.slice(0, 89)}…` : oneLine;
+  }
+  return snapshot.activePhase;
 }

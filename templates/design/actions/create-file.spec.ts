@@ -5,6 +5,8 @@ import { QueryClient } from "@tanstack/react-query";
 import { transformSync } from "esbuild";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { createHubSpotEmailHtml } from "../shared/hubspot-email.js";
+
 const mocks = vi.hoisted(() => {
   let existingRows: Array<Record<string, unknown>> = [];
   let restoreClaimRows: Array<Record<string, unknown>> = [];
@@ -26,11 +28,13 @@ const mocks = vi.hoisted(() => {
       filename: "designFiles.filename",
       fileType: "designFiles.fileType",
       content: "designFiles.content",
+      createdAt: "designFiles.createdAt",
     },
     designs: { id: "designs.id", data: "designs.data" },
     designScreenRestoreClaims: {
       id: "designScreenRestoreClaims.id",
       designId: "designScreenRestoreClaims.designId",
+      sourceFileId: "designScreenRestoreClaims.sourceFileId",
       snapshot: "designScreenRestoreClaims.snapshot",
       consumedAt: "designScreenRestoreClaims.consumedAt",
       restoredFileId: "designScreenRestoreClaims.restoredFileId",
@@ -149,7 +153,10 @@ const mocks = vi.hoisted(() => {
       existingRows = rows;
     },
     setRestoreClaimRows: (rows: Array<Record<string, unknown>>) => {
-      restoreClaimRows = rows;
+      restoreClaimRows = rows.map((row) => ({
+        sourceFileId: "source-file-1",
+        ...row,
+      }));
     },
     getRestoreClaimRows: () => restoreClaimRows,
     getDesignData: () => designData,
@@ -194,13 +201,22 @@ vi.mock("../server/lib/design-data-mutation.js", () => ({
   mutateDesignData: mocks.mutateDesignData,
 }));
 
+import { insertAtFileOrderIndex } from "../app/pages/design-editor/history";
 import { readDesignEditorSource } from "../app/pages/design-editor/read-design-editor-source";
 import { screenRestoreContentHashes } from "../server/lib/screen-restore-claims.js";
 import { ensureCodeLayerNodeIdsInHtml } from "../shared/code-layer.js";
 import { annotateScreenHtmlForPersist } from "../shared/screen-annotation.js";
 import action from "./create-file.js";
 
-function loadOptimisticCreatedFileInsertion(queryClient: QueryClient) {
+function loadOptimisticCreatedFileInsertion(
+  queryClient: QueryClient,
+  historyFilesRef: { current: Array<{ id: string; content: string }> } = {
+    current: [],
+  },
+  sourceLoader: {
+    prime: (id: string, file: { content: string; updatedAt: string }) => void;
+  } = { prime: () => {} },
+) {
   const source = readDesignEditorSource();
   const start = source.indexOf(
     "const optimisticallyInsertCreatedFile = useCallback(",
@@ -218,7 +234,10 @@ function loadOptimisticCreatedFileInsertion(queryClient: QueryClient) {
     "id",
     "queryClient",
     "annotateScreenHtmlForPersist",
+    "insertAtFileOrderIndex",
     "historyFilesRef",
+    "designMetadataQueryKey",
+    "sourceLoader",
     `${callback}\nreturn optimisticallyInsertCreatedFile;`,
   );
   return create(
@@ -226,7 +245,10 @@ function loadOptimisticCreatedFileInsertion(queryClient: QueryClient) {
     "design-1",
     queryClient,
     annotateScreenHtmlForPersist,
-    { current: [] },
+    insertAtFileOrderIndex,
+    historyFilesRef,
+    (id: string) => ["action", "get-design", { id, includeFileContent: false }],
+    sourceLoader,
   ) as (args: {
     fileId: string;
     filename: string;
@@ -406,6 +428,7 @@ describe("create-file: node-id annotation", () => {
         snapshot: JSON.stringify({
           filename: "restored.html",
           fileType: "html",
+          createdAt: "2026-07-08T00:00:00.000Z",
           contentHashes: screenRestoreContentHashes(
             annotateScreenHtmlForPersist(content, "html"),
             "html",
@@ -434,7 +457,9 @@ describe("create-file: node-id annotation", () => {
     expect(mocks.insertValues.mock.calls[0]![0]).toMatchObject({
       id: result.id,
       filename: "restored.html",
+      createdAt: "2026-07-08T00:00:00.000Z",
     });
+    expect(result.createdAt).toBe("2026-07-08T00:00:00.000Z");
 
     const inserted = {
       ...(mocks.insertValues.mock.calls[0]![0] as Record<string, unknown>),
@@ -493,9 +518,194 @@ describe("create-file: node-id annotation", () => {
         filename: "restored.html",
       }),
     );
+    expect(result.createdAt).toEqual(expect.any(String));
+    expect(Number.isFinite(Date.parse(result.createdAt!))).toBe(true);
     expect(mocks.getRestoreClaimRows()[0]?.restoredFileId).toBe(
       "restored-file-1",
     );
+  });
+
+  it("restores an ordinary Screen creation timestamp without connection metadata", async () => {
+    const content = "<html><body><main>Ordinary Screen</main></body></html>";
+    const createdAt = "2026-07-08T00:00:00.000Z";
+    mocks.setRestoreClaimRows([
+      {
+        id: "restore-claim-ordinary",
+        designId: "design-1",
+        snapshot: JSON.stringify({
+          filename: "ordinary.html",
+          fileType: "html",
+          createdAt,
+          contentHashes: screenRestoreContentHashes(
+            annotateScreenHtmlForPersist(content, "html"),
+            "html",
+          ),
+        }),
+        consumedAt: null,
+        restoredFileId: null,
+      },
+    ]);
+
+    const result = await action.run({
+      designId: "design-1",
+      filename: "ordinary.html",
+      content,
+      fileType: "html",
+      restoreClaimId: "restore-claim-ordinary",
+    });
+
+    expect(mocks.insertValues).toHaveBeenCalledWith(
+      expect.objectContaining({ createdAt }),
+    );
+    expect(result.createdAt).toBe(createdAt);
+  });
+
+  it("restores an ordinary Screen with its known null creation time", async () => {
+    const content = "<html><body><main>Ordinary Screen</main></body></html>";
+    mocks.setRestoreClaimRows([
+      {
+        id: "restore-claim-ordinary-null",
+        designId: "design-1",
+        snapshot: JSON.stringify({
+          filename: "ordinary-null.html",
+          fileType: "html",
+          createdAt: null,
+          contentHashes: screenRestoreContentHashes(
+            annotateScreenHtmlForPersist(content, "html"),
+            "html",
+          ),
+        }),
+        consumedAt: null,
+        restoredFileId: null,
+      },
+    ]);
+
+    const result = await action.run({
+      designId: "design-1",
+      filename: "ordinary-null.html",
+      content,
+      fileType: "html",
+      restoreClaimId: "restore-claim-ordinary-null",
+    });
+
+    expect(mocks.insertValues).toHaveBeenCalledWith(
+      expect.objectContaining({ createdAt: null }),
+    );
+    expect(result.createdAt).toBeNull();
+  });
+
+  it("restores a connected Screen with its known null creation time", async () => {
+    const content = "<html><body><main>Connected Screen</main></body></html>";
+    mocks.setRestoreClaimRows([
+      {
+        id: "restore-claim-connected-null",
+        designId: "design-1",
+        snapshot: JSON.stringify({
+          filename: "connected-null.html",
+          fileType: "html",
+          createdAt: null,
+          contentHashes: screenRestoreContentHashes(
+            annotateScreenHtmlForPersist(content, "html"),
+            "html",
+          ),
+          screenMetadata: { connectionId: "connection-1" },
+        }),
+        consumedAt: null,
+        restoredFileId: null,
+      },
+    ]);
+
+    const result = await action.run({
+      designId: "design-1",
+      filename: "connected-null.html",
+      content,
+      fileType: "html",
+      restoreClaimId: "restore-claim-connected-null",
+    });
+
+    expect(mocks.insertValues).toHaveBeenCalledWith(
+      expect.objectContaining({ createdAt: null }),
+    );
+    expect(result.createdAt).toBeNull();
+  });
+
+  it("preserves null on an idempotent restore of an existing Screen", async () => {
+    const content = "<html><body><main>Restored</main></body></html>";
+    mocks.setRestoreClaimRows([
+      {
+        id: "restore-claim-null-bound",
+        designId: "design-1",
+        snapshot: JSON.stringify({
+          filename: "restored-null.html",
+          fileType: "html",
+          createdAt: null,
+          contentHashes: screenRestoreContentHashes(
+            annotateScreenHtmlForPersist(content, "html"),
+            "html",
+          ),
+        }),
+        consumedAt: null,
+        restoredFileId: "restored-null-file",
+      },
+    ]);
+    mocks.setExistingRows([
+      {
+        id: "restored-null-file",
+        designId: "design-1",
+        filename: "restored-null.html",
+        fileType: "html",
+        content,
+        createdAt: null,
+      },
+    ]);
+
+    const result = await action.run({
+      designId: "design-1",
+      filename: "restored-null.html",
+      content,
+      fileType: "html",
+      restoreClaimId: "restore-claim-null-bound",
+    });
+
+    expect(result.id).toBe("restored-null-file");
+    expect(result.createdAt).toBeNull();
+    expect(mocks.insertValues).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid present timestamp even with connection metadata", async () => {
+    const content = "<html><body><main>Connected Screen</main></body></html>";
+    mocks.setRestoreClaimRows([
+      {
+        id: "restore-claim-invalid-date",
+        designId: "design-1",
+        snapshot: JSON.stringify({
+          filename: "invalid-date.html",
+          fileType: "html",
+          createdAt: "",
+          contentHashes: screenRestoreContentHashes(
+            annotateScreenHtmlForPersist(content, "html"),
+            "html",
+          ),
+          screenMetadata: { connectionId: "connection-1" },
+        }),
+        consumedAt: null,
+        restoredFileId: null,
+      },
+    ]);
+
+    await expect(
+      action.run({
+        designId: "design-1",
+        filename: "invalid-date.html",
+        content,
+        fileType: "html",
+        restoreClaimId: "restore-claim-invalid-date",
+      }),
+    ).rejects.toMatchObject({
+      errorCode: "screen_restore_claim_invalid",
+      statusCode: 403,
+    });
+    expect(mocks.insertValues).not.toHaveBeenCalled();
   });
 
   it("rejects recreating a missing bound Screen when the claim is consumed", async () => {
@@ -580,12 +790,22 @@ describe("create-file: node-id annotation", () => {
       content: string;
     };
     const queryClient = new QueryClient();
-    const queryKey = ["action", "get-design", { id: "design-1" }] as const;
+    const queryKey = [
+      "action",
+      "get-design",
+      { id: "design-1", includeFileContent: false },
+    ] as const;
     queryClient.setQueryData(queryKey, {
       files: [] as Array<Record<string, unknown>>,
     });
-    const insertOptimistically =
-      loadOptimisticCreatedFileInsertion(queryClient);
+    const historyFilesRef: { current: Array<{ id: string; content: string }> } =
+      { current: [] };
+    const sourceLoader = { prime: vi.fn() };
+    const insertOptimistically = loadOptimisticCreatedFileInsertion(
+      queryClient,
+      historyFilesRef,
+      sourceLoader,
+    );
 
     try {
       insertOptimistically({
@@ -598,14 +818,24 @@ describe("create-file: node-id annotation", () => {
       const optimistic = queryClient
         .getQueryData<{ files: Array<Record<string, unknown>> }>(queryKey)
         ?.files.find((file) => file.id === result.id);
-      expect(optimistic?.content).toBe(persisted.content);
+      expect(optimistic).not.toHaveProperty("content");
+      expect(
+        historyFilesRef.current.find((file) => file.id === result.id)?.content,
+      ).toBe(persisted.content);
+      expect(sourceLoader.prime).toHaveBeenCalledWith(
+        result.id,
+        expect.objectContaining({ content: persisted.content }),
+      );
       expect(mocks.seedFromText).toHaveBeenCalledWith(
         result.id,
         persisted.content,
       );
 
       const preparedForSourceIdentity = ensureCodeLayerNodeIdsInHtml(
-        String(optimistic?.content),
+        String(
+          historyFilesRef.current.find((file) => file.id === result.id)
+            ?.content,
+        ),
         { source: { kind: "design-file", fileId: result.id } },
       );
       expect(preparedForSourceIdentity).toEqual({
@@ -630,7 +860,11 @@ describe("create-file: node-id annotation", () => {
         queries: { retry: false, gcTime: Infinity, staleTime: 0 },
       },
     });
-    const queryKey = ["action", "get-design", { id: "design-1" }] as const;
+    const queryKey = [
+      "action",
+      "get-design",
+      { id: "design-1", includeFileContent: false },
+    ] as const;
     const staleResult = {
       id: "design-1",
       files: [{ id: "old-file", filename: "index.html", content: "old" }],
@@ -782,6 +1016,23 @@ describe("create-file: canvas placement and landing URL", () => {
     );
   });
 
+  it("persists a semantic HubSpot email at email width and preserves the starter tokens", async () => {
+    const result = await action.run({
+      designId: "design-1",
+      filename: "welcome-email.html",
+      content: createHubSpotEmailHtml({ title: "Welcome" }),
+      fileType: "html",
+    });
+    expect(result.frameType).toBe("hubspot-email");
+    expect(mocks.getDesignData().canvasFrames).toMatchObject({
+      [result.id]: { width: 600, height: 800 },
+    });
+    expect(mocks.insertValues.mock.calls[0]![0].content).toContain(
+      "{{ unsubscribe_link }}",
+    );
+  });
+
+  // oracle-change: create-file no longer accepts frameType, so there is no requested-email marker check to reject.
   it("gives a new renderable screen a default desktop placement and an overview landing URL", async () => {
     const result = await action.run({
       designId: "design-1",

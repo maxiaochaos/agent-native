@@ -61,6 +61,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type ReactNode,
 } from "react";
 import { toast } from "sonner";
 
@@ -325,9 +326,19 @@ function ConnectedRow({
       }
       description={
         server.status.state === "connected"
-          ? `${scope} · ${t("mcpIntegrations.toolsAvailable", {
-              count: server.status.toolCount,
-            })}`
+          ? [
+              scope,
+              t("mcpIntegrations.toolsAvailable", {
+                count: server.status.toolCount,
+              }),
+              ...(server.status.error
+                ? [
+                    t("mcpIntegrations.connectionErrorReason", {
+                      reason: server.status.error,
+                    }),
+                  ]
+                : []),
+            ].join(" · ")
           : server.status.state === "error"
             ? t("mcpIntegrations.connectionErrorReason", {
                 reason: server.status.error,
@@ -373,6 +384,8 @@ export interface IntegrationDetailPageProps {
   id: string;
   appName: string;
   context: SettingsPageContext;
+  /** App-owned settings for this integration, kept within its shared page. */
+  extensionContent?: ReactNode;
 }
 
 /**
@@ -385,6 +398,7 @@ export function IntegrationDetailPage({
   id,
   appName,
   context,
+  extensionContent,
 }: IntegrationDetailPageProps) {
   const catalog = useMemo(catalogWithoutBuilderPublish, []);
   const integration = catalog.find((entry) => entry.id === id);
@@ -407,6 +421,7 @@ export function IntegrationDetailPage({
       catalog={catalog}
       appName={appName}
       context={context}
+      extensionContent={extensionContent}
     />
   );
 }
@@ -416,11 +431,13 @@ function IntegrationDetail({
   catalog,
   appName,
   context,
+  extensionContent,
 }: {
   integration: DefaultMcpIntegration;
   catalog: DefaultMcpIntegration[];
   appName: string;
   context: SettingsPageContext;
+  extensionContent?: ReactNode;
 }) {
   const t = useT();
   const org = useOrg();
@@ -450,6 +467,10 @@ function IntegrationDetail({
 
   const connect = async () => {
     if (unavailable || signIn === "token") return;
+    if (integration.id === "hubspot") {
+      setSetupOpen(true);
+      return;
+    }
     // No preset URL (Sigma's is per account): the connect dialog asks for it.
     if (!integration.url.trim()) {
       setSetupOpen(true);
@@ -738,6 +759,8 @@ function IntegrationDetail({
           }
         />
       </SettingsGroup>
+
+      {extensionContent}
 
       <SettingsGroup id="information" title={t(`${CH}.information`)}>
         <SettingsRow

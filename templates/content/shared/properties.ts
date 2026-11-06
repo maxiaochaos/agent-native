@@ -203,6 +203,15 @@ export function countWords(content: string | null | undefined): number {
   const text = (content ?? "")
     // Drop fenced code blocks wholesale — they're not prose.
     .replace(/```[\s\S]*?```/g, " ")
+    // Tags such as `<br>` and `<empty-block/>` are markup, not words. A `<`
+    // written in prose is saved escaped (`\<`), so it never starts a tag; a
+    // backslash written in prose is saved escaped too (`\\`), so a tag can
+    // follow an even run of backslashes. The lookahead keeps the backward scan
+    // to positions at a `<`, so a long run of backslashes stays linear.
+    .replace(
+      /(?=<)(?<=(?:^|[^\\])(?:\\\\)*)<\/?[a-z][a-z0-9-]*(?:\s[^>]*)?\/?>/gi,
+      " ",
+    )
     // Strip inline/other markdown punctuation that would split or pad tokens.
     .replace(/[#>*_`~\-+=|[\]()!]/g, " ")
     .replace(/\s+/g, " ")
@@ -483,6 +492,32 @@ function normalizeDatePropertyPart(value: string, includeTime: boolean) {
   const hour = String(date.getHours()).padStart(2, "0");
   const minute = String(date.getMinutes()).padStart(2, "0");
   return `${year}-${month}-${day}T${hour}:${minute}`;
+}
+
+// The apps a URL property can link into besides the web. Named one by one, so a
+// link on a shared page can't reach whatever protocol handler a machine has
+// installed. A t3-thread link only opens an existing thread in T3 Code.
+const URL_PROPERTY_APP_PROTOCOLS = new Set(["t3-thread:"]);
+
+function urlProtocol(value: string) {
+  try {
+    return new URL(value.trim()).protocol;
+    // coercion-ok: null is "not a URL", and callers treat it as absent.
+  } catch {
+    return null;
+  }
+}
+
+/** Whether a URL property's value links into an app rather than a web page. */
+export function isAppLinkUrl(value: string) {
+  const protocol = urlProtocol(value);
+  return protocol !== null && URL_PROPERTY_APP_PROTOCOLS.has(protocol);
+}
+
+/** Whether a URL property can hold this value: a web address or a named app link. */
+export function isUrlPropertyValue(value: string) {
+  const protocol = urlProtocol(value);
+  return protocol === "http:" || protocol === "https:" || isAppLinkUrl(value);
 }
 
 export function normalizePropertyValue(

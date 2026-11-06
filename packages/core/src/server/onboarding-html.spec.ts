@@ -96,6 +96,27 @@ describe("getOnboardingHtml", () => {
     expect(readAuthPageData(fallback).initialView).toBe("signup");
   });
 
+  it("spins the Google button loader without Tailwind on the page", () => {
+    const styles = (html: string) =>
+      html.match(/<style>([\s\S]*?)<\/style>/)?.[1] ?? "";
+    const pages = [
+      getOnboardingHtml(),
+      getOnboardingHtml({ googleOnly: true }),
+      getOnboardingHtml({ requestHost: "mail.agent-native.com" }),
+    ];
+
+    for (const page of pages) {
+      const css = styles(page);
+      expect(css).toContain(".animate-spin { animation: spin 0.75s linear");
+      expect(css).toContain(
+        "@keyframes spin { to { transform: rotate(360deg); } }",
+      );
+      expect(css).toMatch(
+        /@media \(prefers-reduced-motion: reduce\) \{\s*\.animate-spin \{ animation: none; \}/,
+      );
+    }
+  });
+
   it("uses the injected reset renderer and a plain HTML fallback", () => {
     const renderResetPasswordPage = vi.fn(
       (props: ResetPasswordPageProps) =>
@@ -418,7 +439,7 @@ describe("getOnboardingHtml", () => {
       ".auth-marketing-home .card input {\n      color: var(--auth-marketing-foreground);\n      border-color: var(--auth-marketing-border);",
     );
     expect(html).toContain(
-      ".auth-marketing-home .auth-marketing-description-link {\n    color: var(--auth-marketing-muted);",
+      ".auth-marketing-home .auth-marketing-description-link {\n    color: var(--auth-marketing-foreground);",
     );
     expect(html).toContain("--auth-marketing-muted: #9a9997;");
     expect(html).toContain(".auth-marketing-home .card input:focus {");

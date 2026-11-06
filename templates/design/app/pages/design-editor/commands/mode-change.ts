@@ -19,7 +19,7 @@ import type {
 } from "@/pages/design-editor/types";
 
 export interface ModeChangeArgs {
-  activeFile: DesignFile;
+  activeFile: DesignFile | undefined;
   annotateLab: AnnotateLabStatus;
   canEditDesign: boolean;
   hasPendingVisualEdits?: boolean;
@@ -29,7 +29,7 @@ export interface ModeChangeArgs {
   enterSingleScreen: (
     fileId?: string | null,
     options?: { keepInteractDevice?: boolean },
-  ) => void;
+  ) => boolean | void;
   files: DesignFile[];
   pendingLiveNonStyleEdits: PendingLiveNonStyleEdit[];
   pendingVisualStyleEdits: PendingVisualStyleEdit[];
@@ -97,7 +97,7 @@ export function runModeChange(
     /** A screen change made from inside Interact keeps the chosen device. */
     keepInteractDevice?: boolean;
   },
-) {
+): boolean {
   const next = resolveModeForAnnotateLab(requested, annotateLab);
   const interactEntry =
     next === "interact"
@@ -120,7 +120,7 @@ export function runModeChange(
     : options?.targetFileId
       ? files.find((file) => file.id === options.targetFileId)
       : activeFile;
-  if (!canEditDesign && next === "annotate") return;
+  if (!canEditDesign && next === "annotate") return false;
   if (interactEntry && !nextActiveFile) {
     toast.error(
       t(
@@ -129,9 +129,9 @@ export function runModeChange(
           : "designEditor.responsiveInteract.unknownScreen",
       ),
     );
-    return;
+    return false;
   }
-  if (next === "annotate" && !nextActiveFile) return;
+  if (next === "annotate" && !nextActiveFile) return false;
   if (
     next === "interact" &&
     hasPendingVisualEdits &&
@@ -140,7 +140,7 @@ export function runModeChange(
   ) {
     onPendingVisualEditsBlocked();
     toast.error(t("designEditor.pendingVisualStyles.interactBlocked"));
-    return;
+    return false;
   }
   if (options?.discardPendingLiveEdits) {
     requestPendingVisualStyleRevert(pendingVisualStyleEdits);
@@ -153,31 +153,35 @@ export function runModeChange(
     viewMode: viewModeRef.current,
   });
   if (routing === "enter-single-interact") {
-    rememberOverviewScreenSelection(nextActiveFile!.id);
-    setOverviewInteractScreenId(nextActiveFile!.id);
-    enterSingleScreen(nextActiveFile?.id);
-    return;
+    if (!nextActiveFile) return false;
+    const entered = options?.keepInteractDevice
+      ? enterSingleScreen(nextActiveFile.id, { keepInteractDevice: true })
+      : enterSingleScreen(nextActiveFile.id);
+    if (entered === false) return false;
+    rememberOverviewScreenSelection(nextActiveFile.id);
+    setOverviewInteractScreenId(nextActiveFile.id);
+    return true;
   }
   if (routing === "enter-overview") {
-    setOverviewInteractScreenId(null);
     if (options?.targetFileId) setActiveFileId(options.targetFileId);
     enterOverviewFromZoom(next);
-    return;
+    return true;
   }
   if (next === "interact" && overviewInteractScreenId) {
-    setOverviewInteractScreenId(nextActiveFile!.id);
+    if (!nextActiveFile) return false;
     if (
       options?.targetFileId &&
-      nextActiveFile!.id !== overviewInteractScreenId
+      nextActiveFile.id !== overviewInteractScreenId
     ) {
-      rememberOverviewScreenSelection(nextActiveFile!.id);
-      if (options.keepInteractDevice) {
-        enterSingleScreen(nextActiveFile!.id, { keepInteractDevice: true });
-      } else {
-        enterSingleScreen(nextActiveFile!.id);
-      }
-      return;
+      const entered = options.keepInteractDevice
+        ? enterSingleScreen(nextActiveFile.id, { keepInteractDevice: true })
+        : enterSingleScreen(nextActiveFile.id);
+      if (entered === false) return false;
+      rememberOverviewScreenSelection(nextActiveFile.id);
+      setOverviewInteractScreenId(nextActiveFile.id);
+      return true;
     }
+    setOverviewInteractScreenId(nextActiveFile.id);
   }
   if (options?.targetFileId) setActiveFileId(options.targetFileId);
   else if (
@@ -203,4 +207,5 @@ export function runModeChange(
     setDrawMode(false);
     setPinMode(false);
   }
+  return true;
 }

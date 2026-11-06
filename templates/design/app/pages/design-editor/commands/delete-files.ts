@@ -27,8 +27,10 @@ import {
 } from "@/pages/design-editor/history";
 import type { DesignFile } from "@/pages/design-editor/types";
 
+import { designMetadataQueryKey } from "../design-query-key";
+
 export interface DeleteFilesArgs {
-  activeFile: DesignFile;
+  activeFile: DesignFile | undefined;
   canvasFrameGeometryById: CanvasFrameGeometryById;
   clearRedoStacks: () => void;
   designDataJsonRef: RefObject<Record<string, unknown>>;
@@ -146,7 +148,7 @@ export async function runDeleteFiles(
   };
   const selectionRevisionAtStart = selectionRevisionRef?.current;
   const nextGeometry = cloneCanvasFrameGeometry(canvasFrameGeometryById);
-  const designQueryKey = ["action", "get-design", { id }] as const;
+  const designQueryKey = designMetadataQueryKey(id);
   const previousDesignQuery = queryClient.getQueryData?.(designQueryKey);
   const recordDeletionHistory = options?.recordDeletionHistory === true;
   if (recordDeletionHistory) {
@@ -360,11 +362,24 @@ export async function runDeleteFiles(
     deletedFiles.every((file) =>
       serverDeletedFileSnapshots.some((snapshot) => snapshot.id === file.id),
     );
+  const orderedServerDeletedFileSnapshots = serverDeletedFileSnapshots
+    .map((snapshot) => {
+      const fileOrderIndex = files.findIndex((file) => file.id === snapshot.id);
+      return {
+        ...snapshot,
+        ...(fileOrderIndex >= 0 ? { fileOrderIndex } : {}),
+      };
+    })
+    .sort(
+      (left, right) =>
+        (left.fileOrderIndex ?? Number.MAX_SAFE_INTEGER) -
+        (right.fileOrderIndex ?? Number.MAX_SAFE_INTEGER),
+    );
   const deletionHistoryEntry: FileDeletionHistoryEntry | null =
     recordDeletionHistory &&
     deletedFiles.length > 0 &&
     hasCompleteHistorySnapshot
-      ? { files: serverDeletedFileSnapshots }
+      ? { files: orderedServerDeletedFileSnapshots }
       : null;
 
   if (recordDeletionHistory && deletedFiles.length > 0) {

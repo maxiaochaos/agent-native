@@ -10,6 +10,7 @@ import {
 } from "@agent-native/core/testing";
 import type { APIRequestContext, Page } from "@playwright/test";
 
+import enUS from "../app/i18n/en-US.js";
 import {
   buildCodeLayerProjection,
   readCodeLayerNodeTextContent,
@@ -324,8 +325,7 @@ function sourceNodeIds(html: string, sourceNodeId: string): string[] {
   });
 }
 
-// fixme: fails in CI on current main: app reported http 409: POST /_agent-native/actions/update-file
-test.fixme("real component instances propagate, detach, and persist a variant", async ({
+test("real component instances propagate, detach, and persist a variant", async ({
   app,
   page,
   request,
@@ -506,7 +506,7 @@ test.fixme("real component instances propagate, detach, and persist a variant", 
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(
     page.getByRole("button", { name: "Move", exact: true }),
-  ).toBeVisible({ timeout: 30_000 });
+  ).toBeVisible();
   html = await source(request, designId);
   expect(nodeText(html, attachedTitleId)).toBe("Attached only edit");
   expect(tagForNode(html, attached.nodeId)).toContain(
@@ -515,6 +515,171 @@ test.fixme("real component instances propagate, detach, and persist a variant", 
   expect(tagForNode(html, detached.nodeId)).not.toContain(
     "data-agent-native-component",
   );
+});
+
+test("linked edits reject oversized offscreen source sets before loading or changing them", async ({
+  app,
+  page,
+  request,
+}) => {
+  const designId = await app.seed(fs.readFileSync(INLINE_FIXTURE, "utf8"));
+  const promoted = await action(request, "create-component", {
+    designId,
+    nodeId: "card-main",
+    name: "ReusableCard",
+  });
+  expect(promoted.persisted).toBe(true);
+  const active = await readAction(request, "read-source-file", {
+    designId,
+    path: "index.html",
+  });
+  const metadata = await readAction(request, "get-design", {
+    id: designId,
+    includeFileContent: "false",
+  });
+  const activeId = metadata.files.find(
+    (file: DesignFile) => file.filename === "index.html",
+  )?.id;
+  expect(activeId).toBeTruthy();
+  const oversized = new Set<string>();
+  const comment = "<!--" + "x".repeat(5 * 1024 * 1024) + "-->";
+  for (let index = 0; index < 4; index++) {
+    const file = await action(request, "create-file", {
+      designId,
+      filename: `offscreen-${index}.html`,
+      fileType: "html",
+      content: `<!doctype html><html><head><title>Offscreen</title></head><body>${comment}</body></html>`,
+    });
+    oversized.add(file.id);
+  }
+  await action(request, "update-design", {
+    id: designId,
+    dataOperations: [...oversized].map((id, index) => ({
+      op: "set",
+      path: ["canvasFrames", id],
+      value: { x: 100000 + index * 2000, y: 100000, width: 800, height: 600 },
+    })),
+  });
+  const sourceReads: string[] = [];
+  const mutations: string[] = [];
+  page.on("request", (sent) => {
+    const url = new URL(sent.url());
+    if (url.pathname.endsWith("/apply-component-prop-edit"))
+      mutations.push(sent.url());
+    if (url.pathname.endsWith("/get-design")) {
+      const fileId = url.searchParams.get("fileId");
+      if (fileId && oversized.has(fileId)) sourceReads.push(fileId);
+      if (!fileId && url.searchParams.get("includeFileContent") !== "false")
+        sourceReads.push("all sources");
+    }
+  });
+  app.allowFailure(
+    /^error toast This linked component edit exceeds the source size limit\.$/,
+    "linked edits reject a source set above the memory budget",
+  );
+  await page.goto(
+    `${baseURL}/design/${designId}?editorView=single&screen=${activeId}`,
+    { waitUntil: "domcontentloaded" },
+  );
+  await selectNodeById(page, "card-main", activeId);
+  const width = page.getByRole("textbox", { name: "W size in pixels" });
+  await expect(width).toHaveValue("420");
+  await width.fill("440");
+  await width.press("Enter");
+  await expect(
+    page
+      .locator("[data-sonner-toast]")
+      .filter({ hasText: enUS.common.linkedSourceSizeLimit }),
+  ).toBeVisible();
+  await app.settled();
+  expect(mutations).toEqual([]);
+  expect(sourceReads).toEqual([]);
+  const persisted = await readAction(request, "read-source-file", {
+    designId,
+    path: "index.html",
+  });
+  expect(persisted.content).toBe(active.content);
+});
+
+test("redoing a duplicated component while the undo's save is in flight reads no missing node", async ({
+  app,
+  page,
+  request,
+}) => {
+  const designId = await app.seed(fs.readFileSync(INLINE_FIXTURE, "utf8"));
+  await gotoEditor(page, designId);
+  await selectNodeById(page, "card-main");
+  const promoted = await action(request, "create-component", {
+    designId,
+    nodeId: "card-main",
+    name: "ReusableCard",
+  });
+  expect(promoted.persisted).toBe(true);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const mainTag = tagForNode(await source(request, designId), "card-main");
+  const componentId = mainTag
+    ? attributeValue(mainTag, "data-agent-native-component-id")
+    : undefined;
+  expect(componentId).toBeTruthy();
+
+  await selectNodeById(page, "card-main");
+  await page.keyboard.press("ControlOrMeta+d");
+  await expect
+    .poll(
+      async () =>
+        componentRoots(await source(request, designId), componentId!).length,
+    )
+    .toBe(2);
+  const referenceId = componentRoots(
+    await source(request, designId),
+    componentId!,
+  ).find((root) => !root.main)?.nodeId;
+  expect(referenceId).toBeTruthy();
+  await selectNodeById(page, referenceId!);
+
+  let releaseSave: (() => void) | undefined;
+  let notifySaveHeld: (() => void) | undefined;
+  const saveReleased = new Promise<void>((resolve) => {
+    releaseSave = resolve;
+  });
+  const saveHeld = new Promise<void>((resolve) => {
+    notifySaveHeld = resolve;
+  });
+  const pendingSaves: Promise<void>[] = [];
+  await page.route("**/_agent-native/actions/update-file", async (route) => {
+    const pending = (async () => {
+      const response = await route.fetch();
+      notifySaveHeld?.();
+      await saveReleased;
+      await route.fulfill({ response });
+    })();
+    pendingSaves.push(pending);
+    await pending;
+  });
+  const copyDetails = page.waitForResponse(
+    (response) =>
+      response.url().includes("/_agent-native/actions/get-component-details") &&
+      response.url().includes(encodeURIComponent(referenceId!)),
+    { timeout: 30_000 },
+  );
+  try {
+    await page.keyboard.press("ControlOrMeta+z");
+    await saveHeld;
+    await page.keyboard.press("ControlOrMeta+Shift+z");
+    releaseSave?.();
+    await expect
+      .poll(
+        async () =>
+          componentRoots(await source(request, designId), componentId!).length,
+        { timeout: 20_000 },
+      )
+      .toBe(2);
+    expect((await copyDetails).status()).toBe(200);
+  } finally {
+    releaseSave?.();
+    await Promise.all(pendingSaves);
+    await page.unroute("**/_agent-native/actions/update-file");
+  }
 });
 
 test("Design components preserve identity across inline and URL-backed React boundaries", async ({
@@ -887,9 +1052,7 @@ test("Design components preserve identity across inline and URL-backed React bou
   await page.reload({ waitUntil: "domcontentloaded" });
   await expect(
     page.getByRole("button", { name: "Move", exact: true }),
-  ).toBeVisible({
-    timeout: 30_000,
-  });
+  ).toBeVisible();
   await expect
     .poll(async () =>
       parentIdentity(await source(request, designId), referenceButtonId!),

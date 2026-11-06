@@ -17,8 +17,6 @@ const mockedSlackReader = {
   getCompleteThread: vi.fn(),
   verifyAgentNativeIdentity: vi.fn(),
   getAgentNativeIdentity: vi.fn(),
-  addReaction: vi.fn(),
-  hasReaction: vi.fn(),
   postChannelMessage: vi.fn(),
   postThreadReply: vi.fn(),
 };
@@ -38,8 +36,6 @@ beforeEach(() => {
   mockedSlackReader.getCompleteThread.mockReset();
   mockedSlackReader.verifyAgentNativeIdentity.mockReset();
   mockedSlackReader.getAgentNativeIdentity.mockReset();
-  mockedSlackReader.addReaction.mockReset();
-  mockedSlackReader.hasReaction.mockReset();
   mockedSlackReader.postChannelMessage.mockReset();
   mockedSlackReader.postThreadReply.mockReset();
   mockedSlackReader.getTeamInfo
@@ -286,5 +282,291 @@ describe("pollSlackChannel", () => {
         ownerEmail: "owner@example.com",
       }),
     ).rejects.toBe(failure);
+  });
+});
+
+describe("pollSlackChannel headlines", () => {
+  const long = `${"word ".repeat(200)}end`;
+  const history = () =>
+    mockedSlackReader.getChannelHistory.mockResolvedValue({
+      messages: [
+        {
+          type: "message",
+          user: "U1",
+          text: "*Pay button* is dead\nSteps:\n1. open <https://example.test|the cart>",
+          ts: "40.1",
+        },
+        { type: "message", user: "U2", text: long, ts: "40.2" },
+        { type: "message", user: "U3", text: "<@U9> :wave:", ts: "40.3" },
+      ],
+      has_more: false,
+    });
+  const poll = (headlines?: boolean) =>
+    pollSlackChannel({
+      workspace: "primary",
+      channelId: "C1",
+      priorLastSlackTs: "40.0",
+      ownerEmail: "owner@example.com",
+      ...(headlines === undefined ? {} : { headlines }),
+    });
+
+  it("records the first line of the message as the headline, and leaves the title as the author label", async () => {
+    history();
+
+    const { envelopes } = await poll(true);
+
+    expect(envelopes[0]).toMatchObject({
+      title: "Slack user U1",
+      metadata: { headline: "Pay button is dead" },
+    });
+    // The summary is the compact copy it always was.
+    expect(envelopes[0]?.summary).toBe(
+      "*Pay button* is dead Steps: 1. open <https://example.test|the cart>",
+    );
+  });
+
+  it("says the stored summary is cut short of the message when it is, and only then", async () => {
+    history();
+
+    const { envelopes } = await poll(true);
+
+    expect(envelopes[0]?.metadata).not.toHaveProperty("textTruncated");
+    expect(envelopes[1]?.metadata).toMatchObject({ textTruncated: true });
+    expect(envelopes[1]?.summary?.endsWith("…")).toBe(true);
+    expect(envelopes[1]?.metadata?.headline).toEqual(expect.any(String));
+    expect(String(envelopes[1]?.metadata?.headline).length).toBeLessThanOrEqual(
+      100,
+    );
+  });
+
+  it("records no headline for a message with no words, so the author label stands", async () => {
+    history();
+
+    const { envelopes } = await poll(true);
+
+    expect(envelopes[2]?.title).toBe("Slack user U3");
+    expect(envelopes[2]?.metadata).not.toHaveProperty("headline");
+  });
+
+  it("adds nothing to what a poll always recorded unless asked", async () => {
+    history();
+
+    const plain = await poll();
+    const refused = await poll(false);
+
+    for (const { envelopes } of [plain, refused]) {
+      for (const envelope of envelopes) {
+        expect(envelope.metadata).not.toHaveProperty("headline");
+        expect(envelope.metadata).not.toHaveProperty("textTruncated");
+      }
+    }
+    const withoutReceivedAt = (envelopes: typeof plain.envelopes) =>
+      envelopes.map(({ receivedAt: _receivedAt, ...rest }) => rest);
+    expect(withoutReceivedAt(plain.envelopes)).toEqual(
+      withoutReceivedAt(refused.envelopes),
+    );
+  });
+});
+
+describe("pollSlackChannel reactions", () => {
+  const OWN_BOT = "UAGENTNATIVE";
+
+  type Reaction = { name: string; count?: number; users?: string[] };
+
+  function history(...messages: Array<Record<string, unknown>>) {
+    mockedSlackReader.getChannelHistory.mockResolvedValue({
+      messages: messages.map((message) => ({ type: "message", ...message })),
+      has_more: false,
+    });
+  }
+
+  /** Who Slack says is a bot: ids in `bots` are, every other id is a person. */
+  function users(bots: string[] = [], failing: string[] = []) {
+    mockedSlackReader.getAgentNativeIdentity.mockResolvedValue({
+      userId: OWN_BOT,
+      userName: "agent-native",
+      teamId: "T1",
+      teamName: "Builder",
+    });
+    mockedSlackReader.getUserInfo.mockImplementation(
+      async (_workspace: string, userId: string) => {
+        if (failing.includes(userId)) throw new Error("users.info failed");
+        return {
+          id: userId,
+          name: null,
+          displayName: null,
+          isBot: bots.includes(userId),
+        };
+      },
+    );
+  }
+
+  /** The users asked about, beyond the message author the poller always labels. */
+  const reactorLookups = () =>
+    mockedSlackReader.getUserInfo.mock.calls
+      .map(([, userId]) => userId as string)
+      .filter((userId) => userId !== "UAUTHOR");
+
+  async function poll(...reactions: Reaction[][]) {
+    history(
+      ...reactions.map((list, index) => ({
+        user: "UAUTHOR",
+        text: `report ${index}`,
+        ts: `20.${index + 1}`,
+        ...(list.length > 0 ? { reactions: list } : {}),
+      })),
+    );
+    const result = await pollSlackChannel({
+      workspace: "primary",
+      channelId: "C1",
+      priorLastSlackTs: "10.0",
+      ownerEmail: "owner@example.com",
+    });
+    return result.envelopes.map((envelope) => envelope.metadata);
+  }
+
+  it("records that a message nobody reacted to was read and has no person reaction", async () => {
+    users();
+
+    const [metadata] = await poll([]);
+
+    expect(metadata).toMatchObject({
+      personReactions: [],
+      personReactors: [],
+    });
+    expect(metadata).not.toHaveProperty("unverifiedReactors");
+    expect(mockedSlackReader.getAgentNativeIdentity).not.toHaveBeenCalled();
+  });
+
+  it("records the reaction a person added, and who added it", async () => {
+    users();
+
+    const [metadata] = await poll([
+      { name: "eyes", count: 1, users: ["UPERSON"] },
+    ]);
+
+    expect(metadata).toMatchObject({
+      personReactions: ["eyes"],
+      personReactors: ["UPERSON"],
+    });
+    expect(metadata).not.toHaveProperty("unverifiedReactors");
+  });
+
+  it("does not count the workspace's own bot, and does not look it up", async () => {
+    users();
+
+    const [metadata] = await poll([
+      { name: "eyes", count: 1, users: [OWN_BOT] },
+    ]);
+
+    expect(metadata).toMatchObject({ personReactions: [], personReactors: [] });
+    expect(reactorLookups()).toEqual([]);
+  });
+
+  it("does not count another bot, and counts the person who reacted beside it", async () => {
+    users(["UOTHERBOT"]);
+
+    const [onlyBot, both] = await poll(
+      [{ name: "eyes", count: 1, users: ["UOTHERBOT"] }],
+      [
+        { name: "eyes", count: 2, users: ["UOTHERBOT", "UPERSON"] },
+        { name: "rocket", count: 1, users: ["UOTHERBOT"] },
+      ],
+    );
+
+    expect(onlyBot).toMatchObject({ personReactions: [], personReactors: [] });
+    expect(both).toMatchObject({
+      personReactions: ["eyes"],
+      personReactors: ["UPERSON"],
+    });
+  });
+
+  it("looks each reactor up once, however many messages they reacted to", async () => {
+    users();
+
+    await poll(
+      [{ name: "eyes", count: 1, users: ["UPERSON"] }],
+      [{ name: "rocket", count: 1, users: ["UPERSON"] }],
+    );
+
+    expect(reactorLookups()).toEqual(["UPERSON"]);
+  });
+
+  it("counts a reactor it could not look up as a person, and says it could not verify them", async () => {
+    users([], ["UUNKNOWN"]);
+
+    const [metadata] = await poll([
+      { name: "eyes", count: 1, users: ["UUNKNOWN"] },
+    ]);
+
+    expect(metadata).toMatchObject({
+      personReactions: ["eyes"],
+      personReactors: [],
+      unverifiedReactors: ["UUNKNOWN"],
+    });
+  });
+
+  it("counts a reactor Slack gave no bot flag for the same way", async () => {
+    users();
+    mockedSlackReader.getUserInfo.mockResolvedValue({
+      id: "UFLAGLESS",
+      name: null,
+      displayName: null,
+    });
+
+    const [metadata] = await poll([
+      { name: "eyes", count: 1, users: ["UFLAGLESS"] },
+    ]);
+
+    expect(metadata).toMatchObject({
+      personReactions: ["eyes"],
+      unverifiedReactors: ["UFLAGLESS"],
+    });
+  });
+
+  it("counts reactors Slack did not list as people it could not verify", async () => {
+    users();
+
+    const [metadata] = await poll([
+      { name: "eyes", count: 3, users: ["UPERSON"] },
+    ]);
+
+    expect(metadata).toMatchObject({
+      personReactions: ["eyes"],
+      personReactors: ["UPERSON"],
+      unverifiedReactors: ["eyes:+2"],
+    });
+  });
+
+  it("leaves a reply's reactions out, so they cannot overwrite the report's", async () => {
+    users();
+    history(
+      {
+        user: "UAUTHOR",
+        text: "a broadcast reply",
+        ts: "20.5",
+        thread_ts: "11.0",
+        reactions: [{ name: "eyes", count: 1, users: ["UPERSON"] }],
+      },
+      {
+        user: "UAUTHOR",
+        text: "a report",
+        ts: "21.0",
+      },
+    );
+
+    const result = await pollSlackChannel({
+      workspace: "primary",
+      channelId: "C1",
+      priorLastSlackTs: "10.0",
+      ownerEmail: "owner@example.com",
+    });
+
+    const [reply, report] = result.envelopes.map(
+      (envelope) => envelope.metadata,
+    );
+    expect(reply).not.toHaveProperty("personReactions");
+    expect(reply).not.toHaveProperty("personReactors");
+    expect(report).toMatchObject({ personReactions: [] });
   });
 });

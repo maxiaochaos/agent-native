@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { parse, type DefaultTreeAdapterTypes as P5 } from "parse5";
 
 import { IN_PLACE_TEXT_UNDO_LIMIT } from "../../app/components/editor/in-place-text-session.ts";
+import { CLIENT_COMPATIBILITY_VERSION } from "../../shared/client-compatibility.ts";
 import {
   pick,
   resolvePnpmEntry,
@@ -28,18 +29,32 @@ import {
   authoringFuzzUnavailableExitCode,
   authoringFuzzProfileIndex,
   canonicalizeAuthoringFuzzPersistence,
+  cleanupNavigationSessionCorrelation,
   formatAuthoringFuzzCleanupIssue,
   formatAuthoringFuzzUnavailable,
+  browserSessionNavigationRequestIdentity,
+  hasActiveCleanupNavigationSessionCompetitor,
+  isCleanupNavigationCompetitionPage,
   isExpectedCleanupNavigationError as isExpectedCleanupNavigationRequestError,
   isExpectedCleanupRecoveryPageBrowserSessionError,
+  cleanupRecoveryClaimRequestAgeMs,
+  isPotentialCleanupRecoveryPageBrowserSessionError,
+  isWithinCleanupRecoveryClaimCorrelationWindow,
   isFirefoxBrowserSessionConsoleError,
   lineNavigationKeys,
   normalizeFirefoxBrowserSessionConsoleError,
+  recordCleanupNavigationSessionCompetitor,
+  removeCleanupNavigationSessionCompetitor,
   recordCleanupRequestOutcome,
+  retiredBrowserSessionPollConsoleGraceMs,
+  redactBrowserSessionRequestPath,
+  redactBrowserSessionSensitiveText,
   retryAuthoringFuzzScratchDeckLookup,
   runAuthoringFuzz,
+  shouldRetainCleanupRecoveryClaimEvidence,
   type AuthoringFuzzPersistence,
 } from "./authoring-fuzz.ts";
+import { deleteScratchDeck } from "./client-action.ts";
 import { devServerListeningUrl } from "./dev-server-url.ts";
 import {
   CHROME_SELECTOR,
@@ -77,7 +92,13 @@ import {
   type StyleDiff,
 } from "./lib/metrics.ts";
 import { isRetryableInfraError } from "./retry-infra.ts";
-import { authoringFilterError, readValueOption } from "./run-options.ts";
+import {
+  authoringFilterError,
+  parseShard,
+  readValueOption,
+  selectShard,
+  type ShardSelection,
+} from "./run-options.ts";
 import {
   ActionTransportError,
   ActionRequestTimeoutError,
@@ -118,10 +139,18 @@ const getSlashListbox = async (page: any, editor: any) => {
     (element: HTMLElement) => {
       const listboxId = element.getAttribute("aria-controls");
       const listbox = listboxId ? document.getElementById(listboxId) : null;
-      return listbox?.getAttribute("role") === "listbox";
+      if (listbox?.getAttribute("role") !== "listbox") return false;
+      const style = getComputedStyle(listbox);
+      const rect = listbox.getBoundingClientRect();
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
     },
     editorHandle,
-    { timeout: 5_000 },
+    { polling: 50, timeout: 5_000 },
   );
   const listboxId = await editor.getAttribute("aria-controls");
   if (!listboxId) throw new Error("slash menu did not expose its listbox");
@@ -151,6 +180,7 @@ const VALUE_FLAGS = new Set([
   "--authoring-source",
   "--authoring-flow",
   "--authoring-case",
+  "--authoring-shard",
   "--line-key-platform",
 ]);
 const opt = (name: string) => {
@@ -217,6 +247,12 @@ const authoringFuzzOnly = argv.includes("--authoring-fuzz");
 const authoringSourceFilter = opt("--authoring-source");
 const authoringFlowFilter = opt("--authoring-flow");
 const authoringCaseFilter = opt("--authoring-case");
+let authoringShard: ShardSelection | undefined;
+try {
+  authoringShard = parseShard(opt("--authoring-shard"));
+} catch (error) {
+  fatal((error as Error).message);
+}
 const authoringFlows = ["slash", "shortcut", "list", "paste"] as const;
 const incompatibleAuthoringFilters = authoringFilterError(
   authoringSourceFilter,
@@ -228,6 +264,9 @@ if ((authoringSourceFilter || authoringFlowFilter) && !authoringCorpusOnly) {
 }
 if (authoringCaseFilter && !authoringOnly) {
   fatal("--authoring-case requires --authoring");
+}
+if (authoringShard && !authoringOnly) {
+  fatal("--authoring-shard requires --authoring");
 }
 if (
   authoringFlowFilter &&
@@ -592,6 +631,18 @@ async function freePort(): Promise<number> {
   });
 }
 
+// The server runs in its own process group, which a negative pid signals. On
+// Windows it runs under cmd.exe with no group, so taskkill stops the tree.
+function killServerTree(pid: number, signal: NodeJS.Signals): void {
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+      stdio: "ignore",
+    });
+    return;
+  }
+  process.kill(-pid, signal);
+}
+
 async function startServer(): Promise<{
   base: string;
   stop: () => Promise<void>;
@@ -622,7 +673,12 @@ async function startServer(): Promise<{
       String(port),
       "--inspect=0",
     ],
-    { cwd: WORKTREE_ROOT, detached: true, stdio: ["ignore", log, log] },
+    {
+      cwd: WORKTREE_ROOT,
+      detached: true,
+      shell: process.platform === "win32",
+      stdio: ["ignore", log, log],
+    },
   );
   let exited: number | null = null;
   child.on("exit", (code) => {
@@ -633,7 +689,7 @@ async function startServer(): Promise<{
   process.on("exit", () => {
     if (exited === null && child.pid) {
       try {
-        process.kill(-child.pid, "SIGKILL");
+        killServerTree(child.pid, "SIGKILL");
         // coercion-ok: ESRCH means the server group already exited.
       } catch {
         // already gone
@@ -643,7 +699,7 @@ async function startServer(): Promise<{
   const stop = async () => {
     if (exited !== null || !child.pid) return;
     try {
-      process.kill(-child.pid, "SIGTERM");
+      killServerTree(child.pid, "SIGTERM");
       // coercion-ok: ESRCH means the server group already exited.
     } catch {
       return;
@@ -651,7 +707,7 @@ async function startServer(): Promise<{
     for (let i = 0; i < 50 && exited === null; i++) await sleep(200);
     if (exited === null) {
       try {
-        process.kill(-child.pid, "SIGKILL");
+        killServerTree(child.pid, "SIGKILL");
         // coercion-ok: ESRCH means the server group already exited.
       } catch {
         // already gone
@@ -721,6 +777,14 @@ async function action<T = any>(
   method: "DELETE" | "GET" | "POST" = "POST",
   timeoutMs = 30_000,
 ): Promise<T> {
+  if (name === "delete-deck") {
+    return deleteScratchDeck<T>(page, {
+      body,
+      compatibilityVersion: CLIENT_COMPATIBILITY_VERSION,
+      source: `/@fs/${WORKTREE_ROOT.replace(/\\/g, "/")}/packages/core/src/client/use-action.ts`,
+      timeoutMs,
+    });
+  }
   const evaluation = page.evaluate(
     async ({ name, body, method, timeoutMs }: any) => {
       const url =
@@ -1291,6 +1355,7 @@ async function runChatTypingRegression(page: Page, base: string) {
   const problems: string[] = [];
   const submitRoute = /\/_agent-native\/agent-chat(?:\?.*)?$/;
   let submitRequestSeen = false;
+  let submitRequestCount = 0;
   let resolveSubmitRequested!: () => void;
   let releaseSubmit!: () => void;
   let resolveSubmitRouteFinished!: () => void;
@@ -1313,6 +1378,7 @@ async function runChatTypingRegression(page: Page, base: string) {
   await page.route(submitRoute, async (route: any) => {
     if (route.request().method() !== "POST") return route.continue();
     submitRequestSeen = true;
+    submitRequestCount += 1;
     resolveSubmitRequested();
     try {
       await submitGate;
@@ -1479,8 +1545,16 @@ async function runChatTypingRegression(page: Page, base: string) {
             `pending draft mismatch: ${JSON.stringify(pendingText)}`,
           );
         }
+        // A draft sent while the first send is pending queues behind it; it
+        // must never start a second chat request that races the first.
         if (await sendButton.isEnabled()) {
-          problems.push("chat send button stayed enabled during submission");
+          await sendButton.click();
+          await sleep(1000);
+          if (submitRequestCount > 1) {
+            problems.push(
+              "a draft sent during a pending submission started a second chat request",
+            );
+          }
         }
         await page.screenshot({
           path: path.join(outRoot, "chat-input-lock-pending.png"),
@@ -1662,9 +1736,9 @@ async function runMobileImportStatusRegression(page: Page, base: string) {
         "empty mobile live region took space beside the import button",
       );
     }
+    // Import is one button that opens the file dialog for every supported type.
     const fileChooser = page.waitForEvent("filechooser");
     await page.getByRole("button", { name: "Import" }).click();
-    await page.getByRole("menuitem", { name: "PPT" }).click();
     await (await fileChooser).setFiles(fixturePath);
 
     const uploadReached = await Promise.race([
@@ -2259,6 +2333,8 @@ async function runTextSurfaceQa(page: Page, base: string, browserName: string) {
     locator: any,
     label: string,
     multiline: boolean,
+    // Comment boxes send on Enter, so they start a new line with Shift+Enter.
+    newlineKey = "Enter",
   ) => {
     await locator.waitFor({ state: "visible", timeout: 10_000 });
     await locator.focus();
@@ -2312,7 +2388,7 @@ async function runTextSurfaceQa(page: Page, base: string, browserName: string) {
       );
     }
     if (multiline) {
-      await locator.press("Enter");
+      await locator.press(newlineKey);
       await locator.pressSequentially("lineX");
       await locator.press("Backspace");
       await locator.pressSequentially("2");
@@ -2727,8 +2803,10 @@ async function runTextSurfaceQa(page: Page, base: string, browserName: string) {
       );
     }
 
-    await page.getByRole("button", { name: "Speaker Notes" }).click();
-    const notes = page.getByPlaceholder("Add speaker notes...");
+    await page
+      .getByRole("button", { name: "Speaker notes", exact: true })
+      .click();
+    const notes = page.getByRole("textbox", { name: "Speaker notes" });
     const expectedNotes = await exerciseControl(notes, "speaker notes", true);
     let notesSlide: { notes?: string } | undefined;
     const notesSaved = await waitFor(
@@ -2769,7 +2847,7 @@ async function runTextSurfaceQa(page: Page, base: string, browserName: string) {
     if (!(await composingEscape(comment, "comment composer"))) {
       await addComment.click();
     }
-    await exerciseControl(comment, "comment composer", true);
+    await exerciseControl(comment, "comment composer", true, "Shift+Enter");
     await comment.press("Escape");
     await addComment.click();
     const rootComposer = page.getByPlaceholder("Add a comment...");
@@ -2795,7 +2873,7 @@ async function runTextSurfaceQa(page: Page, base: string, browserName: string) {
       await replyButton.click();
       await reply.waitFor({ state: "visible", timeout: 5000 });
     }
-    await exerciseControl(reply, "comment reply", true);
+    await exerciseControl(reply, "comment reply", true, "Shift+Enter");
     await reply.press("Escape");
     await rootComment.hover();
     await page.getByRole("button", { name: "Edit comment" }).click();
@@ -2804,10 +2882,8 @@ async function runTextSurfaceQa(page: Page, base: string, browserName: string) {
       await rootComment.hover();
       await page.getByRole("button", { name: "Edit comment" }).click();
     }
-    await exerciseControl(editComment, "comment edit", true);
+    await exerciseControl(editComment, "comment edit", true, "Shift+Enter");
     await editComment.press("Escape");
-    await page.getByRole("button", { name: "More" }).click();
-    await page.locator("[data-toolbar-pin-button]").click();
     const [pinTarget] = await listTargets(page, slideTwo);
     if (!pinTarget)
       throw new Error("second slide has no comment anchor target");
@@ -2818,10 +2894,15 @@ async function runTextSurfaceQa(page: Page, base: string, browserName: string) {
       await page.mouse.click(pinTarget.point.x, pinTarget.point.y);
       await pinComment.waitFor({ state: "visible", timeout: 5000 });
     }
-    await exerciseControl(pinComment, "pinned comment composer", true);
+    await exerciseControl(
+      pinComment,
+      "pinned comment composer",
+      true,
+      "Shift+Enter",
+    );
     await pinComment.press("Escape");
     await page.getByRole("button", { name: "More" }).click();
-    await page.locator("[data-toolbar-pin-button]").click();
+    await page.getByRole("menuitem", { name: /^Comments/ }).click();
 
     const deckTitle = page
       .locator('[data-slides-editor-root="true"] input[type="text"]')
@@ -3071,6 +3152,7 @@ async function runAuthoringParityQa(
   base: string,
   outRoot: string,
   caseFilter?: string,
+  shard?: ShardSelection,
 ) {
   const problems: string[] = [];
   let firstMarkupMismatch = "";
@@ -3123,6 +3205,8 @@ async function runAuthoringParityQa(
     })),
     { id: "authoring-list-ul", kind: "ul-flow" as const },
     { id: "authoring-list-ol", kind: "ol-flow" as const },
+    { id: "authoring-list-ul-enter-exit", kind: "ul-enter-exit" as const },
+    { id: "authoring-list-ol-enter-exit", kind: "ol-enter-exit" as const },
     { id: "authoring-list-styled", kind: "styled-flow" as const },
     {
       id: "authoring-list-boundary-delete",
@@ -3146,11 +3230,14 @@ async function runAuthoringParityQa(
     },
     { id: "authoring-soft-break-slash", kind: "soft-break-slash" as const },
   ];
-  const cases = allCases.filter(
-    (test) => !caseFilter || test.id.includes(caseFilter),
+  const cases = selectShard(
+    allCases.filter((test) => !caseFilter || test.id.includes(caseFilter)),
+    shard,
   );
   if (!cases.length) {
-    throw new Error(`no authoring parity cases match ${caseFilter}`);
+    throw new Error(
+      `no authoring parity cases match ${caseFilter ?? "(no filter)"} in shard ${shard ? `${shard.index + 1}/${shard.total}` : "(all)"}`,
+    );
   }
 
   await page.goto(`${base}/home`, { waitUntil: "domcontentloaded" });
@@ -3158,14 +3245,14 @@ async function runAuthoringParityQa(
   const created = await action(page, "create-deck", {
     title: `[edit-fidelity] authoring parity ${Date.now()}`,
     slides: cases.map((test) => {
-      if (test.kind === "ul-flow") {
+      if (test.kind === "ul-flow" || test.kind === "ul-enter-exit") {
         return {
           id: test.id,
           content:
             '<div class="fmd-slide"><ul style="list-style-type: disc"><li><p>Alpha</p></li></ul></div>',
         };
       }
-      if (test.kind === "ol-flow") {
+      if (test.kind === "ol-flow" || test.kind === "ol-enter-exit") {
         return {
           id: test.id,
           content:
@@ -3439,6 +3526,16 @@ async function runAuthoringParityQa(
         tailInBullet: authoredListText.some((value) => value.includes("Tail")),
         retainedSourceText: text.includes("Alpha"),
         hasTypedText: text.includes("Tail"),
+        markerFontSizesMatchText: bulletRows.every((row) => {
+          const marker = row.firstElementChild;
+          const text = row.lastElementChild;
+          return (
+            marker instanceof HTMLElement &&
+            text instanceof HTMLElement &&
+            getComputedStyle(marker).fontSize ===
+              getComputedStyle(text).fontSize
+          );
+        }),
         html: root.innerHTML,
       };
     });
@@ -3446,7 +3543,8 @@ async function runAuthoringParityQa(
       state.bulletCount === 0 ||
       !state.tailInBullet ||
       !state.retainedSourceText ||
-      !state.hasTypedText
+      !state.hasTypedText ||
+      !state.markerFontSizesMatchText
     ) {
       throw new Error(
         `bullet shortcut did not create a new bullet containing the inserted text: ${JSON.stringify(state)}`,
@@ -3788,6 +3886,16 @@ async function runAuthoringParityQa(
             );
           }
         });
+      } else if (
+        test.kind === "ul-enter-exit" ||
+        test.kind === "ol-enter-exit"
+      ) {
+        await editor.press(lineEndKey);
+        await editor.press("Enter");
+        await editor.press("Enter");
+        await editor.pressSequentially("Plain");
+        await assertPlainLine(editor);
+        await finish(index, async () => {});
       } else if (test.kind === "ul-flow" || test.kind === "ol-flow") {
         await editor.press(lineEndKey);
         await editor.press("Enter");
@@ -3807,7 +3915,7 @@ async function runAuthoringParityQa(
           }
           await editor.press(lineEndKey);
           await editor.press("Enter");
-          await editor.press("Enter");
+          await editor.press("Backspace");
           await editor.pressSequentially("Plain");
           await assertPlainLine(editor);
         } else {
@@ -3826,7 +3934,7 @@ async function runAuthoringParityQa(
           }
           await editor.press(lineEndKey);
           await editor.press("Enter");
-          await editor.press("Enter");
+          await editor.press("Backspace");
           await editor.pressSequentially("Plain");
           await assertPlainLine(editor);
         }
@@ -5574,45 +5682,111 @@ async function runAuthoringFuzzQa(
     let createError: unknown = null;
     let seedHarnessUnavailable: CouldNotRun | null = null;
     const unavailableCleanupPages = new Set<Page>();
+    type CleanupSessionIdentity = {
+      kind: "poll" | "heartbeat";
+      sessionId: string;
+      pathname: string;
+    };
     const cleanupRequestStartTimes = new Map<
       any,
-      { page: Page; startedAt: number }
+      {
+        page: Page;
+        startedAt: number;
+        requestSourceIsMainFrame: boolean;
+        requestFrameUrl: string | null;
+        outgoingDocumentUrl: string | null;
+        sessionIdentity: CleanupSessionIdentity | null;
+      }
     >();
     const cleanupRequestFinishedAt = new WeakMap<any, number>();
     const cleanupClaimSequenceByRequest = new WeakMap<any, number>();
+    const cleanupClaimSequenceByPage = new Map<Page, number>();
+    const cleanupClaimSequenceByPageAndUrl = new WeakMap<
+      Page,
+      Map<string, number>
+    >();
+    const cleanupPendingClaimRequestsByPage = new Map<Page, Set<any>>();
+    const cleanupMainFrameNavigationStartsByPage = new Map<Page, number[]>();
     const failedCleanupBrowserSessionClaims: Array<{
       page: Page;
       url: string;
       pathname: string;
       method: string;
+      sessionId: string;
       startedAt: number;
       failedAt: number;
       sameOrigin: boolean;
       sequence: number;
+      competingClaimPendingAtFailure: boolean;
+      competingSameUrlClaimStartedAfterFailure?: boolean;
+      competingSameUrlClaimPendingAtFailure: boolean;
+      requestWasPendingAtNavigation: boolean;
     }> = [];
     let cleanupClaimSequence = 0;
     let cleanupNavigationStarted = false;
     let cleanupNavigationPage: Page | null = null;
+    let cleanupNavigationCompetingPollStarted = false;
     let cleanupNavigationCompetingClaimStarted = false;
-    let cleanupNavigationCompetingRegistrationStarted = false;
+    const cleanupNavigationCompetingClaimUrls = new Set<string>();
     const cleanupNavigationCompetingRequestUrls = new Set<string>();
+    const cleanupNavigationCompetingSessionRequests = new Map<
+      string,
+      Set<object>
+    >();
+    const cleanupNavigationCompetingSessionRequestKeysByRequest = new Map<
+      object,
+      string[]
+    >();
+    const removePendingCleanupClaim = (target: Page, request: any) => {
+      const pendingClaims = cleanupPendingClaimRequestsByPage.get(target);
+      if (!pendingClaims) return;
+      pendingClaims.delete(request);
+      if (pendingClaims.size === 0) {
+        cleanupPendingClaimRequestsByPage.delete(target);
+      }
+    };
+    const cleanupSessionIdentityFor = (
+      request: any,
+    ): CleanupSessionIdentity | null => {
+      const requestUrl = new URL(request.url());
+      if (
+        !/^\/_agent-native\/browser-sessions(?:\/|$)/.test(requestUrl.pathname)
+      ) {
+        return null;
+      }
+      let postData: string | null = null;
+      if (request.method() === "POST") {
+        try {
+          postData = request.postData() ?? null;
+        } catch {
+          postData = null;
+        }
+      }
+      const identity = browserSessionNavigationRequestIdentity(
+        request.method(),
+        requestUrl.pathname,
+        postData,
+      );
+      if (identity?.status === "identified") {
+        return {
+          kind: identity.kind,
+          sessionId: identity.sessionId,
+          pathname: requestUrl.pathname,
+        };
+      }
+      return null;
+    };
     const isBrowserSessionRequest = (request: any) =>
       /^\/_agent-native\/browser-sessions(?:\/|$)/.test(
         new URL(request.url()).pathname,
       );
-    const isBrowserSessionClaimRequest = (request: any) =>
-      request.method() === "POST" &&
-      /^\/_agent-native\/browser-sessions\/[^/]+\/requests\/claim$/.test(
-        new URL(request.url()).pathname,
+    const isCleanupPollRequest = (request: any) => {
+      const requestUrl = new URL(request.url());
+      return (
+        request.method() === "GET" &&
+        requestUrl.pathname === "/_agent-native/poll"
       );
-    const isBrowserSessionRegistrationRequest = (request: any) =>
-      request.method() === "POST" &&
-      (/^\/_agent-native\/browser-sessions$/.test(
-        new URL(request.url()).pathname,
-      ) ||
-        /^\/_agent-native\/browser-sessions\/[^/]+\/heartbeat$/.test(
-          new URL(request.url()).pathname,
-        ));
+    };
     const cleanupRequestTrackingPages = new Map<
       Page,
       {
@@ -5624,46 +5798,138 @@ async function runAuthoringFuzzQa(
     const trackCleanupRequests = (target: Page) => {
       if (cleanupRequestTrackingPages.has(target)) return;
       const onRequest = (request: any) => {
-        if (isBrowserSessionClaimRequest(request)) {
+        let requestFrame: any = null;
+        const sessionIdentity = cleanupSessionIdentityFor(request);
+        try {
+          if (request.serviceWorker() === null) requestFrame = request.frame();
+        } catch {
+          requestFrame = null;
+        }
+        const startedAt = Date.now();
+        let isMainFrameNavigationRequest = false;
+        try {
+          isMainFrameNavigationRequest =
+            request.isNavigationRequest() &&
+            requestFrame === target.mainFrame();
+        } catch {
+          isMainFrameNavigationRequest = false;
+        }
+        if (isMainFrameNavigationRequest) {
+          const navigationStarts =
+            cleanupMainFrameNavigationStartsByPage.get(target) ?? [];
+          navigationStarts.push(startedAt);
+          cleanupMainFrameNavigationStartsByPage.set(
+            target,
+            navigationStarts.slice(-20),
+          );
+        }
+        if (sessionIdentity?.kind === "poll") {
           cleanupClaimSequence += 1;
           cleanupClaimSequenceByRequest.set(request, cleanupClaimSequence);
+          cleanupClaimSequenceByPage.set(target, cleanupClaimSequence);
+          const claimSequencesByUrl =
+            cleanupClaimSequenceByPageAndUrl.get(target) ?? new Map();
+          claimSequencesByUrl.set(request.url(), cleanupClaimSequence);
+          cleanupClaimSequenceByPageAndUrl.set(target, claimSequencesByUrl);
+          const pendingClaims =
+            cleanupPendingClaimRequestsByPage.get(target) ?? new Set();
+          pendingClaims.add(request);
+          cleanupPendingClaimRequestsByPage.set(target, pendingClaims);
         }
-        if (cleanupNavigationStarted && isBrowserSessionRequest(request)) {
+        if (
+          isCleanupNavigationCompetitionPage(
+            target,
+            cleanupNavigationPage,
+            cleanupNavigationStarted,
+          ) &&
+          isBrowserSessionRequest(request)
+        ) {
           cleanupNavigationCompetingRequestUrls.add(request.url());
-          if (isBrowserSessionClaimRequest(request)) {
-            cleanupNavigationCompetingClaimStarted = true;
+          if (sessionIdentity) {
+            recordCleanupNavigationSessionCompetitor(
+              request,
+              sessionIdentity,
+              cleanupNavigationCompetingSessionRequests,
+              cleanupNavigationCompetingSessionRequestKeysByRequest,
+            );
           }
-          if (isBrowserSessionRegistrationRequest(request)) {
-            cleanupNavigationCompetingRegistrationStarted = true;
-          }
+        }
+        if (
+          cleanupNavigationStarted &&
+          target === cleanupNavigationPage &&
+          isCleanupPollRequest(request)
+        ) {
+          cleanupNavigationCompetingPollStarted = true;
+        }
+        if (
+          cleanupNavigationStarted &&
+          target === cleanupNavigationPage &&
+          sessionIdentity?.kind === "poll"
+        ) {
+          cleanupNavigationCompetingClaimStarted = true;
+          cleanupNavigationCompetingClaimUrls.add(request.url());
         }
         cleanupRequestStartTimes.set(request, {
           page: target,
           startedAt: Date.now(),
+          requestSourceIsMainFrame: requestFrame === target.mainFrame(),
+          requestFrameUrl: requestFrame?.url() ?? null,
+          outgoingDocumentUrl: target.url() || null,
+          sessionIdentity,
         });
       };
       const onRequestFinished = (request: any) => {
+        removeCleanupNavigationSessionCompetitor(
+          request,
+          cleanupNavigationCompetingSessionRequests,
+          cleanupNavigationCompetingSessionRequestKeysByRequest,
+        );
         recordCleanupRequestOutcome(
           cleanupRequestFinishedAt,
           request,
           "finished",
           Date.now(),
         );
+        removePendingCleanupClaim(target, request);
         cleanupRequestStartTimes.delete(request);
       };
       const onRequestFailed = (request: any) => {
+        removeCleanupNavigationSessionCompetitor(
+          request,
+          cleanupNavigationCompetingSessionRequests,
+          cleanupNavigationCompetingSessionRequestKeysByRequest,
+        );
         const started = cleanupRequestStartTimes.get(request);
-        if (started && isBrowserSessionClaimRequest(request)) {
+        if (started && started.sessionIdentity?.kind === "poll") {
           const requestUrl = new URL(request.url());
+          const failedAt = Date.now();
           failedCleanupBrowserSessionClaims.push({
             page: target,
             url: request.url(),
             pathname: requestUrl.pathname,
             method: request.method(),
+            sessionId: started.sessionIdentity.sessionId,
             startedAt: started.startedAt,
-            failedAt: Date.now(),
+            failedAt,
             sameOrigin: requestUrl.origin === new URL(base).origin,
             sequence: cleanupClaimSequenceByRequest.get(request) ?? 0,
+            competingClaimPendingAtFailure: [
+              ...(cleanupPendingClaimRequestsByPage.get(target) ?? []),
+            ].some((pendingRequest) => pendingRequest !== request),
+            competingSameUrlClaimPendingAtFailure: [
+              ...(cleanupPendingClaimRequestsByPage.get(target) ?? []),
+            ].some(
+              (pendingRequest) =>
+                pendingRequest !== request &&
+                pendingRequest.url() === request.url(),
+            ),
+            requestWasPendingAtNavigation: (
+              cleanupMainFrameNavigationStartsByPage.get(target) ?? []
+            ).some(
+              (navigationStartedAt) =>
+                started.startedAt <= navigationStartedAt &&
+                navigationStartedAt <= failedAt,
+            ),
           });
         }
         recordCleanupRequestOutcome(
@@ -5672,6 +5938,7 @@ async function runAuthoringFuzzQa(
           "failed",
           Date.now(),
         );
+        removePendingCleanupClaim(target, request);
         cleanupRequestStartTimes.delete(request);
       };
       target.on("request", onRequest);
@@ -5852,7 +6119,8 @@ async function runAuthoringFuzzQa(
       }
     } finally {
       const cleanupErrors: string[] = [];
-      const pendingCleanupConsoleInspections = new Set<Promise<void>>();
+      const pendingCleanupErrorInspections = new Set<Promise<void>>();
+      const pendingRecoveryPageErrors = new Set<{ at: number }>();
       const monitoredPages = new Set<Page>();
       const cleanupPageListeners = new Map<
         Page,
@@ -5869,7 +6137,12 @@ async function runAuthoringFuzzQa(
         pathname: string;
         method: string;
         startedAt: number;
+        sessionIdentity: CleanupSessionIdentity | null;
         sameOrigin: boolean;
+        requestSourceIsMainFrame: boolean;
+        requestFrameUrl: string | null;
+        outgoingDocumentUrl: string | null;
+        retiredSessionId: string | null;
         requestWasPendingAtNavigation: true;
       }> = [];
       let recoveryPage: Page | null = stableCleanupPage;
@@ -5880,7 +6153,9 @@ async function runAuthoringFuzzQa(
         target: Page | null = lastCleanupPage,
       ) => {
         cleanupErrors.push(
-          formatAuthoringFuzzCleanupIssue(label, deckId, error),
+          redactBrowserSessionSensitiveText(
+            formatAuthoringFuzzCleanupIssue(label, deckId, error),
+          ),
         );
         if (
           target &&
@@ -5896,8 +6171,16 @@ async function runAuthoringFuzzQa(
       const getCleanupNavigationCandidates = () => {
         const now = Date.now();
         return cleanupNavigationCandidates.map(
-          ({ request, startedAt, ...candidate }) => {
+          ({ request, startedAt, sessionIdentity, ...candidate }) => {
             const finishedAt = cleanupRequestFinishedAt.get(request);
+            const sessionCorrelation =
+              cleanupNavigationSessionCorrelation(sessionIdentity);
+            const competingSessionRequestStarted = sessionIdentity
+              ? hasActiveCleanupNavigationSessionCompetitor(
+                  sessionIdentity,
+                  cleanupNavigationCompetingSessionRequests,
+                )
+              : cleanupNavigationCompetingRequestUrls.has(candidate.url);
             return {
               ...candidate,
               ageMs: now - startedAt,
@@ -5908,11 +6191,22 @@ async function runAuthoringFuzzQa(
                     settledAgeMs: now - finishedAt,
                   }),
               competingRequestStartedAfterNavigation:
-                cleanupNavigationCompetingRequestUrls.has(candidate.url),
+                candidate.pathname === "/_agent-native/poll"
+                  ? cleanupNavigationCompetingPollStarted
+                  : competingSessionRequestStarted,
               competingClaimStartedAfterNavigation:
+                sessionIdentity?.kind === "poll" &&
                 cleanupNavigationCompetingClaimStarted,
+              competingSameUrlClaimStartedAfterNavigation:
+                cleanupNavigationCompetingClaimUrls.has(candidate.url),
               competingRegistrationStartedAfterNavigation:
-                cleanupNavigationCompetingRegistrationStarted,
+                sessionIdentity?.kind === "heartbeat" &&
+                competingSessionRequestStarted,
+              ...sessionCorrelation,
+              competingSameTypeRequest:
+                sessionIdentity?.kind === "heartbeat"
+                  ? competingSessionRequestStarted
+                  : undefined,
             };
           },
         );
@@ -5921,32 +6215,73 @@ async function runAuthoringFuzzQa(
         target === cleanupNavigationPage
           ? getCleanupNavigationCandidates()
           : [];
-      const recoveryPollCandidatesFor = (target: Page, now = Date.now()) => {
+      const pruneFailedCleanupBrowserSessionClaims = (now = Date.now()) => {
+        const pendingPageErrorAts = Array.from(
+          pendingRecoveryPageErrors,
+          ({ at }) => at,
+        );
         for (
           let index = failedCleanupBrowserSessionClaims.length - 1;
           index >= 0;
           index -= 1
         ) {
-          if (now - failedCleanupBrowserSessionClaims[index].failedAt > 250) {
+          if (
+            !shouldRetainCleanupRecoveryClaimEvidence(
+              failedCleanupBrowserSessionClaims[index].failedAt,
+              now,
+              pendingPageErrorAts,
+            )
+          ) {
             failedCleanupBrowserSessionClaims.splice(index, 1);
           }
         }
+      };
+      const recoveryPollCandidatesFor = (
+        target: Page,
+        pageErrorAt = Date.now(),
+        now = Date.now(),
+      ) => {
+        pruneFailedCleanupBrowserSessionClaims(now);
         return failedCleanupBrowserSessionClaims
-          .filter((candidate) => candidate.page === target)
+          .filter(
+            (candidate) =>
+              candidate.page === target &&
+              isWithinCleanupRecoveryClaimCorrelationWindow(
+                candidate.failedAt,
+                pageErrorAt,
+              ),
+          )
           .map((candidate) => ({
             url: candidate.url,
             pathname: candidate.pathname,
             method: candidate.method,
-            requestAgeMs: now - candidate.startedAt,
-            failureAgeMs: now - candidate.failedAt,
+            sessionId: candidate.sessionId,
+            requestAgeMs: cleanupRecoveryClaimRequestAgeMs(
+              candidate.startedAt,
+              pageErrorAt,
+            ),
+            failureOffsetMs: candidate.failedAt - pageErrorAt,
             sameOrigin: candidate.sameOrigin,
             competingClaimStartedAfterFailure:
-              cleanupClaimSequence > candidate.sequence,
+              (cleanupClaimSequenceByPage.get(target) ?? candidate.sequence) >
+              candidate.sequence,
+            competingClaimPendingAtFailure:
+              candidate.competingClaimPendingAtFailure,
+            competingSameUrlClaimStartedAfterFailure:
+              (cleanupClaimSequenceByPageAndUrl
+                .get(target)
+                ?.get(candidate.url) ?? candidate.sequence) >
+              candidate.sequence,
+            competingSameUrlClaimPendingAtFailure:
+              candidate.competingSameUrlClaimPendingAtFailure,
+            requestWasPendingAtNavigation:
+              candidate.requestWasPendingAtNavigation,
           }));
       };
       const isExpectedCleanupNavigationError = (
         target: Page,
-        message: string,
+        message: string | Error,
+        recoveryPageErrorAt = Date.now(),
       ) => {
         return (
           isExpectedCleanupNavigationRequestError(
@@ -5957,7 +6292,7 @@ async function runAuthoringFuzzQa(
           (target !== page &&
             isExpectedCleanupRecoveryPageBrowserSessionError(
               message,
-              recoveryPollCandidatesFor(target),
+              recoveryPollCandidatesFor(target, recoveryPageErrorAt),
             ))
         );
       };
@@ -5982,28 +6317,74 @@ async function runAuthoringFuzzQa(
           const shouldIgnore = (normalized: string) =>
             isExpectedCleanupNavigationError(target, normalized);
           if (!isFirefoxBrowserSessionConsoleError(text)) {
-            if (!shouldIgnore(text)) cleanupErrors.push(`console: ${text}`);
+            if (!shouldIgnore(text))
+              cleanupErrors.push(
+                redactBrowserSessionSensitiveText(`console: ${text}`),
+              );
             return;
           }
           let inspection: Promise<void>;
           inspection = normalizeFirefoxBrowserSessionConsoleError(message)
             .then((normalized) => {
               if (!shouldIgnore(normalized))
-                cleanupErrors.push(`console: ${normalized}`);
+                cleanupErrors.push(
+                  redactBrowserSessionSensitiveText(`console: ${normalized}`),
+                );
             })
             .catch((error: unknown) => {
-              cleanupErrors.push(`console: ${text} (${String(error)})`);
+              cleanupErrors.push(
+                redactBrowserSessionSensitiveText(
+                  `console: ${text} (${String(error)})`,
+                ),
+              );
             })
-            .finally(() => pendingCleanupConsoleInspections.delete(inspection));
-          pendingCleanupConsoleInspections.add(inspection);
+            .finally(() => pendingCleanupErrorInspections.delete(inspection));
+          pendingCleanupErrorInspections.add(inspection);
         };
         const onPageError = (error: Error) => {
-          if (isExpectedCleanupNavigationError(target, error.message)) return;
-          cleanupErrors.push(`pageerror: ${error.stack ?? String(error)}`);
+          const pageErrorAt = Date.now();
+          if (isPotentialCleanupRecoveryPageBrowserSessionError(error)) {
+            const pendingPageError = { at: pageErrorAt };
+            pendingRecoveryPageErrors.add(pendingPageError);
+            let inspection: Promise<void>;
+            inspection = new Promise<void>((resolve) =>
+              setTimeout(resolve, retiredBrowserSessionPollConsoleGraceMs),
+            )
+              .then(() => {
+                if (
+                  !isExpectedCleanupNavigationError(target, error, pageErrorAt)
+                ) {
+                  cleanupErrors.push(
+                    redactBrowserSessionSensitiveText(
+                      `pageerror: ${error.stack ?? String(error)}`,
+                    ),
+                  );
+                }
+              })
+              .finally(() => {
+                pendingRecoveryPageErrors.delete(pendingPageError);
+                pruneFailedCleanupBrowserSessionClaims();
+                pendingCleanupErrorInspections.delete(inspection);
+              });
+            pendingCleanupErrorInspections.add(inspection);
+            return;
+          }
+          if (isExpectedCleanupNavigationError(target, error, pageErrorAt)) {
+            return;
+          }
+          cleanupErrors.push(
+            redactBrowserSessionSensitiveText(
+              `pageerror: ${error.stack ?? String(error)}`,
+            ),
+          );
         };
         const onResponse = (response: { status(): number; url(): string }) => {
           if (response.status() >= 400) {
-            cleanupErrors.push(`HTTP ${response.status()} ${response.url()}`);
+            cleanupErrors.push(
+              redactBrowserSessionSensitiveText(
+                `HTTP ${response.status()} ${response.url()}`,
+              ),
+            );
           }
         };
         target.on("console", onConsole);
@@ -6155,7 +6536,7 @@ async function runAuthoringFuzzQa(
               ...cleanupRequestStartTimes.entries(),
             ]
               .filter(([, request]) => request.page === cleanupPage)
-              .map(([request, { startedAt }]) => {
+              .map(([request, tracked]) => {
                 const url = request.url();
                 const requestUrl = new URL(url);
                 return {
@@ -6163,8 +6544,13 @@ async function runAuthoringFuzzQa(
                   url,
                   pathname: requestUrl.pathname,
                   method: request.method(),
-                  startedAt,
+                  startedAt: tracked.startedAt,
+                  sessionIdentity: tracked.sessionIdentity,
                   sameOrigin: requestUrl.origin === cleanupUrl.origin,
+                  requestSourceIsMainFrame: tracked.requestSourceIsMainFrame,
+                  requestFrameUrl: tracked.requestFrameUrl,
+                  outgoingDocumentUrl: tracked.outgoingDocumentUrl,
+                  retiredSessionId: tracked.sessionIdentity?.sessionId ?? null,
                   requestWasPendingAtNavigation: true as const,
                 };
               });
@@ -6214,8 +6600,8 @@ async function runAuthoringFuzzQa(
           recordCleanupFailure(label, error, target);
         }
       };
-      while (pendingCleanupConsoleInspections.size) {
-        await Promise.all([...pendingCleanupConsoleInspections]);
+      while (pendingCleanupErrorInspections.size) {
+        await Promise.all([...pendingCleanupErrorInspections]);
       }
       cleanupNavigationCandidates = [];
       if (page) await closePage(page, "could not close authoring page");
@@ -7590,13 +7976,20 @@ async function main() {
             request.method() === "POST" && request.postData()
               ? request.postDataJSON()
               : undefined;
+          const pathname = new URL(request.url()).pathname;
           const response = authoringFuzzBrowserSessionResponse(
             request.method(),
-            new URL(request.url()).pathname,
+            pathname,
             requestBody,
           );
+          const status = response ? (response.ok ? 200 : 400) : 501;
+          if (!response) {
+            console.error(
+              `[edit-fidelity] unexpected browser-session mock request: ${request.method()} ${redactBrowserSessionRequestPath(pathname)} (${status})`,
+            );
+          }
           await route.fulfill({
-            status: response ? (response.ok ? 200 : 400) : 501,
+            status,
             contentType: "application/json",
             headers: corsHeaders,
             body: JSON.stringify(
@@ -7771,6 +8164,7 @@ async function main() {
         base,
         outRoot,
         authoringCaseFilter,
+        authoringShard,
       );
       await page.close();
       if (problems.length) {

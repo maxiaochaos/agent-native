@@ -1,3 +1,7 @@
+import { saveRevisionOf } from "@agent-native/core/save-conflict";
+
+export type CutRange = { startMs: number; endMs: number };
+
 export interface TrimRange {
   id?: string;
   startMs: number;
@@ -31,6 +35,8 @@ export interface EditsJson {
   stitchedFrom?: string[];
   mediaStorageLayout?: "external";
   rewindOriginalStartMs?: number;
+  /** The Rewind pre-roll whose range was prepended, so a retry knows. */
+  rewindPreRollId?: string;
   overlays?: unknown[];
   burnedRedactions?: unknown[];
 }
@@ -55,6 +61,7 @@ export function parseEdits(raw: string | null | undefined): EditsJson {
       stitchedFrom: _stitchedFrom,
       mediaStorageLayout: _mediaStorageLayout,
       rewindOriginalStartMs: _rewindOriginalStartMs,
+      rewindPreRollId: _rewindPreRollId,
       overlays: _overlays,
       burnedRedactions: _burnedRedactions,
       ...unknown
@@ -84,6 +91,9 @@ export function parseEdits(raw: string | null | undefined): EditsJson {
       j.rewindOriginalStartMs > 0
         ? { rewindOriginalStartMs: Math.round(j.rewindOriginalStartMs) }
         : {}),
+      ...(typeof j.rewindPreRollId === "string" && j.rewindPreRollId
+        ? { rewindPreRollId: j.rewindPreRollId }
+        : {}),
     };
   } catch {
     return { ...DEFAULT_EDITS };
@@ -105,6 +115,14 @@ function withTrimId(trim: TrimRange, index: number): IdentifiedTrim {
   };
 }
 
+/**
+ * The revision of a recording's trim list. Only a change to the trims moves it,
+ * so saving an overlay doesn't stale someone editing trims.
+ */
+export function trimsRevisionOf(editsJson: string | null | undefined): string {
+  return saveRevisionOf(parseEdits(editsJson).trims);
+}
+
 export function identifyTrims(trims: TrimRange[]): IdentifiedTrim[] {
   return trims.map(withTrimId);
 }
@@ -124,6 +142,18 @@ export function serializeEdits(edits: EditsJson): string {
 
 export function getExcludedRanges(edits: EditsJson): TrimRange[] {
   return normalizeExcluded(edits.trims.filter((t) => t.excluded));
+}
+
+/**
+ * The cut ranges chapter times are mapped through, as plain {startMs,endMs}.
+ * set-chapters compares an editor's copy with the stored one, so both sides
+ * build it here.
+ */
+export function cutRangesOf(edits: EditsJson): CutRange[] {
+  return getExcludedRanges(edits).map(({ startMs, endMs }) => ({
+    startMs,
+    endMs,
+  }));
 }
 
 export function normalizeExcluded(ranges: TrimRange[]): TrimRange[] {
@@ -178,6 +208,22 @@ export function effectiveDuration(
     );
   }
   return Math.max(0, durationMs - excluded);
+}
+
+/**
+ * Where a mark stored at an original-media time (a chapter, comment or
+ * reaction) sits on the edited timeline, or null when a cut hides it. The
+ * player's marks and the chapter list both use this, so they agree on which
+ * marks show and where.
+ */
+export function editedMarkerMs(
+  originalMs: number,
+  edits: EditsJson,
+): number | null {
+  if (!Number.isFinite(originalMs) || isExcluded(originalMs, edits)) {
+    return null;
+  }
+  return originalToEdited(originalMs, edits);
 }
 
 export function isExcluded(originalMs: number, edits: EditsJson): boolean {

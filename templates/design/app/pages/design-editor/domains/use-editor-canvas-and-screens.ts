@@ -12,6 +12,7 @@ import {
 import { type CanvasFrameGeometryById } from "@shared/canvas-frames";
 import { getFrameGroupBounds } from "@shared/canvas-math";
 import type { A11yFinding } from "@shared/design-review";
+import type { FrameSizePreset } from "@shared/frame-size-presets";
 import type { InteractionState } from "@shared/interaction-states";
 import { annotateScreenHtmlForPersist } from "@shared/screen-annotation";
 import { sourceContentHash } from "@shared/source-workspace";
@@ -58,6 +59,7 @@ import { runRecordPendingLiveTextEdit } from "../commands/record-pending-live-te
 import { runRecordPendingVisualStyleEdit } from "../commands/record-pending-visual-style-edit";
 import { runSendRuntimeLayerMoveSemanticHandoff } from "../commands/send-runtime-layer-move-semantic-handoff";
 import { getCreatedScreenNavigationPlan } from "../created-screen-navigation";
+import { designMetadataQueryKey } from "../design-query-key";
 import { shouldAcceptEditorDragStateEvent } from "../editor-drag-state";
 import { runtimeMultiplicityForElementProvenance } from "../editor-helpers";
 import { TAB_ID } from "../editor-session";
@@ -65,7 +67,7 @@ import {
   getFreshActiveFileContent,
   getFreshScreenContent,
 } from "../editor-state";
-import { MAX_DESIGN_UNDO_STACK } from "../history";
+import { insertAtFileOrderIndex, MAX_DESIGN_UNDO_STACK } from "../history";
 import {
   autoHeightScreenIds,
   getAllScreenFrameEntries,
@@ -177,9 +179,11 @@ export function useEditorCanvasAndScreens({
     designEditorCommandVersion,
     designAccessRole,
     canEditDesign,
+    canPersistDesignSource,
     rawServerFilesByIdRef,
     historyFilesRef,
     pendingLocalFileContentsRef,
+    sourceLoader,
     createFileMutation,
     createFileAsync,
     deleteFileMutation,
@@ -335,19 +339,27 @@ export function useEditorCanvasAndScreens({
       filename: string;
       fileType: DesignFile["fileType"];
       content: string;
+      createdAt?: string | null;
+      fileOrderIndex?: number;
       result?: Record<string, unknown> | null;
     }) => {
       if (!id) return;
       const now = new Date().toISOString();
+      const createdAt =
+        args.createdAt === undefined ? args.result?.createdAt : args.createdAt;
+      if (
+        createdAt !== undefined &&
+        createdAt !== null &&
+        typeof createdAt !== "string"
+      ) {
+        throw new Error("Invalid file creation timestamp");
+      }
       const optimisticFile: DesignFile = {
         id: args.fileId,
         filename: args.filename,
         fileType: args.fileType,
         content: annotateScreenHtmlForPersist(args.content, args.fileType),
-        createdAt:
-          typeof args.result?.createdAt === "string"
-            ? args.result.createdAt
-            : now,
+        createdAt: createdAt === undefined ? now : createdAt,
         updatedAt:
           typeof args.result?.updatedAt === "string"
             ? args.result.updatedAt
@@ -359,26 +371,41 @@ export function useEditorCanvasAndScreens({
         ? historyFilesRef.current.map((file) =>
             file.id === args.fileId ? optimisticFile : file,
           )
-        : [...historyFilesRef.current, optimisticFile];
+        : insertAtFileOrderIndex(
+            historyFilesRef.current,
+            optimisticFile,
+            args.fileOrderIndex,
+          );
       void queryClient.cancelQueries({
-        queryKey: ["action", "get-design", { id }],
+        queryKey: designMetadataQueryKey(id),
         exact: true,
       });
-      queryClient.setQueryData(["action", "get-design", { id }], (old: any) => {
-        if (!old || typeof old !== "object" || !Array.isArray(old.files)) {
-          return old;
-        }
-        return {
-          ...old,
-          files: old.files.some((file: DesignFile) => file.id === args.fileId)
-            ? old.files.map((file: DesignFile) =>
-                file.id === args.fileId ? optimisticFile : file,
-              )
-            : [...old.files, optimisticFile],
-        };
+      queryClient.setQueryData(
+        designMetadataQueryKey(id),
+        (old: Record<string, unknown> | undefined) => {
+          if (!old || typeof old !== "object" || !Array.isArray(old.files))
+            return old;
+          const { content: _content, ...metadata } = optimisticFile;
+          return {
+            ...old,
+            files: old.files.some((file: DesignFile) => file.id === args.fileId)
+              ? old.files.map((file: DesignFile) =>
+                  file.id === args.fileId ? metadata : file,
+                )
+              : insertAtFileOrderIndex(
+                  old.files,
+                  metadata,
+                  args.fileOrderIndex,
+                ),
+          };
+        },
+      );
+      sourceLoader?.prime(args.fileId, {
+        content: optimisticFile.content,
+        updatedAt: optimisticFile.updatedAt,
       });
     },
-    [id, queryClient],
+    [id, queryClient, sourceLoader],
   );
 
   const focusCreatedScreen = useCallback(
@@ -419,13 +446,12 @@ export function useEditorCanvasAndScreens({
           };
         });
       }
-      if (!options?.preserveCamera) {
-        cameraCommandNonceRef.current += 1;
-        setCameraCommand({
-          ...plan.camera,
-          nonce: cameraCommandNonceRef.current,
-        });
-      }
+      cameraCommandNonceRef.current += 1;
+      setCameraCommand({
+        ...plan.camera,
+        ...(options?.preserveCamera ? { revealOnly: true } : {}),
+        nonce: cameraCommandNonceRef.current,
+      });
     },
     [clearPendingOverviewLayerSelectionTimer, overviewScreens.length],
   );
@@ -569,7 +595,7 @@ export function useEditorCanvasAndScreens({
   );
 
   const handleCreateScreenFromPreset = useCallback(
-    (preset: { name: string; width: number; height: number }) => {
+    (preset: FrameSizePreset) => {
       const frames = getAllScreenFrameEntries({
         overviewScreens,
         canvasFrameGeometryById: exportCanvasFrameGeometryById,
@@ -686,6 +712,7 @@ export function useEditorCanvasAndScreens({
     serverFiles,
     publishCanonicalContent,
     canEditDesign,
+    canPersistDesignSource,
     isSignedIn,
     activeFileId,
     viewMode,

@@ -1,3 +1,4 @@
+import { isActionContractError } from "@agent-native/core/action";
 import { and, eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
@@ -187,6 +188,7 @@ function matchesDesignFile(row: FileRow, predicate: Predicate): boolean {
   return equalities.every(({ column, value }) => {
     if (column === "id") return row.id === value;
     if (column === "designId") return row.designId === value;
+    if (column === "filename") return row.filename === value;
     return true;
   });
 }
@@ -256,11 +258,21 @@ vi.mock("../server/db/index.js", () => {
 import { hasCollabState, applyText } from "@agent-native/core/collab";
 import { assertAccess } from "@agent-native/core/sharing";
 
+import { designOutputWriteReceipt } from "../shared/generation-output-receipt.js";
 import {
   sourceContentHash,
   sourceContentPatch,
 } from "../shared/source-workspace.js";
 import updateFileAction from "./update-file.js";
+
+async function rejectionFrom(run: () => Promise<unknown>): Promise<unknown> {
+  try {
+    await run();
+  } catch (error) {
+    return error;
+  }
+  throw new Error("Expected run to reject");
+}
 
 function buildDoc(bodyExtra = ""): string {
   return `<!DOCTYPE html>
@@ -348,6 +360,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       id: FILE_ID,
       designId: "design_1",
       updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(next);
     expect(await hasCollabState(FILE_ID)).toBe(true);
@@ -407,6 +420,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       id: FILE_ID,
       designId: DESIGN_ID,
       updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(next);
     expect(await hasCollabState(FILE_ID)).toBe(true);
@@ -501,6 +515,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       designId: "design_1",
       updated: true,
       skippedStaleMirror: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 0),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(sqlContentBefore);
     expect(designFilesStore.rows.get(FILE_ID)!.content).not.toContain(
@@ -546,6 +561,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       id: FILE_ID,
       designId: "design_1",
       updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(next);
     const liveText = getOrCreateDoc(FILE_ID).getText("content").toString();
@@ -571,6 +587,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       designId: "design_1",
       updated: true,
       skippedStaleMirror: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.filename).toBe("renamed.html");
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(sqlContentBefore);
@@ -586,6 +603,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       id: FILE_ID,
       designId: "design_1",
       updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.filename).toBe(
       "renamed-only.html",
@@ -593,7 +611,37 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
     expect("skippedStaleMirror" in result).toBe(false);
   });
 
-  it("6c. filename-only update alongside a would-be-throw case (syncCollab true) still throws for the whole call", async () => {
+  it("6c. file-type-only update counts as changed output", async () => {
+    const result = await updateFileAction.run({
+      id: FILE_ID,
+      fileType: "css",
+    } as never);
+
+    expect(result).toEqual({
+      id: FILE_ID,
+      designId: "design_1",
+      updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
+    });
+    expect(designFilesStore.rows.get(FILE_ID)!.fileType).toBe("css");
+  });
+
+  it("6d. unchanged file metadata does not count as changed output", async () => {
+    const result = await updateFileAction.run({
+      id: FILE_ID,
+      filename: "index.html",
+      fileType: "html",
+    } as never);
+
+    expect(result).toEqual({
+      id: FILE_ID,
+      designId: "design_1",
+      updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 0),
+    });
+  });
+
+  it("6e. filename-only update alongside a would-be-throw case (syncCollab true) still throws for the whole call", async () => {
     await applyText(FILE_ID, buildDoc(" live-edit-"), "content", "agent");
     const staleHash = sourceContentHash(buildDoc());
 
@@ -626,6 +674,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       id: FILE_ID,
       designId: "design_1",
       updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 0),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(next);
   });
@@ -653,6 +702,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       designId: "design_1",
       updated: true,
       skippedStaleMirror: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 0),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(sqlContentBefore);
   });
@@ -688,6 +738,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       id: FILE_ID,
       designId: "design_1",
       updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(editTwo);
 
@@ -716,6 +767,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       designId: "design_1",
       updated: true,
       skippedStaleMirror: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 0),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(sqlContentBefore);
     const liveText = getOrCreateDoc(FILE_ID).getText("content").toString();
@@ -745,6 +797,7 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
       id: FILE_ID,
       designId: "design_1",
       updated: true,
+      _receipt: designOutputWriteReceipt(DESIGN_ID, 1),
     });
     expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(callerContent);
 
@@ -753,7 +806,39 @@ describe("update-file: expectedVersionHash / syncCollab regression baseline", ()
     );
   });
 
-  it("12. delete-race after the access lookup: inner missing-file guard returns 404 (not a bare 500) so the outbox drops it", async () => {
+  it("12. versioned mirror-tip write conflicts with a divergent live document", async () => {
+    await applyText(
+      FILE_ID,
+      buildDoc(" other-editors-live-only-edit-"),
+      "content",
+      "agent",
+    );
+    const mirrorState = buildDoc(" mirror-state-");
+    designFilesStore.rows.get(FILE_ID)!.content = mirrorState;
+
+    let rejection: unknown = null;
+    try {
+      await updateFileAction.run({
+        id: FILE_ID,
+        content: buildDoc(" upload-based-on-mirror-state-"),
+        syncCollab: false,
+        expectedVersionHash: sourceContentHash(mirrorState),
+        operationSource: "screen-image-upload",
+        operationRevision: 1,
+      } as never);
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect((rejection as Error)?.message).toMatch(/changed since it was read/);
+    expect((rejection as { statusCode?: number })?.statusCode).toBe(409);
+    expect(designFilesStore.rows.get(FILE_ID)!.content).toBe(mirrorState);
+    expect(getOrCreateDoc(FILE_ID).getText("content").toString()).toBe(
+      buildDoc(" other-editors-live-only-edit-"),
+    );
+  });
+
+  it("13. delete-race after the access lookup: inner missing-file guard returns 404 (not a bare 500) so the outbox drops it", async () => {
     vi.mocked(assertAccess).mockImplementationOnce(async () => {
       designFilesStore.rows.clear();
       return { role: "editor", resource: {} } as never;
@@ -910,5 +995,58 @@ describe("update-file: editor-surface checkpoint skip surfaces in the result", (
     );
 
     expect(result).not.toHaveProperty("checkpoint");
+  });
+});
+
+describe("update-file: typed filename refusals", () => {
+  it("rejects a filename already used by another file in the design as a typed 409 and changes no row", async () => {
+    designFilesStore.rows.set("file_taken", {
+      id: "file_taken",
+      designId: DESIGN_ID,
+      filename: "taken.html",
+      fileType: "html",
+      content: buildDoc(" taken "),
+      createdAt: "2026-07-06T00:00:00.000Z",
+      updatedAt: "2026-07-06T00:00:00.000Z",
+    });
+    const before = [...designFilesStore.rows.values()].map((row) => ({
+      ...row,
+    }));
+
+    const error = await rejectionFrom(() =>
+      updateFileAction.run({
+        id: FILE_ID,
+        filename: "taken.html",
+      } as never),
+    );
+
+    expect(isActionContractError(error)).toBe(true);
+    expect(error).toMatchObject({
+      errorCode: "filename_taken",
+      statusCode: 409,
+      message: `File "taken.html" already exists in design ${DESIGN_ID}`,
+    });
+    expect([...designFilesStore.rows.values()]).toEqual(before);
+  });
+
+  it("rejects a path-traversal filename as a typed 400 before reading or writing any row", async () => {
+    const before = [...designFilesStore.rows.values()].map((row) => ({
+      ...row,
+    }));
+
+    const error = await rejectionFrom(() =>
+      updateFileAction.run({
+        id: FILE_ID,
+        filename: "../escape.html",
+      } as never),
+    );
+
+    expect(isActionContractError(error)).toBe(true);
+    expect(error).toMatchObject({
+      errorCode: "invalid_filename",
+      statusCode: 400,
+      message: "Invalid filename: path traversal not allowed",
+    });
+    expect([...designFilesStore.rows.values()]).toEqual(before);
   });
 });

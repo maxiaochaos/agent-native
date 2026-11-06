@@ -245,6 +245,8 @@ export interface DecideResourceSuggestionInput {
   idempotencyKey: string;
   observedBase: string;
   observedRevision?: number;
+  /** Where the resource's editor showed the suggestion; editors set it. */
+  placement?: unknown;
 }
 export interface CreateResourceSuggestionProposalInput {
   resourceType: string;
@@ -264,7 +266,13 @@ export interface DecideResourceSuggestionProposalInput {
   proposalId: string;
   decision: SuggestionDecision;
   idempotencyKey: string;
-  members: { id: string; observedRevision: number; observedBase: string }[];
+  members: {
+    id: string;
+    observedRevision: number;
+    observedBase: string;
+    /** Where the resource's editor showed the suggestion; editors set it. */
+    placement?: unknown;
+  }[];
 }
 export interface ResourceSuggestionProposalResult {
   proposal: ResourceSuggestionProposal;
@@ -588,6 +596,31 @@ function updateCommentSummary(
       summary.agentQueueCount + count(next, "agent") - count(previous, "agent"),
     ),
   };
+}
+
+/**
+ * Marks a comment deleted. The server deletes a thread's replies along with
+ * its first comment, so the cache does the same.
+ */
+export function markCommentDeleted(
+  comments: ReviewComment[],
+  commentId: string,
+): ReviewComment[] {
+  const deletedRoot = comments.find(
+    (comment) => comment.id === commentId && comment.parentCommentId === null,
+  );
+  const now = new Date().toISOString();
+  return comments.map((comment) =>
+    comment.id === commentId ||
+    (deletedRoot && comment.threadId === deletedRoot.threadId)
+      ? {
+          ...comment,
+          status: "deleted" as const,
+          deletedAt: now,
+          updatedAt: now,
+        }
+      : comment,
+  );
 }
 
 function matchesCommentQuery(
@@ -929,18 +962,9 @@ export function useDeleteReviewComment() {
     resource: input,
     transform: (data, params) =>
       updateComments(data, (comments) =>
-        comments
-          .map((comment) =>
-            comment.id === input.commentId
-              ? {
-                  ...comment,
-                  status: "deleted" as const,
-                  deletedAt: new Date().toISOString(),
-                  updatedAt: new Date().toISOString(),
-                }
-              : comment,
-          )
-          .filter((comment) => matchesCommentQuery(params, comment)),
+        markCommentDeleted(comments, input.commentId).filter((comment) =>
+          matchesCommentQuery(params, comment),
+        ),
       ),
   }));
 }
@@ -1064,10 +1088,47 @@ export function useCreateResourceSuggestionProposal() {
 }
 
 export function useDecideResourceSuggestionProposal() {
-  return useActionMutation<
+  return useOptimisticReviewMutation<
     ResourceSuggestionProposalResult,
     DecideResourceSuggestionProposalInput
-  >("decide-resource-suggestion-proposal");
+  >("decide-resource-suggestion-proposal", proposalDecisionOverlay);
+}
+
+/** Shows every listed proposal member as decided until the server answers. */
+export function proposalDecisionOverlay(
+  input: DecideResourceSuggestionProposalInput,
+  queryClient: QueryClient,
+): ReviewOptimisticMutation {
+  const [first] = input.members;
+  const resource = first && resourceForSuggestion(queryClient, first.id);
+  if (!resource) return noSuggestionOverlay();
+  const memberIds = new Set(input.members.map((member) => member.id));
+  return {
+    action: "list-resource-suggestions",
+    resource,
+    transform: (data, params) =>
+      updateSuggestions(data, (suggestions) =>
+        suggestions.flatMap((suggestion) => {
+          if (!memberIds.has(suggestion.id)) return [suggestion];
+          const next = { ...suggestion, status: input.decision };
+          return matchesSuggestionQuery(params, next) ? [next] : [];
+        }),
+      ),
+    onSuccess: (result) => (data, params) => {
+      const decided = new Map(
+        (result as ResourceSuggestionProposalResult).suggestions.map(
+          (suggestion) => [suggestion.id, suggestion],
+        ),
+      );
+      return updateSuggestions(data, (suggestions) =>
+        suggestions.flatMap((suggestion) => {
+          const next = decided.get(suggestion.id);
+          if (!next) return [suggestion];
+          return matchesSuggestionQuery(params, next) ? [next] : [];
+        }),
+      );
+    },
+  };
 }
 
 export function useDecideResourceSuggestion() {

@@ -1,5 +1,9 @@
-import { setClientAppState } from "@agent-native/core/client/hooks";
+import {
+  getBrowserTabId,
+  setClientAppState,
+} from "@agent-native/core/client/hooks";
 import { stripInlineBytes } from "@agent-native/core/shared";
+import { isHubSpotEmailHtml } from "@shared/hubspot-email";
 import type { LayoutGridById } from "@shared/layout-grid";
 import type { MotionPlaybackMode } from "@shared/motion-timeline";
 import type { InteractThemeMode } from "@shared/preview-color-scheme";
@@ -8,6 +12,7 @@ import type { RefObject } from "react";
 import type { CodeWorkbenchActiveFile } from "@/components/design/code-workbench/CodeWorkbench";
 import type { MotionDockLiveState } from "@/components/design/MotionDock";
 import type { ElementInfo } from "@/components/design/types";
+import { reportDesignWriteFailure } from "@/lib/design-write-failure";
 import type { ResponsiveEditScope } from "@/pages/design-editor/command-types";
 import { KEEPALIVE_ACTION_MAX_BYTES } from "@/pages/design-editor/data-operations";
 import { DESIGN_SELECTION_ZOOM_SAVE_DELAY_MS } from "@/pages/design-editor/editor-constants";
@@ -53,6 +58,18 @@ const MAX_SUMMARY_CLASSES = 40;
 const MAX_SUMMARY_CLASS_LENGTH = 200;
 const MAX_SUMMARY_TEXT_LENGTH = 200;
 const SELECTION_PUBLISH_RETRY_DELAYS_MS = [1_000, 2_000, 4_000];
+const frameTypeByFile = new WeakMap<
+  DesignFile,
+  { content: string; frameType: "hubspot-email" | null }
+>();
+
+function frameTypeForFile(file: DesignFile): "hubspot-email" | null {
+  const cached = frameTypeByFile.get(file);
+  if (cached && cached.content === file.content) return cached.frameType;
+  const frameType = isHubSpotEmailHtml(file.content) ? "hubspot-email" : null;
+  frameTypeByFile.set(file, { content: file.content, frameType });
+  return frameType;
+}
 
 // The agent targets an element by these ids; its subtree style snapshot stays
 // in the frame, where copy reads it on demand.
@@ -129,6 +146,7 @@ export interface PublishAgentSelectionContextArgs {
   persistedSelectionStateRef: RefObject<string | null>;
   persistedSelectionWriteTimerRef: RefObject<number | null>;
   responsiveEditScope: ResponsiveEditScope;
+  reviewThreadId: string | null;
   selectedElement: ElementInfo | null;
   selectedScreenIds: string[];
   selectedStateId: string | null;
@@ -165,6 +183,7 @@ export function runPublishAgentSelectionContext({
   persistedSelectionStateRef,
   persistedSelectionWriteTimerRef,
   responsiveEditScope,
+  reviewThreadId,
   selectedElement,
   selectedScreenIds,
   selectedStateId,
@@ -177,12 +196,14 @@ export function runPublishAgentSelectionContext({
     designTitle: design?.title ?? null,
     activeFileId: activeFile?.id ?? null,
     activeFilename: activeFile?.filename ?? null,
+    activeFrameType: activeFile ? frameTypeForFile(activeFile) : null,
     viewMode,
     zoom,
     screens: files.map((file) => ({
       id: file.id,
       filename: file.filename,
       fileType: file.fileType,
+      frameType: frameTypeForFile(file),
     })),
     selectedScreenIds,
     selectedElement,
@@ -197,6 +218,9 @@ export function runPublishAgentSelectionContext({
         ? { device: interactDevice, theme: interactTheme }
         : null,
     leftPanel: activeLeftPanel,
+    // The comment thread open on the canvas or highlighted in the Threads
+    // panel; null when none is, so the agent never reads a closed thread.
+    reviewThreadId,
     codeWorkspace: {
       open: activeLeftPanel === "code",
       backendKind: activeCodeFile?.backendKind ?? "virtual-inline",
@@ -221,6 +245,16 @@ export function runPublishAgentSelectionContext({
           ? motionDockLiveState.selectedKeyframeIds[0]
           : null,
       selectedKeyframeIds: motionDockLiveState.selectedKeyframeIds,
+      selectedEasingSegment: motionDockLiveState.selectedEasingSegment
+        ? {
+            trackId: motionDockLiveState.selectedEasingSegment.trackId,
+            targetNodeId:
+              motionDockLiveState.selectedEasingSegment.targetNodeId,
+            property: motionDockLiveState.selectedEasingSegment.property,
+            fromT: motionDockLiveState.selectedEasingSegment.fromT,
+            toT: motionDockLiveState.selectedEasingSegment.toT,
+          }
+        : null,
     },
     breakpoint: (activeBreakpointWidthState != null
       ? activeBreakpointWidthState < 500
@@ -285,6 +319,7 @@ export function runPublishAgentSelectionContext({
     activeTool: selection.activeTool,
     interact: selection.interact,
     leftPanel: selection.leftPanel,
+    reviewThreadId: selection.reviewThreadId,
     codeWorkspace: selection.codeWorkspace,
     dock: selection.dock,
     motion: selection.motion,
@@ -310,16 +345,22 @@ export function runPublishAgentSelectionContext({
     persistedSelectionStateRef.current = pending.key;
     persistedSelectionContextRef.current = pending.contextKey;
     const keys = designSelectionStateKeys();
+    const requestSource = getBrowserTabId();
     // Every key's write shares the browser's in-flight keepalive budget.
     const keepalive =
       new TextEncoder().encode(pending.key).length * keys.length <=
       KEEPALIVE_ACTION_MAX_BYTES;
+    let failure: DesignSelectionPublishError | undefined;
     void Promise.all(
       keys.map((key) =>
-        setClientAppState(key, pending.value, { keepalive }).then(
+        setClientAppState(key, pending.value, {
+          keepalive,
+          requestSource,
+        }).then(
           () => true,
           (cause: unknown) => {
-            console.error(new DesignSelectionPublishError(key, cause));
+            failure = new DesignSelectionPublishError(key, cause);
+            console.error(failure);
             return false;
           },
         ),
@@ -333,13 +374,15 @@ export function runPublishAgentSelectionContext({
       }
       persistedSelectionStateRef.current = null;
       persistedSelectionContextRef.current = null;
-      const delay = SELECTION_PUBLISH_RETRY_DELAYS_MS[attempt];
-      if (
-        delay === undefined ||
-        persistedSelectionWriteTimerRef.current !== null
-      ) {
+      if (attempt >= SELECTION_PUBLISH_RETRY_DELAYS_MS.length) {
+        reportDesignWriteFailure(
+          failure,
+          "designEditor.selectionPublishFailed",
+        );
         return;
       }
+      if (persistedSelectionWriteTimerRef.current !== null) return;
+      const delay = SELECTION_PUBLISH_RETRY_DELAYS_MS[attempt];
       persistedSelectionWriteTimerRef.current = window.setTimeout(() => {
         persistedSelectionWriteTimerRef.current = null;
         writePersistedSelection(pending, attempt + 1);

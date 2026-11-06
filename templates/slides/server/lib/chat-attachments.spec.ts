@@ -5,6 +5,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const saveUploadedReferenceFileMock = vi.hoisted(() => vi.fn());
 const readBoundedResponseBytesMock = vi.hoisted(() => vi.fn());
 const ssrfSafeFetchMock = vi.hoisted(() => vi.fn());
+const rememberThreadUploadsMock = vi.hoisted(() => vi.fn());
+
+vi.mock("./thread-uploads.js", () => ({
+  rememberThreadUploads: rememberThreadUploadsMock,
+}));
 
 vi.mock("../handlers/uploads.js", () => ({
   saveUploadedReferenceFile: saveUploadedReferenceFileMock,
@@ -128,6 +133,66 @@ describe("prepareSlidesChatAttachments", () => {
     saveUploadedReferenceFileMock.mockReset();
     readBoundedResponseBytesMock.mockReset();
     ssrfSafeFetchMock.mockReset();
+    rememberThreadUploadsMock.mockReset();
+  });
+
+  it("records each saved file under its thread so later turns can open it by name", async () => {
+    saveUploadedReferenceFileMock.mockResolvedValue({
+      path: "attachment:v1:example",
+      originalName: "proposal.pdf",
+      filename: "proposal.pdf",
+      type: "application/pdf",
+      size: 4,
+    });
+
+    const result = await prepareSlidesChatAttachments({
+      ownerEmail: "adam@builder.io",
+      message: "use this proposal",
+      threadId: "thread-1",
+      attachments: [
+        {
+          type: "file",
+          name: "proposal.pdf",
+          contentType: "application/pdf",
+          data: "data:application/pdf;base64,JVBERg==",
+        },
+      ],
+    });
+
+    expect(rememberThreadUploadsMock).toHaveBeenCalledWith("thread-1", [
+      { name: "proposal.pdf", path: "attachment:v1:example" },
+    ]);
+    expect(result?.message).toContain("at path: attachment:v1:example");
+  });
+
+  it("still lists this turn's files when the thread record cannot be saved", async () => {
+    saveUploadedReferenceFileMock.mockResolvedValue({
+      path: "attachment:v1:example",
+      originalName: "proposal.pdf",
+      filename: "proposal.pdf",
+      type: "application/pdf",
+      size: 4,
+    });
+    rememberThreadUploadsMock.mockRejectedValue(new Error("db unavailable"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await prepareSlidesChatAttachments({
+      ownerEmail: "adam@builder.io",
+      message: "use this proposal",
+      threadId: "thread-1",
+      attachments: [
+        {
+          type: "file",
+          name: "proposal.pdf",
+          contentType: "application/pdf",
+          data: "data:application/pdf;base64,JVBERg==",
+        },
+      ],
+    });
+
+    expect(result?.message).toContain("at path: attachment:v1:example");
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 
   it("keeps raw image data when storage returns an embeddable URL", async () => {
@@ -377,7 +442,11 @@ describe("prepareSlidesChatAttachments", () => {
     expect((result?.attachments?.[0] as any)?.slidesUploadPath).toBe(
       "slides-upload:v1:source",
     );
-    expect(result?.attachments?.[0]?.url).toBeUndefined();
+    // oracle-change: a URL-only document keeps its URL as a reference so the chat builder does not report it as unreadable.
+    expect(result?.attachments?.[0]).toMatchObject({
+      url,
+      referenceOnly: true,
+    });
   });
 
   it("bounds url-only attachment count and aggregate download bytes", async () => {
@@ -486,7 +555,7 @@ describe("prepareSlidesChatAttachments", () => {
     );
   });
 
-  it("surfaces an already-hosted, url-only image instead of silently dropping it", async () => {
+  it("surfaces an already-hosted image URL without presenting it as an import path", async () => {
     const result = await prepareSlidesChatAttachments({
       ownerEmail: "adam@builder.io",
       message: "add this image",
@@ -506,10 +575,72 @@ describe("prepareSlidesChatAttachments", () => {
     expect(result?.message).toContain(
       "embeddable URL: https://cdn.example.com/editor-ai.jpeg",
     );
+    expect(result?.message).not.toContain(
+      "path: https://cdn.example.com/editor-ai.jpeg",
+    );
+    expect(result?.message).toContain(
+      "Do not pass this URL or filename to `import-file`",
+    );
     expect(result?.attachments?.[0]?.url).toBe(
       "https://cdn.example.com/editor-ai.jpeg",
     );
+    expect(
+      (result?.attachments?.[0] as { slidesUploadPath?: string })
+        ?.slidesUploadPath,
+    ).toBeUndefined();
   });
+
+  it("keeps a URL-only image visible when its MIME metadata is missing", async () => {
+    const result = await prepareSlidesChatAttachments({
+      ownerEmail: "adam@builder.io",
+      message: "add this image",
+      attachments: [
+        {
+          type: "image",
+          name: "editor-ai.jpeg",
+          url: "https://cdn.example.com/editor-ai.jpeg",
+        },
+      ],
+    });
+
+    expect(result?.message).toContain("editor-ai.jpeg");
+    expect(result?.message).toContain(
+      "embeddable URL: https://cdn.example.com/editor-ai.jpeg",
+    );
+    expect(result?.message).not.toContain(
+      "path: https://cdn.example.com/editor-ai.jpeg",
+    );
+  });
+
+  it.each([
+    "source.html",
+    "source.htm",
+    "source.txt",
+    "source.md",
+    "source.csv",
+    "source.json",
+  ])(
+    "leaves %s readable by the shared text attachment pipeline",
+    async (name) => {
+      const attachments = [
+        {
+          type: "file",
+          name,
+          contentType: "text/plain",
+          url: "https://storage.example.test/source",
+        },
+      ];
+      const prepared = await prepareSlidesChatAttachments({
+        ownerEmail: "user@example.com",
+        message: "convert this",
+        attachments,
+      });
+      expect(prepared).toBeUndefined();
+      expect(attachments[0]).not.toHaveProperty("referenceOnly");
+      expect(saveUploadedReferenceFileMock).not.toHaveBeenCalled();
+      expect(ssrfSafeFetchMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("ignores an already-hosted attachment whose extension isn't a supported reference type", async () => {
     const result = await prepareSlidesChatAttachments({

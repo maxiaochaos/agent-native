@@ -9,30 +9,33 @@ import {
 } from "@agent-native/core/server";
 import { backgroundAgentTurnIdForReceipt } from "@agent-native/core/shared";
 import { assertAccess } from "@agent-native/core/sharing";
-import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  notInArray,
+  sql,
+} from "drizzle-orm";
 import { z } from "zod";
 
 import { documentRevisionToken } from "../../actions/_document-edit-mutation.js";
 import { commentIdForIdempotency } from "../../actions/add-comment.js";
-import type {
-  CommentAiErrorCode,
-  CommentAiIntent,
-  CommentAiPendingSession,
-  CommentAiRequest,
-  CommentAiSessionStatus,
-  CommentAiStatus,
-  CommentAiSubmittedMode,
-  StartCommentAiResult,
+import {
+  ACTIVE_COMMENT_AI_STATUSES,
+  type CommentAiErrorCode,
+  type CommentAiIntent,
+  type CommentAiPendingSession,
+  type CommentAiRequest,
+  type CommentAiSessionStatus,
+  type CommentAiStatus,
+  type CommentAiSubmittedMode,
+  type StartCommentAiResult,
 } from "../../shared/comment-ai.js";
 import { getDb, schema } from "../db/index.js";
 
-const ACTIVE_STATUSES = [
-  "classifying",
-  "classified",
-  "queued",
-  "running",
-  "refreshing",
-] as const;
 const TERMINAL_SUCCESS = ["replied", "suggested", "resolved"] as const;
 const MAX_ATTEMPTS = 2;
 
@@ -628,6 +631,14 @@ export async function startCommentAiRequest(
     });
     if (source.root.resolved)
       throw new Error("Reopen the comment before asking AI");
+    if (source.root.fieldId) {
+      // Ask AI reads and edits the page body; a thread in another Blocks
+      // field tab would get answers about text it isn't on.
+      fail("Ask AI works on comments in the page body only", {
+        statusCode: 400,
+        errorCode: "comment_ai_field_unsupported",
+      });
+    }
     if (
       source.comments.length > 100 ||
       source.comments.reduce(
@@ -648,38 +659,61 @@ export async function startCommentAiRequest(
         ? `comment-ai-classifier-${crypto.randomUUID()}`
         : null;
     const snapshot = snapshotComments(source.comments);
-    const inserted = await db
-      .insert(schema.commentAiRequests)
-      .values({
-        id: args.requestId,
-        ownerEmail: source.document.ownerEmail,
-        requesterEmail: email,
-        documentId: args.documentId,
-        threadId: args.threadId,
-        rootCommentId: args.rootCommentId,
-        fieldId: "body",
-        intent: resolvedIntent ?? "unresolved",
-        submittedMode: submission.submittedMode,
-        instructions: submission.instructions,
-        submittedProvider: submission.provider,
-        submittedModel: submission.model,
-        submittedEngine: submission.engine,
-        status: resolvedIntent ? "queued" : "classifying",
-        submittedThreadDigest: commentThreadDigest(source.comments),
-        submittedSnapshotJson: JSON.stringify(snapshot),
-        threadDigest: commentThreadDigest(source.comments),
-        snapshotJson: JSON.stringify(snapshot),
-        baseRevision: documentRevisionToken(
-          source.document.bodyRevision,
-          source.document.content,
-        ),
-        suggestionRevision: source.document.updatedAt,
-        agentThreadId,
-        classificationThreadId,
-        continuationOfRequestId: continuation?.id ?? null,
-      })
-      .onConflictDoNothing()
-      .returning();
+    const inserted = await db.transaction(async (tx) => {
+      // Locked as delete-comment locks it, so the thread can't be deleted
+      // between the check that it's still here and the insert.
+      const roots = await tx
+        .select({ id: schema.documentComments.id })
+        .from(schema.documentComments)
+        .where(
+          and(
+            eq(schema.documentComments.id, args.rootCommentId),
+            eq(schema.documentComments.documentId, args.documentId),
+            eq(schema.documentComments.threadId, args.threadId),
+            isNull(schema.documentComments.parentId),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (roots.length === 0) {
+        throw operationError(
+          "root_comment_changed",
+          "The selected comment no longer belongs to this Page and thread",
+        );
+      }
+      return tx
+        .insert(schema.commentAiRequests)
+        .values({
+          id: args.requestId,
+          ownerEmail: source.document.ownerEmail,
+          requesterEmail: email,
+          documentId: args.documentId,
+          threadId: args.threadId,
+          rootCommentId: args.rootCommentId,
+          fieldId: "body",
+          intent: resolvedIntent ?? "unresolved",
+          submittedMode: submission.submittedMode,
+          instructions: submission.instructions,
+          submittedProvider: submission.provider,
+          submittedModel: submission.model,
+          submittedEngine: submission.engine,
+          status: resolvedIntent ? "queued" : "classifying",
+          submittedThreadDigest: commentThreadDigest(source.comments),
+          submittedSnapshotJson: JSON.stringify(snapshot),
+          threadDigest: commentThreadDigest(source.comments),
+          snapshotJson: JSON.stringify(snapshot),
+          baseRevision: documentRevisionToken(
+            source.document.bodyRevision,
+            source.document.content,
+          ),
+          suggestionRevision: source.document.updatedAt,
+          agentThreadId,
+          classificationThreadId,
+          continuationOfRequestId: continuation?.id ?? null,
+        })
+        .onConflictDoNothing()
+        .returning();
+    });
     if (inserted[0]) {
       request = inserted[0];
       dispatch = true;
@@ -691,7 +725,9 @@ export async function startCommentAiRequest(
           and(
             eq(schema.commentAiRequests.documentId, args.documentId),
             eq(schema.commentAiRequests.rootCommentId, args.rootCommentId),
-            inArray(schema.commentAiRequests.status, [...ACTIVE_STATUSES]),
+            inArray(schema.commentAiRequests.status, [
+              ...ACTIVE_COMMENT_AI_STATUSES,
+            ]),
           ),
         )
         .limit(1);

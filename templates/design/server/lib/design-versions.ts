@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 
-import type { ActionRunContext } from "@agent-native/core/action";
+import {
+  withoutWriteObservation,
+  type ActionRunContext,
+} from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import {
   AGENT_CLIENT_ID,
@@ -62,6 +65,7 @@ export interface DesignVersionFile {
   filename: string;
   fileType: string;
   content: string;
+  createdAt?: string;
 }
 
 export interface ParsedDesignVersionSnapshot {
@@ -295,7 +299,15 @@ export function parseDesignVersionSnapshot(
       typeof candidate.fileType === "string" && candidate.fileType.trim()
         ? candidate.fileType
         : "html";
-    files.push({ id, filename, fileType, content });
+    files.push({
+      id,
+      filename,
+      fileType,
+      content,
+      ...(typeof candidate.createdAt === "string"
+        ? { createdAt: candidate.createdAt }
+        : {}),
+    });
   }
 
   const parsed: ParsedDesignVersionSnapshot = {
@@ -523,6 +535,7 @@ async function assertNoForeignCollaborators(
   }
 
   for (const row of rows.flat()) {
+    if (row.cleared) continue;
     if (row.clientId === AGENT_CLIENT_ID) continue;
     const email = parseAwarenessUserEmail(row.state);
     if (!email || !currentEmail || email !== currentEmail) {
@@ -781,6 +794,7 @@ async function readDesignVersionSourceRows(
       fileType: file.fileType,
       content: useLiveContent ? liveContent : file.content,
       source: useLiveContent ? "collab" : "stored",
+      createdAt: file.createdAt,
     });
     collaborationVersions.set(file.id, lease.baseVersion);
   }
@@ -1801,13 +1815,17 @@ export async function snapshotDesignBeforeAgentEdit(
   },
 ): Promise<DesignVersionCheckpointResult> {
   if (!context) return null;
-  return withDesignVersionLock(designId, () =>
-    snapshotDesignBeforeAgentEditInLock(
-      designId,
-      context,
-      undefined,
-      "auxiliary",
-      options?.allowCheckpointFailureSkip ?? false,
+  // A retry adds no second version: the turn's earlier version is found first,
+  // and a new one has a deterministic id and is skipped on a state-hash match.
+  return withoutWriteObservation(() =>
+    withDesignVersionLock(designId, () =>
+      snapshotDesignBeforeAgentEditInLock(
+        designId,
+        context,
+        undefined,
+        "auxiliary",
+        options?.allowCheckpointFailureSkip ?? false,
+      ),
     ),
   );
 }
@@ -2186,7 +2204,7 @@ export async function restoreDesignVersion(args: {
                     contentOperationSource: null,
                     contentOperationRevision: null,
                     contentOperationResultHash: null,
-                    createdAt: updatedAt,
+                    createdAt: targetFile.createdAt ?? updatedAt,
                     updatedAt,
                   });
                 }

@@ -8,7 +8,7 @@ import {
 
 export default defineAction({
   description:
-    "Read the signed-in user's AgentKit context-source and integration capabilities for Design or Slides. Returns only supported, connected capability labels and availability; never returns credentials or connection details.",
+    "Read the signed-in user's AgentKit context-source and integration capabilities for Design, Slides, or Slides 2. Returns only supported, connected capability labels and availability; never returns credentials or connection details.",
   schema: z.object({}),
   http: { method: "GET" },
   readOnly: true,

@@ -8,13 +8,17 @@ function stringifyValue(value: unknown): string {
   return value == null ? "" : (JSON.stringify(value) ?? "");
 }
 
+import { withoutWriteObservation } from "../action-frame.js";
 import {
   getDbExec,
   isProductionServerlessFunctionRuntime,
   type DbExec,
   type DbExecStatement,
 } from "./client.js";
-import { appMigratesAtRelease } from "./migration-policy.js";
+import {
+  appMigratesAtRelease,
+  schemaEnsureSkipRequested,
+} from "./migration-policy.js";
 import {
   isHostedFunctionInvocationRuntime,
   isMigrationExecutingRuntime,
@@ -22,6 +26,7 @@ import {
   withMigrationExecutionRuntime,
 } from "./migration-runtime.js";
 import { retainRequestDbPoolScope } from "./request-pool-context.js";
+import { dbClientGeneration } from "./runtime-facts.js";
 
 const PLAIN_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -35,22 +40,25 @@ function schemaEnsureDisabled(): boolean {
   ) {
     return true;
   }
-  const raw = process.env.AGENT_NATIVE_SKIP_ENSURE_TABLES?.trim();
-  return !!raw && ["1", "true", "yes", "on"].includes(raw.toLowerCase());
+  return schemaEnsureSkipRequested();
 }
 
+// The ensure* helpers run their DDL through here. It is idempotent setup the
+// first action to need it happens to run, so it never counts as that action's
+// write.
 async function withLegacyServerlessSchemaDdl<T>(
   run: () => Promise<T>,
 ): Promise<T> {
+  const exempt = () => withoutWriteObservation(run);
   if (
     !isMigrationExecutingRuntime() &&
     !appMigratesAtRelease() &&
     (isHostedFunctionInvocationRuntime() ||
       isProductionServerlessFunctionRuntime())
   ) {
-    return withMigrationExecutionRuntime(run);
+    return withMigrationExecutionRuntime(exempt);
   }
-  return run();
+  return exempt();
 }
 
 type SchemaSnapshot = {
@@ -61,6 +69,7 @@ type SchemaSnapshot = {
 
 const injectedSnapshots = new WeakMap<DbExec, Promise<SchemaSnapshot | null>>();
 let globalSnapshot: Promise<SchemaSnapshot | null> | undefined;
+let globalSnapshotGeneration: number | undefined;
 
 export function invalidateSchemaSnapshot(injectedClient?: DbExec): void {
   globalSnapshot = undefined;
@@ -138,6 +147,13 @@ function schemaSnapshot(client: DbExec, injected: boolean) {
       injectedSnapshots.set(client, pending);
     }
     return pending;
+  }
+  // The snapshot describes one database; closing the clients may reconnect
+  // this process to another.
+  const generation = dbClientGeneration();
+  if (globalSnapshotGeneration !== generation) {
+    globalSnapshot = undefined;
+    globalSnapshotGeneration = generation;
   }
   if (!globalSnapshot) {
     globalSnapshot = retainRequestDbPoolScope(loadSchemaSnapshot(client));

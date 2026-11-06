@@ -1,13 +1,14 @@
 import { getDbExec } from "../db/client.js";
 import { ensureTableExists } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
 
-let _initPromise: Promise<void> | undefined;
-
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const createSql = `CREATE TABLE IF NOT EXISTS integration_configs (
+export const integrationConfigsStore = defineStore({
+  id: "integration_configs",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createSql = `CREATE TABLE IF NOT EXISTS integration_configs (
   platform TEXT NOT NULL,
   config_key TEXT NOT NULL,
   config_data TEXT NOT NULL,
@@ -15,18 +16,14 @@ export async function ensureTable(): Promise<void> {
   updated_at BIGINT NOT NULL,
   PRIMARY KEY (platform, config_key)
 )`;
-
-      {
         await ensureTableExists("integration_configs", createSql);
-        return;
-      }
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+      },
+    },
+  ],
+});
+
+export function ensureTable(): Promise<void> {
+  return integrationConfigsStore.ready();
 }
 
 let _configWriteEpoch = 0;
@@ -127,6 +124,29 @@ export async function deleteIntegrationConfig(
     args: [platform, configKey],
   });
   _configWriteEpoch += 1;
+}
+
+/** Deletes the row only if it hasn't been written since `expected` was read. */
+export async function deleteIntegrationConfigIfUnchanged(
+  platform: string,
+  configKey: string,
+  expected: IntegrationConfig,
+): Promise<boolean> {
+  await ensureTable();
+  const client = getDbExec();
+  // raw-sql-ok: static SQL; the platform, key and snapshot are bound as query args.
+  const result = await client.execute({
+    sql: `DELETE FROM integration_configs WHERE platform = ? AND config_key = ? AND config_data = ? AND updated_at = ?`,
+    args: [
+      platform,
+      configKey,
+      JSON.stringify(expected.configData),
+      expected.updatedAt,
+    ],
+  });
+  if (result.rowsAffected === 0) return false;
+  _configWriteEpoch += 1;
+  return true;
 }
 
 export async function listIntegrationConfigPage(

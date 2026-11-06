@@ -130,7 +130,6 @@ async function expectSavedAsRendered(
   ).toEqual(await liveFill(app, nodeId));
 }
 
-// oracle: none — app fill-layer behavior with no native Figma counterpart; only how the row's trigger is located changed.
 test("gradient fill trigger stays inside its cell and opens from one click", async ({
   app,
   page,
@@ -216,9 +215,7 @@ test("gradient fill trigger stays inside its cell and opens from one click", asy
   expectOnlyChanged(before, await app.savedNodes(designId), []);
 });
 
-// oracle: none — gradient alpha persistence is app behavior with no native Figma counterpart; only the stop opacity locator changed.
-// fixme: product bug: The first PNG export POSTs render-export-png without the agent-native-ui-capability cookie and gets 403 (console error); the client then
-test.fixme("gradient fill opacity preserves stop alpha through zero and reload", async ({
+test("gradient fill opacity preserves stop alpha through zero and reload", async ({
   app,
   page,
 }) => {
@@ -370,7 +367,6 @@ test.fixme("gradient fill opacity preserves stop alpha through zero and reload",
   expectOnlyChanged(before, await app.savedNodes(designId), ["fill-gradient"]);
 });
 
-// oracle: none — only the paint type button changed (Linear is now Gradient); no Figma behavior is claimed.
 test("solid-to-gradient conversion keeps its picker open", async ({
   app,
   page,
@@ -428,7 +424,6 @@ test("solid-to-gradient conversion keeps its picker open", async ({
   expectOnlyChanged(before, await app.savedNodes(designId), ["fill-solid"]);
 });
 
-// oracle: none — only the paint type button changed (Linear is now Gradient); no Figma behavior is claimed.
 test("removing a converted Solid gradient closes its picker and preserves the sibling", async ({
   app,
   page,
@@ -548,9 +543,7 @@ test("removing a converted Solid gradient closes its picker and preserves the si
   );
 });
 
-// oracle: none — only the paint type button changed (Linear is now Gradient); no Figma behavior is claimed.
-// fixme: product bug: The editor requests GET /design/&quot;https://example.test/image.png&quot; (404): a CSS url() is read with its HTML-entity quotes.
-test.fixme("converting the base solid appends it below sibling fills and keeps their arrays", async ({
+test("converting the base solid appends it below sibling fills and keeps their arrays", async ({
   app,
   page,
 }) => {
@@ -617,7 +610,6 @@ test.fixme("converting the base solid appends it below sibling fills and keeps t
   ]);
 });
 
-// oracle: none — only the paint type button changed (Linear is now Gradient); no Figma behavior is claimed.
 test("gradient-to-solid preserves sibling fill arrays and keeps the picker open", async ({
   app,
   page,
@@ -741,8 +733,7 @@ test("gradient-to-solid preserves sibling fill arrays and keeps the picker open"
   await expect(page.getByRole("textbox", { name: "Hex" })).toBeVisible();
 });
 
-// fixme: product bug: The editor requests GET /design/&quot;https://fills.invalid/first.png&quot; (and second/third) -> 404: CSS url() values are read with
-test.fixme("hiding and reordering an image fill keeps its cover size attached to that fill", async ({
+test("hiding and reordering an image fill keeps its cover size attached to that fill", async ({
   app,
   page,
 }) => {

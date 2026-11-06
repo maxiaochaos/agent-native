@@ -48,11 +48,17 @@ import {
 } from "../server/cookie-namespace.js";
 import { resolveAgentNativeBuildId } from "../shared/build-id.js";
 import {
+  CHUNK_RECOVERY_BROWSER_CACHE_CONTROL,
   DEFAULT_SPECULATION_RULES_PATH,
+  DISABLED_SSR_CACHE_HEADERS,
   resolveChunkRecoveryCacheHeaders,
   resolveSsrCacheHeaders,
   resolveSsrCacheKeyHeaders,
+  resolveSsrCachePolicy,
+  SSR_CACHEABLE_ERROR_STATUSES,
+  SSR_MAX_AGE_HEADER,
   SSR_QUERY_CACHE_KEY_HEADER,
+  ssrRouteCacheLimits,
 } from "../shared/cache-control.js";
 import {
   EMBED_TARGET_QUERY_PARAM,
@@ -96,6 +102,7 @@ import {
   resolveFirstRunOnboardingBuildReplacement,
   resolveHarnessBuildReplacement,
 } from "../vite/agent-native-config-loader.js";
+import { boundedTaskSourcePlugin } from "../vite/bounded-task-plugin.js";
 import { createSentryServerSourceMapUploadPlugins } from "../vite/sentry-source-maps.js";
 import {
   cloneServerBundleForFunction,
@@ -1451,6 +1458,7 @@ export function generateWorkerEntry(
   const chunkRecoveryCacheHeaders =
     resolveChunkRecoveryCacheHeaders(ssrCacheHeaders);
   const ssrCacheKeyHeaders = resolveSsrCacheKeyHeaders();
+  const ssrRouteLimits = ssrRouteCacheLimits(resolveSsrCachePolicy());
   const ssrAuthRedirectCookieName = frameworkSessionHintCookieName(
     resolveAuthCookieNamespace().frameworkCookieName,
   );
@@ -1498,8 +1506,12 @@ export function generateWorkerEntry(
       `  const ${handlerName} = defineEventHandler(async (event) => {
     setResponseHeader(event, "Cache-Control", "no-" + "store");
     const actionIsUiOnly = ${a.uiOnly ? "true" : `${varName}.uiOnly === true`};
-    const uiActionContext = actionIsUiOnly
-      ? await getGeneratedUiActionContext(event)
+    const actionDeclaresApproval =
+      ${varName}.needsApproval !== undefined && ${varName}.needsApproval !== false;
+    const actionIsEmbedded = (actionIsUiOnly || actionDeclaresApproval) &&
+      hasGeneratedEmbedCredential(event);
+    const uiActionContext = actionIsUiOnly || actionDeclaresApproval
+      ? await getGeneratedUiActionContext(event, actionIsEmbedded)
       : undefined;
     if (actionIsUiOnly && !uiActionContext) {
       return new Response(
@@ -1546,10 +1558,30 @@ export function generateWorkerEntry(
         actionName: ${JSON.stringify(a.name)},
         ...(actionContext ?? {}),
       };
-      const runAction = () => ${varName}.run(params, actionRunContext);
+      const runAction = async () => {
+        if (
+          actionDeclaresApproval &&
+          !(uiActionContext && caller === "frontend")
+        ) {
+          const refusal = await generatedActionApprovalRefusal(
+            ${varName},
+            params,
+            actionRunContext,
+            actionIsEmbedded,
+          );
+          if (refusal) {
+            return new Response(
+              JSON.stringify({ error: refusal.message, errorCode: refusal.errorCode }),
+              { status: refusal.statusCode, headers: { "Content-Type": "application/json" } },
+            );
+          }
+        }
+        return ${varName}.run(params, actionRunContext);
+      };
       const result = actionContext
         ? await runWithGeneratedRequestContext(actionContext, runAction)
         : await runAction();
+      if (result instanceof Response) return result;
       if (typeof result === "string") { try { return JSON.parse(result); } catch { return result; } }
       return result;
     } catch (err) {
@@ -1580,7 +1612,7 @@ ${["post", "put", "delete"]
   getFrameworkRoutePrefix as getAgentNativeFrameworkRoutePrefix,
   getSsrAuthRedirectScript as getAgentNativeSsrAuthRedirectScript,
   resolveAppHomePath as resolveAgentNativeAppHomePath,
-${hasActions ? "  getSession as getGeneratedSession,\n  hasUiActionCapability as hasGeneratedUiActionCapability,\n  isSameOriginRequest as isGeneratedSameOriginRequest,\n  mountUiActionCapabilityRoute as mountGeneratedUiActionCapabilityRoute,\n  resolveOrgIdForEmailViaEvent as resolveGeneratedOrgId,\n  runWithRequestContext as runWithGeneratedRequestContext,\n" : ""}
+${hasActions ? "  directHttpActionApprovalRefusal as generatedActionApprovalRefusal,\n  getSession as getGeneratedSession,\n  getBrowserCookieSession as getGeneratedBrowserCookieSession,\n  hasPresentedEmbedSessionCredential as hasGeneratedEmbedCredential,\n  hasUiActionCapability as hasGeneratedUiActionCapability,\n  hasSameOriginBrowserEvidence as hasGeneratedSameOriginBrowserEvidence,\n  mountUiActionCapabilityRoute as mountGeneratedUiActionCapabilityRoute,\n  resolveOrgIdForEmailViaEvent as resolveGeneratedOrgId,\n  runWithRequestContext as runWithGeneratedRequestContext,\n" : ""}
 } from "${EDGE_SERVER_ENTRYPOINT}";`,
   );
 
@@ -2124,6 +2156,14 @@ function getAppOriginClientConfigScript() {
   const workspaceAppPath =
     workspaceAppMountConfig?.currentPath ??
     (workspaceRuntime ? configuredWorkspaceAppPath : "");
+  const explicitRootPath =
+    workspaceAppMountConfig?.currentPath === "/" ||
+    (typeof appConfig.app.basePath === "string" &&
+      appConfig.app.basePath.trim().length > 0 &&
+      normalizeAppBasePath(appConfig.app.basePath) === "");
+  const frameworkRoutePrefix = (
+    process.env.AGENT_NATIVE_CONFIG_RUNTIME_FRAMEWORK_ROUTE_PREFIX || ""
+  ).trim();
   const config = {
     ...(appConfig.app.id ? { appId: appConfig.app.id } : {}),
     ...(appConfig.app.workspaceId
@@ -2141,6 +2181,8 @@ function getAppOriginClientConfigScript() {
     ...(workspaceAppMountConfig?.paths
       ? { workspaceAppMountPaths: workspaceAppMountConfig.paths }
       : {}),
+    ...(explicitRootPath ? { explicitRootPath: true } : {}),
+    ...(frameworkRoutePrefix ? { frameworkRoutePrefix } : {}),
   };
   const toUnicodeEscape = (character) =>
     String.fromCharCode(92) +
@@ -2173,6 +2215,13 @@ const SSR_CACHE_HEADERS = ${JSON.stringify(ssrCacheHeaders)};
 const CHUNK_RECOVERY_ALIAS_CACHE_HEADERS = ${JSON.stringify(chunkRecoveryCacheHeaders)};
 const SSR_CACHE_KEY_HEADERS = ${JSON.stringify(ssrCacheKeyHeaders)};
 const SSR_QUERY_CACHE_KEY_HEADER = ${JSON.stringify(SSR_QUERY_CACHE_KEY_HEADER)};
+const SSR_MAX_AGE_HEADER = ${JSON.stringify(SSR_MAX_AGE_HEADER)};
+// The longest windows a route's SSR_MAX_AGE_HEADER can ask for; null when the
+// deployment stores nothing.
+const SSR_ROUTE_CACHE_LIMITS = ${JSON.stringify(ssrRouteLimits)};
+const SSR_UNSTORED_CACHE_HEADERS = ${JSON.stringify(DISABLED_SSR_CACHE_HEADERS)};
+const SSR_ROUTE_BROWSER_CACHE_CONTROL = ${JSON.stringify(CHUNK_RECOVERY_BROWSER_CACHE_CONTROL)};
+const SSR_CACHEABLE_ERROR_STATUSES = new Set(${JSON.stringify(SSR_CACHEABLE_ERROR_STATUSES)});
 const CHUNK_RECOVERY_PATH_SUFFIX = ${JSON.stringify(CHUNK_RECOVERY_PATH_SUFFIX)};
 const CHUNK_RECOVERY_QUERY_PARAM = ${JSON.stringify(CHUNK_RECOVERY_QUERY_PARAM)};
 const CHUNK_RECOVERY_QUERY_VALUE = ${JSON.stringify(CHUNK_RECOVERY_QUERY_VALUE)};
@@ -2255,10 +2304,38 @@ function injectDefaultSocialImageMeta(html, imageUrl) {
 }
 
 function isSsrHtmlOrDataResponse(headers, status, pathname) {
-  if (status < 200 || status >= 400) return false;
+  if (status < 200) return false;
+  if (status >= 400 && !SSR_CACHEABLE_ERROR_STATUSES.has(status)) return false;
   const contentType = (headers.get("content-type") || "").toLowerCase();
   if (contentType.includes("text/html")) return true;
   return pathname.endsWith(".data") && contentType.includes("text/x-script");
+}
+
+// Mirror parseSsrMaxAge and ssrCacheHeadersWithin in shared/cache-control.ts;
+// build.spec.ts checks this worker against them.
+function parseSsrMaxAge(raw) {
+  if (raw == null) return null;
+  const value = raw.trim();
+  return /^\\d+$/.test(value) ? Number(value) : 0;
+}
+
+function sharedWithin(window, seconds) {
+  return (
+    "s-maxage=" +
+    Math.min(seconds, window.maxAge) +
+    ", stale-while-revalidate=" +
+    Math.min(seconds, window.stale)
+  );
+}
+
+function ssrCacheHeadersWithin(seconds) {
+  if (!SSR_ROUTE_CACHE_LIMITS || seconds <= 0) return SSR_UNSTORED_CACHE_HEADERS;
+  return {
+    "cache-control": SSR_ROUTE_BROWSER_CACHE_CONTROL,
+    "cdn-cache-control": "public, " + sharedWithin(SSR_ROUTE_CACHE_LIMITS.cdn, seconds),
+    "netlify-cdn-cache-control":
+      "public, durable, " + sharedWithin(SSR_ROUTE_CACHE_LIMITS.netlify, seconds),
+  };
 }
 
 /**
@@ -2272,6 +2349,8 @@ function applyDefaultSsrCacheHeader(headers, status, pathname, isRecoveryAlias =
   const varyByQuery =
     (headers.get(SSR_QUERY_CACHE_KEY_HEADER) || "").trim().toLowerCase() === "query";
   headers.delete(SSR_QUERY_CACHE_KEY_HEADER);
+  const routeMaxAge = parseSsrMaxAge(headers.get(SSR_MAX_AGE_HEADER));
+  headers.delete(SSR_MAX_AGE_HEADER);
   if (!isSsrHtmlOrDataResponse(headers, status, pathname)) return;
 
   headers.delete("set-cookie");
@@ -2288,7 +2367,9 @@ function applyDefaultSsrCacheHeader(headers, status, pathname, isRecoveryAlias =
     else headers.delete("vary");
   }
 
-  for (const [name, value] of Object.entries(SSR_CACHE_HEADERS)) {
+  const cacheHeaders =
+    routeMaxAge === null ? SSR_CACHE_HEADERS : ssrCacheHeadersWithin(routeMaxAge);
+  for (const [name, value] of Object.entries(cacheHeaders)) {
     headers.set(name, value);
   }
   const netlifyVary = varyByQuery
@@ -2535,13 +2616,16 @@ ${pluginCalls.join("\n")}
 
 ${
   hasActions
-    ? `  async function getGeneratedUiActionContext(event) {
-    const session = await getGeneratedSession(event);
+    ? `  async function getGeneratedUiActionContext(event, embedded) {
+    if (event.req.headers.has("authorization") || embedded) {
+      return null;
+    }
+    const session = await getGeneratedBrowserCookieSession(event);
     const userEmail =
       typeof session?.email === "string" ? session.email.trim().toLowerCase() : undefined;
     if (
       !userEmail ||
-      !isGeneratedSameOriginRequest(event) ||
+      !hasGeneratedSameOriginBrowserEvidence(event) ||
       !hasGeneratedUiActionCapability(event, userEmail)
     ) {
       return null;
@@ -6161,6 +6245,7 @@ export default bundle;
           ? [createCloudflareModuleStubPlugin()]
           : []),
         createBrowserOnlyServerStubPlugin(),
+        boundedTaskSourcePlugin(),
         ...sentryServerSourceMapPlugins,
         ...(enterpriseAuthAdaptersEnabled
           ? []

@@ -23,6 +23,7 @@ import {
   useCommentPanelSession,
 } from "./comment-drafts";
 import {
+  agentSuggestionReason,
   CommentsSidebar,
   useCommentReplyDrafts,
   usePendingCommentDraft,
@@ -89,10 +90,11 @@ vi.mock("@agent-native/core/client/i18n", () => ({
   useFormatters: () => ({
     formatDate: (date: Date | string) => new Date(date).toISOString(),
   }),
-  useT: () => (key: string) => key,
+  useT: () => (key: string, params?: { count?: number }) =>
+    key === "comments.proposalEditCount" ? `${key}:${params?.count}` : key,
 }));
 vi.mock("@agent-native/toolkit/app/review", () => ({
-  InlineMarkdown: ({ content }: { content: string }) => content,
+  CommentBody: ({ body }: { body: string }) => body,
 }));
 
 function thread(id: string, resolved = false): CommentThread {
@@ -180,6 +182,10 @@ function SidebarOwner({
     commentAi?: CommentAiController;
     onActivateThread?: (threadId: string) => void;
     suggestions?: ResourceSuggestion[];
+    awaitedSuggestionIds?: ReadonlySet<string>;
+    unreadableSuggestionIds?: ReadonlySet<string>;
+    onRetrySuggestionRead?: () => void;
+    decidingSuggestion?: (suggestionId: string) => boolean;
     activeSuggestionId?: string;
     unplaceableSuggestionRevisions?: ReadonlyMap<string, number>;
     alignToAnchors?: boolean;
@@ -211,6 +217,9 @@ function SidebarOwner({
       documentId="fixture"
       threads={threads}
       suggestions={options.suggestions}
+      awaitedSuggestionIds={options.awaitedSuggestionIds}
+      unreadableSuggestionIds={options.unreadableSuggestionIds}
+      onRetrySuggestionRead={options.onRetrySuggestionRead}
       activeSuggestionId={options.activeSuggestionId}
       unplaceableSuggestionRevisions={options.unplaceableSuggestionRevisions}
       selectedThreadId={selected}
@@ -225,6 +234,7 @@ function SidebarOwner({
           : undefined
       }
       onDecideSuggestionProposal={options.onDecideSuggestionProposal}
+      decidingSuggestion={options.decidingSuggestion}
       forceVisible
       presentation={presentation}
       commentAi={options.commentAi}
@@ -273,6 +283,10 @@ describe("comment review interactions", () => {
       commentAi?: CommentAiController;
       onActivateThread?: (threadId: string) => void;
       suggestions?: ResourceSuggestion[];
+      awaitedSuggestionIds?: ReadonlySet<string>;
+      unreadableSuggestionIds?: ReadonlySet<string>;
+      onRetrySuggestionRead?: () => void;
+      decidingSuggestion?: (suggestionId: string) => boolean;
       activeSuggestionId?: string;
       unplaceableSuggestionRevisions?: ReadonlyMap<string, number>;
       alignToAnchors?: boolean;
@@ -340,6 +354,27 @@ describe("comment review interactions", () => {
       ).not.toBeNull();
     },
   );
+  it("keeps an expanded proposal open and counts the edits left after its first is accepted", () => {
+    const members = ["one", "two", "three"].map((id) => proposalSuggestion(id));
+    const header = () =>
+      container.querySelector<HTMLButtonElement>(
+        "[data-suggestion-proposal='proposal'] > button[aria-expanded]",
+      );
+    render(null, [], "inline", { suggestions: members });
+    expect(header()?.getAttribute("aria-expanded")).toBe("false");
+    expect(header()?.textContent).toContain("comments.proposalEditCount:3");
+    act(() => header()!.click());
+    expect(header()?.getAttribute("aria-expanded")).toBe("true");
+
+    render(null, [], "inline", {
+      suggestions: [
+        { ...members[0]!, status: "accepted" },
+        ...members.slice(1),
+      ],
+    });
+    expect(header()?.getAttribute("aria-expanded")).toBe("true");
+    expect(header()?.textContent).toContain("comments.proposalEditCount:2");
+  });
   it("shows every pending proposal member before deciding from a focused inline card", () => {
     const onDecideSuggestionProposal = vi.fn();
     render(null, [], "inline", {
@@ -356,7 +391,7 @@ describe("comment review interactions", () => {
     ).not.toBeNull();
     expect(container.querySelectorAll("[data-suggestion-id]")).toHaveLength(2);
     const accept = [...container.querySelectorAll("button")].find((button) =>
-      button.textContent?.includes("comments.acceptRemaining"),
+      button.textContent?.includes("comments.acceptAll"),
     );
     expect(accept).toBeDefined();
     act(() => accept!.click());
@@ -370,6 +405,72 @@ describe("comment review interactions", () => {
     );
     expect(onDecideSuggestionProposal.mock.calls[0]?.[2]).toHaveLength(2);
   });
+  it("keeps a proposal's Accept all off while one of its edits can't be placed", () => {
+    const failed = proposalSuggestion("one");
+    render(null, [], "inline", {
+      suggestions: [failed, proposalSuggestion("two")],
+      activeSuggestionId: "one",
+      alignToAnchors: false,
+      unplaceableSuggestionRevisions: new Map([["one", failed.revision]]),
+      onDecideSuggestionProposal: vi.fn(),
+    });
+    const decision = (value: "accepted" | "rejected") =>
+      container.querySelector<HTMLButtonElement>(
+        `[data-suggestion-proposal-decision='${value}']`,
+      );
+    expect(decision("accepted")?.disabled).toBe(true);
+    expect(decision("rejected")?.disabled).toBe(false);
+  });
+  it("clamps a grouped suggestion's reason only while the group is closed", () => {
+    const reason =
+      "React is a UI library, so on its own it has nowhere to centralize business logic; Rails gives you models and controllers for that.";
+    render(null, [], "inline", {
+      suggestions: [
+        { ...proposalSuggestion("one"), proposalSummary: reason },
+        { ...proposalSuggestion("two"), proposalSummary: reason },
+      ],
+    });
+    const header = container.querySelector<HTMLButtonElement>(
+      "[data-suggestion-proposal='proposal'] > button[aria-expanded]",
+    )!;
+    const text = [...header.querySelectorAll("span")].find(
+      (span) => span.textContent === reason,
+    )!;
+    expect(header.getAttribute("aria-expanded")).toBe("false");
+    expect(text.className).toContain("line-clamp-2");
+    act(() => header.click());
+    expect(header.getAttribute("aria-expanded")).toBe("true");
+    expect(text.className).not.toContain("line-clamp-2");
+    act(() => header.click());
+    expect(text.className).toContain("line-clamp-2");
+  });
+  it.each(["inline", "history"] as const)(
+    "shows an agent's reason above its lone suggestion in %s, but not inside a group",
+    (presentation) => {
+      const agent = (id: string): ResourceSuggestion => ({
+        ...proposalSuggestion(id),
+        actorKind: "agent",
+        proposalSummary: "Rails is the framework the article compares against.",
+        summary: 'Replace "React" with "Rails"',
+      });
+      render(null, [], presentation, {
+        suggestions: [{ ...agent("one"), proposalId: "lone" }],
+      });
+      expect(
+        container.querySelector(
+          "[data-suggestion-id='one'] [data-suggestion-reason]",
+        )?.textContent,
+      ).toBe("Rails is the framework the article compares against.");
+      render(null, [], presentation, {
+        suggestions: [agent("one"), agent("two")],
+        activeSuggestionId: "one",
+      });
+      expect(
+        container.querySelector("[data-suggestion-id='two']"),
+      ).not.toBeNull();
+      expect(container.querySelector("[data-suggestion-reason]")).toBeNull();
+    },
+  );
   it("drops the conflict alert once an unplaceable suggestion is amended", () => {
     const conflictAlert = () =>
       [
@@ -489,6 +590,304 @@ describe("comment review interactions", () => {
     expect(dismissResolution).toHaveBeenCalledWith("one");
   });
 
+  /** Thread one's AI request, finished with the suggestion it names. */
+  const suggestedRequest = (
+    suggestionId: string,
+    operationId = "request-one",
+    updatedAt = "2026-10-20T12:01:00Z",
+  ): CommentAiController["requests"][number] => ({
+    operationId,
+    requestId: operationId,
+    documentId: "fixture",
+    threadId: "one",
+    rootCommentId: "one-root",
+    intent: "suggest",
+    status: "suggested",
+    attemptId: null,
+    attemptCount: 1,
+    runId: null,
+    agentThreadId: null,
+    agentTurnId: null,
+    model: "claude-haiku-5-5",
+    engine: "anthropic",
+    result: { suggestionId },
+    errorCode: null,
+    error: null,
+    createdAt: "2026-10-20T12:00:00Z",
+    updatedAt,
+  });
+  const commentAiWithRequests = (
+    requests: CommentAiController["requests"],
+  ): CommentAiController => ({
+    requests,
+    startingThreadIds: new Set<string>(),
+    stoppingRequestIds: new Set<string>(),
+    continuations: new Map(),
+    transcriptRevision: 0,
+    start: vi.fn(),
+    continue: vi.fn(),
+    retry: vi.fn(),
+    resume: vi.fn(),
+    stop: vi.fn(),
+    open: vi.fn(),
+    undo: vi.fn(),
+    freshResolutions: new Map(),
+    dismissResolution: vi.fn(),
+  });
+  const suggestedCommentAi = (suggestionId: string) =>
+    commentAiWithRequests([suggestedRequest(suggestionId)]);
+
+  describe("Accept and resolve", () => {
+    const asked = (id: string, status: ResourceSuggestion["status"]) => ({
+      ...proposalSuggestion(id, status),
+      metadata: { sourceThreadId: "one", commentAiRequestId: "request-one" },
+    });
+    let deciding = false;
+    const decide = vi.fn(() => {
+      deciding = true;
+    });
+    const show = (status: ResourceSuggestion["status"]) =>
+      render("one", [thread("one")], "inline", {
+        suggestions: [asked("first", status), asked("second", status)],
+        onDecideSuggestionProposal: decide,
+        decidingSuggestion: () => deciding,
+      });
+    beforeEach(() => {
+      deciding = false;
+    });
+
+    it("resolves the thread once every edit it asked for is accepted", () => {
+      show("pending");
+      const button = container.querySelector<HTMLButtonElement>(
+        "[data-suggestion-accept-resolve]",
+      );
+      if (!button) throw new Error("The proposal has no Accept and resolve");
+      expect(button.textContent).toBe("comments.acceptAllAndResolve");
+      act(() => button.click());
+      expect(decide).toHaveBeenCalledWith(
+        "proposal",
+        "accepted",
+        expect.arrayContaining([
+          expect.objectContaining({ id: "first" }),
+          expect.objectContaining({ id: "second" }),
+        ]),
+      );
+      // Resolving now would send the pending edits out to their own cards.
+      expect(actions.resolve).not.toHaveBeenCalled();
+      // The edits show accepted before the server answers.
+      show("accepted");
+      expect(actions.resolve).not.toHaveBeenCalled();
+
+      deciding = false;
+      show("accepted");
+      expect(actions.resolve).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "one-root", resolved: true }),
+      );
+    });
+
+    it("leaves the thread open when the accept does not land", () => {
+      show("pending");
+      const button = container.querySelector<HTMLButtonElement>(
+        "[data-suggestion-accept-resolve]",
+      );
+      if (!button) throw new Error("The proposal has no Accept and resolve");
+      act(() => button.click());
+      show("accepted");
+      deciding = false;
+      show("pending");
+      show("accepted");
+      expect(actions.resolve).not.toHaveBeenCalled();
+    });
+
+    it("leaves the thread open when an edit it asked for ends rejected", () => {
+      show("pending");
+      const button = container.querySelector<HTMLButtonElement>(
+        "[data-suggestion-accept-resolve]",
+      );
+      if (!button) throw new Error("The proposal has no Accept and resolve");
+      act(() => button.click());
+      deciding = false;
+      render("one", [thread("one")], "inline", {
+        suggestions: [asked("first", "accepted"), asked("second", "rejected")],
+        onDecideSuggestionProposal: decide,
+        decidingSuggestion: () => deciding,
+      });
+      expect(actions.resolve).not.toHaveBeenCalled();
+    });
+
+    it("offers to resolve only on the last group with pending edits", () => {
+      const later = (status: ResourceSuggestion["status"]) => ({
+        ...asked("third", status),
+        proposalId: null,
+      });
+      const showBoth = (status: ResourceSuggestion["status"]) =>
+        render("one", [thread("one")], "inline", {
+          suggestions: [
+            asked("first", "pending"),
+            asked("second", "pending"),
+            later(status),
+          ],
+          onDecideSuggestionProposal: decide,
+          decidingSuggestion: () => deciding,
+        });
+
+      showBoth("pending");
+      expect(
+        container.querySelector("[data-suggestion-accept-resolve]"),
+      ).toBeNull();
+
+      showBoth("rejected");
+      expect(
+        container.querySelectorAll("[data-suggestion-accept-resolve]"),
+      ).toHaveLength(1);
+    });
+
+    it("offers no resolve while its AI's newer edit is still loading", () => {
+      const showLoading = (awaited: ReadonlySet<string>) =>
+        render("one", [thread("one")], "inline", {
+          suggestions: [asked("first", "pending"), asked("second", "pending")],
+          onDecideSuggestionProposal: decide,
+          decidingSuggestion: () => deciding,
+          commentAi: suggestedCommentAi("fresh"),
+          awaitedSuggestionIds: awaited,
+        });
+
+      showLoading(new Set(["fresh"]));
+      expect(
+        container.querySelector("[data-thread-suggestion-placeholder]"),
+      ).not.toBeNull();
+      expect(
+        container.querySelector("[data-suggestion-accept-resolve]"),
+      ).toBeNull();
+
+      showLoading(new Set());
+      expect(
+        container.querySelector("[data-suggestion-accept-resolve]"),
+      ).not.toBeNull();
+    });
+
+    it("offers no resolve while an earlier request's edit is still loading", () => {
+      const retryRead = vi.fn();
+      const showEarlier = (
+        awaited: ReadonlySet<string>,
+        unreadable: ReadonlySet<string> = new Set(),
+      ) =>
+        render("one", [thread("one")], "inline", {
+          suggestions: [asked("first", "pending"), asked("second", "pending")],
+          onDecideSuggestionProposal: decide,
+          decidingSuggestion: () => deciding,
+          commentAi: commentAiWithRequests([
+            suggestedRequest(
+              "earlier",
+              "request-earlier",
+              "2026-10-20T11:00:00Z",
+            ),
+            { ...suggestedRequest("first"), status: "replied" },
+          ]),
+          awaitedSuggestionIds: awaited,
+          unreadableSuggestionIds: unreadable,
+          onRetrySuggestionRead: retryRead,
+        });
+
+      showEarlier(new Set(["earlier"]));
+      expect(
+        container.querySelector("[data-suggestion-accept-resolve]"),
+      ).toBeNull();
+      expect(
+        container.querySelector("[data-thread-suggestion-placeholder]"),
+      ).not.toBeNull();
+
+      // The thread stays open on its read, so a failed one offers a retry.
+      showEarlier(new Set(["earlier"]), new Set(["earlier"]));
+      const failed = container.querySelector(
+        '[data-thread-suggestion-placeholder="failed"]',
+      );
+      act(() => failed?.querySelector("button")?.click());
+      expect(retryRead).toHaveBeenCalled();
+
+      showEarlier(new Set());
+      expect(
+        container.querySelector("[data-thread-suggestion-placeholder]"),
+      ).toBeNull();
+      expect(
+        container.querySelector("[data-suggestion-accept-resolve]"),
+      ).not.toBeNull();
+    });
+
+    it("leaves the thread open when its AI adds an edit during the accept", () => {
+      show("pending");
+      const button = container.querySelector<HTMLButtonElement>(
+        "[data-suggestion-accept-resolve]",
+      );
+      if (!button) throw new Error("The proposal has no Accept and resolve");
+      act(() => button.click());
+      deciding = false;
+      render("one", [thread("one")], "inline", {
+        suggestions: [
+          asked("first", "accepted"),
+          asked("second", "accepted"),
+          { ...asked("third", "pending"), proposalId: null },
+        ],
+        onDecideSuggestionProposal: decide,
+        decidingSuggestion: () => deciding,
+      });
+      expect(actions.resolve).not.toHaveBeenCalled();
+    });
+
+    it("leaves the thread open while its AI's new edit is still loading", () => {
+      show("pending");
+      const button = container.querySelector<HTMLButtonElement>(
+        "[data-suggestion-accept-resolve]",
+      );
+      if (!button) throw new Error("The proposal has no Accept and resolve");
+      act(() => button.click());
+      deciding = false;
+      render("one", [thread("one")], "inline", {
+        suggestions: [asked("first", "accepted"), asked("second", "accepted")],
+        onDecideSuggestionProposal: decide,
+        decidingSuggestion: () => deciding,
+        commentAi: suggestedCommentAi("fresh"),
+        awaitedSuggestionIds: new Set(["fresh"]),
+      });
+      expect(actions.resolve).not.toHaveBeenCalled();
+    });
+  });
+
+  it("holds a suggested request's place until its suggestion loads", () => {
+    const commentAi = suggestedCommentAi("suggestion-one");
+
+    render("one", [thread("one")], "inline", {
+      commentAi,
+      awaitedSuggestionIds: new Set(["suggestion-one"]),
+    });
+    expect(
+      container.querySelector("[data-thread-suggestion-placeholder]"),
+    ).not.toBeNull();
+    expect(container.querySelector("[data-comment-ai-status]")).toBeNull();
+
+    // A failed read can't say the suggestion is gone; it offers a retry.
+    const retryRead = vi.fn();
+    render("one", [thread("one")], "inline", {
+      commentAi,
+      awaitedSuggestionIds: new Set(["suggestion-one"]),
+      unreadableSuggestionIds: new Set(["suggestion-one"]),
+      onRetrySuggestionRead: retryRead,
+    });
+    const failed = container.querySelector(
+      '[data-thread-suggestion-placeholder="failed"]',
+    );
+    expect(failed?.textContent).toContain("comments.suggestionLoadFailed");
+    act(() => failed?.querySelector("button")?.click());
+    expect(retryRead).toHaveBeenCalled();
+
+    // Read and still absent: nothing to wait for, and nothing to review.
+    render("one", [thread("one")], "inline", { commentAi });
+    expect(
+      container.querySelector("[data-thread-suggestion-placeholder]"),
+    ).toBeNull();
+    expect(container.querySelector("[data-comment-ai-status]")).toBeNull();
+  });
+
   const commentAiWith = (start: CommentAiController["start"]) =>
     ({
       requests: [],
@@ -506,14 +905,17 @@ describe("comment review interactions", () => {
       freshResolutions: new Map(),
       dismissResolution: vi.fn(),
     }) satisfies CommentAiController;
-  const clickAiSend = () =>
-    act(async () =>
-      (
-        container.querySelector(
-          '[aria-label="comments.aiSend"]',
-        ) as HTMLButtonElement
-      ).click(),
+  const clickAiSend = () => {
+    const send = container.querySelector<HTMLButtonElement>(
+      "[data-comment-ai-send-mode]",
     );
+    if (!send) throw new Error("The composer has no AI send button");
+    // Send names the response it asks for, not a bare "Send".
+    expect(send.getAttribute("data-comment-ai-send-mode")).toBe("suggest");
+    expect(send.textContent).toBe("comments.aiSendSuggest");
+    expect(send.getAttribute("aria-label")).toBe("comments.aiSendMode");
+    return act(async () => send.click());
+  };
 
   const sendAiReply = async (
     start: CommentAiController["start"],
@@ -614,14 +1016,9 @@ describe("comment review interactions", () => {
     expect(actions.remove).not.toHaveBeenCalled();
     expect(replyDraft.draft.text).toBe("");
   });
-  it("preserves a reply through dismissal, thread switches, and panel presentation remounts", async () => {
+  it("preserves a reply through thread switches and panel presentation remounts", async () => {
     render("one");
     await type("Unsent detailed feedback");
-    act(() => {
-      richEditor(container)!.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
-      );
-    });
     render("two");
     await type("Different draft");
     render(null, undefined, "history");
@@ -805,7 +1202,11 @@ describe("comment review interactions", () => {
     });
     expect(actions.resolve).toHaveBeenCalledOnce();
     expect(actions.create).not.toHaveBeenCalled();
-    expect(submit.disabled).toBe(true);
+    // Resolving in the margin closes the reply box with its card. A box
+    // opened while the resolve waits stays blocked until it settles.
+    expect(
+      container.querySelector('[aria-label="comments.submit"]'),
+    ).toBeNull();
     render("one", undefined, "inline", { key: "remounted-sidebar" });
     const remountedSubmit = container.querySelector(
       '[aria-label="comments.submit"]',
@@ -857,7 +1258,7 @@ describe("comment review interactions", () => {
   });
   it("distinguishes the initial empty list from filtering", () => {
     render(null, [], "history");
-    expect(container.textContent).toContain("comments.selectTextToComment");
+    expect(container.textContent).toContain("comments.discussionEmpty");
     expect(container.textContent).not.toContain("comments.noFilteredComments");
   });
 
@@ -922,5 +1323,50 @@ describe("comment review interactions", () => {
       rects.mockRestore();
       scroll.remove();
     }
+  });
+});
+
+describe("agentSuggestionReason", () => {
+  const base = (
+    overrides: Partial<ResourceSuggestion> = {},
+  ): ResourceSuggestion => ({
+    ...proposalSuggestion("one"),
+    actorKind: "agent",
+    proposalSummary: "Use American spelling, like the rest of the page.",
+    summary: 'Replace "colour" with "color"',
+    metadata: { sourceFind: "colour", sourceReplace: "color" },
+    ...overrides,
+  });
+  it("returns the reason an agent wrote", () => {
+    expect(agentSuggestionReason(base())).toBe(
+      "Use American spelling, like the rest of the page.",
+    );
+    expect(
+      agentSuggestionReason(
+        base({ proposalId: null, proposalSummary: null, summary: "Typo." }),
+      ),
+    ).toBe("Typo.");
+  });
+  it("skips people's suggestions", () => {
+    expect(agentSuggestionReason(base({ actorKind: "human" }))).toBeNull();
+  });
+  it("skips the summary written for an agent that gave no reason", () => {
+    expect(
+      agentSuggestionReason(
+        base({
+          proposalSummary: 'Replace "colour" with "color"',
+          summary: 'Replace "a" with "A"',
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      agentSuggestionReason(
+        base({
+          proposalSummary: 'Delete "very "',
+          summary: "Delete: very",
+          metadata: { sourceFind: "very ", sourceReplace: "" },
+        }),
+      ),
+    ).toBeNull();
   });
 });

@@ -63,6 +63,10 @@ vi.mock("@agent-native/core/client/mcp-app-host", async (importOriginal) => {
 vi.mock("@agent-native/core/client/hooks", () => {
   const callAction = (name: string, params: unknown) => {
     server.calls.push({ name, params });
+    // The page-open read answers with get-document's page.
+    if (name === "get-page-open-read") {
+      return Promise.resolve({ document: server.documentResponse });
+    }
     return Promise.resolve(
       name === "get-preview-document-draft"
         ? server.draftResponse
@@ -72,6 +76,9 @@ vi.mock("@agent-native/core/client/hooks", () => {
   return {
     callAction,
     getBrowserTabId: () => "tab-1",
+    // The page asks for the UI write capability early; the mocked session
+    // has nothing to mint.
+    prepareUiActionCapability: vi.fn(),
     useDbSync: vi.fn(),
     useSession: () => ({ session: server.session }),
     setClientAppState: vi.fn(() => Promise.resolve()),
@@ -139,6 +146,7 @@ const page = {
   content: "Saved body",
   updatedAt: "v2",
   revision: "saved-body-revision",
+  contentHash: "sha256:saved-body",
   canEdit: true,
 } as Document;
 
@@ -297,6 +305,7 @@ describe("Page draft recovery on a page open", () => {
         title: "Saved",
         content: "Unsaved words",
         baseDocumentUpdatedAt: "v2",
+        baseContentHash: "sha256:saved-body",
         loadedContentWasEmpty: 0,
         deferredReason: "conflict",
         editorSessionId: "tab:other",

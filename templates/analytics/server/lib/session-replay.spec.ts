@@ -1,6 +1,6 @@
 import { gzipSync } from "node:zlib";
 
-import { getTableConfig } from "drizzle-orm/pg-core";
+import { getTableConfig, type PgTable } from "drizzle-orm/pg-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getDbMock = vi.hoisted(() => vi.fn());
@@ -240,9 +240,7 @@ describe("session replay list page", () => {
       const db = {
         select: vi.fn((selection?: Record<string, unknown>) => {
           if (!selection) return rowSelect();
-          const rows = selection.app
-            ? [{ app: "clips", count: "137" }]
-            : [{ count: String(total) }];
+          const rows = total ? [{ app: "clips", count: String(total) }] : [];
           const query = {
             from: () => query,
             where: () => query,
@@ -264,9 +262,103 @@ describe("session replay list page", () => {
       ).resolves.toEqual({
         recordings: [],
         total,
-        appCounts: [{ app: "clips", count: 137 }],
+        appCounts: total ? [{ app: "clips", count: total }] : [],
       });
       expect(rowSelect).not.toHaveBeenCalled();
+    },
+  );
+
+  it("totals every app's recordings from one read when no app is chosen", async () => {
+    const selections: Record<string, unknown>[] = [];
+    const db = {
+      select: vi.fn((selection?: Record<string, unknown>) => {
+        if (selection) selections.push(selection);
+        const rows = selection
+          ? [
+              { app: "clips", count: "137" },
+              { app: null, count: "3" },
+            ]
+          : [];
+        const query = {
+          from: () => query,
+          where: () => query,
+          groupBy: () => query,
+          orderBy: () => query,
+          limit: () => query,
+          offset: async () => rows,
+          then: (resolve: (value: unknown[]) => void) =>
+            Promise.resolve(rows).then(resolve),
+        };
+        return query;
+      }),
+    };
+    getDbMock.mockReturnValue(db);
+
+    await expect(
+      listSessionRecordingsPage({ userEmail: "qa@example.test", orgId: null }),
+    ).resolves.toEqual({
+      recordings: [],
+      total: 140,
+      appCounts: [{ app: "clips", count: 137 }],
+    });
+    expect(selections).toHaveLength(1);
+  });
+
+  it("totals a chosen app apart from the counts for every app", async () => {
+    const rowSelect = vi.fn(() => {
+      throw new Error("Out-of-range recording row query must not run");
+    });
+    const db = {
+      select: vi.fn((selection?: Record<string, unknown>) => {
+        if (!selection) return rowSelect();
+        const rows = selection.app
+          ? [{ app: "clips", count: "137" }]
+          : [{ count: "0" }];
+        const query = {
+          from: () => query,
+          where: () => query,
+          groupBy: () => query,
+          orderBy: () => query,
+          then: (resolve: (value: unknown[]) => void) =>
+            Promise.resolve(rows).then(resolve),
+        };
+        return query;
+      }),
+    };
+    getDbMock.mockReturnValue(db);
+
+    await expect(
+      listSessionRecordingsPage(
+        { userEmail: "qa@example.test", orgId: null },
+        { app: "slides" },
+      ),
+    ).resolves.toEqual({
+      recordings: [],
+      total: 0,
+      appCounts: [{ app: "clips", count: 137 }],
+    });
+    expect(rowSelect).not.toHaveBeenCalled();
+  });
+
+  it.each(["many", "not a count"])(
+    "fails on an unreadable app count of %s",
+    async (count) => {
+      const query = {
+        from: () => query,
+        where: () => query,
+        groupBy: () => query,
+        orderBy: () => query,
+        then: (resolve: (value: unknown[]) => void) =>
+          Promise.resolve([{ app: "clips", count }]).then(resolve),
+      };
+      getDbMock.mockReturnValue({ select: vi.fn(() => query) });
+
+      await expect(
+        listSessionRecordingsPage({
+          userEmail: "qa@example.test",
+          orgId: null,
+        }),
+      ).rejects.toThrow("invalid count");
     },
   );
 
@@ -385,7 +477,7 @@ describe("session replay list page", () => {
       { sessionId: "s-observed", query: "s-observed" },
     );
 
-    expect(conditions).toHaveLength(3);
+    expect(conditions).toHaveLength(2);
     const where = conditions.map(conditionText).join(" ");
     expect(where).toContain("session_recording_session_associations");
     expect(where).toContain("not exists");
@@ -2765,7 +2857,7 @@ describe("session replay ingest parsing", () => {
       [...keyResults.slice(0, 3), [recording], [oldChunk]],
       [[]],
     );
-    const retryUpdate = vi.fn(() => ({
+    const retryUpdate = vi.fn((_table: unknown) => ({
       set: vi.fn(() => ({ where: vi.fn(() => replaySignalCountQuery()) })),
     }));
     getDbMock.mockReturnValue({ ...retry.db, update: retryUpdate });
@@ -2785,7 +2877,15 @@ describe("session replay ingest parsing", () => {
         .map((row) => row.sessionId)
         .sort(),
     ).toEqual(["legacy-session", "new-session"]);
-    expect(retryUpdate).toHaveBeenCalledTimes(2);
+    expect(
+      retryUpdate.mock.calls.map(
+        ([table]) => getTableConfig(table as PgTable).name,
+      ),
+    ).toEqual([
+      "session_recordings",
+      "session_replay_ingests",
+      "analytics_public_keys",
+    ]);
   });
 
   it("rolls back chunks when association persistence fails so a retry can repair it", async () => {
@@ -2827,7 +2927,7 @@ describe("session replay ingest parsing", () => {
       [...keyResults.slice(0, 3), [recording], [oldChunk]],
       [[]],
     );
-    const retryUpdate = vi.fn(() => ({
+    const retryUpdate = vi.fn((_table: unknown) => ({
       set: vi.fn(() => ({ where: vi.fn(() => replaySignalCountQuery()) })),
     }));
     getDbMock.mockReturnValue({ ...retry.db, update: retryUpdate });
@@ -2850,7 +2950,15 @@ describe("session replay ingest parsing", () => {
         .map((row) => row.sessionId)
         .sort(),
     ).toEqual(["legacy-session", "new-session"]);
-    expect(retryUpdate).toHaveBeenCalledTimes(2);
+    expect(
+      retryUpdate.mock.calls.map(
+        ([table]) => getTableConfig(table as PgTable).name,
+      ),
+    ).toEqual([
+      "session_recordings",
+      "session_replay_ingests",
+      "analytics_public_keys",
+    ]);
   });
 
   it("does not associate a rotated session when an ingest only retries duplicate chunks", async () => {
@@ -3315,6 +3423,125 @@ describe("session replay ingest parsing", () => {
         sessionId: "session_1",
       }),
     ]);
+  });
+
+  it("settles the usage row at the gzipped bytes it stores", async () => {
+    // Cross-origin recorders upload uncompressed text, so the request is
+    // several times the size of the blob the server keeps.
+    putPrivateBlobMock.mockResolvedValue({
+      opaque: "blob_1",
+      provider: "test",
+    });
+    const raw = {
+      publicKey: "anpk_test",
+      replayId: "recording_1",
+      sessionId: "session_1",
+      sequence: 0,
+      events: Array.from({ length: 200 }, (_, index) => ({
+        type: 3,
+        timestamp: index,
+        data: {
+          source: 1,
+          positions: [{ x: 10, y: 20, id: 7, timeOffset: 0 }],
+        },
+      })),
+    };
+    const input = parseSessionReplayIngestPayload(raw);
+    const requestBytes = Buffer.byteLength(JSON.stringify(raw));
+    const storedBytes = gzipSync(
+      Buffer.from(input.chunks[0]!.inlineData!, "utf8"),
+    ).byteLength;
+    expect(storedBytes).toBeLessThan(requestBytes / 4);
+    const { db, inserts, updates } = createReplayDbMock(
+      replayIngestKeyDbResults(null),
+    );
+    getDbMock.mockReturnValue(db);
+
+    await recordSessionReplayChunks(input, {
+      origin: "https://app.example.com",
+      requestBytes,
+    });
+
+    expect(
+      inserts.find((entry) => entry.table === schema.sessionReplayIngests)
+        ?.values,
+    ).toEqual(expect.objectContaining({ byteLength: requestBytes }));
+    expect(
+      updates.filter((entry) => entry.table === schema.sessionReplayIngests),
+    ).toEqual([
+      {
+        table: schema.sessionReplayIngests,
+        values: { byteLength: storedBytes },
+      },
+    ]);
+  });
+
+  it("settles above a gzipped request's wire size when its chunks store larger", async () => {
+    // A same-origin request arrives gzipped as one stream, so its wire size can
+    // be smaller than its chunks gzipped one at a time.
+    putPrivateBlobMock.mockResolvedValue({
+      opaque: "blob_1",
+      provider: "test",
+    });
+    const input = replayIngestPayload();
+    const storedBytes = gzipSync(
+      Buffer.from(input.chunks[0]!.inlineData!, "utf8"),
+    ).byteLength;
+    const { db, updates } = createReplayDbMock(replayIngestKeyDbResults(null));
+    getDbMock.mockReturnValue(db);
+
+    await recordSessionReplayChunks(input, {
+      origin: "https://app.example.com",
+      requestBytes: 10,
+    });
+
+    expect(storedBytes).toBeGreaterThan(10);
+    expect(
+      updates.filter((entry) => entry.table === schema.sessionReplayIngests),
+    ).toEqual([
+      expect.objectContaining({ values: { byteLength: storedBytes } }),
+    ]);
+  });
+
+  it("keeps the reservation when a chunk is a blob the client stored", async () => {
+    const storageRef = JSON.stringify({
+      kind: "agent-native.session-replay.private-blob",
+      version: 1,
+      compression: "gzip",
+      handle: { opaque: "client-blob-1" },
+    });
+    const input = parseSessionReplayIngestPayload({
+      publicKey: "anpk_test",
+      replayId: "recording_1",
+      sessionId: "session_1",
+      chunks: [
+        {
+          seq: 0,
+          storageRef,
+          byteLength: 1,
+          eventCount: 1,
+          checksum: "client_checksum_1",
+        },
+      ],
+    });
+    const { db, inserts, updates } = createReplayDbMock(
+      replayIngestKeyDbResults(null),
+    );
+    getDbMock.mockReturnValue(db);
+
+    await recordSessionReplayChunks(input, {
+      origin: "https://app.example.com",
+      requestBytes: 4_000,
+    });
+
+    expect(putPrivateBlobMock).not.toHaveBeenCalled();
+    expect(
+      inserts.find((entry) => entry.table === schema.sessionReplayIngests)
+        ?.values,
+    ).toEqual(expect.objectContaining({ byteLength: 4_000 }));
+    expect(
+      updates.filter((entry) => entry.table === schema.sessionReplayIngests),
+    ).toEqual([]);
   });
 
   it("adds signals for newly stored chunks once across batches and retries", async () => {

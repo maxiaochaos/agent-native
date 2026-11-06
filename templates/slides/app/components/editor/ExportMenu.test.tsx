@@ -38,6 +38,7 @@ vi.mock("@agent-native/core", () => ({
 
 vi.mock("@agent-native/core/client/api-path", () => ({
   agentNativePath: (path: string) => `/agent${path}`,
+  appApiPath: (path: string) => `/slides${path}`,
   appBasePath: () => "/slides",
 }));
 
@@ -62,6 +63,9 @@ vi.mock("@agent-native/core/client/i18n", () => ({
           "A copy of this deck was created in your Google Drive.",
         "editorExport.googleSlidesGoTo": "Go to Google Slides",
         "editorExport.downloadHtml": "Download as HTML",
+        "editorExport.downloadPdf": "Download as PDF",
+        "editorExport.downloadPptx": "Download as PPTX",
+        "editorToolbar.export": "Export",
         "editorExport.duplicateDeck": "Duplicate deck",
         "editorExport.export": "Export",
         "editorExport.exportAndDuplicate": "Export and duplicate",
@@ -79,6 +83,9 @@ vi.mock("@agent-native/core/client/i18n", () => ({
         "editorExport.exportGoogleSlidesError":
           "Could not export Google Slides.",
         "editorExport.exportHtmlError": "Could not export HTML.",
+        "editorExport.cancel": "Cancel",
+        "editorExport.saveBeforeExportFailed":
+          "Couldn't save your latest changes. Try exporting again.",
         "comments.close": "Close",
       }) as Record<string, string>
     )[key] ?? key,
@@ -93,7 +100,9 @@ import {
 
 import {
   canExportPptxFromServer,
+  ExportDropdown,
   ExportMenu,
+  ExportSubmenu,
   type ExportMenuHandle,
 } from "./ExportMenu";
 
@@ -345,20 +354,28 @@ describe("<ExportMenu>", () => {
     expect(canExportPptxFromServer(undefined)).toBe(false);
   });
 
-  it("renders export actions inline inside a parent menu", async () => {
+  it("renders export actions inside a parent menu through a headless handle", async () => {
     const onExportPptx = vi.fn().mockResolvedValue(undefined);
+    const ref = createRef<ExportMenuHandle>();
     render(
       <QueryClientProvider client={queryClient}>
+        <ExportMenu
+          ref={ref}
+          headless
+          hasSlides
+          deckId="deck-1"
+          deckTitle="Quarterly Review"
+          onDuplicate={vi.fn()}
+          onExportPdf={vi.fn()}
+          onExportPptx={onExportPptx}
+        />
         <DropdownMenu open>
           <DropdownMenuContent>
-            <ExportMenu
-              inline
+            <ExportSubmenu
+              exportMenuRef={ref}
               hasSlides
-              deckId="deck-1"
-              deckTitle="Quarterly Review"
-              onDuplicate={vi.fn()}
-              onExportPdf={vi.fn()}
-              onExportPptx={onExportPptx}
+              showPdf
+              showGoogleSlides={false}
             />
           </DropdownMenuContent>
         </DropdownMenu>
@@ -366,12 +383,75 @@ describe("<ExportMenu>", () => {
     );
 
     expect(screen.queryByRole("button", { name: /^export$/i })).toBeNull();
-    const exportTrigger = screen.getByRole("menuitem", { name: "Export" });
+    const exportTrigger = screen.getByRole("menuitem", {
+      name: "appMenu.export",
+    });
     fireEvent.focus(exportTrigger);
     fireEvent.keyDown(exportTrigger, { key: "ArrowRight" });
     fireEvent.click(screen.getByText("Export as PPTX"));
 
     await waitFor(() => expect(onExportPptx).toHaveBeenCalledTimes(1));
+  });
+
+  it("lists the downloads under the top-bar Export button and runs them through the headless handle", async () => {
+    const onExportPptx = vi.fn().mockResolvedValue(undefined);
+    const ref = createRef<ExportMenuHandle>();
+    render(
+      <QueryClientProvider client={queryClient}>
+        <ExportMenu
+          ref={ref}
+          headless
+          hasSlides
+          deckId="deck-1"
+          deckTitle="Quarterly Review"
+          onDuplicate={vi.fn()}
+          onExportPdf={vi.fn()}
+          onExportPptx={onExportPptx}
+        />
+        <ExportDropdown
+          exportMenuRef={ref}
+          hasSlides
+          showPdf
+          showGoogleSlides
+        />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Export" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    await screen.findByRole("menuitem", { name: "Download as PDF" });
+    expect(
+      screen.getAllByRole("menuitem").map((item) => item.textContent),
+    ).toEqual([
+      "Download as PDF",
+      "Download as PPTX",
+      "Export to Google Slides",
+      "Download as HTML",
+    ]);
+    for (const item of screen.getAllByRole("menuitem")) {
+      expect(item.querySelector("svg")).toBeNull();
+    }
+    fireEvent.click(screen.getByRole("menuitem", { name: "Download as PPTX" }));
+
+    await waitFor(() => expect(onExportPptx).toHaveBeenCalledTimes(1));
+  });
+
+  it("disables the top-bar Export button for an empty deck", () => {
+    render(
+      <ExportDropdown
+        exportMenuRef={{ current: null }}
+        hasSlides={false}
+        showPdf
+        showGoogleSlides={false}
+      />,
+    );
+
+    expect(
+      (screen.getByRole("button", { name: "Export" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 
   it("exports the converted deck to Google Slides", async () => {
@@ -572,5 +652,91 @@ describe("<ExportMenu>", () => {
       "/_agent-native/actions/export-html",
     );
     expect(URL.createObjectURL).toHaveBeenCalled();
+  });
+  it("leaves PDF out of the menu when there is no PDF handler", async () => {
+    renderMenu({ onExportPdf: undefined });
+
+    openExportMenu();
+    await screen.findByText("Export as PPTX");
+    expect(screen.queryByText("Export PDF")).toBeNull();
+  });
+
+  it("shows one line while exporting and cancels a long PDF export", async () => {
+    let exportSignal: AbortSignal | undefined;
+    const onExportPdf = vi.fn(
+      (signal: AbortSignal) =>
+        new Promise<void>((_resolve, reject) => {
+          exportSignal = signal;
+          signal.addEventListener("abort", () => {
+            const error = new Error("Export cancelled");
+            error.name = "AbortError";
+            reject(error);
+          });
+        }),
+    );
+    renderMenu({ onExportPdf });
+
+    openExportMenu();
+    fireEvent.click(await screen.findByText("Export PDF"));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent.match(/Exporting\.\.\./g)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(exportSignal?.aborted).toBe(true);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByText("Export failed")).toBeNull();
+  });
+
+  it("saves pending edits before the HTML export reads the deck", async () => {
+    const order: string[] = [];
+    flushDeckSaveMock.mockImplementation(async () => {
+      order.push("flush");
+    });
+    globalThis.fetch = vi.fn(async () => {
+      order.push("fetch");
+      return new Response(new Blob(["<html></html>"]), { status: 200 });
+    }) as typeof fetch;
+
+    renderMenu();
+    openExportMenu();
+    fireEvent.click(await screen.findByText("Download as HTML"));
+
+    await waitFor(() => expect(order).toEqual(["flush", "fetch"]));
+  });
+
+  it("commits the open inline draft before the HTML export reads the deck", async () => {
+    const order: string[] = [];
+    const flushInlineEdit = vi.fn(() => {
+      order.push("inline");
+    });
+    flushDeckSaveMock.mockImplementation(async () => {
+      order.push("flush");
+    });
+    globalThis.fetch = vi.fn(async () => {
+      order.push("fetch");
+      return new Response(new Blob(["<html></html>"]), { status: 200 });
+    }) as typeof fetch;
+
+    renderMenu({ flushInlineEdit });
+    openExportMenu();
+    fireEvent.click(await screen.findByText("Download as HTML"));
+
+    await waitFor(() => expect(order).toEqual(["inline", "flush", "fetch"]));
+  });
+
+  it("reports a failed save instead of exporting stale HTML", async () => {
+    flushDeckSaveMock.mockRejectedValue(new Error("network down"));
+
+    renderMenu();
+    openExportMenu();
+    fireEvent.click(await screen.findByText("Download as HTML"));
+
+    await waitFor(() =>
+      expect(screen.getByRole("dialog").textContent).toContain(
+        "Couldn't save your latest changes. Try exporting again.",
+      ),
+    );
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

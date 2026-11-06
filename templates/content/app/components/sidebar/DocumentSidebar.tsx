@@ -37,8 +37,6 @@ import {
   IconTrash,
   IconGitBranch,
   IconSearch,
-  IconDatabase,
-  IconFileText,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -54,6 +52,7 @@ import {
 import {
   clearPageDraftJournal,
   listPageDraftJournal,
+  liveDraftWriterIds,
   PageDraftJournalError,
   readPageDraftJournal,
   writePageDraftJournal,
@@ -116,6 +115,7 @@ import {
   useEnsureContentSpaces,
   type ContentSpaceSummary,
 } from "@/hooks/use-content-spaces";
+import { isRestoreBusyError } from "@/hooks/use-content-trash";
 import {
   useContentNavigationContext,
   useDocuments,
@@ -253,27 +253,52 @@ export function readCreateRecoveryDraft(
   }
 }
 
+type DraftRead = () =>
+  | PageDraftJournalEntry
+  | null
+  | Promise<PageDraftJournalEntry | null>;
+
 export async function retryCreateAfterDraftRead<T>(
-  read: () => PageDraftJournalEntry | null,
+  read: DraftRead,
   create: () => Promise<T>,
 ): Promise<{ created: T; draft: PageDraftJournalEntry | null }> {
-  const beforeCreate = readCreateRecoveryDraft(read);
-  if (beforeCreate.kind === "unreadable") throw beforeCreate.error;
-
+  // An unreadable journal stops the create before it starts.
+  await read();
   const created = await create();
-  const afterCreate = readCreateRecoveryDraft(read);
-  if (afterCreate.kind === "unreadable") throw afterCreate.error;
-  return { created, draft: afterCreate.entry };
+  return { created, draft: await read() };
 }
 
 export function retryCreateAfterIntentWrite<T>(
   scope: DocumentCreateIntentScope,
   intent: DocumentCreateIntent,
-  read: () => PageDraftJournalEntry | null,
+  read: DraftRead,
   create: () => Promise<T>,
 ): Promise<{ created: T; draft: PageDraftJournalEntry | null }> {
   writeDocumentCreateIntentBestEffort(scope, { ...intent, status: "pending" });
   return retryCreateAfterDraftRead(read, create);
+}
+
+/**
+ * Reads the draft to replay into a page this tab creates for a pending intent.
+ * An editor open in another tab saves its own draft, and replaying that draft
+ * here would race its save, so its entries are skipped. Each read asks again
+ * which editors are open: one can open while the page is being created.
+ */
+export function readReplayableDraft(
+  scope: Parameters<typeof readPageDraftJournal>[0],
+): () => Promise<PageDraftJournalEntry | null> {
+  return async () => {
+    let skipped = await liveDraftWriterIds();
+    for (;;) {
+      const entry = readPageDraftJournal(scope, skipped ?? undefined);
+      if (!entry || !skipped) return entry;
+      // An editor can open and write its first entry between the lock query
+      // and the read, so the entry's writer is checked after reading it.
+      const live = await liveDraftWriterIds();
+      if (!live?.has(entry.scope.writerId)) return entry;
+      skipped = new Set([...skipped, ...live]);
+    }
+  };
 }
 
 export async function readDocumentBeforeCreateDiscard(
@@ -998,11 +1023,9 @@ function WorkspaceSidebarItem({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-44">
               <DropdownMenuItem onClick={() => onCreatePageInSpace(space)}>
-                <IconFileText className="me-2 size-4" />
                 {t("sidebar.page")}
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => onCreateDatabaseInSpace(space)}>
-                <IconDatabase className="me-2 size-4" />
                 {t("sidebar.collection")}
               </DropdownMenuItem>
             </DropdownMenuContent>
@@ -1056,7 +1079,6 @@ function WorkspaceSidebarItem({
                       {folder.repository?.branch ||
                       folder.repository?.commit ? (
                         <span className="flex items-center gap-1 truncate font-mono text-[10px] text-muted-foreground">
-                          <IconGitBranch size={11} />
                           {folder.repository.branch ??
                             folder.repository.commit?.slice(0, 8)}
                         </span>
@@ -2224,7 +2246,7 @@ export function DocumentSidebar({
                   showRetry();
                   return;
                 }
-                const read = () => readPageDraftJournal(draftScope);
+                const read = readReplayableDraft(draftScope);
                 const { created, draft } = await retryCreateAfterIntentWrite(
                   scope,
                   currentIntent,
@@ -2308,7 +2330,7 @@ export function DocumentSidebar({
                     clearPageDraftJournal(draft.scope, draft.snapshot);
                   }
                 }
-                const remainingDraft = read();
+                const remainingDraft = await read();
                 confirmedDocument = mergeCreatedDocumentWithDraft(
                   confirmedDocument,
                   remainingDraft,
@@ -3108,8 +3130,11 @@ export function DocumentSidebar({
         toast.success(t("sidebar.databaseRestored"));
       } catch (err) {
         toast.error(t("sidebar.failedRestoreDatabase"), {
-          description:
-            err instanceof Error ? err.message : t("empty.genericError"),
+          description: isRestoreBusyError(err)
+            ? t("trash.restoreBusy")
+            : err instanceof Error
+              ? err.message
+              : t("empty.genericError"),
         });
       }
     },
@@ -3144,8 +3169,11 @@ export function DocumentSidebar({
         toast.success(t("sidebar.pageRestored"));
       } catch (err) {
         toast.error(t("sidebar.failedRestorePage"), {
-          description:
-            err instanceof Error ? err.message : t("empty.genericError"),
+          description: isRestoreBusyError(err)
+            ? t("trash.restoreBusy")
+            : err instanceof Error
+              ? err.message
+              : t("empty.genericError"),
         });
       }
     },
@@ -3209,13 +3237,11 @@ export function DocumentSidebar({
           <DropdownMenuItem
             onClick={() => void handleCreatePageInSpace(selectedSpace)}
           >
-            <IconFileText className="me-2 size-4" />
             {t("sidebar.page")}
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => void handleCreateDatabaseInSpace(selectedSpace)}
           >
-            <IconDatabase className="me-2 size-4" />
             {t("sidebar.collection")}
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -3337,13 +3363,11 @@ export function DocumentSidebar({
           <DropdownMenuItem
             onClick={() => void handleCreatePageInSpace(selectedSpace)}
           >
-            <IconFileText className="me-2 size-4" />
             {t("sidebar.page")}
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => void handleCreateDatabaseInSpace(selectedSpace)}
           >
-            <IconDatabase className="me-2 size-4" />
             {t("sidebar.collection")}
           </DropdownMenuItem>
         </DropdownMenuContent>

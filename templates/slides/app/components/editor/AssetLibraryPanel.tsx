@@ -1,4 +1,4 @@
-import { appBasePath } from "@agent-native/core/client/api-path";
+import { appApiPath } from "@agent-native/core/client/api-path";
 import { useT } from "@agent-native/core/client/i18n";
 import { IconUpload, IconTrash, IconLoader2, IconX } from "@tabler/icons-react";
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -13,6 +13,7 @@ interface Asset {
   id: string;
   url: string;
   filename: string;
+  type: string;
   size: number;
   createdAt: string;
 }
@@ -21,13 +22,17 @@ interface AssetLibraryPanelProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onSelectAsset?: (url: string) => void;
-  anchorRef?: React.RefObject<HTMLButtonElement | null>;
+  deckId?: string;
+  anchorRef?: React.RefObject<HTMLElement | null>;
 }
+
+const SELECTABLE_TILE = "cursor-pointer hover:ring-2 hover:ring-[#609FF8]/50"; // guard:allow-raw-color — the editor's selection accent, used across the slides editor
 
 export default function AssetLibraryPanel({
   open,
   onOpenChange,
   onSelectAsset,
+  deckId,
   anchorRef,
 }: AssetLibraryPanelProps) {
   const t = useT();
@@ -62,7 +67,7 @@ export default function AssetLibraryPanel({
   const fetchAssets = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await fetch(`${appBasePath()}/api/assets`);
+      const res = await fetch(appApiPath("/api/assets"));
       if (res.ok) setAssets(await res.json());
     } catch {
     } finally {
@@ -88,8 +93,9 @@ export default function AssetLibraryPanel({
       for (const file of Array.from(files)) {
         const form = new FormData();
         form.append("file", file);
+        if (deckId) form.append("deckId", deckId);
         try {
-          const res = await fetch(`${appBasePath()}/api/assets/upload`, {
+          const res = await fetch(appApiPath("/api/assets/upload"), {
             method: "POST",
             body: form,
           });
@@ -143,14 +149,26 @@ export default function AssetLibraryPanel({
   const handleDelete = async (id: string) => {
     try {
       const res = await fetch(
-        `${appBasePath()}/api/assets/${encodeURIComponent(id)}`,
+        appApiPath(`/api/assets/${encodeURIComponent(id)}`),
         {
           method: "DELETE",
         },
       );
+      if (res.status === 404) {
+        setAssets((prev) => prev.filter((a) => a.id !== id));
+        return;
+      }
+      if (res.status === 409) {
+        toast.error(t("raw.assetDeleteInUse"));
+        return;
+      }
       if (!res.ok) {
         toast.error(t("raw.assetDeleteFailed"));
         return;
+      }
+      const body: { storageDeleted: boolean } = await res.json();
+      if (!body.storageDeleted) {
+        toast.warning(t("raw.assetDeleteStorageRemains"));
       }
       setAssets((prev) => prev.filter((a) => a.id !== id));
     } catch {
@@ -263,19 +281,29 @@ export default function AssetLibraryPanel({
                 key={asset.id}
                 className="group relative aspect-square rounded-md overflow-hidden border border-border bg-muted"
               >
-                <button
-                  onClick={
-                    onSelectAsset ? () => handleSelect(asset.url) : undefined
-                  }
-                  className={`w-full h-full ${onSelectAsset ? "cursor-pointer hover:ring-2 hover:ring-[#609FF8]/50" : "cursor-default"}`}
-                >
-                  <img
+                {asset.type.startsWith("video/") ? (
+                  <video
                     src={asset.url}
-                    alt={asset.filename}
+                    aria-label={asset.filename}
                     className="w-full h-full object-cover"
-                    loading="lazy"
+                    muted
+                    preload="metadata"
                   />
-                </button>
+                ) : (
+                  <button
+                    onClick={
+                      onSelectAsset ? () => handleSelect(asset.url) : undefined
+                    }
+                    className={`w-full h-full ${onSelectAsset ? SELECTABLE_TILE : "cursor-default"}`}
+                  >
+                    <img
+                      src={asset.url}
+                      alt={asset.filename}
+                      className="w-full h-full object-cover"
+                      loading="lazy"
+                    />
+                  </button>
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();

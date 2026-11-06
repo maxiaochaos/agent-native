@@ -9,6 +9,7 @@ import {
 } from "vitest";
 
 import { createTestPglite } from "../a2a/test-pglite.js";
+import { resetAppConfigForTests } from "../app-config/index.js";
 
 vi.mock("../db/client.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../db/client.js")>();
@@ -99,11 +100,30 @@ afterAll(async () => {
 });
 
 describe("workspace connection store", () => {
+  it("does not run schema DDL in hosted apps without release migrations", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    vi.stubEnv("NETLIFY_FUNCTION_NAME", "workspace-groups-test");
+    resetAppConfigForTests();
+    const execute = vi.spyOn(sharedClient, "execute");
+    try {
+      const { workspaceUserGroupsStore } = await import("./groups.js");
+      workspaceUserGroupsStore.reset();
+      await workspaceUserGroupsStore.ready();
+      expect(execute).not.toHaveBeenCalled();
+    } finally {
+      execute.mockRestore();
+      vi.unstubAllEnvs();
+      resetAppConfigForTests();
+    }
+  });
+
   it("does not run runtime schema DDL in hosted function invocations", async () => {
     const previousNodeEnv = process.env.NODE_ENV;
     const previousNetlifyFunctionName = process.env.NETLIFY_FUNCTION_NAME;
     process.env.NODE_ENV = "production";
     process.env.NETLIFY_FUNCTION_NAME = "workspace-groups-test";
+    vi.stubEnv("AGENT_NATIVE_RELEASE_MIGRATIONS", "1");
+    resetAppConfigForTests();
     const execute = vi.spyOn(sharedClient, "execute");
     try {
       const { ensureWorkspaceUserGroupsTable } = await import("./groups.js");
@@ -111,6 +131,8 @@ describe("workspace connection store", () => {
       expect(execute).not.toHaveBeenCalled();
     } finally {
       execute.mockRestore();
+      vi.unstubAllEnvs();
+      resetAppConfigForTests();
       if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = previousNodeEnv;
       if (previousNetlifyFunctionName === undefined) {
@@ -516,6 +538,74 @@ describe("workspace connection store", () => {
       readyConnectionCount: 1,
       appGrant: { statuses: ["connected"] },
     });
+  });
+
+  it("resolves every connection a caller can use for an app in one pass", async () => {
+    const { runWithRequestContext } =
+      await import("../server/request-context.js");
+    const { resolveWorkspaceConnectionsForApp, upsertWorkspaceConnection } =
+      await import("./store.js");
+
+    await runWithRequestContext(
+      { userEmail: "alice@example.com", orgId: "org-batch" },
+      async () => {
+        await upsertWorkspaceConnection({
+          id: "conn-batch-open",
+          provider: "slack",
+          label: "Open Slack",
+          allowedApps: ["analytics"],
+        });
+        await upsertWorkspaceConnection({
+          id: "conn-batch-alice",
+          provider: "slack",
+          label: "Alice Slack",
+          allowedApps: ["analytics"],
+          allowedUsers: ["alice@example.com"],
+        });
+        await upsertWorkspaceConnection({
+          id: "conn-batch-bob",
+          provider: "slack",
+          label: "Bob Slack",
+          allowedApps: ["analytics"],
+          allowedUsers: ["bob@example.com"],
+        });
+        await upsertWorkspaceConnection({
+          id: "conn-batch-other-app",
+          provider: "slack",
+          label: "Brain-only Slack",
+          allowedApps: ["brain"],
+        });
+      },
+    );
+
+    const aliceVisible = await runWithRequestContext(
+      { userEmail: "alice@example.com", orgId: "org-batch" },
+      () =>
+        resolveWorkspaceConnectionsForApp({
+          appId: "analytics",
+          provider: "slack",
+        }),
+    );
+    expect(aliceVisible.map((connection) => connection.id).sort()).toEqual([
+      "conn-batch-alice",
+      "conn-batch-open",
+    ]);
+    expect(
+      aliceVisible.every((connection) => connection.appAccess.available),
+    ).toBe(true);
+
+    const bobVisible = await runWithRequestContext(
+      { userEmail: "bob@example.com", orgId: "org-batch" },
+      () =>
+        resolveWorkspaceConnectionsForApp({
+          appId: "analytics",
+          provider: "slack",
+        }),
+    );
+    expect(bobVisible.map((connection) => connection.id).sort()).toEqual([
+      "conn-batch-bob",
+      "conn-batch-open",
+    ]);
   });
 
   it("scopes personal list, upsert, and delete to the request user", async () => {
@@ -1632,6 +1722,95 @@ describe("workspace connection store", () => {
     expect(resolved.reason).toMatch(/needs_reauth/);
   });
 
+  it("accepts a connected Gmail app grant without the provider-wide scope superset", async () => {
+    const { runWithRequestContext } =
+      await import("../server/request-context.js");
+    const {
+      resolveWorkspaceConnectionForApp,
+      listWorkspaceConnectionsForApp,
+      upsertWorkspaceConnection,
+      upsertWorkspaceConnectionGrant,
+    } = await import("./store.js");
+    const requestContext = {
+      userEmail: "alice@example.com",
+      orgId: "org-1",
+    };
+    const scopes = [
+      "openid",
+      "email",
+      "https://www.googleapis.com/auth/gmail.modify",
+    ];
+
+    await runWithRequestContext(requestContext, async () => {
+      await upsertWorkspaceConnection({
+        id: "mail-test-app-gmail-modify",
+        provider: "gmail",
+        label: "Mail Gmail",
+        accountId: "alice@example.com",
+        status: "connected",
+        scopes,
+        config: { credentialMode: "oauth" },
+        allowedApps: ["mail-test-app"],
+      });
+      await upsertWorkspaceConnectionGrant({
+        connectionId: "mail-test-app-gmail-modify",
+        appId: "mail-test-app",
+        scopes,
+        config: { credentialMode: "oauth" },
+      });
+    });
+
+    const [listed] = await runWithRequestContext(requestContext, () =>
+      listWorkspaceConnectionsForApp({
+        appId: "mail-test-app",
+        provider: "gmail",
+      }),
+    );
+    expect(listed).toMatchObject({
+      id: "mail-test-app-gmail-modify",
+      status: "connected",
+      explicitGrant: { scopes },
+    });
+
+    const resolved = await runWithRequestContext(requestContext, () =>
+      resolveWorkspaceConnectionForApp({
+        appId: "mail-test-app",
+        provider: "gmail",
+        connectionId: "mail-test-app-gmail-modify",
+        requireConnected: true,
+      }),
+    );
+
+    expect(resolved).toMatchObject({
+      available: true,
+      connection: {
+        id: "mail-test-app-gmail-modify",
+        status: "connected",
+      },
+      appAccess: { available: true },
+    });
+
+    const missingCapability = await runWithRequestContext(requestContext, () =>
+      resolveWorkspaceConnectionForApp({
+        appId: "mail-test-app",
+        provider: "gmail",
+        connectionId: "mail-test-app-gmail-modify",
+        requireConnected: true,
+        requiredScopeSets: [
+          ["https://www.googleapis.com/auth/contacts.readonly"],
+        ],
+      }),
+    );
+
+    expect(missingCapability).toMatchObject({
+      available: false,
+      connection: {
+        id: "mail-test-app-gmail-modify",
+        status: "needs_reauth",
+      },
+    });
+  });
+
   it("builds a reusable provider catalog for one app", async () => {
     const { runWithRequestContext } =
       await import("../server/request-context.js");
@@ -1691,12 +1870,50 @@ describe("workspace connection store", () => {
     expect(JSON.stringify(catalog)).not.toContain("xox");
   });
 
+  it.each([
+    ["notion", "connected"],
+    ["gmail", "needs_reauth"],
+  ])(
+    "derives %s readiness from the provider's actual scope contract",
+    async (provider, status) => {
+      const { runWithRequestContext } =
+        await import("../server/request-context.js");
+      const {
+        upsertWorkspaceConnection,
+        upsertWorkspaceConnectionGrant,
+        listWorkspaceConnectionsForApp,
+      } = await import("./store.js");
+      const connections = await runWithRequestContext(
+        { userEmail: "owner@example.test", orgId: "org-1" },
+        async () => {
+          await upsertWorkspaceConnection({
+            id: "scopeless-test",
+            provider,
+            label: "Synthetic account",
+            status: "connected",
+            scopes: [],
+            config: { credentialMode: "oauth" },
+          });
+          await upsertWorkspaceConnectionGrant({
+            connectionId: "scopeless-test",
+            appId: "content",
+            scopes: [],
+          });
+          return listWorkspaceConnectionsForApp({ appId: "content", provider });
+        },
+      );
+      expect(connections).toHaveLength(1);
+      expect(connections[0]?.status).toBe(status);
+    },
+  );
+
   it("revokes workspace connection grants without changing legacy allowed apps", async () => {
     const { runWithRequestContext } =
       await import("../server/request-context.js");
     const {
       listWorkspaceConnectionGrants,
       listWorkspaceConnections,
+      resolveWorkspaceConnectionForApp,
       revokeWorkspaceConnectionGrant,
       upsertWorkspaceConnection,
       upsertWorkspaceConnectionGrant,
@@ -1728,6 +1945,24 @@ describe("workspace connection store", () => {
       },
     );
 
+    const beforeRevocation = await runWithRequestContext(
+      { userEmail: "bob@example.com", orgId: "org-1" },
+      () =>
+        resolveWorkspaceConnectionForApp({
+          appId: "dispatch",
+          provider: "github",
+          connectionId: "conn-granted",
+          requireConnected: true,
+        }),
+    );
+    expect(beforeRevocation).toMatchObject({
+      available: true,
+      connection: {
+        id: "conn-granted",
+        appAccess: { available: true, mode: "explicit-grant" },
+      },
+    });
+
     const otherOrgRevoked = await runWithRequestContext(
       { userEmail: "carol@example.com", orgId: "org-2" },
       () => revokeWorkspaceConnectionGrant("conn-granted", "dispatch"),
@@ -1745,6 +1980,25 @@ describe("workspace connection store", () => {
       appId: "dispatch",
       ownerEmail: "bob@example.com",
       orgId: "org-1",
+    });
+
+    const afterRevocation = await runWithRequestContext(
+      { userEmail: "bob@example.com", orgId: "org-1" },
+      () =>
+        resolveWorkspaceConnectionForApp({
+          appId: "dispatch",
+          provider: "github",
+          connectionId: "conn-granted",
+          requireConnected: true,
+        }),
+    );
+    expect(afterRevocation).toMatchObject({
+      available: false,
+      connection: {
+        id: "conn-granted",
+        appAccess: { available: false, mode: "unavailable" },
+      },
+      appAccess: { available: false, mode: "unavailable" },
     });
 
     const grants = await runWithRequestContext(

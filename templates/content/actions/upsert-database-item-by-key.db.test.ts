@@ -2,6 +2,7 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { withMigrationRuntime } from "@agent-native/core/db";
 import {
   runFrameworkReleaseMigrations,
   runWithRequestContext,
@@ -59,7 +60,7 @@ beforeAll(async () => {
   updateRow = (await import("./update-database-item.js")).default;
   upsertRow = (await import("./upsert-database-item-by-key.js")).default;
   if (TEST_DATABASE_URL.startsWith("postgres")) {
-    await runFrameworkReleaseMigrations(undefined);
+    await withMigrationRuntime(() => runFrameworkReleaseMigrations(undefined));
   }
   const plugin = (await import("../server/plugins/db.js")).default;
   await plugin(undefined as any);
@@ -397,6 +398,43 @@ describe("reliable Content database row mutations", () => {
       .from(schema.contentDatabaseItems)
       .where(eq(schema.contentDatabaseItems.databaseId, ids.databaseId));
     expect(rows).toHaveLength(0);
+  });
+
+  it("lets a URL property hold a t3-thread link and refuses other app schemes", async () => {
+    const ids = await fixture();
+    const urlId = await addProperty({ ...ids, name: "Open", type: "url" });
+    const response = await asOwner(() =>
+      getDatabase.run({ databaseId: ids.databaseId }),
+    );
+    if (!("database" in response) || !response.mutationContract)
+      throw new Error("Missing mutation contract.");
+    const contract = response.mutationContract;
+
+    const threadLink = "t3-thread://v1/ada5164c-bc1f-4866-b908-dd17f8d65cd2";
+    const result = await asOwner(() =>
+      createRow.run({
+        ...envelope(contract, "thread-link"),
+        propertyValues: { [urlId]: threadLink },
+      }),
+    );
+    expect(result.receipt.readback.propertyValues).toMatchObject({
+      [urlId]: threadLink,
+    });
+
+    for (const [key, value] of [
+      ["javascript", "javascript:alert(1)"],
+      ["data", "data:text/html,hi"],
+      ["other-app", "ms-msdt:/id"],
+    ] as const) {
+      await expect(
+        asOwner(() =>
+          createRow.run({
+            ...envelope(contract, `refused-${key}`),
+            propertyValues: { [urlId]: value },
+          }),
+        ),
+      ).rejects.toMatchObject({ errorCode: "INVALID_PROPERTY_VALUE" });
+    }
   });
 
   it("sparsely updates exact IDs, preserves body and omitted fields, and rejects stale row CAS", async () => {

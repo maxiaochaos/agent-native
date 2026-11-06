@@ -3,21 +3,268 @@
 All notable user-facing changes to Agent-Native Slides are documented here. Open it any
 time from the command menu (Cmd+K → "What's new").
 
-## 2026-10-14
+## 2026-11-05
 
 ### Fixed
 
+- Fixed a crash when selecting slide text after the editor updates.
+- Presenter view is no longer offered on shared links, and a blocked popup now shows a message instead of failing silently.
+
+## 2026-11-04
+
+### Improved
+
+- Outside agents like Claude, Codex, and the Agent-Native desktop app now get the slide canvas size and a content budget when they create a deck, so their slides spill off the bottom far less often.
+- The agent finds the right Slides action more often, for example image generation when you ask for a picture.
+- view-screen lists the 20 most recent decks on Home and says how many more there are.
+
+### Fixed
+
+- PDF, PowerPoint, and Google Slides export from the editor now work for long decks instead of failing with a 'slide is not currently rendered' error.
+- Building slides from PDFs or notes no longer stops with a placeholder error on some models
+- Pasting a copied slide from the thumbnail rail now works even if you wait a while after copying.
+- PowerPoint imports preserve rounded rectangle corner radii.
+- Presentation links open correctly again
+- Undo no longer fails silently when an earlier change has already been applied; it now says the step was skipped.
+
+## 2026-11-03
+
+### Fixed
+
+- Deleting an asset now removes its stored file and reports a real error when the asset is missing, owned by someone else, or its file cannot be deleted.
+- Fewer failed slide edits when the agent quotes spacing that differs from the stored HTML.
+- HTML and text references stay attached in chat and remain readable beyond their previews.
+- Restore now says when a version was already current, and reports an error instead of success when the deck fails to reload.
+- Slides actions now report failures instead of success when they skip a change: unknown or taken slide IDs are rejected, a duplicated slide keeps its background, transition, and skipped flag, notes save with update-slide, navigate fails without a browser tab, and generate-slides-ai warns when the slide count is capped.
+- The agent now recovers when a PowerPoint import produced no slides, instead of stopping mid-run.
+
+## 2026-11-02
+
+### Fixed
+
+- Exports now include slide text you just typed, even before it has auto-saved.
+- Agent edits to slide comment text no longer get silently dropped when the comment is also resolved or reopened.
+
+## 2026-10-30
+
+### Fixed
+
+- Viewers no longer see Rename, Delete, or Set as workspace default on deck cards, and a refused delete, rename, or upload now reports an error instead of looking successful.
+- Agents on read-only connections can now read decks and design systems, so the share dialog's Open in Claude prompt works for them.
+- Asking to import a file you attached earlier in the chat now finds it, instead of stopping with a setup error.
+- Stars on Home now stay after a reload.
+
+## 2026-10-29
+
+### Added
+
+- Undo the agent's last change from a toast or with Cmd+Z, and review both versions side by side when edits conflict.
+
+### Improved
+
+- Decks open faster, the deck list loads in pages, and collaborators' edits refresh only the slide that changed.
+- Import is one button that opens your files, and pasting a Google Slides link into the home prompt offers to import it.
+- Moving, resizing, drawing and pasting objects snaps to an 8px grid, and inspector values show whole pixels.
+- Sharing is one panel: invite people and your organization's agents from one field, see everyone with access in one list, and find Copy link and Send to at the bottom.
+- Teammates can request edit access, owners choose the role, and presentation links always show the latest on-brand slides.
+- The font menu lists the full Google Fonts library with each font previewed in its own face, and font size offers a type scale.
+
+### Fixed
+
+- Deck actions now return specific errors for missing decks, slides, versions, and comments, and duplicate-deck id collisions no longer expose database details.
+- Fixed text edits saving the editor's height lock into slide HTML, which made edited paragraphs overlap the block below after they grew.
+- Hiding a slide while someone else edits the deck no longer fails to save or loses the slide.
+- Present starts in one click, presentation clickers work, exports warn instead of silently dropping content, images have a Crop button, zoom has Fit to screen and keyboard shortcuts, and new decks no longer report a false failure or generate twice.
+- Pressing Enter on a card edits its first value, new table cells take typing, spreadsheet paste fills table cells, and overflowing text can shrink to fit.
+- Restoring a deck version keeps the deck's design system.
+- Saves keep working after a slide you were editing is deleted elsewhere; the stale edit is dropped instead of blocking every later save.
+- Slides saves edits to large, image-heavy slides when the tab is hidden or closed.
+- Snapshot share links stop working when their deck is deleted or made private, and can be listed and revoked from the share dialog. Snapshot links created before this update are not tied to a deck and stop working; re-share the deck to get a new link.
+- Deck change notifications are now only sent to people who can open the deck, so private decks no longer reveal their ids, slide ids, or editing activity to other users.
+
+## 2026-10-28
+
+### Fixed
+
+- A new deck that asks you a question before generating now waits for your answer instead of showing Generation failed
+- Adding a slide from chat no longer fails on a deck that has no target slide count
+
+## 2026-10-27
+
+### Improved
+
+- Slides now asks how you want to use an attached file before generating slides when your message doesn't say.
+- Presentation ideas appear right away, with a smoother path from prompt to finished deck.
+- Slides now arrive one at a time as the agent writes them, and the canvas follows along, drawing each element's frame in blue before its content appears
+- Start presentations with ready-to-use role-based prompts, then refine, export, or share your first result from the canvas.
+- First-run setup makes free credits the primary path while keeping personal API keys one click away
+
+### Fixed
+
+- PDFs handed off from another app now import instead of being reported as unreadable
+
+## 2026-10-26
+
+### Improved
+
+- The new-deck prompt keeps Send as its main button; the mic still dictates.
+- Voice edits make the smallest matching change, say the new value out loud, and start faster
+
+### Fixed
+
+- The home prompt bar no longer leaves empty space under its controls.
+
+## 2026-10-24
+
+### Added
+
+- Pick slides and slide elements for the agent with the Select button in the chat composer.
+
+### Improved
+
+- The home prompt uses the large composer with dictation, and the agent panel opens on the same default model as the home prompt
+
+## 2026-10-23
+
+### Fixed
+
+- The agent keeps going after a slide edit that would change nothing, instead of stopping the run with an error.
+- The agent retries a slide edit whose text it could not find instead of stopping the run with an error.
+
+## 2026-10-22
+
+### Added
+
+- Outside assistants can clone a slide from existing context and open the copy in the Slides editor.
+
+### Fixed
+
+- New decks and added slides open in the full Slides app from their chat links.
+
+## 2026-10-21
+
+### Improved
+
+- The ownership filter beside search is a lighter button with a filter icon.
+
+### Fixed
+
+- Deleting a deck through an agent requires approval for each deletion.
+
+## 2026-10-20
+
+### Improved
+
+- Phones now see a page that shares or emails the link to a larger screen, instead of an editor that isn't built for small screens.
+
+### Fixed
+
+- Slides handles chat attachments more reliably, including documents with unclear filenames and image links.
+
+## 2026-10-19
+
+### Added
+
+- Speaker notes panel under the slide canvas, with Generate notes and agent quick picks from the toolbar
+
+### Improved
+
+- Slide image generation uses the local provider by default, with Assets available for brand-library requests.
+
+### Fixed
+
+- Generated images stay available when slide insertion fails.
+- Slides image generation stays in Slides and respects its supported reference image limit.
+- Slides owns deck creation and editing, avoiding unnecessary Design handoffs.
+
+### Changed
+
+- Apps no longer keep server functions and databases warm by default; set `AGENT_NATIVE_ENABLE_KEEP_WARM=1` to opt in.
+
+## 2026-10-16
+
+### Added
+
+- Animations can now play with the previous one, so several objects appear together in one click
+
+### Improved
+
+- Deck lists use the shared ownership filter, and visibility badges use localized labels.
+- Contextual toolbar: the second row now changes with what is selected (text, shape, image, video, multi-select), and every state ends with an Edit with Agent button with quick picks.
+- The top bar shows a deck's privacy next to its name, Share has People and Agents tabs, and Present opens a menu to start in this tab, full screen, or Presenter View.
+
+### Fixed
+
+- Preserve PDF text line spacing when importing decks.
+- Search and preview reference decks before choosing one
+- Slides can research public sources when creating presentations
+- Slides keeps the original prompt available if saving a failed generation status does not work.
+
+## 2026-10-15
+
+### Added
+
+- Advance a presentation with spoken next-slide and previous-slide commands
+
+### Improved
+
+- Cmd+A selects all the text in a slide text box on the first press, and typing right after a bold, italic or underline toggle keeps the space you type
+- Blank decks and simple follow-ups like adding one empty slide now finish in a single quick step instead of running the full deck-generation process.
+
+### Fixed
+
+- Backspace clears empty list items, and typed bullet markers match the text size
+- Deck prompts stay visible when generation status checks fail
+- Pasting into slide text keeps lists as lists, keeps bold and italic from other apps, and links bare URLs without leaving stray empty paragraphs
+- Presenter controls preserve Space navigation after mouse clicks and explain microphone recovery.
+- Presenter voice commands now distinguish localized phrases and preserve presentation controls.
+- Text editing in slides behaves like a standard rich text editor: Enter, Backspace and Delete join, split and exit lists, quotes and headings correctly, and Undo no longer breaks after a list toggle
+- Slides can paste the slide you copied into another deck with the keyboard or thumbnail menu.
+- Slides keeps your original request visible when a deck cannot be saved or checked.
+- Slides shows fallback prompts immediately, keeps them disabled until chat setup is ready, and persists generated decks before setup waits.
+- Undo and redo now reliably restore moved images and keep their selection in place
+- Undo and redo now restore moved objects and keep their selection stable.
+- Undo and redo now restore the correct slide change and keep the intended element selected.
+- Undo and redo reliably restore slide edits after saves and layout updates.
+- Undo and redo restore moved images and keep their selection aligned.
+- Undo and redo restore object moves, keep the changed object selected, and surface conflicts while preserving older history.
+- Your original prompt stays available when you reopen a deck after a failed generation
+- Selected slide elements now show a single blue outline.
+- Slides shows fallback prompts immediately and persists generated decks before setup waits.
+- Suggestion chips have more breathing room above the chat field
+
+## 2026-10-14
+
+### Improved
+
+- The logo now opens an app menu with File, Edit, View, Preferences and Help.
+- Slash command options are easier to distinguish with pointer and keyboard navigation
+
+### Fixed
+
+- Decks now render in their linked design system's colors, fonts, and canvas for everyone who can open them, even when that design system isn't shared with them or sets no slide default background
+- Backspace removes a leading space in a heading or quote without changing its formatting
+- Chats no longer stop with "result is unknown" after a rejected edit; the agent corrects the call and continues.
+- Fixed retries so the original deck request stays available if generation is delayed.
+- Slash-command keyboard navigation now starts from the first command when the menu reopens.
+- If a retry never starts, Slides keeps your prompt and lets you try again.
 - Prompting the agent no longer occasionally strips all styling from a slide
 
 ## 2026-10-13
 
 ### Improved
 
+- Long slide editing sessions preserve more undo history.
 - Choosing a single direction now continues slide generation automatically.
 - The agent now fixes colors and other small style issues across several slides with targeted edits instead of rewriting each slide, so those fixes finish much faster.
 
 ### Fixed
 
+- Bold formatting stays consistent when you format and copy selected slide text
+- Keep the caret inside list items when navigating to line edges
+- List formatting keeps the caret after a soft line break
+- Markdown formatting shortcuts preserve styling when the caret is already inside a styled run
+- Slash-menu keyboard selection stays responsive through repeated arrow presses
 - Color and style fixes across slides no longer fail partway through and stop the agent.
 - Deck creation errors disappear after the slides are edited to fix them.
 - Failed deck generations keep your original prompt so you can try again.
@@ -77,6 +324,7 @@ time from the command menu (Cmd+K → "What's new").
 
 ### Fixed
 
+- Slide outlines generated with Gemini work again: Google retired the model they used.
 - By-paragraph animations now work with native paragraphs and bullet lists.
 - By-paragraph animations reveal multiple paragraphs in a list item one at a time.
 - By-paragraph animations step through nested list items in order, preserving explicit paragraph effects and consistently prioritizing the first configured effect when targets overlap.

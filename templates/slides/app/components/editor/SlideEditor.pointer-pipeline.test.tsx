@@ -457,7 +457,8 @@ describe("SlideEditor pointer pipeline on the clip slide", () => {
   });
 
   it("moves only the card when dragged from its padding (oracle 4.4, oracle 6.7)", async () => {
-    const editor = await mountEditor(CLIP_SLIDE);
+    const onUpdateSlide = vi.fn();
+    const editor = await mountEditor(CLIP_SLIDE, { onUpdateSlide });
 
     editor.press("card", { x: 85, y: 300 });
     fireEvent.pointerMove(window, { clientX: 125, clientY: 330, pointerId: 1 });
@@ -471,6 +472,10 @@ describe("SlideEditor pointer pipeline on the clip slide", () => {
     for (const id of ["h2", "callout", "left", "container", "cardBody"]) {
       expect(editor.el(id).style.position, id).not.toBe("absolute");
     }
+    expect(onUpdateSlide.mock.calls.at(-1)?.[2]).toMatchObject({
+      separateUndo: true,
+      persistence: "immediate",
+    });
   });
 
   it("leaves the card where it was when Escape cancels the drag (oracle 4.7)", async () => {
@@ -912,7 +917,10 @@ describe("SlideEditor pointer pipeline selection and press fixes", () => {
     const html = () => editor.el("table").outerHTML;
     const before = html();
 
+    // A press in a cell edits its text, empty or not; Escape leaves the cell
+    // selected as an object.
     editor.click("emptyCell", { x: 310, y: 110 });
+    fireEvent.keyDown(editor.el("emptyCell"), { key: "Escape" });
     expect(editor.lastSelected()).toBe(editor.el("emptyCell"));
     expect(editor.outlineBox()).not.toBeNull();
     expect(document.querySelector("[data-slide-resize-handle]")).toBeNull();
@@ -1584,8 +1592,9 @@ describe("SlideEditor pointer pipeline Alt-drag of a multi-selection", () => {
     expect(updates).toHaveLength(1);
     const objects = placements(updates[0]);
     expect(objects).toHaveLength(2);
-    expect(objects[0]).toMatchObject({ left: "120px", top: "265px" });
-    expect(objects[1]).toMatchObject({ left: "120px", top: "320px" });
+    // The pair's top-left lands on the 8px grid; the card keeps its offset.
+    expect(objects[0]).toMatchObject({ left: "120px", top: "264px" });
+    expect(objects[1]).toMatchObject({ left: "120px", top: "319px" });
   });
 
   it("moves the originals when Alt is released on the drop itself", async () => {
@@ -1597,7 +1606,7 @@ describe("SlideEditor pointer pipeline Alt-drag of a multi-selection", () => {
 
     const objects = placements(updates[0]);
     expect(objects).toHaveLength(2);
-    expect(objects[0]).toMatchObject({ left: "120px", top: "265px" });
+    expect(objects[0]).toMatchObject({ left: "120px", top: "264px" });
   });
 
   it("removes the copies and persists nothing when Escape cancels (oracle 4.7)", async () => {

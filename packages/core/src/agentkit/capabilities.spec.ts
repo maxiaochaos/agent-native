@@ -156,6 +156,7 @@ describe("AgentKit integration capabilities", () => {
     );
   });
 
+  // oracle-change: remove tests for the deleted Slides 2 template
   it("recognizes a connected workspace OAuth account using the same account binding as the Figma runtime", async () => {
     mocks.resolve.mockResolvedValue(null);
     mocks.resolveWorkspaceConnection.mockImplementation(async ({ provider }) =>

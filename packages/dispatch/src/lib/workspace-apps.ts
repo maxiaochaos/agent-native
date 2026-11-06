@@ -9,15 +9,19 @@ import {
   withBuilderUtmTrackingParams,
 } from "@agent-native/core/shared";
 
+import { workspaceAppRoute } from "../shared/workspace-app-route";
 import {
   CANONICAL_WORKSPACE_SSO_APP_ORIGINS,
   isWorkspaceSsoAppUrl,
 } from "../shared/workspace-sso";
 
+export { workspaceAppRoute } from "../shared/workspace-app-route";
+
 export interface WorkspaceAppSummary {
   id: string;
   name: string;
   description?: string;
+  whenToUse?: string[];
   defaultDescriptionKey?: string;
   path: string;
   homePath?: string;
@@ -43,6 +47,7 @@ export interface WorkspaceAppSummary {
   archived?: boolean;
   workspaceSso?: boolean;
   source?: WorkspaceAppSource;
+  hiddenFromLaunchers?: boolean;
 }
 
 export type WorkspaceAppSource = "workspace" | "builtin" | "connected";
@@ -164,9 +169,13 @@ export function isDefaultWorkspaceAppHiddenId(appId: string): boolean {
 }
 
 export function isWorkspaceAppVisibleInDefaultLaunchers(
-  app: Pick<WorkspaceAppSummary, "id" | "isDispatch">,
+  app: Pick<WorkspaceAppSummary, "id" | "isDispatch" | "hiddenFromLaunchers">,
 ): boolean {
-  return !app.isDispatch && !isDefaultWorkspaceAppHiddenId(app.id);
+  return (
+    !app.isDispatch &&
+    !app.hiddenFromLaunchers &&
+    !isDefaultWorkspaceAppHiddenId(app.id)
+  );
 }
 
 const DEFAULT_WORKSPACE_APP_DESCRIPTIONS: Record<
@@ -217,10 +226,6 @@ export function defaultWorkspaceAppUrl(rawUrl: string): string {
     // coercion-ok: malformed default metadata remains an absent navigation target.
     return rawUrl;
   }
-}
-
-export function workspaceAppRoute(appId: string): string {
-  return `/apps/${encodeURIComponent(appId)}`;
 }
 
 function normalizeWorkspaceAppRoutePath(rawPath: string): URL | null {
@@ -280,8 +285,10 @@ export function workspaceAppRouteForChildPath(
       ? parsed.pathname.slice(mountPath.length) || "/"
       : parsed.pathname;
   const routePath = workspaceAppRoute(app.id);
-  const suffix = relativePathname === "/" ? "" : relativePathname;
-  return `${routePath}${suffix}${parsed.search}${parsed.hash}`;
+  const childRoute = `${relativePathname}${parsed.search}${parsed.hash}`;
+  if (childRoute === "/") return routePath;
+  const search = new URLSearchParams([["__workspace_app_path", childRoute]]);
+  return `${routePath}?${search}`;
 }
 
 export function workspaceAppInitialPathFromSplat(
@@ -289,6 +296,14 @@ export function workspaceAppInitialPathFromSplat(
   search: string,
   hash: string,
 ): string | undefined {
+  const appPath = new URLSearchParams(search).get("__workspace_app_path");
+  if (appPath !== null) {
+    const parsed = normalizeWorkspaceAppRoutePath(appPath);
+    if (!parsed) return undefined;
+    const path = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    return path === "/" ? undefined : path;
+  }
+
   const pathname = routeSplat?.trim()
     ? `/${routeSplat.trim().replace(/^[/\\]+/, "")}`
     : "/";
@@ -308,6 +323,27 @@ export function workspaceAppIdFromRoute(pathname: string): string | null {
     // coercion-ok: malformed app routes are inactive, not app ids.
     return null;
   }
+}
+
+// A mounted app's registry `url` is the Dispatch page that hosts it
+// (`<dispatch>/apps/<id>`). Read from that same Dispatch, it is the page doing
+// the framing, so framing it again nests Dispatch inside itself.
+export function isWorkspaceAppHostPageUrl(
+  app: Pick<WorkspaceAppSummary, "id" | "url">,
+  dispatchOrigin: string | undefined,
+): boolean {
+  const rawUrl = app.url?.trim();
+  if (!rawUrl || !dispatchOrigin) return false;
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    // coercion-ok: a URL that does not parse is not Dispatch's page for the app.
+    return false;
+  }
+  if (url.origin !== dispatchOrigin) return false;
+  const pathname = url.pathname.replace(/\/+$/, "").toLowerCase();
+  return pathname.endsWith(workspaceAppRoute(app.id.trim()).toLowerCase());
 }
 
 export function workspaceAppHref(app: WorkspaceAppSummary): string | null {
@@ -475,6 +511,7 @@ export function mergeChatFirstWorkspaceApps(
     description?: string | null;
     url?: string | null;
     source?: WorkspaceAppSource;
+    hiddenFromLaunchers?: boolean;
   }[] = [],
 ): WorkspaceAppSummary[] {
   const enabledBuiltins = new Set(
@@ -523,6 +560,7 @@ export function mergeChatFirstWorkspaceApps(
           name: app.name.trim() || existing.name,
           description: app.description ?? existing.description,
           url: app.url?.trim() || existing.url,
+          ...(app.hiddenFromLaunchers ? { hiddenFromLaunchers: true } : {}),
         });
       }
       continue;
@@ -535,6 +573,7 @@ export function mergeChatFirstWorkspaceApps(
       url: app.url?.trim() || null,
       status: "ready",
       source: app.source ?? "connected",
+      ...(app.hiddenFromLaunchers ? { hiddenFromLaunchers: true } : {}),
     });
   }
 

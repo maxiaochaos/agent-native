@@ -3,10 +3,7 @@ import {
   useAvatarUrl,
 } from "@agent-native/core/client/hooks";
 import { useFormatters, useT } from "@agent-native/core/client/i18n";
-import {
-  InlineMarkdown,
-  type InlineMarkdownProtectedSpan,
-} from "@agent-native/toolkit/app/review";
+import { CommentBody } from "@agent-native/toolkit/app/review";
 import {
   IconArrowUp,
   IconMessageCircle,
@@ -190,6 +187,11 @@ export interface CommentsPanelProps {
   currentUserName?: string;
   enableComments: boolean;
   canComment: boolean;
+  /**
+   * Lets the viewer delete comments they wrote. Defaults to `canComment`; an
+   * owner reviewing history with comments off may delete without commenting.
+   */
+  canDeleteOwnComments?: boolean;
   onSeek: (ms: number) => void;
   queryKey: readonly unknown[];
   selectComments?: CommentsLens["selectComments"];
@@ -208,6 +210,7 @@ export function CommentsPanel(props: CommentsPanelProps) {
     currentUserName,
     enableComments,
     canComment,
+    canDeleteOwnComments = canComment,
     onSeek,
     onUnauthenticated,
     queryKey,
@@ -222,6 +225,9 @@ export function CommentsPanel(props: CommentsPanelProps) {
     isSharePresentation || isInlinePresentation;
   const formatters = useFormatters();
   const [draft, setDraft] = useState("");
+  // A comment belongs to the frame on screen when typing starts, not when it
+  // is sent.
+  const [draftAtMs, setDraftAtMs] = useState<number | null>(null);
   const [replyDraft, setReplyDraft] = useState("");
   const [replyTo, setReplyTo] = useState<Comment | null>(null);
   const [visibleComments, setVisibleComments] = useState(comments);
@@ -655,7 +661,7 @@ export function CommentsPanel(props: CommentsPanelProps) {
       : {
           recordingId,
           content: text,
-          videoTimestampMs: getCurrentMs?.() ?? currentMs,
+          videoTimestampMs: draftAtMs ?? getCurrentMs?.() ?? currentMs,
           ...mentionArgs(value, draftMentions),
           ...(currentUserName ? { authorName: currentUserName } : {}),
         };
@@ -665,6 +671,7 @@ export function CommentsPanel(props: CommentsPanelProps) {
       setReplyTo(null);
     } else {
       setDraft("");
+      setDraftAtMs(null);
       setDraftMentions([]);
     }
     addComment.mutate(vars);
@@ -715,10 +722,16 @@ export function CommentsPanel(props: CommentsPanelProps) {
     });
   }
 
+  function changeDraft(value: string) {
+    if (!value.trim()) setDraftAtMs(null);
+    else if (draftAtMs === null) setDraftAtMs(getCurrentMs?.() ?? currentMs);
+    setDraft(value);
+  }
+
   const composer = (
     <CommentComposer
       draft={draft}
-      currentMs={currentMs}
+      currentMs={draftAtMs ?? currentMs}
       currentUserEmail={currentUserEmail}
       currentUserName={currentUserName}
       isSignedIn={isSignedIn}
@@ -726,7 +739,7 @@ export function CommentsPanel(props: CommentsPanelProps) {
       isInlinePresentation={isInlinePresentation}
       enableComments={enableComments}
       canComment={canComment}
-      onDraftChange={setDraft}
+      onDraftChange={changeDraft}
       onMentionAdd={(mention) =>
         setDraftMentions((current) => upsertMention(current, mention))
       }
@@ -755,10 +768,11 @@ export function CommentsPanel(props: CommentsPanelProps) {
           formatRelativeTime={formatters.formatRelativeTime}
           currentUserEmail={currentUserEmail}
           canComment={canComment}
+          canDelete={canDeleteOwnComments}
           onSeek={onSeek}
           onReply={() => openReply(node.comment)}
           onDelete={(id) => remove.mutate({ id })}
-          isEditing={editingId === node.comment.id}
+          isEditing={canComment && editingId === node.comment.id}
           editDraft={editDraft}
           onEditDraftChange={setEditDraft}
           onEditMentionAdd={(mention) =>
@@ -776,7 +790,7 @@ export function CommentsPanel(props: CommentsPanelProps) {
           canReply={replyAllowed}
           isReply={depth > 0}
         />
-        {replyAllowed && replyTo?.id === node.comment.id ? (
+        {canComment && replyAllowed && replyTo?.id === node.comment.id ? (
           <div className="ps-8">
             <InlineReplyComposer
               draft={replyDraft}
@@ -1037,7 +1051,6 @@ function CommentComposer({
                 ? "min-h-8 flex-1 border-0 px-0 py-1 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
                 : "min-h-[60px]",
             )}
-            submitOnEnter
           />
           <Button
             type="button"
@@ -1107,7 +1120,6 @@ function InlineReplyComposer({
           rows={1}
           className="min-h-6 resize-none border-0 bg-transparent px-0 py-0.5 text-sm leading-5 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
           onEscape={onCancel}
-          submitOnEnter
         />
         <Button
           size="icon"
@@ -1157,7 +1169,6 @@ function InlineEditComposer({
         aria-label={t("commentsPanel.editComment")}
         className="min-h-16 resize-none border-0 bg-background text-sm"
         onEscape={onCancel}
-        submitOnEnter
       />
       <div className="mt-2 flex justify-end gap-2">
         <Button variant="ghost" size="sm" onClick={onCancel}>
@@ -1183,6 +1194,7 @@ function CommentCard({
   formatRelativeTime,
   currentUserEmail,
   canComment,
+  canDelete,
   editDraft,
   isEditing,
   onSeek,
@@ -1204,6 +1216,7 @@ function CommentCard({
   formatRelativeTime: ReturnType<typeof useFormatters>["formatRelativeTime"];
   currentUserEmail?: string;
   canComment: boolean;
+  canDelete: boolean;
   editDraft: string;
   isEditing: boolean;
   onSeek: (ms: number) => void;
@@ -1301,12 +1314,11 @@ function CommentCard({
           />
         ) : (
           <>
-            <InlineMarkdown
-              content={comment.content}
+            <CommentBody
+              body={comment.content}
+              mentions={comment.mentions?.map(({ name }) => ({ label: name }))}
               className="mt-0.5 text-sm leading-5 text-foreground [overflow-wrap:anywhere]"
               linkClassName="text-link underline-offset-2 hover:underline"
-              renderLists
-              protectedSpans={commentMentionSpans(comment.mentions)}
             />
 
             <div
@@ -1404,7 +1416,7 @@ function CommentCard({
                 );
               })}
 
-              {isOwner && canComment ? (
+              {isOwner && (canComment || canDelete) ? (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button
@@ -1420,15 +1432,19 @@ function CommentCard({
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
-                    <DropdownMenuItem onSelect={onStartEdit}>
-                      {t("commentsPanel.editComment")}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      className="text-destructive focus:text-destructive"
-                      onSelect={() => onDelete(comment.id)}
-                    >
-                      {t("commentsPanel.delete")}
-                    </DropdownMenuItem>
+                    {canComment ? (
+                      <DropdownMenuItem onSelect={onStartEdit}>
+                        {t("commentsPanel.editComment")}
+                      </DropdownMenuItem>
+                    ) : null}
+                    {canDelete ? (
+                      <DropdownMenuItem
+                        className="text-destructive focus:text-destructive"
+                        onSelect={() => onDelete(comment.id)}
+                      >
+                        {t("commentsPanel.delete")}
+                      </DropdownMenuItem>
+                    ) : null}
                   </DropdownMenuContent>
                 </DropdownMenu>
               ) : null}
@@ -1465,19 +1481,6 @@ function mentionArgs(
 ): { mentions?: CommentMention[] } {
   const present = mentionsForCommentText(text, mentions);
   return present.length > 0 ? { mentions: present } : {};
-}
-
-function commentMentionSpans(
-  mentions: readonly CommentMentionDisplay[] | null | undefined,
-): InlineMarkdownProtectedSpan[] {
-  const labels = Array.from(
-    new Set((mentions ?? []).map((mention) => mention.name)),
-  ).sort((a, b) => b.length - a.length);
-  return labels.map((name) => ({
-    source: `@${name}`,
-    label: `@${name}`,
-    className: "comment-mention font-medium text-primary",
-  }));
 }
 
 function initials(name: string): string {

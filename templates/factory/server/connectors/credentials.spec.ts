@@ -26,11 +26,21 @@ vi.mock("../db/index.js", () => ({
   getDb: () => ({ select: mocks.select }),
 }));
 
+import { UnreadableSecretError } from "../lib/unreadable-secret.js";
+import {
+  createRunObserver,
+  withRunObserver,
+} from "../lib/workflow-run-observer.js";
+import { sanitizeDetails } from "../tripwire/redact.js";
+import { createCapturingTripwireSink } from "../tripwire/testing.js";
+import type { TripwireInput, TripwireSink } from "../tripwire/types.js";
 import {
   VaultUnavailableError,
+  assertFactoryConnectorReady,
   hasConnectorSecret,
   resolveConnectorSecret,
   resolveFactoryConnectorReadiness,
+  resolveFactoryConnectorSources,
 } from "./credentials.js";
 
 const HOSTED_RUNTIME_ENV_KEYS = [
@@ -444,5 +454,280 @@ describe("resolveFactoryConnectorReadiness", () => {
     await expect(
       hasConnectorSecret("SLACK_BOT_TOKEN", userEmail, { orgId: "active-org" }),
     ).rejects.toBeInstanceOf(VaultUnavailableError);
+  });
+});
+
+describe("a saved key this deployment cannot decrypt", () => {
+  const userEmail = "owner@example.com";
+  const options = { orgId: "active-org" };
+
+  /** What core throws for a saved value it cannot decrypt; it names no key. */
+  const coreUnreadable = () =>
+    Object.assign(new Error("A saved connection could not be decrypted."), {
+      errorCode: "app_secret_unreadable",
+    });
+
+  /** The vault holds `unreadable` keys that cannot be opened and `present` ones that can. */
+  function vaultHolds(present: string[], unreadable: string[]) {
+    mocks.readAppSecret.mockImplementation(async ({ key }: { key: string }) => {
+      if (unreadable.includes(key)) throw coreUnreadable();
+      return present.includes(key) ? { value: `${key}-value` } : null;
+    });
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.unstubAllEnvs();
+    stubCleanLocalRuntimeEnv();
+    mocks.readAppSecret.mockResolvedValue(null);
+    mocks.resolveCredential.mockResolvedValue(undefined);
+    mocks.resolveWorkspaceConnectionCredentialForApp.mockResolvedValue({
+      available: false,
+      value: undefined,
+    });
+    mocks.resolveOrgIdForEmail.mockResolvedValue("active-org");
+  });
+
+  it("is not retried as a vault outage: it names the key, says a person must fix it, and stops the search", async () => {
+    mocks.readAppSecret.mockRejectedValue(coreUnreadable());
+
+    const failure = await resolveConnectorSecret(
+      "SLACK_BOT_TOKEN",
+      userEmail,
+      options,
+    ).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(UnreadableSecretError);
+    expect(failure).not.toBeInstanceOf(VaultUnavailableError);
+    expect(failure).toMatchObject({
+      errorCode: "app_secret_unreadable",
+      keys: ["SLACK_BOT_TOKEN"],
+      retryable: false,
+    });
+    const { message } = failure as Error;
+    expect(message).toMatch(
+      /SLACK_BOT_TOKEN is saved but this deployment cannot decrypt it/,
+    );
+    expect(message).toMatch(/Retrying will not help.*a person must save it/);
+    expect(message).not.toMatch(/transient|retry in a moment/i);
+    expect(mocks.readAppSecret).toHaveBeenCalledTimes(1);
+  });
+
+  it("is named too when core's own error comes out of the legacy resolver or the connection read", async () => {
+    mocks.resolveCredential.mockRejectedValue(coreUnreadable());
+    await expect(
+      resolveConnectorSecret("FACTORY_TEST_CONNECTOR_KEY", userEmail, options),
+    ).rejects.toMatchObject({
+      errorCode: "app_secret_unreadable",
+      keys: ["FACTORY_TEST_CONNECTOR_KEY"],
+    });
+
+    mocks.resolveWorkspaceConnectionCredentialForApp.mockRejectedValue(
+      coreUnreadable(),
+    );
+    await expect(
+      resolveConnectorSecret("SLACK_BOT_TOKEN", userEmail, options),
+    ).rejects.toMatchObject({
+      errorCode: "app_secret_unreadable",
+      keys: ["SLACK_BOT_TOKEN"],
+    });
+  });
+
+  it("is not read as a missing key by a presence check or a save-time readiness check", async () => {
+    vaultHolds([], ["SLACK_BOT_TOKEN"]);
+
+    await expect(
+      hasConnectorSecret("SLACK_BOT_TOKEN", userEmail, options),
+    ).rejects.toBeInstanceOf(UnreadableSecretError);
+    await expect(
+      assertFactoryConnectorReady("slack", userEmail, options),
+    ).rejects.toMatchObject({
+      errorCode: "app_secret_unreadable",
+      keys: ["SLACK_BOT_TOKEN"],
+    });
+  });
+
+  it("is reported per connector, so one unreadable token leaves the others their own answers", async () => {
+    vaultHolds(["SENTRY_SERVER_TOKEN"], ["SLACK_BOT_TOKEN"]);
+
+    await expect(
+      resolveFactoryConnectorSources(userEmail, options),
+    ).resolves.toEqual({
+      slack: { state: "unreadable", keys: ["SLACK_BOT_TOKEN"] },
+      slackSecondary: { state: "absent" },
+      github: { state: "absent" },
+      sentry: { state: "present", source: "workspace" },
+    });
+  });
+
+  it("names every unreadable GitHub App key, and a token that reads outranks nothing", async () => {
+    vaultHolds(
+      ["GITHUB_APP_ID"],
+      ["GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+    );
+
+    const sources = await resolveFactoryConnectorSources(userEmail, options);
+
+    expect(sources.github).toEqual({
+      state: "unreadable",
+      keys: ["GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_PRIVATE_KEY"],
+    });
+  });
+
+  it("fails a yes-or-no readiness read, which could only call it absent", async () => {
+    vaultHolds(["SENTRY_SERVER_TOKEN"], ["SLACK_BOT_TOKEN"]);
+
+    await expect(
+      resolveFactoryConnectorReadiness(userEmail, options),
+    ).rejects.toMatchObject({
+      errorCode: "app_secret_unreadable",
+      keys: ["SLACK_BOT_TOKEN"],
+    });
+  });
+});
+
+describe("credential_source_used tripwire", () => {
+  const userEmail = "owner@example.com";
+  const SLACK_SECRET = "xoxb-FAKE-0000-aaaaaaaaaaaa";
+  const GITHUB_SECRET = "ghp_FAKE0000aaaaaaaaaaaa";
+
+  // A note lands only inside a run's observer, so a call made with no run open
+  // is the same call with no sink at all.
+  function inRun<T>(sink: TripwireSink, work: () => Promise<T>): Promise<T> {
+    return withRunObserver(createRunObserver(sink), work);
+  }
+
+  function stored(event: TripwireInput) {
+    return { ...event, details: sanitizeDetails(event.details).fields };
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.unstubAllEnvs();
+    stubCleanLocalRuntimeEnv();
+    mocks.readAppSecret.mockResolvedValue(null);
+    mocks.resolveCredential.mockResolvedValue(undefined);
+    mocks.resolveWorkspaceConnectionCredentialForApp.mockResolvedValue({
+      available: false,
+      value: undefined,
+    });
+    mocks.resolveOrgIdForEmail.mockResolvedValue("active-org");
+    mocks.select.mockReturnValue({
+      from: () => ({
+        where: async () => [{ orgId: "active-org" }],
+      }),
+    });
+  });
+
+  it("records a workspace-connection use, and never the value", async () => {
+    mocks.resolveWorkspaceConnectionCredentialForApp.mockResolvedValue({
+      available: true,
+      value: SLACK_SECRET,
+    });
+    const { sink, events } = createCapturingTripwireSink();
+
+    const observed = await inRun(sink, () =>
+      resolveConnectorSecret("SLACK_BOT_TOKEN", userEmail, {
+        orgId: "active-org",
+      }),
+    );
+    const unobserved = await resolveConnectorSecret(
+      "SLACK_BOT_TOKEN",
+      userEmail,
+      { orgId: "active-org" },
+    );
+
+    expect(unobserved).toBe(observed);
+    expect(observed).toBe(SLACK_SECRET);
+    expect(JSON.stringify(events[0])).not.toContain(SLACK_SECRET);
+  });
+
+  it.each([
+    ["the organization the run is for", "active-org"],
+    ["the designated vault organization", "designated-vault-org"],
+  ])(
+    "records a vault use found in %s and never an id or the stored value",
+    async (_where, foundIn) => {
+      vi.stubEnv("AGENT_VAULT_ORG_ID", "designated-vault-org");
+      mocks.readAppSecret.mockImplementation(async ({ key, scope, scopeId }) =>
+        key === "SLACK_BOT_TOKEN" && scope === "org" && scopeId === foundIn
+          ? { value: SLACK_SECRET }
+          : null,
+      );
+      const { sink, events } = createCapturingTripwireSink();
+
+      await expect(
+        inRun(sink, () =>
+          resolveConnectorSecret("SLACK_BOT_TOKEN", userEmail, {
+            orgId: "active-org",
+          }),
+        ),
+      ).resolves.toBe(SLACK_SECRET);
+
+      const text = JSON.stringify(stored(events[0]));
+      expect(text).not.toContain(SLACK_SECRET);
+      expect(text).not.toContain("designated-vault-org");
+      expect(text).not.toContain("active-org");
+    },
+  );
+
+  it("records an env use only in local development, and never the value", async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("SLACK_BOT_TOKEN", SLACK_SECRET);
+    const { sink, events } = createCapturingTripwireSink();
+
+    await expect(
+      inRun(sink, () =>
+        resolveConnectorSecret("SLACK_BOT_TOKEN", userEmail, {
+          orgId: "active-org",
+        }),
+      ),
+    ).resolves.toBe(SLACK_SECRET);
+
+    expect(JSON.stringify(stored(events[0]))).not.toContain(SLACK_SECRET);
+  });
+
+  it("records one event per provider in a run, and a second provider its own", async () => {
+    mocks.resolveWorkspaceConnectionCredentialForApp.mockImplementation(
+      async ({ provider }) => ({
+        available: true,
+        value: provider === "slack" ? SLACK_SECRET : GITHUB_SECRET,
+      }),
+    );
+    const { sink, events } = createCapturingTripwireSink();
+
+    await inRun(sink, async () => {
+      await resolveConnectorSecret("SLACK_BOT_TOKEN", userEmail, {
+        orgId: "active-org",
+      });
+      await resolveConnectorSecret("SLACK_BOT_TOKEN", userEmail, {
+        orgId: "active-org",
+      });
+      await resolveConnectorSecret("GITHUB_TOKEN", userEmail, {
+        orgId: "active-org",
+      });
+    });
+
+    expect(events).toHaveLength(2);
+    expect(events.map((event) => stored(event).details)).toMatchObject([
+      { provider: "slack", source: "workspace-connection" },
+      { provider: "github", source: "workspace-connection" },
+    ]);
+    expect(JSON.stringify(events.map(stored))).not.toContain(SLACK_SECRET);
+    expect(JSON.stringify(events.map(stored))).not.toContain(GITHUB_SECRET);
+  });
+
+  it("a readiness check", async () => {
+    mocks.resolveWorkspaceConnectionCredentialForApp.mockResolvedValue({
+      available: true,
+      value: SLACK_SECRET,
+    });
+    const { sink } = createCapturingTripwireSink();
+
+    await expect(
+      inRun(sink, () =>
+        resolveFactoryConnectorReadiness(userEmail, { orgId: "active-org" }),
+      ),
+    ).resolves.toMatchObject({ slack: true });
   });
 });

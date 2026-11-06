@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { setCookie, type H3Event } from "h3";
+import { createError, setCookie, type H3Event } from "h3";
 
 import { warnAgent } from "../agent/action-warnings.js";
 import { getAppConfig } from "../app-config/index.js";
@@ -9,6 +9,10 @@ import { getDbExec, isTransientDatabaseError } from "../db/client.js";
 import { isAnonymousWaitlistSessionEmail } from "../server/anonymous-identity.js";
 import { crossSiteCookieAttrs, getSession } from "../server/auth.js";
 import { shouldWriteFirstRunOnboardingEligibility } from "../server/first-run-onboarding-build-mode.js";
+import {
+  effectiveOrgMemberRole,
+  readOrgMemberRole,
+} from "../server/personal-provider-key-policy.js";
 import {
   getVerifiedServiceIdentityFromEvent,
   getRequestContext,
@@ -41,6 +45,31 @@ const EMPTY_CONTEXT: OrgContext = {
   orgName: null,
   role: null,
 };
+const ORG_SCOPE_RESOLUTION_UNAVAILABLE_KEY =
+  "__anOrgScopeResolutionUnavailable";
+const ORG_SCOPE_FORBIDDEN_KEY = "__anOrgScopeForbidden";
+
+export function hasForbiddenOrgScope(event: {
+  context?: Record<string, unknown>;
+}): boolean {
+  return event.context?.[ORG_SCOPE_FORBIDDEN_KEY] === true;
+}
+
+function markForbiddenOrgScope(event: H3Event): void {
+  (event.context as Record<string, unknown>)[ORG_SCOPE_FORBIDDEN_KEY] = true;
+}
+
+export function hasOrgScopeResolutionUnavailable(event: {
+  context?: Record<string, unknown>;
+}): boolean {
+  return event.context?.[ORG_SCOPE_RESOLUTION_UNAVAILABLE_KEY] === true;
+}
+
+function markOrgScopeResolutionUnavailable(event: H3Event): void {
+  (event.context as Record<string, unknown>)[
+    ORG_SCOPE_RESOLUTION_UNAVAILABLE_KEY
+  ] = true;
+}
 
 export async function queryOrgMembers(query: {
   sql: string;
@@ -59,6 +88,37 @@ function normalizeOrgRole(value: unknown): OrgRole | null {
   return value === "owner" || value === "admin" || value === "member"
     ? value
     : null;
+}
+
+function delegatedOrgMemberScope(
+  email?: string | null,
+): string | null | undefined {
+  const requestContext = getRequestContext();
+  if (requestContext?.a2aIdentityAssurance !== "org-member") return undefined;
+  const requestEmail = requestContext.userEmail?.trim().toLowerCase();
+  const requestOrgId = requestContext.orgId?.trim();
+  if (
+    !requestEmail ||
+    !requestOrgId ||
+    (email && email.trim().toLowerCase() !== requestEmail)
+  ) {
+    return null;
+  }
+  return requestOrgId;
+}
+
+function scopeMembershipsForDelegatedIdentity(
+  email: string,
+  memberships: MembershipRow[] | null,
+): MembershipRow[] | null {
+  const scopedOrgId = delegatedOrgMemberScope(email);
+  if (scopedOrgId === undefined || memberships === null) return memberships;
+  if (!scopedOrgId) return [];
+  return memberships.flatMap((membership) => {
+    if (membership.orgId !== scopedOrgId) return [];
+    const role = effectiveOrgMemberRole(membership.role, scopedOrgId, email);
+    return role ? [{ ...membership, role }] : [];
+  });
 }
 
 function emailDomainOf(email: string): string | null {
@@ -138,11 +198,13 @@ async function refreshFederatedMemberships(
   if (!result.active) {
     return memberships.filter((item) => item.orgId !== selected.orgId);
   }
-  if (result.role === selected.role) {
+  const role = effectiveOrgMemberRole(result.role, selected.orgId, email);
+  if (!role) return memberships.filter((item) => item.orgId !== selected.orgId);
+  if (role === selected.role) {
     return memberships;
   }
   return memberships.map((item) =>
-    item.orgId === selected.orgId ? { ...item, role: result.role } : item,
+    item.orgId === selected.orgId ? { ...item, role } : item,
   );
 }
 
@@ -228,6 +290,8 @@ function loadMembershipsForEvent(
   event: H3Event,
   email: string,
 ): Promise<MembershipRow[] | null> {
+  const scopedOrgId = delegatedOrgMemberScope(email);
+  if (scopedOrgId === null) return Promise.resolve([]);
   const ctx = event.context as Record<string, unknown>;
   const cache = ((ctx[MEMBERSHIPS_CACHE_KEY] as
     | Map<string, Promise<MembershipRow[] | null>>
@@ -238,10 +302,16 @@ function loadMembershipsForEvent(
     >())) as Map<string, Promise<MembershipRow[] | null>>;
   let promise = cache.get(email);
   if (!promise) {
-    promise = loadMemberships(email).catch((err) => {
-      cache.delete(email);
-      throw err;
-    });
+    promise = loadMemberships(email)
+      .then((memberships) =>
+        scopedOrgId === undefined
+          ? memberships
+          : scopeMembershipsForDelegatedIdentity(email, memberships),
+      )
+      .catch((err) => {
+        cache.delete(email);
+        throw err;
+      });
     cache.set(email, promise);
   }
   return promise;
@@ -263,19 +333,28 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
   const session = await getSession(event);
   const email = session?.email;
   if (!email) return EMPTY_CONTEXT;
+  const requestContext = getRequestContext();
+  const isDelegatedOrgMember =
+    requestContext?.a2aIdentityAssurance === "org-member";
+  const delegatedOrgId = delegatedOrgMemberScope(email);
+  if (isDelegatedOrgMember && !delegatedOrgId) {
+    return { email, orgId: null, orgName: null, role: null };
+  }
   if (isAnonymousWaitlistSessionEmail(email)) {
     return { email, orgId: null, orgName: null, role: null };
   }
-  if (hasExplicitPersonalOrgScope(event)) {
+  if (!isDelegatedOrgMember && hasExplicitPersonalOrgScope(event)) {
     return { email, orgId: null, orgName: null, role: null };
   }
   const sessionOrgId =
-    typeof session.orgId === "string" && session.orgId.trim()
+    delegatedOrgId ??
+    (typeof session.orgId === "string" && session.orgId.trim()
       ? session.orgId.trim()
-      : null;
-  const sessionOrgRole = normalizeOrgRole(session.orgRole);
+      : null);
+  const sessionOrgRole = isDelegatedOrgMember
+    ? "member"
+    : normalizeOrgRole(session.orgRole);
 
-  const requestContext = getRequestContext();
   const verifiedServiceIdentity = getVerifiedServiceIdentityFromEvent(event);
   const serviceRole = implicitServiceOrgRole({
     email,
@@ -317,7 +396,9 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
 
   const exec = getDbExec();
 
-  const activeOrgSettingPromise = loadActiveOrgSettingForEvent(event, email);
+  const activeOrgSettingPromise = isDelegatedOrgMember
+    ? Promise.resolve(null)
+    : loadActiveOrgSettingForEvent(event, email);
   activeOrgSettingPromise.catch(() => {});
 
   let memberships: MembershipRow[] | null;
@@ -327,6 +408,10 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
     // A transient membership read must not downgrade an authenticated request
     // to a private/solo scope when the session already carries its org.
     if (sessionOrgId && isTransientDatabaseError(err)) {
+      if (isDelegatedOrgMember) {
+        markOrgScopeResolutionUnavailable(event);
+        return { email, orgId: null, orgName: null, role: null };
+      }
       return {
         email,
         orgId: sessionOrgId,
@@ -337,6 +422,11 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
     throw err;
   }
   if (memberships === null) {
+    // A null membership read is unavailable scope, not proof of a solo user.
+    markOrgScopeResolutionUnavailable(event);
+    if (isDelegatedOrgMember) {
+      return { email, orgId: null, orgName: null, role: null };
+    }
     if (sessionOrgId) {
       return {
         email,
@@ -349,18 +439,21 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
   }
 
   const activeOrgSetting = await activeOrgSettingPromise;
-  const explicitPersonal = activeOrgSetting?.orgId === null;
-  const selectedMembership = explicitPersonal
-    ? undefined
-    : ((activeOrgSetting?.orgId
-        ? memberships.find(
-            (membership) => membership.orgId === activeOrgSetting.orgId,
-          )
-        : undefined) ??
-      (sessionOrgId
-        ? memberships.find((membership) => membership.orgId === sessionOrgId)
-        : undefined) ??
-      memberships[0]);
+  const explicitPersonal =
+    !isDelegatedOrgMember && activeOrgSetting?.orgId === null;
+  const selectedMembership = isDelegatedOrgMember
+    ? memberships.find((membership) => membership.orgId === delegatedOrgId)
+    : explicitPersonal
+      ? undefined
+      : ((activeOrgSetting?.orgId
+          ? memberships.find(
+              (membership) => membership.orgId === activeOrgSetting.orgId,
+            )
+          : undefined) ??
+        (sessionOrgId
+          ? memberships.find((membership) => membership.orgId === sessionOrgId)
+          : undefined) ??
+        memberships[0]);
   const selectedOrgId = selectedMembership?.orgId ?? null;
   const selectedWasFederated = Boolean(
     selectedMembership?.identityAuthority || selectedMembership?.identityId,
@@ -380,6 +473,7 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
     selectedOrgId &&
     !memberships.some((membership) => membership.orgId === selectedOrgId)
   ) {
+    markForbiddenOrgScope(event);
     return { email, orgId: null, orgName: null, role: null };
   }
   if (selectedOrgId && memberships.some((m) => m.orgId === selectedOrgId)) {
@@ -388,6 +482,7 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
 
   const emailDomain = emailDomainOf(email);
   const shouldTryDomainAutoJoin =
+    !isDelegatedOrgMember &&
     !explicitPersonal &&
     session.emailVerified === true &&
     emailDomain !== null &&
@@ -418,6 +513,7 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
     const membershipsBeforeJoin = memberships;
     const joined = await autoJoinDomainMatchingOrgs(email, {
       activateJoinedOrg: "never",
+      event,
     });
     const joinedOrgId = joined.joined[0]?.orgId ?? null;
     if (joinedOrgId) {
@@ -496,19 +592,50 @@ async function resolveOrgContextUncached(event: H3Event): Promise<OrgContext> {
       args: [sessionOrgId, email.toLowerCase()],
     });
     if (pending.rows.length > 0) {
+      markForbiddenOrgScope(event);
       return { email, orgId: null, orgName: null, role: null };
     }
+    markForbiddenOrgScope(event);
     return { email, orgId: null, orgName: null, role: null };
   }
 
-  if (memberships.length === 0 && autoCreateDefaultOrgEnabled()) {
+  if (
+    !isDelegatedOrgMember &&
+    memberships.length === 0 &&
+    autoCreateDefaultOrgEnabled()
+  ) {
     const created = await tryCreateDefaultOrg(exec, email, session, event);
+    if (created === "memberships-refreshed") {
+      return resolveOrgContextUncached(event);
+    }
     if (created) return created;
     // Creation failed (race / DB error); fall through with an empty org context
     // so non-blocking invite/domain UI can still surface recovery options.
+    markOrgScopeResolutionUnavailable(event);
   }
 
   if (memberships.length === 0) {
+    if (
+      !isDelegatedOrgMember &&
+      getAppConfig().access.orgCreation === "closed" &&
+      session.emailVerified === true &&
+      isBootstrapAdmin(email) &&
+      (await bootstrapEmptyOrganizationForRequest(email, event))
+    ) {
+      const refreshed = await loadMembershipsUncached(email);
+      if (!refreshed?.length) {
+        markOrgScopeResolutionUnavailable(event);
+        return { email, orgId: null, orgName: null, role: null };
+      }
+      updateMembershipsForEvent(event, email, refreshed);
+      return resolveOrgContextUncached(event);
+    }
+    if (
+      getAppConfig().access.orgCreation === "closed" &&
+      !autoCreateDefaultOrgEnabled() &&
+      !hasOrgScopeResolutionUnavailable(event)
+    )
+      markForbiddenOrgScope(event);
     return { email, orgId: null, orgName: null, role: null };
   }
 
@@ -529,7 +656,8 @@ async function loadMemberships(email: string): Promise<MembershipRow[] | null> {
 export async function listOrgMemberships(
   email: string,
 ): Promise<OrgMembership[] | null> {
-  return loadMemberships(email);
+  const memberships = await loadMemberships(email);
+  return scopeMembershipsForDelegatedIdentity(email, memberships);
 }
 
 export async function listOrgMembershipsForEvent(
@@ -590,10 +718,25 @@ async function loadMembershipsUncached(
   );
 }
 
-export async function resolveOrgIdForEmail(
+export type OrgScopeResolution =
+  | { status: "organization"; orgId: string }
+  | { status: "personal" }
+  | { status: "unknown" };
+
+export async function resolveOrgScopeForEmail(
   email: string,
-): Promise<string | null> {
-  if (getRequestContext()?.orgScope === "personal") return null;
+): Promise<OrgScopeResolution> {
+  const delegatedOrgId = delegatedOrgMemberScope(email);
+  if (delegatedOrgId !== undefined) {
+    if (!delegatedOrgId) return { status: "unknown" };
+    const role = await readOrgMemberRole(delegatedOrgId, email);
+    return role
+      ? { status: "organization", orgId: delegatedOrgId }
+      : { status: "unknown" };
+  }
+  if (getRequestContext()?.orgScope === "personal") {
+    return { status: "personal" };
+  }
   const idsPromise = requestMemberOrgIds(email, async () => {
     const rows = await queryOrgMembers({
       sql: `SELECT org_id FROM org_members
@@ -604,20 +747,26 @@ export async function resolveOrgIdForEmail(
     });
     return rows?.map((r: any) => String(r.org_id)) ?? null;
   });
-  const settingPromise = getUserSetting(
+  const ids = await idsPromise;
+  if (ids === null) return { status: "unknown" };
+  if (ids.length === 0) return { status: "personal" };
+
+  const activeOrgSetting = (await getUserSetting(
     email,
     "active-org-id",
-  ) as Promise<ActiveOrgSetting>;
-  settingPromise.catch(() => {});
-
-  const ids = await idsPromise;
-  if (!ids?.length) return null;
-  const activeOrgSetting = await settingPromise;
-  if (activeOrgSetting?.orgId === null) return null;
+  )) as ActiveOrgSetting;
+  if (activeOrgSetting?.orgId === null) return { status: "personal" };
   if (activeOrgSetting?.orgId && ids.includes(activeOrgSetting.orgId)) {
-    return activeOrgSetting.orgId;
+    return { status: "organization", orgId: activeOrgSetting.orgId };
   }
-  return ids[0];
+  return { status: "organization", orgId: ids[0]! };
+}
+
+export async function resolveOrgIdForEmail(
+  email: string,
+): Promise<string | null> {
+  const resolution = await resolveOrgScopeForEmail(email);
+  return resolution.status === "organization" ? resolution.orgId : null;
 }
 
 export async function resolveActiveOrgIdForStorageCredential(
@@ -625,6 +774,13 @@ export async function resolveActiveOrgIdForStorageCredential(
 ): Promise<string | null> {
   const normalizedEmail = email.trim().toLowerCase();
   if (!normalizedEmail) return null;
+
+  const delegatedOrgId = delegatedOrgMemberScope(normalizedEmail);
+  if (delegatedOrgId !== undefined) {
+    if (!delegatedOrgId) return null;
+    const role = await readOrgMemberRole(delegatedOrgId, normalizedEmail);
+    return role ? delegatedOrgId : null;
+  }
 
   const { rows } = await getDbExec().execute({
     sql: `SELECT m.org_id AS "orgId"
@@ -654,6 +810,26 @@ export async function resolveOrgIdForEmailViaEvent(
   event: H3Event,
   email: string,
 ): Promise<string | null> {
+  const delegatedOrgId = delegatedOrgMemberScope(email);
+  if (delegatedOrgId !== undefined) {
+    if (!delegatedOrgId) return null;
+    const memberships = await loadMembershipsForEvent(event, email);
+    if (!memberships || !memberships.some((m) => m.orgId === delegatedOrgId)) {
+      return null;
+    }
+    const refreshed = await refreshFederatedMemberships(
+      event,
+      email,
+      memberships,
+      delegatedOrgId,
+    );
+    if (refreshed !== memberships) {
+      updateMembershipsForEvent(event, email, refreshed);
+    }
+    return refreshed.some((m) => m.orgId === delegatedOrgId)
+      ? delegatedOrgId
+      : null;
+  }
   if (getRequestContext()?.orgScope === "personal") return null;
   const settingPromise = loadActiveOrgSettingForEvent(event, email);
   settingPromise.catch(() => {});
@@ -728,6 +904,56 @@ export async function createOrganization(
   );
 
   return { id, name: trimmedName, role, a2aSecret, createdAt };
+}
+
+async function bootstrapEmptyOrganizationForRequest(
+  rawEmail: string,
+  event: H3Event,
+): Promise<boolean> {
+  const email = rawEmail.trim().toLowerCase();
+  const config = getAppConfig();
+  const name = config.app.name ?? config.app.id ?? "Agent-Native";
+  const identity = config.app.workspaceId ?? config.app.id ?? name;
+  const id = `bootstrap-${createHash("sha256").update(identity).digest("hex").slice(0, 24)}`;
+  const now = Date.now();
+  const { randomBytes } = await import("node:crypto");
+  const exec = getDbExec();
+  const inserted = await exec.execute({
+    sql: `WITH new_org AS (
+            INSERT INTO organizations (id, name, created_by, created_at, a2a_secret)
+            SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM organizations)
+            ON CONFLICT (id) DO NOTHING RETURNING id
+          )
+          INSERT INTO org_members (id, org_id, email, role, joined_at)
+          SELECT ?, id, ?, 'owner', ? FROM new_org LIMIT 1 RETURNING org_id`,
+    args: [
+      id,
+      name,
+      email,
+      now,
+      randomBytes(32).toString("base64url"),
+      nanoid(),
+      email,
+      now,
+    ],
+  });
+  if (inserted.rows.length) {
+    invalidateMemberOrgCaches();
+    await setActiveOrgId(
+      email,
+      id,
+      "bootstrap admin organization access",
+      event,
+    );
+    return true;
+  }
+  // A concurrent request may have created this same admin's membership.
+  const memberships = await loadMembershipsUncached(email);
+  if (memberships === null) {
+    markOrgScopeResolutionUnavailable(event);
+    return false;
+  }
+  return memberships.length > 0;
 }
 
 export async function bootstrapAdminOrganization(
@@ -887,28 +1113,54 @@ async function tryCreateDefaultOrg(
   email: string,
   session: { name?: string } | null,
   event: H3Event,
-): Promise<OrgContext | null> {
+): Promise<OrgContext | "memberships-refreshed" | null> {
   await getSetting("__init").catch(() => null);
 
   const claimKey = `u:${email.toLowerCase()}:auto-create-claim`;
 
-  if (!(await acquireClaim(exec, claimKey))) return null;
-
-  // Pending-invite check happens INSIDE the claim so the window where a
-  // newly-arrived invitation can be missed is narrowed to a single SQL
-  // round-trip. (A still-narrower window would require a transaction
-  // spanning org_invitations and settings — out of scope.)
-  if (await hasPendingInvitation(exec, email)) {
-    await releaseClaim(exec, claimKey);
-    return null;
-  }
-
-  if (await hasDomainMatch(exec, email)) {
-    await releaseClaim(exec, claimKey);
-    return null;
+  if (!(await acquireClaim(exec, claimKey))) {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const memberships = await loadMembershipsUncached(email);
+      if (memberships === null) break;
+      if (memberships.length > 0) {
+        updateMembershipsForEvent(event, email, memberships);
+        return "memberships-refreshed";
+      }
+    }
+    throw createError({
+      statusCode: 503,
+      statusMessage: "Organization setup is still in progress",
+    });
   }
 
   try {
+    // A request may have read zero memberships before another instance finished.
+    const existing = await loadMembershipsUncached(email);
+    if (existing === null) {
+      throw createError({
+        statusCode: 503,
+        statusMessage: "Organization membership unavailable",
+      });
+    }
+    if (existing.length > 0) {
+      await releaseClaim(exec, claimKey);
+      updateMembershipsForEvent(event, email, existing);
+      return "memberships-refreshed";
+    }
+
+    // Check invitations while holding the claim to narrow the race window.
+    if (await hasPendingInvitation(exec, email)) {
+      await releaseClaim(exec, claimKey);
+      return null;
+    }
+
+    if (await hasDomainMatch(exec, email)) {
+      await releaseClaim(exec, claimKey);
+      return null;
+    }
+
     const orgId = nanoid();
     const orgName = defaultOrgName(email, session);
     const now = Date.now();
@@ -959,9 +1211,9 @@ async function tryCreateDefaultOrg(
     }
 
     return { email, orgId, orgName, role: "owner" };
-  } catch {
+  } catch (error) {
     await releaseClaim(exec, claimKey);
-    return null;
+    throw error;
   }
 }
 
@@ -1006,6 +1258,19 @@ export async function getOrgDomain(orgId: string): Promise<string | null> {
   return domain || null;
 }
 
+export async function getOrgWorkspaceUrl(
+  orgId: string,
+): Promise<string | null> {
+  const exec = getDbExec();
+  const { rows } = await exec.execute({
+    sql: `SELECT workspace_url FROM organizations WHERE id = ? LIMIT 1`,
+    args: [orgId],
+  });
+  if (!rows[0]) return null;
+  const workspaceUrl = String((rows[0] as any).workspace_url ?? "").trim();
+  return workspaceUrl || null;
+}
+
 export async function getOrgA2ASecret(orgId: string): Promise<string | null> {
   const exec = getDbExec();
   const { rows } = await exec.execute({
@@ -1022,31 +1287,43 @@ export async function getA2ASecretByDomain(
 ): Promise<string | null> {
   const exec = getDbExec();
   const { rows } = await exec.execute({
-    sql: `SELECT a2a_secret FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 1`,
+    sql: `SELECT a2a_secret FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 2`,
     args: [domain.toLowerCase()],
   });
-  if (!rows[0]) return null;
+  if (rows.length !== 1) return null;
   const secret = String((rows[0] as any).a2a_secret || "");
   return secret || null;
+}
+
+export type OrgDomainLookup =
+  | { status: "found"; org: { orgId: string; orgName: string } }
+  | { status: "not-found" }
+  | { status: "ambiguous" };
+
+export async function lookupOrgByDomain(
+  domain: string,
+): Promise<OrgDomainLookup> {
+  const exec = getDbExec();
+  const { rows } = await exec.execute({
+    sql: `SELECT id, name FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 2`,
+    args: [domain.toLowerCase()],
+  });
+  if (rows.length === 0) return { status: "not-found" };
+  if (rows.length > 1) return { status: "ambiguous" };
+  return {
+    status: "found",
+    org: {
+      orgId: String((rows[0] as any).id),
+      orgName: String((rows[0] as any).name),
+    },
+  };
 }
 
 export async function resolveOrgByDomain(
   domain: string,
 ): Promise<{ orgId: string; orgName: string } | null> {
-  try {
-    const exec = getDbExec();
-    const { rows } = await exec.execute({
-      sql: `SELECT id, name FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 1`,
-      args: [domain.toLowerCase()],
-    });
-    if (!rows[0]) return null;
-    return {
-      orgId: String((rows[0] as any).id),
-      orgName: String((rows[0] as any).name),
-    };
-  } catch {
-    return null;
-  }
+  const result = await lookupOrgByDomain(domain);
+  return result.status === "found" ? result.org : null;
 }
 
 export async function resolveA2AOrganizationMetadataByDomain(
@@ -1056,9 +1333,10 @@ export async function resolveA2AOrganizationMetadataByDomain(
   if (!normalizedDomain) return null;
   const { rows } = await getDbExec().execute({
     sql: `SELECT id, allowed_domain
-          FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 1`,
+          FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 2`,
     args: [normalizedDomain],
   });
+  if (rows.length !== 1) return null;
   const row = rows[0] as any;
   if (!row) return null;
   const orgId = String(row.id ?? "").trim();
@@ -1094,14 +1372,17 @@ export async function resolveA2AOrganizationCredentialsByDomain(
   orgId: string;
   orgDomain: string;
   secret: string;
+  a2aMemberDelegationEnabled: boolean;
 } | null> {
   const normalizedDomain = domain.trim().toLowerCase();
   if (!normalizedDomain) return null;
   const { rows } = await getDbExec().execute({
-    sql: `SELECT id, allowed_domain, a2a_secret
-          FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 1`,
+    sql: `SELECT id, allowed_domain, a2a_secret,
+                 a2a_member_delegation_enabled
+          FROM organizations WHERE LOWER(allowed_domain) = ? LIMIT 2`,
     args: [normalizedDomain],
   });
+  if (rows.length !== 1) return null;
   const row = rows[0] as any;
   if (!row) return null;
   const orgId = String(row.id ?? "").trim();
@@ -1110,7 +1391,12 @@ export async function resolveA2AOrganizationCredentialsByDomain(
     .toLowerCase();
   const secret = String(row.a2a_secret ?? "").trim();
   if (!orgId || orgDomain !== normalizedDomain || !secret) return null;
-  return { orgId, orgDomain, secret };
+  return {
+    orgId,
+    orgDomain,
+    secret,
+    a2aMemberDelegationEnabled: row.a2a_member_delegation_enabled === true,
+  };
 }
 
 export async function isSoleOrgDomain(domain: string): Promise<boolean> {

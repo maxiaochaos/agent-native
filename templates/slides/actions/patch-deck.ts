@@ -11,7 +11,7 @@
  * dedicated actions which also use the same per-deck lock.
  */
 import { ActionContractError } from "@agent-native/core";
-import { defineAction, fail } from "@agent-native/core/action";
+import { defineAction, fail, NoWriteError } from "@agent-native/core/action";
 import type { ActionRunContext } from "@agent-native/core/action";
 import { assertAccess } from "@agent-native/core/sharing";
 import {
@@ -32,6 +32,7 @@ import {
 } from "../app/lib/normalize-slide-padding.js";
 import { getDb, schema } from "../server/db/index.js";
 import { notifyClients } from "../server/handlers/decks.js";
+import { deckDataColumns } from "../server/lib/deck-list-columns.js";
 import {
   createDeckVersionSnapshot,
   deckVersionChangeGroupFromAction,
@@ -40,6 +41,7 @@ import {
 } from "../server/lib/deck-versions.js";
 import {
   applySlideContentEdits,
+  SlideContentEditError,
   SlideContentEditSchema,
   type SlideContentEdit,
 } from "../server/lib/slide-content-patch.js";
@@ -56,6 +58,7 @@ import {
   assertSlideAnimationsResolve,
   type SlideAnimationBaseline,
 } from "../server/lib/validate-slide-animations.js";
+import { ANIMATION_TRIGGERS } from "../shared/api.js";
 import { ASPECT_RATIO_VALUES } from "../shared/aspect-ratios.js";
 import { isRealSlide } from "../shared/blank-slide.js";
 import { stableStringify } from "../shared/deck-content.js";
@@ -70,6 +73,7 @@ import {
   hashSlideContent,
   slideFitRenderFieldsChanged,
 } from "../shared/slide-fit.js";
+import { withUniqueSlideIds } from "../shared/slide-ids.js";
 import {
   clampTransitionSpeed,
   normalizeSlideTransition,
@@ -140,6 +144,12 @@ const SlideAnimationSchema = z.object({
     .optional()
     .describe(
       "Reveal each paragraph or list item inside this element as its own click step, in document order. A paragraph reveal starts at that paragraph and runs through the rest of its container. With nothing to split it is one step.",
+    ),
+  trigger: z
+    .enum(ANIMATION_TRIGGERS)
+    .optional()
+    .describe(
+      "When this step plays. on-click (default) waits for its own click. with-previous plays in the same click as the step before it, so the objects appear together. The first step always waits for a click.",
     ),
   type: z
     .enum(["appear", "fade", "slide-up", "zoom"])
@@ -731,8 +741,9 @@ export function assertSourceImportSlidesCovered(
   );
   if (missingSlideIds.length === 0) return;
 
-  throw new Error(
+  fail(
     `Deck-wide source restyle requires one content patch per imported slide. Missing ${missingSlideIds.length} slide(s): ${missingSlideIds.slice(0, 12).join(", ")}${missingSlideIds.length > 12 ? ", …" : ""}. Continue with every source slide ID in one patch-deck call before verifying the changed slides with get-deck slideIds and compact=false.`,
+    { errorCode: "source_restyle_incomplete", statusCode: 400 },
   );
 }
 
@@ -770,19 +781,32 @@ async function resolvePatchSlideEdits(
     }
     const slide = slides.find((entry) => entry?.id === operation.slideId);
     if (!slide) {
-      fail(
+      throw new NoWriteError(
         `patch-slide edits target slide "${operation.slideId}", which does not exist in the current deck. Check the slideId; if this slide is added by add-slide in the same call, edits cannot target it until a later call. No slides were changed.`,
-        { errorCode: "slide_not_found", statusCode: 404 },
+        {
+          errorCode: "slide_not_found",
+          statusCode: 404,
+          details: { slideIds: [operation.slideId] },
+        },
       );
     }
     const originalContent = String(slide.content ?? "");
     const currentContent =
       pendingContent.get(operation.slideId) ?? originalContent;
     const { edits, ...rest } = operation;
-    const patched = await applySlideContentEdits(
-      currentContent,
-      edits as SlideContentEdit[],
-    );
+    let patched: Awaited<ReturnType<typeof applySlideContentEdits>>;
+    try {
+      patched = await applySlideContentEdits(
+        currentContent,
+        edits as SlideContentEdit[],
+      );
+    } catch (error) {
+      if (!(error instanceof SlideContentEditError)) throw error;
+      throw new NoWriteError(error.message, {
+        errorCode: error.errorCode,
+        statusCode: error.statusCode,
+      });
+    }
     pendingContent.set(operation.slideId, patched.content);
     const next: Operation = {
       ...rest,
@@ -821,16 +845,18 @@ const AgentPatchDeckInputSchema = z.object({
         AddSlideOp,
         z.object({
           op: z.literal("patch-deck-fields"),
-          fields: z.object({
-            title: z
-              .string()
-              .optional()
-              .describe("The concise, specific title to apply to the deck"),
-            starred: z
-              .boolean()
-              .optional()
-              .describe("Whether the deck should be starred"),
-          }),
+          fields: z
+            .object({
+              title: z
+                .string()
+                .optional()
+                .describe("The concise, specific title to apply to the deck"),
+              starred: z
+                .boolean()
+                .optional()
+                .describe("Whether the deck should be starred"),
+            })
+            .strict(),
         }),
       ]),
     )
@@ -914,6 +940,7 @@ export function applyOperation(
   op: Operation,
   options?: {
     clearLayoutWarningDismissal?: boolean;
+    strictReorder?: boolean;
     sourceContentHashes?: ReadonlyMap<string, string>;
   },
 ): boolean {
@@ -1068,17 +1095,24 @@ export function applyOperation(
       const { orderedIds } = op;
       const duplicateId = firstDuplicate(orderedIds);
       if (duplicateId !== undefined) {
-        throw new Error(
-          `Cannot reorder slides with duplicate ID ${duplicateId}`,
-        );
+        fail(`Cannot reorder slides with duplicate ID ${duplicateId}`, {
+          errorCode: "duplicate_slide_id",
+          statusCode: 400,
+        });
       }
       const byId = new Map(slides.map((s: { id: string }) => [s.id, s]));
-      // Build the new order from the client's desired order, keeping only
-      // slides that actually exist in the server copy.
+      const unknownId = orderedIds.find((id) => !byId.has(id));
+      if (unknownId !== undefined && options?.strictReorder) {
+        fail(
+          `Cannot reorder: slide ${unknownId} is not in this deck. Nothing was moved; re-read the deck and reorder with current slide IDs.`,
+          { errorCode: "reorder_unknown_slide_id", statusCode: 409 },
+        );
+      }
+      // Unnamed slides stay at the end so a concurrent add is not dropped.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const reordered: any[] = orderedIds
-        .map((id) => byId.get(id))
-        .filter(Boolean);
+        .filter((id) => byId.has(id))
+        .map((id) => byId.get(id));
       const orderedSet = new Set(orderedIds);
       for (const s of slides) {
         if (!orderedSet.has(s.id)) reordered.push(s);
@@ -1438,8 +1472,9 @@ export default defineAction({
           statusCode: 404,
         });
 
+      const storedDeck: { slides?: unknown } = JSON.parse(row.data);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const deck: any = JSON.parse(row.data);
+      const deck: any = withUniqueSlideIds(deckId, storedDeck);
       if (
         !isMcpWidgetPatchAllowed(ctx?.caller, requestedOperations, {
           rewriteSource,
@@ -1511,7 +1546,9 @@ export default defineAction({
 
       const currentSlides = Array.isArray(deck.slides) ? deck.slides : [];
       if (ctx?.caller === "mcp-widget-write") {
-        const storedSlideIds = currentSlides
+        const storedSlideIds = (
+          Array.isArray(storedDeck.slides) ? storedDeck.slides : []
+        )
           .map((slide: { id?: unknown }) => slide?.id)
           .filter((id: unknown): id is string => typeof id === "string");
         const duplicateSlideId = firstDuplicate(storedSlideIds);
@@ -1532,16 +1569,32 @@ export default defineAction({
             [slide.id, hashSlideContent(String(slide.content ?? ""))] as const,
         ),
       );
+      // Ops apply in order: earlier adds are valid targets, earlier deletes are not.
       const existingSlideIds = new Set(
         currentSlides.map((slide: { id?: unknown }) => slide.id),
       );
-      const missingSlideIds = operations
-        .filter((operation) => operation.op === "patch-slide")
-        .map((operation) => operation.slideId)
-        .filter((slideId) => !existingSlideIds.has(slideId));
+      const missingSlideIds: string[] = [];
+      for (const operation of operations) {
+        if (operation.op === "add-slide") {
+          existingSlideIds.add(operation.slideId);
+        } else if (operation.op === "delete-slide") {
+          existingSlideIds.delete(operation.slideId);
+        } else if (
+          operation.op === "patch-slide" &&
+          !existingSlideIds.has(operation.slideId)
+        ) {
+          missingSlideIds.push(operation.slideId);
+        }
+      }
       if (missingSlideIds.length > 0) {
-        throw new Error(
-          `Cannot patch missing slide(s): ${[...new Set(missingSlideIds)].join(", ")}`,
+        const slideIds = [...new Set(missingSlideIds)];
+        throw new NoWriteError(
+          `Cannot patch slide(s) ${slideIds.join(", ")}: they are no longer in the deck. Re-read the deck with get-deck; no slides were changed.`,
+          {
+            errorCode: "slide_not_found",
+            statusCode: 404,
+            details: { slideIds },
+          },
         );
       }
 
@@ -1612,6 +1665,7 @@ export default defineAction({
 
       const layoutFitSlideIds = new Set<string>();
       const deletedSlideIds = new Set<string>();
+      const skippedSlideIds = new Set<string>();
       const signaturesBeforeOperations = slideSignatures(deck);
       const contentsBeforeOperations = slideContents(deck);
       const animationBaselinesBeforeOperations = slideAnimationBaselines(deck);
@@ -1657,8 +1711,17 @@ export default defineAction({
           (deck.slides as Array<{ id?: string }>).some(
             (slide) => slide.id === op.slideId,
           );
+        if (
+          op.op === "add-slide" &&
+          (deck.slides as Array<{ id?: string }>).some(
+            (slide) => slide.id === op.slideId,
+          )
+        ) {
+          skippedSlideIds.add(op.slideId);
+        }
         const operationChangedStructure = applyOperation(deck, op, {
           clearLayoutWarningDismissal: isAgentCaller,
+          strictReorder: isAgentCaller,
           sourceContentHashes,
         });
         structuralOperationApplied ||= operationChangedStructure;
@@ -1946,7 +2009,7 @@ export default defineAction({
         requestedSlideIds.length > 0 &&
         changedSlideIds.size === 0
       ) {
-        throw new Error(
+        throw new NoWriteError(
           `Nothing was written: every patched slide (${requestedSlideIds.join(", ")}) is identical to the deck's current content, so the deck is unchanged. Do not report these slides as edited. Re-read them with get-deck and send content that actually differs.`,
         );
       }
@@ -1959,8 +2022,10 @@ export default defineAction({
         generationRecord !== undefined;
       if (!meaningfulChange) {
         if (isAgentCaller) {
-          throw new Error(
-            "Nothing was written: the requested deck patch is identical to the current deck. Re-read with get-deck before retrying.",
+          throw new NoWriteError(
+            skippedSlideIds.size
+              ? `Nothing was written: add-slide skipped ${[...skippedSlideIds].join(", ")} because a slide with that ID already exists. Use a new slideId to add another slide.`
+              : "Nothing was written: the requested deck patch is identical to the current deck. Re-read with get-deck before retrying.",
           );
         }
         if (clientWrite) {
@@ -2002,7 +2067,7 @@ export default defineAction({
           .update(schema.decks)
           .set({
             title: sqlTitle,
-            data: JSON.stringify(deck),
+            ...deckDataColumns(deck),
             designSystemId: sqlDesignSystemId,
             updatedAt: now,
             ...deckClientWriteFields(clientWrite, now),
@@ -2080,6 +2145,14 @@ export default defineAction({
             signaturesBeforeOperations.has(slideId) &&
             !signaturesAfterOperations.has(slideId),
         ),
+        ...(skippedSlideIds.size
+          ? {
+              skippedSlideIds: [...skippedSlideIds],
+              warnings: [
+                `add-slide skipped ${[...skippedSlideIds].join(", ")}: a slide with that ID already exists, so nothing was added. Use a new slideId to add another slide.`,
+              ],
+            }
+          : {}),
         ...(unchangedSlideIds.length
           ? {
               unchangedSlideIds,

@@ -21,7 +21,6 @@ import {
   setThreadSourceIfMissing,
   updateThreadData,
 } from "../chat-threads/store.js";
-import { resolveOrgIdForEmail } from "../org/context.js";
 import {
   startIntervalJob,
   type IntervalJobHandle,
@@ -36,8 +35,10 @@ import {
   listDocComments,
 } from "./adapters/google-docs.js";
 import {
+  deleteIntegrationConfigIfUnchanged,
   getIntegrationConfig,
   integrationConfigWriteEpoch,
+  listIntegrationConfigs,
   saveIntegrationConfig,
   saveIntegrationConfigIfUnchanged,
   type IntegrationConfig,
@@ -47,6 +48,10 @@ import {
   type GoogleDocsPushHeaders,
   verifyGoogleDocsChannel,
 } from "./google-docs-webhook.js";
+import {
+  integrationRequestContext,
+  resolveIntegrationRequestScope,
+} from "./request-scope.js";
 import { getThreadMapping, saveThreadMapping } from "./thread-mapping-store.js";
 import type { IncomingMessage } from "./types.js";
 
@@ -76,6 +81,8 @@ let pollerGeneration = 0;
 const WATCH_CHANNEL_TTL_MS = 23 * 60 * 60 * 1000;
 const WATCH_RETRY_MS = 5 * 60 * 1000;
 const WATCH_STOP_CLAIM_TTL_MS = WATCH_RETRY_MS - 30 * 1000;
+/** Turning Docs off waits on this request, so a stalled one fails and is retried. */
+const WATCH_STOP_TIMEOUT_MS = 10_000;
 let watchRenewalTimer: ReturnType<typeof setTimeout> | null = null;
 
 type WatchStopResult =
@@ -450,6 +457,7 @@ export async function stopGoogleDocsWatchChannel(
           id: channelId,
           ...(typeof resourceId === "string" && { resourceId }),
         }),
+        signal: AbortSignal.timeout(WATCH_STOP_TIMEOUT_MS),
       },
     );
 
@@ -587,6 +595,70 @@ async function setPageToken(token: string): Promise<void> {
   await saveIntegrationConfig(PLATFORM, { pageToken: token }, "page-token");
 }
 
+/** How many polls check a document whose comment check failed before giving up on it. */
+const COMMENT_CHECK_MAX_ATTEMPTS = 5;
+const COMMENT_RETRY_KEY_PREFIX = "comment-retry:";
+
+interface CommentCheckRetry {
+  attempts: number;
+  /** The row as read, so clearing it never removes a newer failure. */
+  row: IntegrationConfig;
+}
+
+/**
+ * Documents whose comment check failed, with how many times it has. Each has
+ * its own row, so polls running at once never overwrite each other's.
+ */
+async function getCommentCheckRetries(): Promise<
+  Map<string, CommentCheckRetry>
+> {
+  const retries = new Map<string, CommentCheckRetry>();
+  for (const row of await listIntegrationConfigs(PLATFORM)) {
+    if (!row.configKey.startsWith(COMMENT_RETRY_KEY_PREFIX)) continue;
+    const attempts = row.configData.attempts;
+    retries.set(row.configKey.slice(COMMENT_RETRY_KEY_PREFIX.length), {
+      // Count a malformed row as one failure rather than skipping or trusting it.
+      attempts:
+        typeof attempts === "number" &&
+        Number.isInteger(attempts) &&
+        attempts > 0
+          ? attempts
+          : 1,
+      row,
+    });
+  }
+  return retries;
+}
+
+// raw-sql-ok: the file ID reaches the config store only as a bound key.
+async function recordCommentCheckFailure(
+  fileId: string,
+  retry: CommentCheckRetry | undefined,
+): Promise<void> {
+  // raw-sql-ok: the key is passed to the config store as a bound value.
+  const key = COMMENT_RETRY_KEY_PREFIX + fileId;
+  if (!retry) {
+    // Add a row only if there isn't one: when the rows couldn't be read, the
+    // document may already have a count this must not reset.
+    await saveIntegrationConfigIfUnchanged(
+      PLATFORM,
+      { attempts: 1 },
+      key,
+      null,
+    );
+    return;
+  }
+  const attempts = retry.attempts + 1;
+  if (attempts < COMMENT_CHECK_MAX_ATTEMPTS) {
+    await saveIntegrationConfig(PLATFORM, { attempts }, key);
+    return;
+  }
+  console.warn(
+    `[google-docs] Giving up on comments in ${fileId} after ${attempts} failed checks`,
+  );
+  await deleteIntegrationConfigIfUnchanged(PLATFORM, key, retry.row);
+}
+
 function isAgentMention(commentText: string, triggerKeyword: string): boolean {
   return commentText.toLowerCase().includes(triggerKeyword.toLowerCase());
 }
@@ -722,9 +794,16 @@ export async function processChanges(
   const { changes, nextPageToken } = await listChanges(pageToken, accessToken);
   await setPageToken(nextPageToken);
 
-  if (changes.length === 0) return;
-
-  const docFileIds = new Set<string>();
+  // The cursor has moved past these changes, so a document whose check
+  // fails is recorded and checked again on later polls.
+  const retries = await getCommentCheckRetries().catch((err) => {
+    console.error(
+      "[google-docs] Could not read documents to check again:",
+      err,
+    );
+    return new Map<string, CommentCheckRetry>();
+  });
+  const docFileIds = new Set<string>(retries.keys());
   for (const change of changes) {
     if (change.removed) continue;
     if (
@@ -735,11 +814,27 @@ export async function processChanges(
     }
   }
 
+  // raw-sql-ok: file IDs reach the config store only as bound keys.
   for (const fileId of docFileIds) {
+    const retry = retries.get(fileId);
     try {
       await checkDocumentComments(fileId, accessToken, options);
+      if (retry) {
+        // raw-sql-ok: the key is passed to the config store as a bound value.
+        await deleteIntegrationConfigIfUnchanged(
+          PLATFORM,
+          COMMENT_RETRY_KEY_PREFIX + fileId,
+          retry.row,
+        );
+      }
     } catch (err) {
       console.error(`[google-docs] Error checking comments on ${fileId}:`, err);
+      await recordCommentCheckFailure(fileId, retry).catch((saveErr) => {
+        console.error(
+          `[google-docs] Could not record the failed check on ${fileId}:`,
+          saveErr,
+        );
+      });
     }
   }
 }
@@ -768,6 +863,10 @@ async function processComment(
   existingThreadId?: string,
 ): Promise<void> {
   const adapter = googleDocsAdapter();
+  const requestScope = await resolveIntegrationRequestScope({
+    ownerEmail: options.ownerEmail,
+  });
+  const requestContext = integrationRequestContext(requestScope);
   const key = commentKey(fileId, commentId);
 
   const incoming: IncomingMessage = {
@@ -786,10 +885,14 @@ async function processComment(
 
   let threadId = existingThreadId;
   if (!threadId) {
-    const thread = await createThread(options.ownerEmail, {
-      title: `Google Doc: ${senderName}`,
-      source,
-    });
+    const thread = await runWithRequestContext(
+      { userEmail: options.ownerEmail, ...requestContext },
+      () =>
+        createThread(options.ownerEmail, {
+          title: `Google Doc: ${senderName}`,
+          source,
+        }),
+    );
     await saveThreadMapping(PLATFORM, key, thread.id, { fileId, commentId });
     threadId = thread.id;
   }
@@ -843,14 +946,17 @@ async function processComment(
   );
   const runId = `gdocs-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const capturedThreadId = threadId;
-  const orgId = (await resolveOrgIdForEmail(options.ownerEmail)) ?? undefined;
 
   startRun(
     runId,
     capturedThreadId,
     async (send, signal) => {
       await runWithRequestContext(
-        { userEmail: options.ownerEmail, orgId, isIntegrationCaller: true },
+        {
+          userEmail: options.ownerEmail,
+          ...requestContext,
+          isIntegrationCaller: true,
+        },
         () =>
           runAgentLoopDirectWithSoftTimeout(
             {
@@ -889,7 +995,7 @@ async function processComment(
         console.error("[google-docs] Error sending response:", err);
       }
     },
-    { model: options.model, engineName: engine.name },
+    { model: options.model, engineName: engine.name, executionLease: true },
   );
 }
 
@@ -1009,6 +1115,7 @@ function startPollLoop(
     pollerStartTimer = null;
     pollerJob = startIntervalJob(poll, { intervalMs });
   }, 5000);
+  pollerStartTimer.unref?.();
 
   const email = getServiceAccountEmail();
   if (process.env.DEBUG) {
@@ -1018,21 +1125,33 @@ function startPollLoop(
   }
 }
 
-export async function stopGoogleDocsPoller(): Promise<void> {
+/**
+ * Stops polling and watch renewal, then retires the shared Drive watch.
+ * With `shuttingDown`, it instead waits for a poll in flight to finish and
+ * leaves the watch registered for the servers still running, or the next
+ * start, to renew or replace.
+ */
+export async function stopGoogleDocsPoller(
+  options: { shuttingDown?: boolean } = {},
+): Promise<void> {
   pollerGeneration += 1;
   activeOptions = null;
   if (pollerStartTimer) {
     clearTimeout(pollerStartTimer);
     pollerStartTimer = null;
   }
-  if (pollerJob) {
-    pollerJob.stop();
-    pollerJob = null;
-  }
   if (watchRenewalTimer) {
     clearTimeout(watchRenewalTimer);
     watchRenewalTimer = null;
   }
+  const running = pollerJob;
+  pollerJob = null;
+  if (options.shuttingDown) {
+    await running?.stop();
+    return;
+  }
+  // Disabling doesn't wait on a slow poll; the stop ends its scheduling.
+  void running?.stop();
   try {
     const stopResult = await stopWatch();
     if (stopResult.status === "retry") {

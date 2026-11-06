@@ -2058,6 +2058,11 @@ export function getOnboardingHtml(opts: OnboardingHtmlOptions = {}): string {
   .btn-google:hover { background: #e5e5e5; }
   .btn-google:disabled { opacity: 0.5; cursor: wait; }
   .btn-google svg { width: 18px; height: 18px; flex-shrink: 0; }
+  .animate-spin { animation: spin 0.75s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .animate-spin { animation: none; }
+  }
   .google-signin {
     position: relative;
     width: 100%;
@@ -2308,7 +2313,7 @@ export function getOnboardingHtml(opts: OnboardingHtmlOptions = {}): string {
     font: 400 1.25rem/1.35 "Geist", system-ui, sans-serif;
   }
   .auth-marketing-home .auth-marketing-description-link {
-    color: var(--auth-marketing-muted);
+    color: var(--auth-marketing-foreground);
     text-decoration: underline;
     text-underline-offset: 0.15em;
     white-space: nowrap;

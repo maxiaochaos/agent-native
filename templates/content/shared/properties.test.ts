@@ -4,6 +4,8 @@ import {
   CREATABLE_DOCUMENT_PROPERTY_TYPES,
   EDITABLE_DOCUMENT_PROPERTY_TYPES,
   blocksRenderMode,
+  isAppLinkUrl,
+  isUrlPropertyValue,
   blocksStorageTarget,
   countWords,
   defaultPropertyOptions,
@@ -29,6 +31,33 @@ import {
 } from "./properties";
 
 describe("document properties", () => {
+  it("lets a URL property hold web addresses and named app links only", () => {
+    for (const value of [
+      "https://example.com/a",
+      "http://example.com/a",
+      "t3-thread://v1/ada5164c-bc1f-4866-b908-dd17f8d65cd2",
+      "t3-thread://v2/env-1/mcp:thread%3A1#item",
+      "T3-THREAD://v1/thread-1",
+    ]) {
+      expect(isUrlPropertyValue(value)).toBe(true);
+    }
+    for (const value of [
+      "javascript:alert(1)",
+      "data:text/html,hi",
+      "file:///C:/Windows/notepad.exe",
+      "ms-msdt:/id",
+      "t3code://threads/env-1/thread-1",
+      "t3-thread",
+      "example.com",
+      "",
+    ]) {
+      expect(isUrlPropertyValue(value)).toBe(false);
+    }
+    expect(isAppLinkUrl("t3-thread://v1/thread-1")).toBe(true);
+    expect(isAppLinkUrl("https://example.com/a")).toBe(false);
+    expect(isAppLinkUrl("javascript:alert(1)")).toBe(false);
+  });
+
   it("normalizes editable values by property type", () => {
     expect(normalizePropertyValue("text", "Draft")).toBe("Draft");
     expect(normalizePropertyValue("person", "Alice Moore")).toEqual([
@@ -331,6 +360,25 @@ describe("Blocks property type", () => {
       countWords("- a\n- b\n- c\n\n**bold** _italic_ [link](https://x.com)"),
     ).toBe(7);
     expect(countWords("```\ncode block ignored\n```\nreal words here")).toBe(3);
+  });
+
+  it("doesn't count stored markup as words", () => {
+    expect(countWords("<empty-block/>\n<empty-block/>\none two")).toBe(2);
+    expect(countWords("one<br>two<br/>three")).toBe(3);
+    expect(countWords("<span>\tindented line</span>")).toBe(2);
+  });
+
+  it("counts prose that only looks like a tag", () => {
+    // "a <b and c> d", saved with its angle brackets escaped.
+    expect(countWords("a \\<b and c\\> d")).toBe(5);
+    // "x\<b y", with both the backslash and the bracket escaped.
+    expect(countWords("x\\\\\\<b y")).toBe(2);
+  });
+
+  it("doesn't count markup that follows a backslash written in prose", () => {
+    // "C:\" then a red word, saved as an escaped backslash and a <span>.
+    expect(countWords('C:\\\\<span color="red">drive</span>')).toBe(2);
+    expect(countWords("foo\\\\<br>bar")).toBe(2);
   });
 
   it("formats a word count for table cells", () => {

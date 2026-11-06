@@ -22,25 +22,31 @@ describe("page body containment", () => {
     expect(css).toMatch(/\n\s*pre,\s*pre code\s*\{[^}]*white-space:\s*pre;/);
     expect(css).toMatch(/\n\s*code\s*\{[^}]*white-space:\s*pre-wrap;/);
     expect(css).toMatch(
-      /\.notion-editor pre code\s*\{[^}]*white-space:\s*pre;/,
+      /\.content-editor pre code\s*\{[^}]*white-space:\s*pre;/,
     );
   });
 
   it("lets list, task, and callout text tracks shrink", () => {
     expect(css).toMatch(
-      /\.notion-editor ol > li\s*\{[^}]*grid-template-columns: minmax\(1rem, auto\) minmax\(0, 1fr\);/,
+      /\.content-editor ol > li\s*\{[^}]*grid-template-columns: minmax\(1rem, auto\) minmax\(0, 1fr\);/,
     );
     expect(css).toMatch(
-      /\.notion-editor \.notion-task-list li\s*\{[^}]*grid-template-columns: 1rem minmax\(0, 1fr\);/,
+      /\.content-editor \.content-task-list li\s*\{[^}]*grid-template-columns: 1rem minmax\(0, 1fr\);/,
     );
     expect(css).toMatch(
       /div\[data-notion-callout\]\s*\{[^}]*grid-template-columns: auto minmax\(0, 1fr\);/,
     );
   });
 
+  it("puts every block of a list item in the text column, not under the marker", () => {
+    expect(css).toMatch(
+      /\.content-editor ul:not\(\.content-task-list\) > li > \*,\s*\.content-editor ol > li > \*\s*\{[^}]*grid-column: 2;/,
+    );
+  });
+
   it("enforces the readable table floor over Tiptap's inline min-width", () => {
     expect(css).toMatch(
-      /\.notion-editor table\s*\{[^}]*min-width: var\(--content-table-min-width, 0px\) !important;/,
+      /\.content-editor table\s*\{[^}]*min-width: var\(--content-table-min-width, 0px\) !important;/,
     );
   });
 

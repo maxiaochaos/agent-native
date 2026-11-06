@@ -3,10 +3,12 @@ import test from "node:test";
 
 import {
   assertFullCoverage,
+  catalogContractCoreSpecs,
   partitionTargetedWeighted,
   partitionWeighted,
   requiresFullCoreFastTests,
   splitLargePackages,
+  toolSearchBenchmarkCoreSpecs,
 } from "./ci-test-lanes.ts";
 
 const pkgs = (...entries: Array<[string, number]>) =>
@@ -96,6 +98,86 @@ test("falls back to all core tests for fixture, config, and instruction changes"
   );
 });
 
+test("runs the catalog contract specs for any workspace source change", () => {
+  const specs = [
+    "src/mcp/advertised-tool-annotations.spec.ts",
+    "src/mcp/instructions-name-advertised-tools.spec.ts",
+    "src/mcp/hidden-inline-apps.spec.ts",
+  ];
+  for (const changed of [
+    "templates/mail/actions/send-email.ts",
+    "templates/forms/server/plugins/agent-chat.ts",
+    "templates/content/server/lib/chatgpt-directory-tools.ts",
+    "templates/slides/shared/api.ts",
+    "templates/design/app/lib/design-tokens.ts",
+    "templates/newapp/actions/create-thing.ts",
+    "templates/newapp/scripts/run-task.ts",
+    "templates/mail/agent-native.json",
+    "templates/mail/package.json",
+    "packages/core/src/server/agent-chat-plugin.ts",
+    "packages/core/src/resources/actions/delete-resource.ts",
+    "packages/core/src/coding-tools/index.ts",
+    "packages/core/src/mcp/server.ts",
+    "packages/core/src/triggers/actions.ts",
+    "packages/core/src/notifications/actions.ts",
+    // A package that registers tools into the plugin from outside core.
+    "packages/creative-context/src/actions/x.ts",
+    // A package no list could have named in advance.
+    "packages/made-up-package/src/lib/register-tools.ts",
+  ]) {
+    assert.deepEqual(catalogContractCoreSpecs([changed]), specs, changed);
+  }
+  for (const unrelated of [
+    "templates/mail/actions/send-email.test.ts",
+    "templates/mail/app/routes/inbox.spec.tsx",
+    "packages/creative-context/src/actions/x.spec.ts",
+    "packages/core/src/server/agent-chat-plugin.lifecycle.spec.ts",
+    "templates/mail/server/types.d.ts",
+    "templates/mail/app/global.css",
+    "templates/mail/public/logo.svg",
+    "packages/made-up-package/assets/icon.png",
+    "templates/mail/README.md",
+    "packages/core/docs/content/external-agents-catalog.mdx",
+    "packages/core/CHANGELOG.md",
+    ".changeset/declare-coding-tool-mcp-annotations.md",
+    "docs/guide.md",
+    "community-templates/demo/actions/do-thing.ts",
+  ]) {
+    assert.deepEqual(catalogContractCoreSpecs([unrelated]), [], unrelated);
+  }
+  assert.deepEqual(
+    catalogContractCoreSpecs([
+      "packages/core/docs/content/external-agents-catalog.mdx",
+      "templates/mail/README.md",
+      ".changeset/declare-coding-tool-mcp-annotations.md",
+    ]),
+    [],
+    "a docs-only change",
+  );
+});
+
+test("runs the tool-search benchmark only for template action and shared changes", () => {
+  const spec = ["src/agent/tool-search.benchmark.spec.ts"];
+  for (const changed of [
+    "templates/mail/actions/manage-draft.ts",
+    "templates/newapp/actions/nested/create-thing.ts",
+    "templates/mail/shared/automation-schema.ts",
+  ]) {
+    assert.deepEqual(toolSearchBenchmarkCoreSpecs([changed]), spec, changed);
+  }
+  for (const unrelated of [
+    "templates/mail/actions/manage-draft.spec.ts",
+    "templates/mail/shared/automation-schema.spec.ts",
+    "templates/mail/app/routes/inbox.tsx",
+    "templates/mail/server/lib/automations.ts",
+    "templates/mail/actions/README.md",
+    "packages/core/src/agent/tool-search.ts",
+    "packages/creative-context/src/actions/x.ts",
+  ]) {
+    assert.deepEqual(toolSearchBenchmarkCoreSpecs([unrelated]), [], unrelated);
+  }
+});
+
 test("refuses lanes that skip or repeat a core shard", () => {
   const lane = (coreShard: string, packages: string[] = []) => ({
     lane: "lane",
@@ -144,6 +226,7 @@ test("keeps packages whole when they are unshardable or too small to split", () 
   );
 });
 
+// oracle-change: remove tests for the deleted Slides 2 template
 test("shards a targeted package alongside changed core tests", () => {
   const rest = [{ name: "design", files: 800, shardable: true }];
   const lanes = partitionTargetedWeighted(rest, 4, 4, "changed", [

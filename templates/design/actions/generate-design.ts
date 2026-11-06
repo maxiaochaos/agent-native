@@ -1,4 +1,5 @@
 import { defineAction, embedApp } from "@agent-native/core";
+import { NoWriteError } from "@agent-native/core/action";
 import {
   readAppState,
   writeAppState,
@@ -23,7 +24,7 @@ import type {
   CreativeContextElementProvenance,
   CreativeContextReuseLabel,
 } from "@agent-native/creative-context/types";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";
 import { z } from "zod";
 
@@ -41,7 +42,13 @@ import {
 import {
   assertSingleCanvasOutput,
   requestedCanvasDeviceVariants,
+  DEFAULT_GENERATION_VIEWPORT,
+  devicesForPrimaryViewport,
+  GENERATED_FRAME_GAP,
+  GENERATION_VIEWPORT_SIZES,
+  type GenerationViewport,
   resolveCanvasIntent,
+  widestGenerationDevice,
 } from "../shared/canvas-dimensions.js";
 import {
   mergeCanvasFramePlacements,
@@ -52,6 +59,7 @@ import {
   getOverviewScreenFileIds,
   isOverviewScreenFile,
 } from "../shared/design-files.js";
+import { designOutputWriteReceipt } from "../shared/generation-output-receipt.js";
 import { DESIGN_GENERATION_ATTEMPT_QUERY_PARAM } from "../shared/generation-provenance.js";
 import {
   designGenerationSessionKey,
@@ -60,10 +68,13 @@ import {
 } from "../shared/generation-session.js";
 import {
   assertDesignHtmlCreateIntegrity,
+  DESIGN_HTML_INTEGRITY_ERROR_CODE,
   describeDesignHtmlIntegrityIssue,
   inspectDesignHtmlDocumentIntegrity,
   isDesignHtmlIntegrityError,
 } from "../shared/html-integrity.js";
+import { assertHubSpotEmailFrameContent } from "../shared/hubspot-email-authoring.js";
+import { isHubSpotEmailHtml } from "../shared/hubspot-email.js";
 import { assertLockedLayersPreserved } from "../shared/locked-layers.js";
 import { derivePromptTitle } from "../shared/prompt-title.js";
 import { widthToPrefix } from "../shared/responsive-classes.js";
@@ -76,7 +87,7 @@ import {
   getScreenPreviewViewport,
   visibleBreakpointWidths,
 } from "../shared/responsive-frame-layout.js";
-import { annotateScreenHtmlForPersist } from "../shared/screen-annotation.js";
+import { annotateAgentScreenHtmlForPersist } from "../shared/screen-annotation.js";
 import { tweakDefinitionsSchema } from "../shared/tweak-definition-schema.js";
 import { withGenerationAttempt } from "./_generation-tracking.js";
 
@@ -96,6 +107,11 @@ function designDeepLink(
   });
 }
 
+// PostgreSQL trim and [:space:] do not match String.prototype.trim, so the
+// class lists exactly the characters trim removes.
+const NON_WHITESPACE_SOURCE_PATTERN =
+  "[^\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]";
+
 function isRenderableDesignFile(file: {
   fileType?: string | null;
   content?: string | null;
@@ -114,45 +130,34 @@ function isRenderableDesignScreenFile(file: {
   return isOverviewScreenFile(file) && isRenderableDesignFile(file);
 }
 
-type GenerationViewport = "mobile" | "tablet" | "desktop";
+function noWriteValidationError(error: unknown): NoWriteError {
+  if (error instanceof NoWriteError) return error;
+  const contractError =
+    typeof error === "object" && error !== null
+      ? (error as { errorCode?: unknown; statusCode?: unknown })
+      : undefined;
+  return new NoWriteError(
+    error instanceof Error
+      ? error.message
+      : "Design generation validation failed before saving.",
+    {
+      ...(typeof contractError?.errorCode === "string"
+        ? { errorCode: contractError.errorCode }
+        : isDesignHtmlIntegrityError(error)
+          ? { errorCode: DESIGN_HTML_INTEGRITY_ERROR_CODE }
+          : {}),
+      ...(typeof contractError?.statusCode === "number"
+        ? { statusCode: contractError.statusCode }
+        : {}),
+    },
+  );
+}
 
-const DEFAULT_GENERATION_VIEWPORT: GenerationViewport = "desktop";
-const GENERATION_VIEWPORT_SIZES: Record<
-  GenerationViewport,
-  { width: number; height: number }
-> = {
-  mobile: { width: 390, height: 844 },
-  tablet: { width: 768, height: 1024 },
-  desktop: { width: 1440, height: 900 },
-};
 const GENERATION_VIEWPORT_LABELS: Record<GenerationViewport, string> = {
   mobile: "Mobile",
   tablet: "Tablet",
   desktop: "Desktop",
 };
-const DEVICE_WIDTH_ORDER: readonly GenerationViewport[] = [
-  "desktop",
-  "tablet",
-  "mobile",
-];
-const GENERATED_FRAME_GAP = 96;
-
-function widestGenerationDevice(
-  devices: readonly GenerationViewport[],
-): GenerationViewport {
-  return (
-    DEVICE_WIDTH_ORDER.find((device) => devices.includes(device)) ??
-    DEFAULT_GENERATION_VIEWPORT
-  );
-}
-
-function devicesForPrimaryViewport(
-  primaryViewport: GenerationViewport,
-): GenerationViewport[] {
-  return primaryViewport === "mobile"
-    ? ["mobile"]
-    : [primaryViewport, "mobile"];
-}
 
 function breakpointSetForDevices(devices: readonly GenerationViewport[]) {
   const primaryWidth =
@@ -281,7 +286,7 @@ async function resolveDesignCreativeContext(input: {
       input.contextPackId !== undefined &&
       input.contextPackId !== sessionContext.contextPackId
     ) {
-      throw new Error(
+      throw new NoWriteError(
         "generate-design must preserve the generation session's creative-context pack",
       );
     }
@@ -436,97 +441,202 @@ async function finalizeGenerationForSavedFiles(
   });
 }
 
-const generateDesignAgentParameters = {
-  type: "object",
-  properties: {
-    designId: {
-      type: "string",
-      description: "Existing design project ID to save generated content to.",
-    },
-    prompt: {
-      type: "string",
-      description:
-        "The user's request for this screen, keeping its output type and exact pixel size. " +
-        "To resize or reformat an existing fixed canvas, name the output and target size, " +
-        'e.g. "Instagram story, 1080x1920 canvas"; a bare "make it taller" reads as a responsive app.',
-    },
-    files: {
-      type: "string",
-      description:
-        "JSON array of files to save. Pass one compact, complete, renderable index.html first, e.g. " +
-        '[{"filename":"index.html","fileType":"html","content":"<!doctype html>..."}]. ' +
-        "Do not use generate-design to replace a selected variant screen after a variant pick; snapshot that fileId and use edit-design instead.",
-    },
-    designSystemId: {
-      type: ["string", "null"],
-      description:
-        "Optional design system ID used for generation. Pass null to unlink.",
-    },
-    projectType: {
-      type: "string",
-      enum: ["prototype", "other"],
-      description: "Optional project type hint.",
-    },
-    tweaks: {
-      type: "string",
-      description:
-        "Optional JSON array of tweak definitions. Omit unless the HTML uses matching CSS variables.",
-    },
-    canvasFrames: {
-      type: "string",
-      description:
-        "Optional JSON array of overview-canvas placements keyed by filename or fileId. " +
-        "Pass explicit x/y/width/height for every generated screen as numbers. " +
-        "When the prompt gives one exact pixel size, use those exact width/height values. " +
-        "For screens with different exact sizes, make separate calls scoped to one screen each.",
-    },
-    contextPackId: {
-      type: "string",
-      description:
-        "Immutable creative-context pack. Omit to preserve the active generation session pack.",
-    },
-    contextModeOverride: {
-      type: "string",
-      enum: ["off"],
-      description:
-        "Disable Creative Context for this generation only without changing the saved preference.",
-    },
-    reuseLabels: {
-      type: "string",
-      description:
-        "Optional JSON array of exact item/version labels, with elementId set to a target filename or frame id when evidence applies to one screen.",
-    },
-    primaryViewport: {
-      type: "string",
-      enum: ["mobile", "tablet", "desktop"],
-      description:
-        "The requested primary form factor. Defaults to desktop (1440x900). " +
-        "Set this from the intake answer when no explicit canvasFrames placement is supplied. " +
-        "Ignored when `devices` is provided (the widest device becomes primary).",
-    },
-    devices: {
-      type: "array",
-      items: { type: "string", enum: ["mobile", "tablet", "desktop"] },
-      description:
-        "Device set for responsive frames. Exact pixels or a platform preset " +
-        "in the original prompt always use no device breakpoints and ignore " +
-        "this field. For a fixed-artwork inference without exact pixels or a " +
-        "preset, honor variants explicitly named in the original prompt; omit " +
-        'to default to ["desktop","mobile"]. Pass [] for fixed artwork ' +
-        "without those named variants and for follow-ups on an existing " +
-        "fixed canvas. " +
-        "The result lists ignored model devices as `ignoredDevices`; give " +
-        "each other exact size its own call. " +
-        "One exact canvas size per call; prompts with multiple distinct exact sizes are rejected. " +
-        "The widest " +
-        "device becomes the primary/base frame and the narrower devices become " +
-        "breakpoint frames — never a duplicate of the base width and never an " +
-        "auto-added tablet. A single device yields one frame with no breakpoints. " +
-        "When provided, this overrides primaryViewport.",
-    },
-  },
-  required: ["designId", "prompt", "files"],
-} as const;
+// The model is shown these typed fields as they are, and the validating schema
+// wraps the structured ones in `jsonField` so a JSON string still parses.
+const designFileSchema = z.object({
+  filename: z.string().describe("Filename (e.g. 'index.html')"),
+  content: z.string().min(1).describe("File content"),
+  fileType: z
+    .enum(["html", "css", "jsx", "asset"])
+    .optional()
+    .default("html")
+    .describe("Type of file"),
+});
+
+const canvasFrameSchema = z
+  .object({
+    fileId: z.string().optional().describe("Id of an existing design file"),
+    filename: z
+      .string()
+      .optional()
+      .describe("Filename of a file saved by this call"),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    width: z.number().optional(),
+    height: z.number().optional(),
+    rotation: z
+      .number()
+      .optional()
+      .describe("Degrees. Omit unless the user asked for a rotated screen."),
+    z: z.number().optional(),
+  })
+  .refine((frame) => frame.fileId || frame.filename, {
+    message: "canvasFrames entries require fileId or filename",
+  });
+
+const designIdField = z
+  .string()
+  .describe("Existing design project ID to save generated content to.");
+
+const promptField = z
+  .string()
+  .describe(
+    "The user's request for this screen, keeping its output type and exact pixel size. " +
+      "To resize or reformat an existing fixed canvas, name the output and target size, " +
+      'e.g. "Instagram story, 1080x1920 canvas"; a bare "make it taller" reads as a responsive app.',
+  );
+
+const filesDescription =
+  "Files to save. Pass one compact, complete, renderable index.html first, with a flat layer tree (no single-child wrapper divs) and whole-pixel lengths. " +
+  'For HubSpot email HTML author email-safe tables with `<meta name="agent-native:frame-type" content="hubspot-email">` in the head; the marker is not required for export. ' +
+  "Do not use generate-design to replace a selected variant screen after a variant pick; snapshot that fileId and use edit-design instead.";
+
+const filesField = z.array(designFileSchema).min(1).describe(filesDescription);
+
+const designSystemIdField = z
+  .string()
+  .nullable()
+  .optional()
+  .describe(
+    "Optional design system ID used for generation. Pass null to unlink.",
+  );
+
+// The agent's copies of `designSystemId` and `tweaks` reject null and []. A
+// model that pads every field sends both for fields it is not using, and
+// accepted they would unlink the design system and replace its tweaks; rejected
+// they are dropped as placeholders. `update-design` unlinks.
+const agentDesignSystemIdField = z
+  .string()
+  .optional()
+  .describe(
+    "Optional design system ID used for generation. It cannot unlink a design system.",
+  );
+
+const projectTypeField = z
+  .enum(["prototype", "other"])
+  .optional()
+  .describe("Optional project type hint.");
+
+const tweaksDescription =
+  "Optional tweak definitions (color swatches, segments, sliders, toggles) bound to CSS custom properties in the design. Omit unless the HTML uses matching CSS variables. Surface 3-6 of the most impactful knobs (accent color, density, radius, dark mode, font choice); each must reference a CSS var the design's `:root` block actually uses.";
+
+const tweaksField = tweakDefinitionsSchema
+  .optional()
+  .describe(tweaksDescription);
+
+const agentTweaksField = tweakDefinitionsSchema
+  .min(1)
+  .optional()
+  .describe(tweaksDescription);
+
+// Reject two placements for the same target in one call. Without this,
+// mergeCanvasFramePlacements folds both entries into a single
+// canvasFrames[fileId] value (last one wins), but the mutateDesignData
+// isApplied check below verifies EVERY placedFrames entry against that single
+// folded value — so the earlier, now-overwritten entry always fails the
+// equality check. Since the mutate callback is deterministic, every retry
+// recomputes the identical mismatch, so the whole action always fails with a
+// "concurrent write conflicts" error after burning through all retries, even
+// though nothing else was actually writing to the design.
+const canvasFramesField = z
+  .array(canvasFrameSchema)
+  .superRefine((frames, ctx) => {
+    const seen = new Map<string, number>();
+    frames.forEach((frame, index) => {
+      const key = frame.fileId
+        ? `id:${frame.fileId}`
+        : `name:${frame.filename}`;
+      const firstIndex = seen.get(key);
+      if (firstIndex !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [index],
+          message:
+            `canvasFrames entry ${index} duplicates the target already placed ` +
+            `at index ${firstIndex} (${frame.fileId ? `fileId ${frame.fileId}` : `filename ${frame.filename}`}). ` +
+            "Pass exactly one placement per screen.",
+        });
+        return;
+      }
+      seen.set(key, index);
+    });
+  })
+  .optional()
+  .describe(
+    "Optional overview-canvas placements keyed by filename or fileId. " +
+      "Pass explicit x/y/width/height for every generated screen as numbers. " +
+      "When the prompt gives one exact pixel size, use those exact width/height values. " +
+      "For screens with different exact sizes, make separate calls scoped to one screen each.",
+  );
+
+const contextPackIdField = z
+  .string()
+  .optional()
+  .describe(
+    "Immutable creative-context pack. Omit to preserve the active generation session pack.",
+  );
+
+const contextModeOverrideField = z
+  .literal("off")
+  .optional()
+  .describe(
+    "Disable Creative Context for this generation only without changing the saved preference.",
+  );
+
+const reuseLabelsField = z
+  .array(reuseLabelSchema)
+  .optional()
+  .default([])
+  .describe(
+    "Optional exact item/version labels, with elementId set to a target filename or frame id when evidence applies to one screen. " +
+      "itemId and itemVersionId go together; only `generated` labels may omit them.",
+  );
+
+const primaryViewportField = z
+  .enum(["mobile", "tablet", "desktop"])
+  .optional()
+  .default(DEFAULT_GENERATION_VIEWPORT)
+  .describe(
+    "The requested primary form factor. Defaults to desktop (1440x900). " +
+      "Set this from the intake answer when no explicit canvasFrames placement is supplied. " +
+      "Ignored when `devices` is provided (the widest device becomes primary).",
+  );
+
+const devicesField = z
+  .array(z.enum(["mobile", "tablet", "desktop"]))
+  .optional()
+  .describe(
+    "Device set for responsive frames. Exact pixels or a platform preset " +
+      "in the original prompt always use no device breakpoints and ignore " +
+      "this field. For a fixed-artwork inference without exact pixels or a " +
+      "preset, honor variants explicitly named in the original prompt; omit " +
+      'to default to ["desktop","mobile"]. Pass [] for fixed artwork ' +
+      "without those named variants and for follow-ups on an existing " +
+      "fixed canvas. " +
+      "The result lists ignored model devices as `ignoredDevices`; give " +
+      "each other exact size its own call. " +
+      "One exact canvas size per call; prompts with multiple distinct exact sizes are rejected. " +
+      "The widest " +
+      "device becomes the primary/base frame and the narrower devices become " +
+      "breakpoint frames — never a duplicate of the base width and never an " +
+      "auto-added tablet. A single device yields one frame with no breakpoints. " +
+      "When provided, this overrides primaryViewport.",
+  );
+
+// Strings are still accepted for the CLI and older callers. A failure names the
+// field: the SyntaxError alone reports only a position.
+const jsonField = (name: string) => (value: unknown, ctx: z.RefinementCtx) => {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    ctx.addIssue({
+      code: "custom",
+      message: `${name} is not valid JSON (${error instanceof Error ? error.message : "parse failed"}). Send it as an array, or escape quotes and newlines inside every string.`,
+    });
+    return z.NEVER;
+  }
+};
 
 const generateDesignAction = defineAction({
   description:
@@ -537,10 +647,12 @@ const generateDesignAction = defineAction({
     "A file rejected by a concurrent edit or an HTML-integrity check does not " +
     "fail the whole call — it is listed in `fileErrors` instead, while every " +
     "other file in the same call still saves; resend just the named file(s). " +
-    "Keep the first save compact and working; for large designs, persist a minimal " +
-    "version then refine individual files with `edit-design` (search/replace) rather " +
-    "than resending a big multi-file payload — a single oversized payload can get cut " +
-    "off mid-stream and stall the turn. " +
+    "Build a new screen with several sections skeleton-first: save the document shell " +
+    "with one sized, unstyled placeholder per section (each marked `data-skeleton` with a " +
+    "`data-layer-name`), then fill one section per `edit-design` call, top to bottom, so " +
+    "the canvas drafts each section in as it lands (steps in the design-generation skill). " +
+    "This also keeps every payload small: a single oversized payload can get cut off " +
+    "mid-stream and stall the turn. " +
     "Do not use this action to replace a selected variant screen after a " +
     "variant pick; call `get-design-snapshot` for the selected `fileId` and " +
     "`edit-design` that same `fileId` instead. " +
@@ -566,160 +678,36 @@ const generateDesignAction = defineAction({
     "Do not report a design as ready until this action succeeds. " +
     "When adding multiple screens or states, pass canvasFrames with filenames " +
     "and numeric x/y/width/height so the new screens appear placed on the " +
-    "overview canvas.",
+    "overview canvas. For HubSpot email output, author email-safe table HTML without browser runtimes, with the `agent-native:frame-type` meta marker in the head. Any HTML frame can be validated with export-hubspot-html before reporting compatibility.",
   schema: z.object({
-    designId: z.string().describe("Design project ID to save content to"),
-    prompt: z
-      .string()
-      .describe(
-        "Original user request for this screen. Preserve requested output type and exact pixel dimensions; do not replace it with a short chat caption. " +
-          'To resize or reformat an existing fixed canvas, name the output and target size, e.g. "Instagram story, 1080x1920 canvas".',
-      ),
-    files: z
-      .preprocess(
-        (v) => (typeof v === "string" ? JSON.parse(v) : v),
-        z
-          .array(
-            z.object({
-              filename: z.string().describe("Filename (e.g. 'index.html')"),
-              content: z.string().min(1).describe("File content"),
-              fileType: z
-                .enum(["html", "css", "jsx", "asset"])
-                .optional()
-                .default("html")
-                .describe("Type of file"),
-            }),
-          )
-          .min(1),
-      )
-      .describe("Array of files to create/update in the design project"),
-    designSystemId: z
-      .string()
-      .nullable()
-      .optional()
-      .describe("Design system ID used for generation, or null to unlink"),
-    projectType: z
-      .enum(["prototype", "other"])
-      .optional()
-      .describe("Project type hint for generation"),
-    tweaks: z
-      .preprocess(
-        (v) => (typeof v === "string" ? JSON.parse(v) : v),
-        tweakDefinitionsSchema.optional(),
-      )
-      .optional()
-      .describe(
-        "Optional array of tweak definitions (color swatches, segments, " +
-          "sliders, toggles) bound to CSS custom properties in the design. " +
-          "Surface 3-6 of the most impactful knobs (accent color, density, " +
-          "radius, dark mode, font choice). Each must reference a CSS var " +
-          "the design's `:root` block actually uses.",
-      ),
+    designId: designIdField,
+    prompt: promptField,
+    files: z.preprocess(jsonField("files"), filesField),
+    designSystemId: designSystemIdField,
+    projectType: projectTypeField,
+    tweaks: z.preprocess(jsonField("tweaks"), tweaksField).optional(),
     canvasFrames: z
-      .preprocess(
-        (v) => (typeof v === "string" ? JSON.parse(v) : v),
-        z
-          .array(
-            z
-              .object({
-                fileId: z.string().optional(),
-                filename: z.string().optional(),
-                x: z.number().optional(),
-                y: z.number().optional(),
-                width: z.number().optional(),
-                height: z.number().optional(),
-                rotation: z.number().optional(),
-                z: z.number().optional(),
-              })
-              .refine((frame) => frame.fileId || frame.filename, {
-                message: "canvasFrames entries require fileId or filename",
-              }),
-          )
-          // Reject two placements for the same target in one call. Without
-          // this, mergeCanvasFramePlacements folds both entries into a single
-          // canvasFrames[fileId] value (last one wins), but the mutateDesignData
-          // isApplied check below verifies EVERY placedFrames entry against
-          // that single folded value — so the earlier, now-overwritten entry
-          // always fails the equality check. Since the mutate callback is
-          // deterministic, every retry recomputes the identical mismatch, so
-          // the whole action always fails with a "concurrent write conflicts"
-          // error after burning through all retries, even though nothing else
-          // was actually writing to the design.
-          .superRefine((frames, ctx) => {
-            const seen = new Map<string, number>();
-            frames.forEach((frame, index) => {
-              const key = frame.fileId
-                ? `id:${frame.fileId}`
-                : `name:${frame.filename}`;
-              const firstIndex = seen.get(key);
-              if (firstIndex !== undefined) {
-                ctx.addIssue({
-                  code: z.ZodIssueCode.custom,
-                  path: [index],
-                  message:
-                    `canvasFrames entry ${index} duplicates the target already placed ` +
-                    `at index ${firstIndex} (${frame.fileId ? `fileId ${frame.fileId}` : `filename ${frame.filename}`}). ` +
-                    "Pass exactly one placement per screen.",
-                });
-                return;
-              }
-              seen.set(key, index);
-            });
-          })
-          .optional(),
-      )
-      .optional()
-      .describe(
-        "Optional overview-canvas placements for generated screens. " +
-          "Reference each screen by filename or fileId and include x/y/width/height " +
-          "from generate-screens regions or your planned canvas layout.",
-      ),
-    contextPackId: z
-      .string()
-      .optional()
-      .describe(
-        "Immutable creative-context pack. Omit to preserve the generation session pack.",
-      ),
-    contextModeOverride: z
-      .literal("off")
-      .optional()
-      .describe(
-        "Disable Creative Context for this generation only without changing the saved preference.",
-      ),
-    reuseLabels: z
-      .preprocess(
-        (value) => (typeof value === "string" ? JSON.parse(value) : value),
-        z.array(reuseLabelSchema).optional().default([]),
-      )
-      .describe(
-        "Exact item/version labels used by the generated files or frames.",
-      ),
-    primaryViewport: z
-      .enum(["mobile", "tablet", "desktop"])
-      .optional()
-      .default(DEFAULT_GENERATION_VIEWPORT)
-      .describe(
-        "Primary generated viewport. Defaults to desktop (1440x900); set " +
-          "mobile or tablet only when that is the requested form factor. " +
-          "Ignored when `devices` is provided (the widest device wins).",
-      ),
-    devices: z
-      .array(z.enum(["mobile", "tablet", "desktop"]))
-      .optional()
-      .describe(
-        "Explicit device set for responsive frames. Honor device variants the " +
-          'prompt requests; omit to default to ["desktop","mobile"]. Pass [] for ' +
-          "static artwork without requested variants and for follow-ups on an existing fixed canvas. " +
-          "When exact dimensions or a platform preset appear in the prompt, " +
-          "the field is ignored even if the request mentions device variants. " +
-          "For a noun-only fixed-artwork inference, honor the variants named " +
-          "in the prompt. Give each other exact size its own call. " +
-          "Widest " +
-          "device = primary/base frame; narrower devices = breakpoint frames " +
-          "(never the base width, never an auto tablet). One device = a single " +
-          "frame with no breakpoints. When provided, this overrides " +
-          "primaryViewport.",
-      ),
+      .preprocess(jsonField("canvasFrames"), canvasFramesField)
+      .optional(),
+    contextPackId: contextPackIdField,
+    contextModeOverride: contextModeOverrideField,
+    reuseLabels: z.preprocess(jsonField("reuseLabels"), reuseLabelsField),
+    primaryViewport: primaryViewportField,
+    devices: devicesField,
+  }),
+  agentInputSchema: z.object({
+    designId: designIdField,
+    prompt: promptField,
+    files: filesField,
+    designSystemId: agentDesignSystemIdField,
+    projectType: projectTypeField,
+    tweaks: agentTweaksField,
+    canvasFrames: canvasFramesField,
+    contextPackId: contextPackIdField,
+    contextModeOverride: contextModeOverrideField,
+    reuseLabels: reuseLabelsField,
+    primaryViewport: primaryViewportField,
+    devices: devicesField,
   }),
   mcpApp: {
     compactCatalog: true,
@@ -736,6 +724,10 @@ const generateDesignAction = defineAction({
     destructiveHint: true,
     openWorldHint: false,
   },
+  eagerInputStreaming: true,
+  // `devices: []` asks for a fixed canvas; the other lists add to what's there.
+  // GPT-6 Luna sends `[]` for every list it isn't using, beside padded nulls.
+  emptyListsEraseNothing: true,
   run: withGenerationAttempt(async (input, context, attempt) => {
     const {
       designId,
@@ -788,18 +780,9 @@ const generateDesignAction = defineAction({
           : {}),
       },
     });
-    await snapshotDesignBeforeAgentEdit(designId, context);
     if (designSystemId) {
       await assertAccess("design-system", designSystemId, "viewer");
     }
-    const creativeContextProvenance = await resolveDesignCreativeContext({
-      prompt,
-      generationSession,
-      contextPackId,
-      contextModeOverride,
-      reuseLabels,
-    });
-
     const db = getDb();
     const now = new Date().toISOString();
 
@@ -809,7 +792,7 @@ const generateDesignAction = defineAction({
         file.filename.includes("/") ||
         file.filename.includes("\\")
       ) {
-        throw new Error(
+        throw new NoWriteError(
           `Invalid filename "${file.filename}": path traversal not allowed`,
         );
       }
@@ -822,32 +805,120 @@ const generateDesignAction = defineAction({
     }> = [];
     attempt.savedFileCount = () => savedFiles.length;
 
+    const requestedFilenames = files.map((file) => file.filename);
     const existingFiles = await db
-      .select()
+      .select({
+        id: schema.designFiles.id,
+        designId: schema.designFiles.designId,
+        filename: schema.designFiles.filename,
+        fileType: schema.designFiles.fileType,
+        content: sql<
+          string | null
+        >`case when ${inArray(schema.designFiles.filename, requestedFilenames)} then ${schema.designFiles.content} else null end`,
+        contentOperationSource: schema.designFiles.contentOperationSource,
+        contentOperationRevision: schema.designFiles.contentOperationRevision,
+        contentOperationResultHash:
+          schema.designFiles.contentOperationResultHash,
+        createdAt: schema.designFiles.createdAt,
+        updatedAt: schema.designFiles.updatedAt,
+      })
       .from(schema.designFiles)
       .where(eq(schema.designFiles.designId, designId));
 
-    const hasRenderableFile =
-      files.some(isRenderableDesignFile) ||
-      existingFiles.some(isRenderableDesignFile);
+    let hasRenderableFile = files.some(isRenderableDesignFile);
     if (!hasRenderableFile) {
-      throw new Error(
+      const renderable = await db
+        .select({ id: schema.designFiles.id })
+        .from(schema.designFiles)
+        .where(
+          and(
+            eq(schema.designFiles.designId, designId),
+            inArray(schema.designFiles.fileType, ["html", "jsx"]),
+            sql`${schema.designFiles.content} ~ ${NON_WHITESPACE_SOURCE_PATTERN}`,
+          ),
+        )
+        .limit(1);
+      hasRenderableFile = renderable.length > 0;
+    }
+    if (!hasRenderableFile) {
+      throw new NoWriteError(
         "generate-design requires at least one non-empty HTML or JSX file before the design can be reported as ready",
       );
     }
 
-    await mutateDesignData({
-      designId,
-      mutate: (current) => current,
-      isApplied: () => true,
+    const creativeContextProvenance = await resolveDesignCreativeContext({
+      prompt,
+      generationSession,
+      ...(contextPackId ? { contextPackId } : {}),
+      ...(contextModeOverride ? { contextModeOverride } : {}),
+      reuseLabels: reuseLabels.map(
+        ({
+          itemId,
+          itemVersionId,
+          kind,
+          label,
+          dataRole,
+          elementId,
+          influence,
+        }) => ({
+          ...(itemId ? { itemId } : {}),
+          ...(itemVersionId ? { itemVersionId } : {}),
+          kind,
+          label,
+          dataRole,
+          ...(elementId ? { elementId } : {}),
+          ...(influence ? { influence } : {}),
+        }),
+      ),
     });
 
     const existingByName = new Map(existingFiles.map((f) => [f.filename, f]));
 
+    for (const file of files) {
+      try {
+        assertHubSpotEmailFrameContent({
+          content: file.content,
+          fileType: file.fileType,
+        });
+      } catch (error) {
+        throw noWriteValidationError(error);
+      }
+    }
+
     const annotatedFiles = files.map((file) => ({
       ...file,
-      content: annotateScreenHtmlForPersist(file.content, file.fileType),
+      content: annotateAgentScreenHtmlForPersist(file.content, file.fileType),
     }));
+
+    const liveFilesById = new Map<
+      string,
+      Awaited<ReturnType<typeof readLiveSourceFile>>
+    >();
+    for (const file of annotatedFiles) {
+      const existing = existingByName.get(file.filename);
+      if (!existing) continue;
+      if (existing.content === null) {
+        throw new NoWriteError(
+          `Requested source was not loaded for ${existing.filename}`,
+        );
+      }
+      const workspaceFile: SourceWorkspaceFile = {
+        id: existing.id,
+        designId: existing.designId,
+        filename: existing.filename,
+        fileType: existing.fileType,
+        content: existing.content,
+        createdAt: null,
+        updatedAt: null,
+      };
+      const live = await readLiveSourceFile(workspaceFile);
+      try {
+        assertLockedLayersPreserved(live.content, file.content);
+      } catch (error) {
+        throw noWriteValidationError(error);
+      }
+      liveFilesById.set(existing.id, live);
+    }
 
     const integrityWarnings: Array<{ filename: string; message: string }> = [];
     for (const file of annotatedFiles) {
@@ -857,11 +928,15 @@ const generateDesignAction = defineAction({
         existing !== undefined && (existing.fileType ?? "html") !== "html";
       let advisory: ReturnType<typeof assertDesignHtmlCreateIntegrity>;
       if (!existing || becomesHtml) {
-        advisory = assertDesignHtmlCreateIntegrity({
-          content: file.content,
-          fileType: "html",
-          filename: file.filename,
-        });
+        try {
+          advisory = assertDesignHtmlCreateIntegrity({
+            content: file.content,
+            fileType: "html",
+            filename: file.filename,
+          });
+        } catch (error) {
+          throw noWriteValidationError(error);
+        }
       } else {
         const inspected = inspectDesignHtmlDocumentIntegrity(file.content);
         advisory = inspected.valid
@@ -876,6 +951,14 @@ const generateDesignAction = defineAction({
       }
     }
 
+    await snapshotDesignBeforeAgentEdit(designId, context);
+
+    await mutateDesignData({
+      designId,
+      mutate: (current) => current,
+      isApplied: () => true,
+    });
+
     const fileErrors: Array<{ filename: string; message: string }> = [];
     for (const file of annotatedFiles) {
       const existing = existingByName.get(file.filename);
@@ -888,18 +971,22 @@ const generateDesignAction = defineAction({
 
         try {
           try {
+            const live = liveFilesById.get(existing.id);
+            if (!live || existing.content === null) {
+              // guard:allow-bare-error — every replacement must have a loaded preflight source before writes begin.
+              throw new Error(
+                `Missing preflight source version for ${existing.filename}`,
+              );
+            }
             const workspaceFile: SourceWorkspaceFile = {
               id: existing.id,
               designId: existing.designId,
-              filename: existing.filename ?? "",
-              fileType: existing.fileType ?? "html",
+              filename: existing.filename,
+              fileType: existing.fileType,
               content: existing.content,
               createdAt: null,
               updatedAt: null,
             };
-            const live = await readLiveSourceFile(workspaceFile);
-
-            assertLockedLayersPreserved(live.content, file.content);
 
             await writeInlineSourceFile({
               designId: existing.designId,
@@ -1008,6 +1095,7 @@ const generateDesignAction = defineAction({
       height: number;
       breakpointWidths: number[] | undefined;
       fixedSize: boolean;
+      contentDriven: boolean;
     }> = [];
     const normalizedTweaks = tweaks?.map((tweak) => ({
       ...tweak,
@@ -1028,13 +1116,18 @@ const generateDesignAction = defineAction({
         files.some((file) => file.filename === existingFile.filename),
       ) &&
       isFixedArtworkCopyFollowUp(prompt);
-    const requestedDevices = exactFixedCanvasOutput
-      ? []
-      : userRequestedDeviceVariants.length > 0
-        ? userRequestedDeviceVariants
-        : devices !== undefined && fixedArtworkFollowUp
-          ? []
-          : devices;
+    const renderableFiles = files.filter(isRenderableDesignScreenFile);
+    const emailOnlyOutput =
+      renderableFiles.length > 0 &&
+      renderableFiles.every((file) => isHubSpotEmailHtml(file.content));
+    const requestedDevices =
+      emailOnlyOutput || exactFixedCanvasOutput
+        ? []
+        : userRequestedDeviceVariants.length > 0
+          ? userRequestedDeviceVariants
+          : devices !== undefined && fixedArtworkFollowUp
+            ? []
+            : devices;
     const ignoredModelDevices = exactFixedCanvasOutput ? (devices ?? []) : [];
     const explicitDeviceSelection =
       requestedDevices !== undefined && requestedDevices.length > 0;
@@ -1159,7 +1252,9 @@ const generateDesignAction = defineAction({
               ? (rawMetadata as Record<string, unknown>)
               : {};
           const frame = merged.canvasFrames[file.id];
+          const emailFrame = isHubSpotEmailHtml(source.content);
           const width =
+            (emailFrame ? 600 : undefined) ??
             promptCanvasDimensions?.width ??
             (explicitDeviceSelection
               ? typeof frame?.width === "number" && frame.width > 0
@@ -1171,6 +1266,11 @@ const generateDesignAction = defineAction({
                   ? frame.width
                   : viewport.width);
           const height =
+            (emailFrame
+              ? typeof metadata.height === "number"
+                ? metadata.height
+                : (frame?.height ?? 800)
+              : undefined) ??
             promptCanvasDimensions?.height ??
             (explicitDeviceSelection
               ? typeof frame?.height === "number" && frame.height > 0
@@ -1210,19 +1310,21 @@ const generateDesignAction = defineAction({
             existingWidth === width &&
             existingHeight === height &&
             !isFixedCanvasFormatConversion(prompt);
-          const breakpointWidths = explicitDeviceSelection
-            ? fixedCanvasOutput
-              ? generatedBreakpointSet.map((breakpoint) => breakpoint.widthPx)
-              : undefined
-            : sameFixedCanvasSize
-              ? (existingBreakpointWidths ?? [])
-              : fixedCanvasOutput || explicitlyEmptyDeviceSelection
-                ? []
-                : existingBreakpointWidths !== undefined
-                  ? existingBreakpointWidths
-                  : generatedBreakpointSet.length === 0
-                    ? []
-                    : undefined;
+          const breakpointWidths = emailFrame
+            ? []
+            : explicitDeviceSelection
+              ? fixedCanvasOutput
+                ? generatedBreakpointSet.map((breakpoint) => breakpoint.widthPx)
+                : undefined
+              : sameFixedCanvasSize
+                ? (existingBreakpointWidths ?? [])
+                : fixedCanvasOutput || explicitlyEmptyDeviceSelection
+                  ? []
+                  : existingBreakpointWidths !== undefined
+                    ? existingBreakpointWidths
+                    : generatedBreakpointSet.length === 0
+                      ? []
+                      : undefined;
           const nextMetadata: Record<string, unknown> = {
             ...metadata,
             width,
@@ -1233,7 +1335,12 @@ const generateDesignAction = defineAction({
           } else {
             delete nextMetadata.breakpointWidths;
           }
-          if (fixedCanvasOutput) {
+          if (emailFrame) {
+            nextMetadata.heightPinned = false;
+            nextMetadata.heightMode = "hug";
+            if (frame)
+              merged.canvasFrames[file.id] = { ...frame, width, height };
+          } else if (fixedCanvasOutput) {
             nextMetadata.heightPinned = true;
             nextMetadata.heightMode = "fixed";
           }
@@ -1244,7 +1351,8 @@ const generateDesignAction = defineAction({
               width,
               height,
               breakpointWidths,
-              fixedSize: fixedCanvasOutput,
+              fixedSize: fixedCanvasOutput && !emailFrame,
+              contentDriven: emailFrame,
             });
           }
         }
@@ -1384,6 +1492,7 @@ const generateDesignAction = defineAction({
           );
           if (!source || !isRenderableDesignScreenFile(source)) continue;
           const current = merged.canvasFrames[file.id] ?? {};
+          const emailFrame = isHubSpotEmailHtml(source.content);
           if (
             preExistingFrameIds.has(file.id) &&
             !exactSizeResizedFileIds.has(file.id) &&
@@ -1394,10 +1503,16 @@ const generateDesignAction = defineAction({
           ) {
             continue;
           }
-          const width =
-            current.width ?? promptCanvasDimensions?.width ?? viewport.width;
+          const width = emailFrame
+            ? 600
+            : (current.width ??
+              promptCanvasDimensions?.width ??
+              viewport.width);
           const height =
-            current.height ?? promptCanvasDimensions?.height ?? viewport.height;
+            current.height ??
+            (emailFrame ? 800 : undefined) ??
+            promptCanvasDimensions?.height ??
+            viewport.height;
           let x = current.x ?? nextX;
           let y = current.y ?? 0;
           let candidateRect = rectOf(
@@ -1562,7 +1677,14 @@ const generateDesignAction = defineAction({
             ? (current.screenMetadata as Record<string, unknown>)
             : {};
         const screenMetadataApplied = screenMetadataUpdates.every(
-          ({ fileId, width, height, breakpointWidths, fixedSize }) => {
+          ({
+            fileId,
+            width,
+            height,
+            breakpointWidths,
+            fixedSize,
+            contentDriven,
+          }) => {
             const metadata = currentMetadata[fileId];
             return (
               metadata &&
@@ -1579,7 +1701,11 @@ const generateDesignAction = defineAction({
                   )) &&
               (!fixedSize ||
                 ((metadata as Record<string, unknown>).heightPinned === true &&
-                  (metadata as Record<string, unknown>).heightMode === "fixed"))
+                  (metadata as Record<string, unknown>).heightMode ===
+                    "fixed")) &&
+              (!contentDriven ||
+                ((metadata as Record<string, unknown>).heightPinned === false &&
+                  (metadata as Record<string, unknown>).heightMode === "hug"))
             );
           },
         );
@@ -1660,14 +1786,13 @@ const generateDesignAction = defineAction({
       );
       return source ? isRenderableDesignFile(source) : false;
     });
-    if (fileErrors.length > 0) attempt.markPartial();
-
     return {
       designId,
       urlPath: firstRenderableSavedFile
         ? `/design/${encodeURIComponent(designId)}?editorView=overview&screen=${encodeURIComponent(firstRenderableSavedFile.id)}&${DESIGN_GENERATION_ATTEMPT_QUERY_PARAM}=${encodeURIComponent(generationAttemptId)}`
         : `/design/${encodeURIComponent(designId)}?${DESIGN_GENERATION_ATTEMPT_QUERY_PARAM}=${encodeURIComponent(generationAttemptId)}`,
       renderable: true,
+      _receipt: designOutputWriteReceipt(designId, savedFiles.length),
       savedFiles,
       placedFrames,
       fileCount: savedFiles.length,
@@ -1704,10 +1829,4 @@ const generateDesignAction = defineAction({
   },
 });
 
-export default {
-  ...generateDesignAction,
-  tool: {
-    ...generateDesignAction.tool,
-    parameters: generateDesignAgentParameters,
-  },
-};
+export default generateDesignAction;

@@ -1,17 +1,34 @@
-import { execFile, execFileSync, spawnSync } from "child_process";
+import { execFileSync, execSync, spawnSync } from "child_process";
 import fs from "fs";
+import { Readable, Transform, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createGunzip } from "node:zlib";
 import os from "os";
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
 
-import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { fetch as fetchWithProxy } from "undici";
 
 import {
   DISPATCH_WORKSPACE_ROOT_REDIRECTS,
   getWorkspaceAppIdValidationError,
 } from "../shared/workspace-app-id.js";
 import type { CreateStartKind } from "./create-tui.js";
-import { setupAgentSymlinks } from "./setup-agents.js";
+import { releasedFrameworkPackageVersion } from "./framework-package-versions.js";
+import {
+  GIT_SYMLINK_MODE,
+  GitHttpUnavailableError,
+  withGitHttpRemote,
+  type GitHttpOptions,
+} from "./git-http.js";
+import { envProxyDispatcher } from "./http-proxy.js";
+import {
+  createAgentSymlink,
+  prepareAgentSymlink,
+  rebaseAgentSymlinkTarget,
+  setupAgentSymlinks,
+} from "./setup-agents.js";
+import { resolveTarExecutable } from "./tar-command.js";
 import { applyTemplateLayer, readTemplateLayer } from "./template-layer.js";
 import {
   coreTemplates,
@@ -24,6 +41,10 @@ import {
   readUpgradeEnvironment,
 } from "./upgrade.js";
 import {
+  mergeWorkspaceYamlListItems,
+  mergeWorkspaceYamlSections,
+} from "./workspace-yaml.js";
+import {
   ensureNodePtyBuildDependency,
   parseWorkspaceScope,
   workspacifyApp,
@@ -34,6 +55,9 @@ const __dirname = path.dirname(__filename);
 
 const REPO = "BuilderIO/agent-native";
 const TEMPLATES_DIR = "templates";
+const MAX_TEMPLATE_ARCHIVE_BYTES = 512 * 1024 * 1024;
+const MAX_COMMUNITY_ARCHIVE_EXPANDED_BYTES = 1024 * 1024 * 1024;
+const MAX_COMMUNITY_ARCHIVE_ENTRIES = 100_000;
 const PGLITE_DEPENDENCY_VERSION = "^0.5.8";
 const POSTGRES_DEPENDENCY_VERSION = "^3.4.9";
 const DRIZZLE_DEPENDENCY_VERSION = "^0.45.3";
@@ -105,10 +129,7 @@ const MINIMUM_RELEASE_AGE_EXCLUDES = [
   "typescript",
   "typescript-7",
 ];
-const FIRST_PARTY_TARBALL_SYMLINK_EXCLUDES = [
-  "*/CLAUDE.md",
-  "*/.claude/skills",
-];
+const FIRST_PARTY_AGENT_LINK_PATHS = ["CLAUDE.md", ".claude/skills"];
 // Workspace-only packages a first-party template uses on its hosted site, with
 // the files that import them. A scaffold cannot install these (a standalone app
 // resolves them from npm, a new workspace has no such package), so it drops the
@@ -629,7 +650,7 @@ async function createWorkspaceInteractive(
       "container — it isn't an app itself. Inside it you pick one or more apps",
       "(below), and each app gets its own route, agent, and UI. Apps in the",
       "same workspace share auth, database, and the agent chat. Add more apps",
-      "later with `npx @agent-native/core@latest add-app`. Chat is the UI on-ramp",
+      "later with `pnpm exec agent-native add-app`. Chat is the UI on-ramp",
       "for a minimal chat-first app with the browser shell already wired.",
       "Dispatch is always included as the workspace control plane —",
       "it owns shared secrets, messaging, approvals, and cross-app routing.",
@@ -802,7 +823,8 @@ function workspaceAppNameForTemplateSelection(templateName: string): string {
 
 function hasPnpm(): boolean {
   try {
-    execFileSync("pnpm", ["--version"], { stdio: "ignore" });
+    // Through a shell, so Windows finds the pnpm.cmd shim.
+    execSync("pnpm --version", { stdio: "ignore" });
     return true;
   } catch {
     return false;
@@ -871,24 +893,11 @@ function linkWorkspaceRootSkills(targetDir: string): void {
 
   fs.mkdirSync(agentsDir, { recursive: true });
 
-  try {
-    const stat = fs.lstatSync(linkPath);
-    if (stat.isSymbolicLink()) {
-      if (fs.readlinkSync(linkPath) === target) return;
-      fs.unlinkSync(linkPath);
-    } else {
-      return;
-    }
-  } catch {
-    // Missing link; create below.
-  }
+  const state = prepareAgentSymlink(linkPath, target, "dir");
+  if (state !== "create") return;
 
   try {
-    fs.symlinkSync(
-      target,
-      linkPath,
-      process.platform === "win32" ? "junction" : "dir",
-    );
+    createAgentSymlink(target, linkPath, "dir");
   } catch {
     try {
       copyDir(sharedSkillsDir, linkPath);
@@ -1797,7 +1806,7 @@ function localPackageTarball(packageDir: string): string {
   const unpackDir = fs.mkdtempSync(
     path.join(os.tmpdir(), "agent-native-local-package-unpack-"),
   );
-  execFileSync("tar", ["-xzf", rawTarball, "-C", unpackDir], {
+  execFileSync(resolveTarExecutable(), ["-xzf", rawTarball, "-C", unpackDir], {
     stdio: "pipe",
   });
   rewritePublishedPackageManifest(
@@ -2237,7 +2246,9 @@ function postProcessStandalone(
           } else if (key === "@agent-native/otel") {
             deps[key] = getOtelDependencyVersion();
           } else if (typeof val === "string" && val.startsWith("workspace:")) {
-            deps[key] = "latest";
+            deps[key] = key.startsWith("@agent-native/")
+              ? releasedFrameworkPackageVersion(key)
+              : "latest";
           } else if (typeof val === "string" && val === "catalog:") {
             deps[key] = catalog[key] ?? "latest";
           }
@@ -2546,7 +2557,6 @@ export {
   getCorePackageVersion as _getCorePackageVersion,
   getGitHubTemplateRef as _getGitHubTemplateRef,
   getGitHubTemplateRefCandidates as _getGitHubTemplateRefCandidates,
-  githubTarballUrl as _githubTarballUrl,
   findLocalTemplateFrom as _findLocalTemplateFrom,
   workspaceAppNameForTemplateSelection as _workspaceAppNameForTemplateSelection,
   startShapePromptOptions as _startShapePromptOptions,
@@ -2556,6 +2566,7 @@ export {
   communityTemplateTarballUrl as _communityTemplateTarballUrl,
   assertCommunityTemplateRoot as _assertCommunityTemplateRoot,
   assertSafeCommunityArchiveListing as _assertSafeCommunityArchiveListing,
+  assertCommunityArchiveLogicalSize as _assertCommunityArchiveLogicalSize,
   validateCommunityArchive as _validateCommunityArchive,
   resolveCommunityTemplateSource as _resolveCommunityTemplateSource,
   discoverCommunityWorkspaceApps as _discoverCommunityWorkspaceApps,
@@ -2566,6 +2577,7 @@ export {
   extractTarball as _extractTarball,
   materializeArchiveSymlinks as _materializeArchiveSymlinks,
   downloadGitHubSubdir as _downloadGitHubSubdir,
+  extractSparseTag as _extractSparseTag,
   findLocalTemplate as _findLocalTemplate,
   templateSourceName as _templateSourceName,
   normalizeTemplateName as _normalizeTemplateName,
@@ -2599,19 +2611,13 @@ function tarExtractArgs(
   tarPath: string,
   destDir: string,
   options: {
-    skipAgentSymlinks?: boolean;
     untrustedCommunityArchive?: boolean;
     additionalExcludes?: string[];
   } = {},
 ): string[] {
-  const excludePatterns = [
-    ...(options.skipAgentSymlinks ? FIRST_PARTY_TARBALL_SYMLINK_EXCLUDES : []),
-    ...(options.additionalExcludes ?? []),
-  ];
-  const excludes = [...new Set(excludePatterns)].flatMap((pattern) => [
-    "--exclude",
-    pattern,
-  ]);
+  const excludes = [...new Set(options.additionalExcludes)].flatMap(
+    (pattern) => ["--exclude", pattern],
+  );
   const safeOwnership = options.untrustedCommunityArchive
     ? ["--no-same-owner", "--no-same-permissions"]
     : [];
@@ -2631,8 +2637,14 @@ interface ArchiveSymlink {
   target: string;
 }
 
+interface ExtractedSymlink {
+  /** Relative to the extraction directory. */
+  path: string;
+  target: string;
+}
+
 function archiveSymlinksForExtraction(tarPath: string): ArchiveSymlink[] {
-  const listing = execFileSync("tar", ["tvzf", tarPath], {
+  const listing = execFileSync(resolveTarExecutable(), ["tvzf", tarPath], {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: TAR_LISTING_MAX_BUFFER,
@@ -2662,11 +2674,9 @@ function isPathWithin(root: string, candidate: string): boolean {
 
 function materializeArchiveSymlinks(
   destDir: string,
-  symlinks: ArchiveSymlink[],
+  symlinks: ExtractedSymlink[],
 ): void {
-  const links = new Map(
-    symlinks.map((link) => [archivePathAfterStrip(link.archivePath), link]),
-  );
+  const links = new Map(symlinks.map((link) => [link.path, link]));
   const active = new Set<string>();
 
   const materialize = (relativeLinkPath: string): void => {
@@ -2690,6 +2700,12 @@ function materializeArchiveSymlinks(
     if (!isPathWithin(path.resolve(destDir), resolvedTarget)) {
       throw new Error(
         `Archive symlink "${relativeLinkPath}" points outside the extraction directory.`,
+      );
+    }
+    // Copying a folder into itself recurses until the path is too long.
+    if (isPathWithin(resolvedTarget, linkPath)) {
+      throw new Error(
+        `Archive symlink "${relativeLinkPath}" points at a folder that contains it.`,
       );
     }
 
@@ -2729,43 +2745,18 @@ function materializeArchiveSymlinks(
   }
 }
 
-function execFileBuffer(
-  command: string,
-  args: string[],
-  options: { maxBuffer: number },
-): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      args,
-      { ...options, encoding: "buffer" },
-      (error, stdout, stderr) => {
-        if (error) {
-          const detail = stderr?.toString().trim();
-          if (detail) error.message = `${error.message}: ${detail}`;
-          reject(error);
-          return;
-        }
-        resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
-      },
-    );
-  });
-}
-
 function extractTarball(
   tarPath: string,
   destDir: string,
   options: {
-    skipAgentSymlinks?: boolean;
     untrustedCommunityArchive?: boolean;
   } = {},
 ): void {
-  const symlinks =
-    options.skipAgentSymlinks || options.untrustedCommunityArchive
-      ? archiveSymlinksForExtraction(tarPath)
-      : [];
+  const symlinks = options.untrustedCommunityArchive
+    ? archiveSymlinksForExtraction(tarPath)
+    : [];
   execFileSync(
-    "tar",
+    resolveTarExecutable(),
     tarExtractArgs(tarPath, destDir, {
       ...options,
       additionalExcludes: symlinks.map((link) => link.archivePath),
@@ -2775,51 +2766,177 @@ function extractTarball(
     },
   );
   if (symlinks.length > 0) {
-    materializeArchiveSymlinks(destDir, symlinks);
+    materializeArchiveSymlinks(
+      destDir,
+      symlinks.map((link) => ({
+        path: archivePathAfterStrip(link.archivePath),
+        target: link.target,
+      })),
+    );
   }
 }
 
-async function downloadAndExtract(
+export async function _downloadToFile(
+  url: string,
+  tarPath: string,
+  maxBytes = MAX_TEMPLATE_ARCHIVE_BYTES,
+): Promise<void> {
+  const dispatcher = envProxyDispatcher(url);
+  const controller = new AbortController();
+  const connectTimeout = setTimeout(() => controller.abort(), 10_000);
+  let downloadTimeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const response = await fetchWithProxy(url, {
+      signal: controller.signal,
+      dispatcher,
+    });
+    clearTimeout(connectTimeout);
+    downloadTimeout = setTimeout(() => controller.abort(), 120_000);
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(`Archive download failed with HTTP ${response.status}.`);
+    }
+    if (!response.body) {
+      throw new Error("Archive download returned an empty response.");
+    }
+
+    const contentLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+      await response.body.cancel();
+      throw new Error(`Archive download exceeds the ${maxBytes}-byte limit.`);
+    }
+
+    let downloadedBytes = 0;
+    const sizeLimit = new Transform({
+      transform(chunk: Uint8Array, _encoding, callback) {
+        downloadedBytes += chunk.byteLength;
+        if (downloadedBytes > maxBytes) {
+          callback(
+            new Error(`Archive download exceeds the ${maxBytes}-byte limit.`),
+          );
+          return;
+        }
+        callback(null, chunk);
+      },
+    });
+
+    await pipeline(
+      Readable.fromWeb(
+        response.body as unknown as import("node:stream/web").ReadableStream,
+      ),
+      sizeLimit,
+      fs.createWriteStream(tarPath),
+      { signal: controller.signal },
+    );
+  } catch (error) {
+    fs.rmSync(tarPath, { force: true });
+    throw error;
+  } finally {
+    clearTimeout(connectTimeout);
+    clearTimeout(downloadTimeout);
+    await dispatcher.close();
+  }
+}
+
+export async function _downloadAndExtract(
   url: string,
   destDir: string,
   options: {
-    skipAgentSymlinks?: boolean;
     untrustedCommunityArchive?: boolean;
   } = {},
 ): Promise<void> {
   fs.mkdirSync(destDir, { recursive: true });
-  const tarball = await execFileBuffer(
-    "curl",
-    [
-      "--fail-with-body",
-      "--connect-timeout",
-      "10",
-      "--max-time",
-      "120",
-      "-sSL",
-      url,
-    ],
-    { maxBuffer: 100 * 1024 * 1024 },
-  );
   const tarPath = path.join(destDir, ".download.tar.gz");
-  fs.writeFileSync(tarPath, tarball);
   try {
+    await _downloadToFile(url, tarPath);
     if (options.untrustedCommunityArchive) {
-      validateCommunityArchive(tarPath);
+      await validateCommunityArchive(tarPath);
     }
     extractTarball(tarPath, destDir, options);
   } finally {
-    fs.unlinkSync(tarPath);
+    fs.rmSync(tarPath, { force: true });
   }
 }
 
-function validateCommunityArchive(tarPath: string): void {
-  const listing = execFileSync("tar", ["tvzf", tarPath], {
+async function validateCommunityArchive(
+  tarPath: string,
+  limits: {
+    maxExpandedBytes?: number;
+    maxEntries?: number;
+  } = {},
+): Promise<void> {
+  const maxExpandedBytes =
+    limits.maxExpandedBytes ?? MAX_COMMUNITY_ARCHIVE_EXPANDED_BYTES;
+  await assertCommunityArchiveExpandedSize(tarPath, maxExpandedBytes);
+  const listing = execFileSync(resolveTarExecutable(), ["tvzf", tarPath], {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: TAR_LISTING_MAX_BUFFER,
   });
+  const entries = listing.split(/\r?\n/).filter((line) => line.trim());
+  const maxEntries = limits.maxEntries ?? MAX_COMMUNITY_ARCHIVE_ENTRIES;
+  if (entries.length > maxEntries) {
+    throw new ValidationError(
+      `Community template archive exceeds the ${maxEntries}-entry limit.`,
+    );
+  }
+  assertCommunityArchiveLogicalSize(listing, maxExpandedBytes);
   assertSafeCommunityArchiveListing(listing);
+}
+
+function assertCommunityArchiveLogicalSize(
+  listing: string,
+  maxBytes: number,
+): void {
+  let logicalBytes = 0;
+  for (const line of listing.split(/\r?\n/)) {
+    if (!line.startsWith("-") && !line.startsWith("S")) continue;
+    const fields = line.trim().split(/\s+/);
+    const isBsdTar = /^\d+$/.test(fields[1] ?? "");
+    const sizeText = fields[isBsdTar ? 4 : 2];
+    if (!sizeText || !/^\d+$/.test(sizeText)) {
+      throw new ValidationError(
+        "Could not determine a regular file's logical size in the community template archive.",
+      );
+    }
+    const size = Number(sizeText);
+    if (!Number.isSafeInteger(size)) {
+      throw new ValidationError(
+        "Community template archive contains an invalid regular file size.",
+      );
+    }
+    if (size > maxBytes - logicalBytes) {
+      throw new ValidationError(
+        "Community template archive exceeds its logical-size limit.",
+      );
+    }
+    logicalBytes += size;
+  }
+}
+
+async function assertCommunityArchiveExpandedSize(
+  tarPath: string,
+  maxBytes: number,
+): Promise<void> {
+  let expandedBytes = 0;
+  await pipeline(
+    fs.createReadStream(tarPath),
+    createGunzip(),
+    new Writable({
+      write(chunk: Buffer, _encoding, callback) {
+        expandedBytes += chunk.byteLength;
+        if (expandedBytes > maxBytes) {
+          callback(
+            new ValidationError(
+              "Community template archive exceeds its expanded-size limit.",
+            ),
+          );
+          return;
+        }
+        callback();
+      },
+    }),
+  );
 }
 
 function assertSafeCommunityArchiveListing(listing: string): void {
@@ -2873,25 +2990,28 @@ async function downloadGitHubSubdir(
   }
   const errors: string[] = [];
   for (const ref of refs) {
-    const tarUrl = githubTarballUrl(repo, ref, "tag");
     const tmpDir = path.join(
       targetDir,
       "..",
       `.agent-native-tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     );
     try {
-      await downloadAndExtract(tarUrl, tmpDir, {
-        skipAgentSymlinks: repo === REPO,
-      });
-      const srcDir = path.join(tmpDir, subdir);
-      if (!fs.existsSync(srcDir)) {
-        throw new Error(
-          `Template directory "${subdir}" not found at ref "${ref}".`,
-        );
-      }
-      copyDir(srcDir, targetDir);
+      await extractSparseTag(
+        `https://github.com/${repo}.git`,
+        ref,
+        subdir,
+        tmpDir,
+        { onRetry: (notice) => console.warn(notice) },
+      );
+      copyDir(path.join(tmpDir, subdir), targetDir);
       return ref;
     } catch (err) {
+      // Every other ref would wait out the same outage.
+      if (err instanceof GitHttpUnavailableError) {
+        throw new Error(
+          `Failed to download templates from ${repo}: ${err.message}`,
+        );
+      }
       errors.push(
         `  ${ref}: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`,
       );
@@ -2901,6 +3021,83 @@ async function downloadGitHubSubdir(
   }
   throw new Error(
     `Failed to download templates from ${repo}. Tried refs:\n${errors.join("\n")}`,
+  );
+}
+
+/**
+ * Writes `subdir` of a tag, plus whatever its symlinks point at, into
+ * `destDir` at their repository paths. Symlinks become copies of their
+ * targets, and regular files at first-party agent link paths are left out.
+ */
+async function extractSparseTag(
+  remoteUrl: string,
+  ref: string,
+  subdir: string,
+  destDir: string,
+  options: GitHttpOptions = {},
+): Promise<void> {
+  await withGitHttpRemote(remoteUrl, options, async (remote) => {
+    const tree = await remote.readTree(await remote.resolveTag(ref));
+    if (!tree.directories.has(subdir)) {
+      throw new Error(
+        `Template directory "${subdir}" not found at ref "${ref}".`,
+      );
+    }
+    fs.mkdirSync(path.join(destDir, subdir), { recursive: true });
+
+    const roots = [subdir];
+    const fetched = new Set<string>();
+    const symlinks: ExtractedSymlink[] = [];
+    let newRoots = [subdir];
+    while (newRoots.length > 0) {
+      const files = tree.files.filter(
+        (file) =>
+          !fetched.has(file.path) &&
+          isWithinGitPaths(file.path, newRoots) &&
+          (file.mode === GIT_SYMLINK_MODE ||
+            !isFirstPartyAgentLinkPath(file.path)),
+      );
+      newRoots = [];
+      for (const { file, content } of await remote.readFiles(files)) {
+        fetched.add(file.path);
+        if (file.mode !== GIT_SYMLINK_MODE) {
+          const filePath = path.join(destDir, file.path);
+          fs.mkdirSync(path.dirname(filePath), { recursive: true });
+          fs.writeFileSync(filePath, content, {
+            mode: Number.parseInt(file.mode, 8) & 0o111 ? 0o755 : 0o644,
+          });
+          continue;
+        }
+        const target = content.toString("utf8");
+        symlinks.push({ path: file.path, target });
+        const resolved = path.posix
+          .join(path.posix.dirname(file.path), target)
+          .replace(/\/+$/, "");
+        if (
+          !path.posix.isAbsolute(target) &&
+          resolved !== ".." &&
+          !resolved.startsWith("../") &&
+          !isWithinGitPaths(resolved, roots)
+        ) {
+          roots.push(resolved);
+          newRoots.push(resolved);
+        }
+      }
+    }
+    materializeArchiveSymlinks(destDir, symlinks);
+  });
+}
+
+function isWithinGitPaths(repoPath: string, roots: string[]): boolean {
+  return roots.some(
+    (root) => repoPath === root || repoPath.startsWith(`${root}/`),
+  );
+}
+
+function isFirstPartyAgentLinkPath(repoPath: string): boolean {
+  const padded = `/${repoPath}/`;
+  return FIRST_PARTY_AGENT_LINK_PATHS.some((linkPath) =>
+    padded.includes(`/${linkPath}/`),
   );
 }
 
@@ -2914,7 +3111,7 @@ async function downloadGitHubRepo(
   const errors: string[] = [];
   for (const ref of refs) {
     try {
-      await downloadAndExtract(
+      await _downloadAndExtract(
         communityTemplateTarballUrl(repo, ref),
         targetDir,
         { untrustedCommunityArchive: true },
@@ -3393,431 +3590,9 @@ function readCommunitySourceIdentity(
   }
 }
 
-function githubTarballUrl(
-  repo: string,
-  ref: string,
-  kind: "branch" | "tag",
-): string {
-  return `https://codeload.github.com/${repo}/tar.gz/refs/${kind === "tag" ? "tags" : "heads"}/${encodeURIComponent(ref)}`;
-}
-
 /* ─────────────────────────────────────────────────────────────────────────
  * Text / filesystem helpers
  * ───────────────────────────────────────────────────────────────────────── */
-
-/**
- * Merge key-value entries into named sections of a pnpm-workspace.yaml string
- * without creating duplicate section headers. For each section:
- *   - If the section already exists, new entries are injected after its header.
- *   - If the section is absent, a new block is appended at the end.
- * Entries already present (by key) are skipped.
- */
-function mergeWorkspaceYamlSections(
-  yaml: string,
-  sections: Record<string, Record<string, string>>,
-): string {
-  let result = yaml;
-  for (const [section, entries] of Object.entries(sections)) {
-    for (const [key, value] of Object.entries(entries)) {
-      const existingSection = findWorkspaceYamlSection(result, section);
-      if (existingSection?.kind === "flow") {
-        if (workspaceYamlFlowMappingHasEntry(existingSection, section, key)) {
-          continue;
-        }
-        result = appendWorkspaceYamlFlowEntry(
-          result,
-          existingSection,
-          `${formatWorkspaceYamlString(normalizeYamlScalar(key))}: ${formatWorkspaceYamlScalar(value)}`,
-        );
-      } else if (existingSection?.kind === "scalar") {
-        throw unsupportedWorkspaceYamlSection(section, "mapping");
-      } else if (existingSection) {
-        if (workspaceYamlSectionHasEntry(existingSection, key)) continue;
-        result =
-          result.slice(0, existingSection.insertAt) +
-          `\n${existingSection.indent}${key}: ${value}` +
-          result.slice(existingSection.insertAt);
-      } else {
-        result =
-          result.trimEnd() +
-          (result ? "\n" : "") +
-          `\n${section}:\n  ${key}: ${value}\n`;
-      }
-    }
-  }
-  return result;
-}
-
-function workspaceYamlSectionHasEntry(
-  existingSection: Extract<WorkspaceYamlSection, { kind: "block" }>,
-  key: string,
-): boolean {
-  return existingSection.body.split(/\r?\n/).some((line) => {
-    const entry = parseYamlMappingKey(line, existingSection.indent);
-    return (
-      entry !== undefined &&
-      normalizeYamlScalar(entry) === normalizeYamlScalar(key)
-    );
-  });
-}
-
-type WorkspaceYamlSection =
-  | { kind: "block"; body: string; indent: string; insertAt: number }
-  | {
-      kind: "flow";
-      collection: "mapping" | "sequence";
-      value: Record<string, unknown> | unknown[];
-      start: number;
-      end: number;
-    }
-  | { kind: "scalar" };
-
-function findWorkspaceYamlSection(
-  yaml: string,
-  section: string,
-): WorkspaceYamlSection | undefined {
-  const sectionHeader = new RegExp(`^${escapeRegExp(section)}:[ \\t]*`, "m");
-  const match = sectionHeader.exec(yaml);
-  if (!match) return undefined;
-
-  const valueStart = match.index + match[0].length;
-  const remainingValue = yaml.slice(valueStart);
-  if (remainingValue.startsWith("{") || remainingValue.startsWith("[")) {
-    let end: number;
-    try {
-      end = findFlowCollectionEnd(remainingValue);
-    } catch (error) {
-      throw new Error(
-        `Cannot update flow-style ${section} in pnpm-workspace.yaml. Convert it to block style before scaffolding.`,
-        { cause: error },
-      );
-    }
-    const source = remainingValue.slice(0, end + 1);
-    let parsed: unknown;
-    try {
-      parsed = parseYaml(source);
-    } catch (error) {
-      throw new Error(
-        `Cannot update flow-style ${section} in pnpm-workspace.yaml. Convert it to block style before scaffolding.`,
-        { cause: error },
-      );
-    }
-    if (source.startsWith("{") && isPlainRecord(parsed)) {
-      return {
-        kind: "flow",
-        collection: "mapping",
-        value: parsed,
-        start: valueStart,
-        end: valueStart + end + 1,
-      };
-    }
-    if (source.startsWith("[") && Array.isArray(parsed)) {
-      return {
-        kind: "flow",
-        collection: "sequence",
-        value: parsed,
-        start: valueStart,
-        end: valueStart + end + 1,
-      };
-    }
-    throw unsupportedWorkspaceYamlSection(section, "mapping or sequence");
-  }
-  const lineEnd = yaml.indexOf("\n", valueStart);
-  const scalar = yaml
-    .slice(valueStart, lineEnd === -1 ? yaml.length : lineEnd)
-    .trim();
-  if (scalar && !scalar.startsWith("#")) {
-    return { kind: "scalar" };
-  }
-
-  const insertAt = lineEnd === -1 ? yaml.length : lineEnd;
-  const remaining = yaml.slice(insertAt);
-  const nextSection = /^(?!#)\S[^:\n]*:[^\n]*$/m.exec(remaining);
-  const body = remaining.slice(0, nextSection?.index ?? remaining.length);
-  const indent = body
-    .split(/\r?\n/)
-    .filter((line) => line.trim() && !line.trimStart().startsWith("#"))
-    .map((line) => line.match(/^[ \t]+/)?.[0])
-    .filter((value): value is string => value !== undefined)
-    .sort((a, b) => a.length - b.length)[0];
-  return {
-    kind: "block",
-    body,
-    indent: indent ?? "  ",
-    insertAt,
-  };
-}
-
-function findFlowCollectionEnd(source: string): number {
-  const closingFor: Record<string, string> = { "{": "}", "[": "]" };
-  const first = source[0];
-  const firstClose = first ? closingFor[first] : undefined;
-  if (!firstClose) throw new Error("Expected a flow-style YAML collection.");
-
-  const stack = [firstClose];
-  let quote: "'" | '"' | undefined;
-  let escaped = false;
-  for (let index = 1; index < source.length; index++) {
-    const char = source[index]!;
-    if (quote === '"' && char === "\\" && !escaped) {
-      escaped = true;
-      continue;
-    }
-    if (quote && char === quote) {
-      if (quote === "'" && source[index + 1] === "'") {
-        index++;
-        continue;
-      }
-      if (!escaped) quote = undefined;
-    } else if (!quote && (char === "'" || char === '"')) {
-      quote = char;
-    } else if (!quote && (char === "{" || char === "[")) {
-      stack.push(closingFor[char]!);
-    } else if (!quote && (char === "}" || char === "]")) {
-      if (stack.pop() !== char) {
-        throw new Error("Cannot update an invalid flow-style YAML collection.");
-      }
-      if (stack.length === 0) return index;
-    } else if (
-      !quote &&
-      char === "#" &&
-      (index === 0 || /[ \t\r\n]/.test(source[index - 1]!))
-    ) {
-      const newline = source.indexOf("\n", index);
-      if (newline < 0) break;
-      index = newline;
-    }
-    escaped = false;
-  }
-  throw new Error("Cannot update an unterminated flow-style YAML collection.");
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function unsupportedWorkspaceYamlSection(
-  section: string,
-  expected: string,
-): Error {
-  return new Error(
-    `Cannot merge ${section} in pnpm-workspace.yaml because its value is not a supported flow-style ${expected}. Convert it to block style before scaffolding.`,
-  );
-}
-
-function workspaceYamlFlowMappingHasEntry(
-  section: Extract<WorkspaceYamlSection, { kind: "flow" }>,
-  sectionName: string,
-  key: string,
-): boolean {
-  if (section.collection !== "mapping" || Array.isArray(section.value)) {
-    throw unsupportedWorkspaceYamlSection(sectionName, "mapping");
-  }
-  return Object.keys(section.value).some(
-    (existingKey) =>
-      normalizeYamlScalar(existingKey) === normalizeYamlScalar(key),
-  );
-}
-
-function appendWorkspaceYamlFlowEntry(
-  yaml: string,
-  section: Extract<WorkspaceYamlSection, { kind: "flow" }>,
-  entry: string,
-): string {
-  const collection = yaml.slice(section.start, section.end);
-  const inner = collection.slice(1, -1);
-  if (hasUnquotedFlowComment(inner)) {
-    throw new Error(
-      "Cannot update a flow-style YAML collection with comments. Convert it to block style before scaffolding.",
-    );
-  }
-  const content = inner.trimEnd();
-  const trailing = inner.slice(content.length);
-  const separator = !content.trim()
-    ? ""
-    : content.endsWith(",")
-      ? " "
-      : inner.includes("\n")
-        ? `,\n${inner.match(/(?:^|\r?\n)([ \t]*)\S/)?.[1] ?? "  "}`
-        : ", ";
-  const nextCollection = `${collection[0]}${content}${separator}${entry}${trailing}${collection.at(-1)}`;
-  return (
-    yaml.slice(0, section.start) + nextCollection + yaml.slice(section.end)
-  );
-}
-
-function hasUnquotedFlowComment(source: string): boolean {
-  let quote: "'" | '"' | undefined;
-  let escaped = false;
-  for (let index = 0; index < source.length; index++) {
-    const char = source[index]!;
-    if (quote === '"' && char === "\\" && !escaped) {
-      escaped = true;
-      continue;
-    }
-    if (quote && char === quote) {
-      if (quote === "'" && source[index + 1] === "'") {
-        index++;
-        continue;
-      }
-      if (!escaped) quote = undefined;
-    } else if (!quote && (char === "'" || char === '"')) {
-      quote = char;
-    } else if (
-      !quote &&
-      char === "#" &&
-      (index === 0 || /[ \t\r\n]/.test(source[index - 1]!))
-    ) {
-      return true;
-    }
-    escaped = false;
-  }
-  return false;
-}
-
-function formatWorkspaceYamlScalar(value: string): string {
-  let parsed: unknown;
-  try {
-    parsed = parseYaml(value);
-  } catch (error) {
-    throw new Error(
-      "Cannot merge an invalid YAML scalar into pnpm-workspace.yaml.",
-      {
-        cause: error,
-      },
-    );
-  }
-  if (parsed !== null && typeof parsed === "object") {
-    throw new Error(
-      "Cannot merge a non-scalar value into pnpm-workspace.yaml.",
-    );
-  }
-  return stringifyYaml(parsed).trim();
-}
-
-function formatWorkspaceYamlString(value: string): string {
-  return stringifyYaml(value).trim();
-}
-
-function parseYamlMappingKey(line: string, indent: string): string | undefined {
-  if (!line.startsWith(indent)) return undefined;
-  const content = line.slice(indent.length);
-  let quote: "'" | '"' | undefined;
-  let escaped = false;
-  for (let index = 0; index < content.length; index++) {
-    const char = content[index];
-    if (quote === '"' && char === "\\" && !escaped) {
-      escaped = true;
-      continue;
-    }
-    if (quote && char === quote) {
-      if (quote === "'" && content[index + 1] === "'") {
-        index++;
-        continue;
-      }
-      if (!escaped) quote = undefined;
-    } else if (!quote && (char === "'" || char === '"')) {
-      quote = char;
-    } else if (
-      !quote &&
-      char === ":" &&
-      (index === content.length - 1 || /[ \t]/.test(content[index + 1]!))
-    ) {
-      return content.slice(0, index).trim();
-    }
-    escaped = false;
-  }
-  return undefined;
-}
-
-function normalizeYamlScalar(value: string): string {
-  let scalar = value.trim();
-  let quote: "'" | '"' | undefined;
-  for (let index = 0; index < scalar.length; index++) {
-    const char = scalar[index];
-    if (quote === '"' && char === "\\") {
-      index++;
-      continue;
-    }
-    if (quote && char === quote) quote = undefined;
-    else if (!quote && (char === "'" || char === '"')) quote = char;
-    else if (
-      !quote &&
-      char === "#" &&
-      (index === 0 || /[ \t]/.test(scalar[index - 1]!))
-    ) {
-      scalar = scalar.slice(0, index).trimEnd();
-      break;
-    }
-  }
-  if (scalar.startsWith('"') && scalar.endsWith('"')) {
-    try {
-      return JSON.parse(scalar);
-    } catch {
-      return scalar.slice(1, -1);
-    }
-  }
-  if (scalar.startsWith("'") && scalar.endsWith("'")) {
-    return scalar.slice(1, -1).replace(/''/g, "'");
-  }
-  return scalar;
-}
-
-function mergeWorkspaceYamlListItems(
-  yaml: string,
-  section: string,
-  items: string[],
-): string {
-  let result = yaml;
-  for (const item of items) {
-    const existingSection = findWorkspaceYamlSection(result, section);
-    if (existingSection?.kind === "flow") {
-      if (
-        existingSection.collection !== "sequence" ||
-        !Array.isArray(existingSection.value)
-      ) {
-        throw unsupportedWorkspaceYamlSection(section, "sequence");
-      }
-      const normalizedItem = normalizeYamlScalar(item);
-      const isPresent = existingSection.value.some(
-        (value) => normalizeYamlScalar(String(value)) === normalizedItem,
-      );
-      if (isPresent) continue;
-      result = appendWorkspaceYamlFlowEntry(
-        result,
-        existingSection,
-        formatWorkspaceYamlString(normalizedItem),
-      );
-      continue;
-    }
-    if (existingSection?.kind === "scalar") {
-      throw unsupportedWorkspaceYamlSection(section, "sequence");
-    }
-    const isPresent = existingSection?.body.split(/\r?\n/).some((line) => {
-      if (!line.startsWith(existingSection.indent)) return false;
-      const entry = line
-        .slice(existingSection.indent.length)
-        .match(/^-[ \t]+(.+)$/);
-      return (
-        entry !== null &&
-        normalizeYamlScalar(entry[1]!) === normalizeYamlScalar(item)
-      );
-    });
-    if (isPresent) continue;
-    if (existingSection) {
-      result =
-        result.slice(0, existingSection.insertAt) +
-        `\n${existingSection.indent}- ${item}` +
-        result.slice(existingSection.insertAt);
-    } else {
-      result =
-        result.trimEnd() +
-        (result ? "\n" : "") +
-        `\n${section}:\n  - ${item}\n`;
-    }
-  }
-  return result;
-}
 
 function loadCatalog(): Record<string, string> {
   try {
@@ -4050,7 +3825,7 @@ function getCoreDependencyVersion(): string {
     if (localCore) return localPackageTarball(localCore);
   }
 
-  return getCorePackageVersion() ?? "latest";
+  return releasedFrameworkPackageVersion("@agent-native/core");
 }
 
 function getDispatchDependencyVersion(): string {
@@ -4059,18 +3834,16 @@ function getDispatchDependencyVersion(): string {
     if (localDispatch) return pathToFileURL(localDispatch).href;
   }
 
-  return "latest";
+  return releasedFrameworkPackageVersion("@agent-native/dispatch");
 }
 
-// OTel is versioned independently of Core (it peer-depends on Core's public
-// observability provider API), so a scaffold takes its current npm release.
 function getOtelDependencyVersion(): string {
   if (process.env.AGENT_NATIVE_CREATE_USE_LOCAL_CORE === "1") {
     const localOtel = findLocalPackage("otel");
     if (localOtel) return localPackageTarball(localOtel);
   }
 
-  return "latest";
+  return releasedFrameworkPackageVersion("@agent-native/otel");
 }
 
 function getToolkitDependencyVersion(): string {
@@ -4079,63 +3852,16 @@ function getToolkitDependencyVersion(): string {
     if (localToolkit) return localPackageTarball(localToolkit);
   }
 
-  const publishedRange = getOwnPackageDependencyVersion(
-    "@agent-native/toolkit",
-  );
-  if (publishedRange !== "latest") return publishedRange;
-
-  // Changesets publishes Toolkit at Core's version from the fixed release group.
-  const coreVersion = getCorePackageVersion();
-  if (coreVersion) return `^${coreVersion}`;
-  throw new Error(
-    "Cannot determine a compatible @agent-native/toolkit version from @agent-native/core.",
-  );
+  return releasedFrameworkPackageVersion("@agent-native/toolkit");
 }
 
 function getAgentKitDependencyVersion(): string {
-  const localAgentKit = findLocalPackage("agentkit");
-  if (process.env.AGENT_NATIVE_CREATE_USE_LOCAL_CORE === "1" && localAgentKit) {
-    return localPackageTarball(localAgentKit);
+  if (process.env.AGENT_NATIVE_CREATE_USE_LOCAL_CORE === "1") {
+    const localAgentKit = findLocalPackage("agentkit");
+    if (localAgentKit) return localPackageTarball(localAgentKit);
   }
 
-  const publishedRange = getOwnPackageDependencyVersion(
-    "@agent-native/agentkit",
-  );
-  if (publishedRange !== "latest") return publishedRange;
-
-  if (localAgentKit) {
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(localAgentKit, "package.json"), "utf-8"),
-    ) as { version?: unknown };
-    if (typeof manifest.version === "string" && manifest.version.length > 0) {
-      return `^${manifest.version}`;
-    }
-  }
-
-  throw new Error(
-    "Cannot determine a compatible @agent-native/agentkit version from @agent-native/core. Reinstall Core before scaffolding Chat.",
-  );
-}
-
-function getOwnPackageDependencyVersion(depName: string): string {
-  try {
-    const ownPkgPath = path.join(__dirname, "../../package.json");
-    const ownPkg = JSON.parse(fs.readFileSync(ownPkgPath, "utf-8"));
-    const range = [
-      ownPkg.dependencies,
-      ownPkg.optionalDependencies,
-      ownPkg.peerDependencies,
-      ownPkg.devDependencies,
-    ].find((dependencies) => dependencies?.[depName])?.[depName];
-    const isPublishedRange =
-      typeof range === "string" &&
-      range.length > 0 &&
-      !range.startsWith("workspace:") &&
-      range !== "catalog:";
-    if (isPublishedRange) return range;
-  } catch {}
-
-  return "latest";
+  return releasedFrameworkPackageVersion("@agent-native/agentkit");
 }
 
 function localToolkitOverride(): string | null {
@@ -4255,6 +3981,17 @@ function rewriteCoreDependencyVersions(projectDir: string): void {
   } catch {}
 }
 
+/**
+ * Builder Workspaces key apps by a stable id (route, record key, access row):
+ * it must start with a letter and be at most 40 characters.
+ */
+const BUILDER_WORKSPACE_APP_ID_REGEX = /^[a-z][a-z0-9-]{0,39}$/;
+
+export function getBuilderWorkspaceAppIdError(appId: string): string | null {
+  if (BUILDER_WORKSPACE_APP_ID_REGEX.test(appId)) return null;
+  return `Invalid app id "${appId}". It must start with a lowercase letter and contain only lowercase letters, digits and hyphens (max 40 characters).`;
+}
+
 function validateWorkspaceAppName(
   appName: string,
   clack: typeof import("@clack/prompts"),
@@ -4263,7 +4000,8 @@ function validateWorkspaceAppName(
   const error =
     opts?.allowDispatch && appName === "dispatch"
       ? null
-      : getWorkspaceAppIdValidationError(appName);
+      : (getWorkspaceAppIdValidationError(appName) ??
+        getBuilderWorkspaceAppIdError(appName));
   if (error) {
     clack.cancel(error);
     process.exit(1);
@@ -4667,8 +4405,10 @@ function copyDir(
   dest: string,
   root?: string,
   opts?: { skipExisting?: boolean; materializeSymlinks?: boolean },
+  destinationRoot?: string,
 ): void {
   const resolvedRoot = root ?? path.resolve(src);
+  const resolvedDestinationRoot = destinationRoot ?? path.resolve(dest);
   const skipExisting = opts?.skipExisting ?? false;
   fs.mkdirSync(dest, { recursive: true });
   for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
@@ -4680,17 +4420,43 @@ function copyDir(
     }
     if (entry.isSymbolicLink()) {
       const target = fs.readlinkSync(srcPath);
-      const resolvedTarget = path.resolve(path.dirname(srcPath), target);
-      if (
-        !opts?.materializeSymlinks &&
-        isPathWithin(resolvedRoot, resolvedTarget)
-      ) {
-        fs.symlinkSync(target, destPath);
+      const copiedTarget = rebaseAgentSymlinkTarget(
+        resolvedRoot,
+        resolvedDestinationRoot,
+        srcPath,
+        destPath,
+        target,
+      );
+      if (!opts?.materializeSymlinks && copiedTarget !== undefined) {
+        let stat: fs.Stats;
+        try {
+          stat = fs.statSync(srcPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          if (process.platform === "win32") {
+            throw new Error(
+              `Cannot copy dangling symlink at "${srcPath}" on Windows because its target type is unknown.`,
+            );
+          }
+          fs.symlinkSync(copiedTarget, destPath);
+          continue;
+        }
+        createAgentSymlink(
+          copiedTarget,
+          destPath,
+          stat.isDirectory() ? "dir" : "file",
+        );
       } else {
         try {
           const stat = fs.statSync(srcPath);
           if (stat.isDirectory()) {
-            copyDir(srcPath, destPath, resolvedRoot, opts);
+            copyDir(
+              srcPath,
+              destPath,
+              resolvedRoot,
+              opts,
+              resolvedDestinationRoot,
+            );
           } else {
             fs.copyFileSync(srcPath, destPath);
           }
@@ -4699,7 +4465,7 @@ function copyDir(
         }
       }
     } else if (entry.isDirectory()) {
-      copyDir(srcPath, destPath, resolvedRoot, opts);
+      copyDir(srcPath, destPath, resolvedRoot, opts, resolvedDestinationRoot);
     } else {
       fs.copyFileSync(srcPath, destPath);
     }

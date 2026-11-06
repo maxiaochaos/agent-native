@@ -6,6 +6,11 @@ import {
 } from "@agent-native/core/client/hooks";
 import { isEmbedMcpChatBridgeActive } from "@agent-native/core/client/host";
 import { useT } from "@agent-native/core/client/i18n";
+import {
+  sessionReadIdentity,
+  sessionReadIdentityStatus,
+  subscribeSessionReadIdentity,
+} from "@agent-native/core/client/use-session";
 import { serializeIconValue } from "@agent-native/core/icons";
 import type {
   ContentDatabaseItemsPageResponse,
@@ -29,7 +34,8 @@ import type {
 import type { ContentSidebarSections } from "@shared/content-personal-navigation";
 import type { ContentRecentResult } from "@shared/content-personal-navigation";
 import { applyContentPersonalNavigationPatch } from "@shared/content-personal-navigation-patch";
-import type { QueryClient } from "@tanstack/react-query";
+import { buildListRowExcerpt } from "@shared/og-description";
+import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import {
   hashKey,
   isCancelledError,
@@ -37,7 +43,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
 import { contentSaveTelemetryHeaders } from "@/lib/content-save-telemetry";
@@ -57,6 +63,7 @@ import {
   documentQueryKey,
   type DocumentQueryContext,
 } from "../lib/document-query";
+import { trackDocumentReadFailures } from "../lib/document-read-failures";
 import {
   documentScopedReadRetryOptions,
   isWithinCreateSettlingWindow,
@@ -66,11 +73,24 @@ import {
   isDocumentCreationPending,
 } from "../lib/optimistic-document";
 import {
+  pageOpenReadOwner,
+  seedPageOpenCollection,
+  type PageOpenReadAnswer,
+  type PageOpenReadOwner,
+} from "../lib/page-open-collection";
+import {
+  abortedByEither,
   adoptPageOpenRead,
   claimPageOpenRead,
+  endPageOpen,
+  invalidatePageOpenReadOnLanding,
+  isAwaitingSession,
   releasePageOpenRead,
   spoilPageOpenReads,
   startPageOpenRead,
+  readFromStartupPageRead,
+  takeStartupPageRead,
+  whenReadIdentityCurrent,
   type PageOpenRead,
   type PageOpenReadAdoption,
 } from "../lib/page-open-reads";
@@ -88,6 +108,7 @@ import {
 } from "./use-content-action-mutation";
 import {
   contentDatabaseConstrainedQueryFilter,
+  contentDatabaseExcerptContainingDocumentFilter,
   contentDatabaseItemsContainingDocumentFilter,
   contentDatabaseNavigationQueryFilter,
   invalidateContentDatabaseNavigationQueries,
@@ -312,6 +333,7 @@ export type DocumentUpdateRequestWithCas = DocumentUpdateRequest & {
   authoredBaseContent?: string;
   authoredCandidateContent?: string;
   editorSnapshotTitle?: string;
+  editorSnapshotTitleBase?: string;
   editorSnapshotContent?: string;
 };
 
@@ -454,6 +476,17 @@ export function patchDocumentInDatabaseCache<
     return {
       ...item,
       document: { ...item.document, ...patch },
+      // A saved body, even an empty one, replaces the excerpt the read sent.
+      ...(patch.content !== undefined &&
+      "excerpt" in item &&
+      item.excerpt !== undefined
+        ? {
+            excerpt: buildListRowExcerpt({
+              content: patch.content,
+              title: patch.title ?? item.document.title,
+            }),
+          }
+        : {}),
     };
   });
   return changed ? ({ ...current, items } as T) : current;
@@ -491,13 +524,17 @@ function patchDocumentWithFavoriteMembershipInDatabaseCache(
     : setDocumentFavoriteInDatabaseCache(patched, documentId, patch.isFavorite);
 }
 
+// Only the page's own reads hold its body; lists, database rows and navigation
+// carry none. `pagePatch` lets the page copies keep a body and its revision
+// together while the rest take the answer's metadata.
 export function patchDocumentCaches(
   queryClient: Pick<QueryClient, "setQueryData" | "setQueriesData">,
   documentId: string,
   patch: PageOwnedDocumentCachePatch,
+  pagePatch: PageOwnedDocumentCachePatch = patch,
 ) {
   queryClient.setQueriesData(documentQueryFilter(documentId), (old: unknown) =>
-    old && typeof old === "object" ? { ...old, ...patch } : old,
+    old && typeof old === "object" ? { ...old, ...pagePatch } : old,
   );
   queryClient.setQueryData(LIST_DOCUMENTS_QUERY_KEY, (old: unknown) =>
     patchDocumentInListDocumentsCache(old, documentId, patch),
@@ -703,15 +740,48 @@ export function removeCreatedDocumentNavigation(
   }
 }
 
+// A save that sends no body still answers with the page's current body
+// revision, hash and timestamp. If another writer moved the body since the
+// cache read it, those name a body the cache does not hold: beside the cached
+// body they make every later save's base invalid and stamp a draft with a body
+// it was not written on. The page's own reads keep their body and the fields
+// that go with it until a fresh read brings the new body.
+export function documentUpdateMovedBody(
+  data: Pick<DocumentUpdateResponse, "bodyRevision">,
+  variables: Pick<DocumentUpdateRequestWithCas, "content">,
+  cachedBodyRevisions: readonly (number | undefined)[],
+): boolean {
+  return (
+    variables.content === undefined &&
+    cachedBodyRevisions.some((revision) => revision !== data.bodyRevision)
+  );
+}
+
+function cachedDocumentBodyRevisions(
+  queryClient: Pick<QueryClient, "getQueriesData">,
+  documentId: string,
+): Array<number | undefined> {
+  return queryClient
+    .getQueriesData<Document>(documentQueryFilter(documentId))
+    .flatMap(([, cached]) =>
+      cached && typeof cached === "object" ? [cached.bodyRevision] : [],
+    );
+}
+
 export function documentUpdateSuccessPatch(
   data: DocumentUpdateResponse,
   variables: DocumentUpdateRequestWithCas,
+  bodyMovedElsewhere = false,
 ): PageOwnedDocumentCachePatch {
   return {
-    updatedAt: data.updatedAt,
-    revision: data.revision,
-    bodyRevision: data.bodyRevision,
-    contentHash: data.contentHash,
+    ...(bodyMovedElsewhere
+      ? {}
+      : {
+          updatedAt: data.updatedAt,
+          revision: data.revision,
+          bodyRevision: data.bodyRevision,
+          contentHash: data.contentHash,
+        }),
     ...(variables.title !== undefined ? { title: data.title } : {}),
     ...(variables.content !== undefined ? { content: data.content } : {}),
     ...(variables.description !== undefined
@@ -796,8 +866,13 @@ function documentReadParams(id: string, context: DocumentQueryContext) {
 export function useDocument(
   id: string | null,
   context: DocumentQueryContext = {},
-  options: { enabled?: boolean; refetchOnMount?: false } = {},
+  options: {
+    enabled?: boolean;
+    refetchOnMount?: false;
+    batchRefetches?: false;
+  } = {},
 ) {
+  trackDocumentReadFailures(useQueryClient());
   return useActionQuery<Document>(
     "get-document",
     id ? documentReadParams(id, context) : undefined,
@@ -812,7 +887,9 @@ export function useDocument(
 // The page editor's read of its document. When a read started for this page
 // open has already landed, it counts as fetched for this mount instead of
 // being discarded and read again. Only the first mount can adopt; a later
-// document switch reads fresh.
+// document switch reads fresh. A read whose session is still being read is
+// adopted too, but counts as fetched only once that is known to be the
+// session this tab accepts: until then it may be another account's page.
 export function usePageOpenDocument(
   documentId: string,
   context: DocumentQueryContext,
@@ -834,11 +911,24 @@ export function usePageOpenDocument(
   }
   const claim = claimRef.current;
   const { adoption } = claim;
+  // Re-renders when the session changes; a read sent as someone else is
+  // dropped (and read again) before this runs.
+  const readIdentityStatus = () =>
+    claim.read ? sessionReadIdentityStatus(claim.read.identity) : "none";
+  useSyncExternalStore(
+    subscribeSessionReadIdentity,
+    readIdentityStatus,
+    readIdentityStatus,
+  );
+  const awaitingSession = isAwaitingSession(claim.read);
   const cachedDocument = queryClient.getQueryData<Document>(queryKey);
   const query = useDocument(documentId, context, {
     enabled: !(
       cachedDocument && isDocumentCreationPending(queryClient, cachedDocument)
     ),
+    // The editor holds its skeleton until this read lands, even over a cached
+    // document, so the read never waits on other reads in a batch.
+    batchRefetches: false,
     ...(adoption === "fresh" ? { refetchOnMount: false } : {}),
   });
   // Runs after the query's own subscription, so from here on sync reaches
@@ -848,9 +938,20 @@ export function usePageOpenDocument(
       releasePageOpenRead(queryClient, claim.queryKey, claim.read);
     }
   }, [claim, queryClient]);
+  // Leaving the page ends its open: work still waiting on the session for it,
+  // such as its comment and suggestion reads, is not run.
+  useEffect(
+    () => () => endPageOpen(queryClient, documentId),
+    [documentId, queryClient],
+  );
+  // A read dropped as not this session's counts once it has been read again.
+  const readAgain = claim.read?.readAgain ?? "no";
   return {
     query,
-    fetchedForThisOpen: query.isFetchedAfterMount || adoption === "fresh",
+    fetchedForThisOpen:
+      !awaitingSession &&
+      (query.isFetchedAfterMount ||
+        (readAgain === "no" ? adoption === "fresh" : readAgain === "landed")),
     // The open's own reads, draft included, already started elsewhere.
     readsStartedEarly: adoption !== "none",
   };
@@ -860,28 +961,83 @@ export function startPageOpenDocumentReads(
   queryClient: QueryClient,
   documentId: string,
   context: DocumentQueryContext = {},
-  { beforeSession = false }: { beforeSession?: boolean } = {},
+  {
+    fromLoad = false,
+    databaseViewId = null,
+  }: {
+    // A load's own open, whose read the document head may already have sent.
+    fromLoad?: boolean;
+    // The collection view the opened address names, if any.
+    databaseViewId?: string | null;
+  } = {},
 ) {
+  trackDocumentReadFailures(queryClient);
   const queryKey = documentQueryKey(documentId, context);
   const cached = queryClient.getQueryData<Document>(queryKey);
   if (cached && isDocumentCreationPending(queryClient, cached)) return;
   const widgetBridgeActive = isEmbedMcpChatBridgeActive();
   const readsDraft =
     !widgetBridgeActive && previewDocumentDraftIsRead(queryClient, cached);
-  // One request answers the page and its draft, so the draft read cannot hold
-  // the page back on its own. Each read takes that answer once: a refetch
-  // through either key sends its own request rather than replaying this one.
-  let pageRead: Promise<PageOpenDocumentRead> | null = null;
-  const readPage = () =>
-    (pageRead ??= callAction<PageOpenDocumentRead>(
-      "get-document",
-      {
-        ...documentReadParams(documentId, context),
-        ...(readsDraft ? { includePreviewDraft: true } : {}),
-      },
-      { method: "GET" },
-    ));
+  // One request answers the page, its draft and, for a collection's page, the
+  // reads its table sends first, so none of them holds the page back on its
+  // own. Each read takes that answer once: a refetch through any of their keys
+  // sends its own request rather than replaying this one.
+  let pageRead: Promise<PageOpenReadAnswer> | null = null;
+  // A chat widget's ticket may call only the reads its connector lists, and
+  // get-page-open-read isn't one of them, so a widget reads the page alone.
+  const widgetHost = widgetBridgeActive || isOpenAiMcpAppHost();
+  // The page query's own signal, so a page read it drops is cancelled.
+  const sendPageRead = (signal?: AbortSignal): Promise<PageOpenReadAnswer> =>
+    widgetHost
+      ? callAction<PageOpenReadAnswer["document"]>(
+          "get-document",
+          {
+            ...documentReadParams(documentId, context),
+            ...(readsDraft ? { includePreviewDraft: true } : {}),
+          },
+          { method: "GET", ...(signal ? { signal } : {}) },
+        ).then((document) => ({ document }))
+      : callAction<PageOpenReadAnswer>(
+          "get-page-open-read",
+          {
+            ...documentReadParams(documentId, context),
+            ...(databaseViewId ? { databaseViewId } : {}),
+            ...(readsDraft ? { includePreviewDraft: true } : {}),
+          },
+          { method: "GET", ...(signal ? { signal } : {}) },
+        );
+  // The load's head script may already have sent this read; a failed or
+  // stalled one is sent again here, so its error comes from the app's own
+  // request. Its age counts from when the script sent it.
+  const startupRead = fromLoad
+    ? takeStartupPageRead(documentId, context)
+    : null;
+  const startedAt = startupRead?.startedAt;
+  // Who these reads go out as. Each is shown only once that is known to be
+  // the session this tab accepts, wherever it was started from.
+  const identity = startupRead?.identity ?? sessionReadIdentity();
+  const readPage = (signal?: AbortSignal) =>
+    (pageRead ??= startupRead
+      ? readFromStartupPageRead(startupRead, (ownSignal) =>
+          sendPageRead(signal ? abortedByEither(signal, ownSignal) : ownSignal),
+        )
+      : sendPageRead(signal));
   let documentTaken = false;
+  let owner: PageOpenReadOwner | undefined;
+  // An answer older than a change sync made to its key since the server read
+  // it lands, and is then read again by whatever watches the key. A fetch
+  // cancelled or replaced meanwhile lands nothing, so it marks nothing.
+  const landsChanged = (
+    key: QueryKey,
+    syncCursor: string | undefined,
+    fetchSignal: AbortSignal,
+  ): void => {
+    if (!owner || fetchSignal.aborted) return;
+    owner.answeredAt(syncCursor);
+    if (owner.invalidatedWhileOut(key)) {
+      invalidatePageOpenReadOnLanding(queryClient, key);
+    }
+  };
   const documentReadStarted = startPageOpenRead(
     queryClient,
     documentId,
@@ -896,13 +1052,31 @@ export function startPageOpenDocumentReads(
           );
         }
         documentTaken = true;
-        return readPage().then(
-          ({ previewDraft: _previewDraft, ...document }) => document,
+        const readOwner = pageOpenReadOwner(
+          queryClient,
+          queryKey,
+          signal,
+          identity,
+          startedAt,
         );
+        owner = readOwner;
+        return readPage(signal)
+          .then(({ document, collection, syncCursor }) => {
+            landsChanged(queryKey, syncCursor, signal);
+            if (collection) {
+              seedPageOpenCollection(queryClient, documentId, collection, {
+                owner: readOwner,
+                syncCursor,
+              });
+            }
+            const { previewDraft: _previewDraft, ...page } = document;
+            return page;
+          })
+          .finally(readOwner.finished);
       },
       retry: false,
     },
-    { beforeSession },
+    { identity, ...(startedAt === undefined ? {} : { startedAt }) },
   );
   if (widgetBridgeActive) return;
   if (readsDraft) {
@@ -922,19 +1096,32 @@ export function startPageOpenDocumentReads(
           // A server without the combined answer, or a page read that failed,
           // leaves the draft to its own request.
           return readPage().then(
-            (read) => read.previewDraft ?? draftRead.queryFn(context),
+            (read) => {
+              if (read.document.previewDraft === undefined) {
+                return draftRead.queryFn(context);
+              }
+              landsChanged(draftRead.queryKey, read.syncCursor, context.signal);
+              return read.document.previewDraft;
+            },
             () => draftRead.queryFn(context),
           );
         },
       },
-      { beforeSession },
+      { identity, ...(startedAt === undefined ? {} : { startedAt }) },
     );
   }
-  // The review reads are not tracked as this open's reads, so one sent before
-  // the session could not be dropped if another account answers it.
-  if (!beforeSession && cached?.source?.mode !== "local-files") {
-    startPageOpenReviewReads(queryClient, documentId);
-  }
+  // The review reads are not tracked as this open's reads, so one sent as
+  // someone else could not be dropped: they start once the session this tab
+  // accepts is the one the page read was sent as.
+  const startReviewReads = () => {
+    const known = queryClient.getQueryData<Document>(queryKey) ?? cached;
+    if (known?.source?.mode !== "local-files") {
+      startPageOpenReviewReads(queryClient, documentId);
+    }
+  };
+  whenReadIdentityCurrent(queryClient, identity, startReviewReads, {
+    documentId,
+  });
 }
 
 // Open comments and suggestions hold the review margin open beside the page,
@@ -971,7 +1158,12 @@ export function startPageOpenCompanionReads(
   if (isEmbedMcpChatBridgeActive()) return;
   startPreviewDocumentDraftRead(queryClient, documentId, knownDocument);
   if (knownDocument?.source?.mode !== "local-files") {
-    startPageOpenReviewReads(queryClient, documentId);
+    whenReadIdentityCurrent(
+      queryClient,
+      sessionReadIdentity(),
+      () => startPageOpenReviewReads(queryClient, documentId),
+      { documentId },
+    );
   }
 }
 
@@ -980,6 +1172,7 @@ export interface PreviewDocumentDraftRecord {
   title: string;
   content: string;
   baseDocumentUpdatedAt: string | null;
+  baseContentHash?: string | null;
   loadedContentWasEmpty: number;
   deferredReason: string | null;
   editorSessionId: string | null;
@@ -994,10 +1187,6 @@ export interface PreviewDocumentDraftResponse {
   draft: PreviewDocumentDraftRecord | null;
   editable: boolean;
 }
-
-type PageOpenDocumentRead = Document & {
-  previewDraft?: PreviewDocumentDraftResponse;
-};
 
 function previewDocumentDraftReadOptions(
   documentId: string,
@@ -1093,6 +1282,7 @@ export function useUpdatePreviewDocumentDraft() {
           title: string;
           content: string;
           baseDocumentUpdatedAt: string | null;
+          baseContentHash: string | null;
           loadedContentWasEmpty: boolean;
           deferredReason: "hydration" | "conflict" | null;
           editorSessionId?: string;
@@ -1538,14 +1728,23 @@ export function useUpdateDocument(options?: { saveOrigin?: "recovery" }) {
           return;
         }
 
+        const bodyMovedElsewhere = documentUpdateMovedBody(
+          data,
+          variables,
+          cachedDocumentBodyRevisions(queryClient, variables.id),
+        );
         patchDocumentCaches(
           queryClient,
           variables.id,
           documentUpdateSuccessPatch(data, variables),
+          documentUpdateSuccessPatch(data, variables, bodyMovedElsewhere),
         );
+        if (bodyMovedElsewhere)
+          void queryClient.invalidateQueries(documentQueryFilter(variables.id));
         if (variables.title !== undefined) {
           invalidateContentQueries(queryClient, [
             contentDatabaseConstrainedQueryFilter(),
+            contentDatabaseExcerptContainingDocumentFilter(variables.id),
             ...contentRowTargets(queryClient, [variables.id]),
             ["action", "search-documents"],
           ]);

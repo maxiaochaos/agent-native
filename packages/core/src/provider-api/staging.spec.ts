@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const _metaStore = new Map<string, Record<string, unknown>>();
 const _rowStore = new Map<string, Record<string, unknown>[]>();
 const _executedSql: string[] = [];
+const _int4Columns = new Map<string, string[]>();
 
 vi.mock("../db/client.js", () => ({
   isProductionServerlessFunctionRuntime: () => false,
@@ -12,6 +13,13 @@ vi.mock("../db/client.js", () => ({
       const args = typeof sql === "string" ? [] : (sql.args as unknown[]);
       _executedSql.push(rawSql);
 
+      if (/information_schema\.columns/i.test(rawSql)) {
+        const columns = _int4Columns.get(args[0] as string) ?? [];
+        return {
+          rows: columns.map((column_name) => ({ column_name })),
+          rowsAffected: 0,
+        };
+      }
       if (/CREATE TABLE/i.test(rawSql)) return { rows: [], rowsAffected: 0 };
       if (/CREATE INDEX/i.test(rawSql)) return { rows: [], rowsAffected: 0 };
 
@@ -43,7 +51,7 @@ vi.mock("../db/client.js", () => ({
       }
 
       if (
-        /SELECT id FROM staged_datasets WHERE id.*AND app_id.*AND owner_email/i.test(
+        /SELECT id(, removed_at, removed_reason)? FROM staged_datasets WHERE id.*AND app_id.*AND owner_email/i.test(
           rawSql,
         )
       ) {
@@ -205,7 +213,7 @@ const { stagingExecuteRequest } = await import("./staging.js");
 const {
   upsertStagedDataset,
   getStagedDatasetRows,
-  MAX_ROWS_PER_APP,
+  MAX_ROWS_PER_OWNER,
   _resetInitPromiseForTests,
 } = await import("./staged-datasets-store.js");
 const { createProviderApiRuntime } = await import("./index.js");
@@ -215,6 +223,7 @@ import type { ProviderApiRequestArgs } from "./index.js";
 
 beforeEach(() => {
   _executedSql.length = 0;
+  _int4Columns.clear();
 });
 
 function makeExecutor(_appId = "testapp") {
@@ -300,14 +309,14 @@ describe("staging caps", () => {
     _resetInitPromiseForTests();
   });
 
-  it("rejects a single dataset larger than MAX_ROWS_PER_APP and names that cause", async () => {
+  it("rejects a single dataset larger than MAX_ROWS_PER_OWNER and names that cause", async () => {
     await expect(
       upsertStagedDataset({
         id: "ds_huge",
         appId: "cappedapp",
         ownerEmail: "ada@example.com",
         name: "huge",
-        rows: Array.from({ length: MAX_ROWS_PER_APP + 1 }, (_, i) => ({
+        rows: Array.from({ length: MAX_ROWS_PER_OWNER + 1 }, (_, i) => ({
           id: i,
         })),
         columns: ["id"],
@@ -324,6 +333,8 @@ describe("staged dataset DDL", () => {
   });
 
   it("uses 64-bit integer columns and widens existing Postgres tables", async () => {
+    _int4Columns.set("staged_datasets", ["created_at"]);
+    _int4Columns.set("staged_dataset_rows", ["row_index"]);
     await upsertStagedDataset({
       id: "ds_postgres_ddl",
       appId: "analytics",
@@ -353,6 +364,11 @@ describe("staged dataset DDL", () => {
         ),
       ),
     ).toBe(true);
+    expect(
+      _executedSql.some((sql) =>
+        /ALTER TABLE staged_datasets ALTER COLUMN row_count/i.test(sql),
+      ),
+    ).toBe(false);
   });
 });
 
@@ -529,6 +545,27 @@ describe("stagingExecuteRequest — cursor pagination + 429", () => {
     ).rejects.toThrow(/cut at the response size limit/);
   });
 
+  it("reports truncation at the row cap when the request has no pagination", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          data: Array.from({ length: MAX_ROWS_PER_OWNER + 1 }, () => ({})),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+
+    const result = await stagingExecuteRequest(
+      { provider: "stripe", path: "/charges", stageAs: "stripe_charges" },
+      makeExecutor(),
+      { appId: "testapp", ownerEmail: "ada@example.com" },
+    );
+
+    expect(result.dataset.rowCount).toBe(MAX_ROWS_PER_OWNER);
+    expect(result.rows).toBe(MAX_ROWS_PER_OWNER);
+    expect(result.truncated).toBe(true);
+  });
+
   it("can send next cursors through a POST body path", async () => {
     const requestBodies: Array<Record<string, unknown>> = [];
     const fetchMock = vi
@@ -555,10 +592,10 @@ describe("stagingExecuteRequest — cursor pagination + 429", () => {
         provider: "gong",
         method: "POST",
         path: "/calls/extensive",
-        body: {
+        body: JSON.stringify({
           filter: { fromDateTime: "2026-01-01T00:00:00.000Z" },
           contentSelector: { exposedFields: { parties: true } },
-        },
+        }),
         stageAs: "gong_calls",
         itemsPath: "calls",
         pagination: {
@@ -579,6 +616,77 @@ describe("stagingExecuteRequest — cursor pagination + 429", () => {
       cursor: "cursor-2",
       filter: { fromDateTime: "2026-01-01T00:00:00.000Z" },
     });
+  });
+
+  it("treats an empty-string body as an empty body when a body cursor is added", async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ calls: [{ id: "call-1" }], cursor: "next" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ calls: [{ id: "call-2" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+
+    await stagingExecuteRequest(
+      {
+        provider: "gong",
+        method: "POST",
+        path: "/calls/extensive",
+        body: "",
+        stageAs: "gong_calls",
+        itemsPath: "calls",
+        pagination: {
+          nextCursorPath: "cursor",
+          cursorBodyPath: "cursor",
+          maxPages: 2,
+        },
+      },
+      makeExecutor(),
+      { appId: "testapp", ownerEmail: "ada@example.com" },
+    );
+
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({
+      cursor: "next",
+    });
+  });
+
+  it("rejects malformed JSON when a body cursor must be added", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ calls: [{ id: "call-1" }], cursor: "next" }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    await expect(
+      stagingExecuteRequest(
+        {
+          provider: "gong",
+          method: "POST",
+          path: "/calls/extensive",
+          body: "not-json",
+          stageAs: "gong_calls",
+          itemsPath: "calls",
+          pagination: {
+            nextCursorPath: "cursor",
+            cursorBodyPath: "cursor",
+            maxPages: 2,
+          },
+        },
+        makeExecutor(),
+        { appId: "testapp", ownerEmail: "ada@example.com" },
+      ),
+    ).rejects.toThrow(/requires a JSON object request body/);
   });
 
   it("handles 429 with Retry-After and retries successfully", async () => {

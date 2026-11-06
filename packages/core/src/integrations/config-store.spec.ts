@@ -2,9 +2,17 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const executeMock = vi.hoisted(() => vi.fn());
 
-vi.mock("../db/client.js", () => ({
-  getDbExec: () => ({ execute: executeMock }),
-}));
+vi.mock("../db/client.js", async () => {
+  const { storeLedgerResult } =
+    await import("../db/store-ledger.test-helpers.js");
+  const db = {
+    execute: async (q: string | { sql: string }) =>
+      storeLedgerResult(typeof q === "string" ? q : q.sql) ?? executeMock(q),
+  };
+  return {
+    getDbExec: () => db,
+  };
+});
 
 vi.mock("../db/ddl-guard.js", () => ({
   ensureTableExists: vi.fn(),
@@ -73,6 +81,36 @@ describe("integration config compare-and-swap", () => {
         sql: expect.stringContaining("updated_at = updated_at + 1"),
       }),
     );
+  });
+
+  it("deletes a row only while it matches the snapshot", async () => {
+    const { deleteIntegrationConfigIfUnchanged } =
+      await import("./config-store.js");
+    executeMock.mockResolvedValueOnce({ rows: [], rowsAffected: 0 });
+
+    const deleted = await deleteIntegrationConfigIfUnchanged(
+      "google-docs",
+      "comment-retry:doc-1",
+      {
+        platform: "google-docs",
+        configKey: "comment-retry:doc-1",
+        configData: { attempts: 1 },
+        owner: null,
+        updatedAt: 100,
+      },
+    );
+
+    expect(deleted).toBe(false);
+    // raw-sql-ok: this test asserts the static SQL text and its bound args.
+    expect(executeMock).toHaveBeenCalledWith({
+      sql: expect.stringContaining("AND config_data = ? AND updated_at = ?"),
+      args: [
+        "google-docs",
+        "comment-retry:doc-1",
+        JSON.stringify({ attempts: 1 }),
+        100,
+      ],
+    });
   });
 
   it("lists configs only for the requested platform with a bounded query", async () => {

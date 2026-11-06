@@ -3,6 +3,43 @@
 All notable user-facing changes to Assets are documented here. Open it any
 time from the command menu (Cmd+K → "What's new") or from Settings.
 
+## 2026-10-30
+
+### Fixed
+
+- Folder counts reflect the selected tab's asset type.
+- The move menu only shows folders an asset can move into.
+
+## 2026-10-29
+
+### Improved
+
+- Sharing is one panel: invite people and your organization's agents from one field, see everyone with access in one list, and find Copy link and Send to at the bottom.
+
+## 2026-10-22
+
+### Improved
+
+- Approval links from a connected agent, such as Claude Code, now open the review inside the app, in its own theme.
+
+## 2026-10-21
+
+### Added
+
+- You can pin a shared chat just for yourself, or hide it from your list and undo that from the toast.
+
+## 2026-10-19
+
+### Changed
+
+- Apps no longer keep server functions and databases warm by default; set `AGENT_NATIVE_ENABLE_KEEP_WARM=1` to opt in.
+
+## 2026-10-16
+
+### Added
+
+- Owned and shared chats appear in separate history sections, with each shared chat's owner shown as an avatar and a Copy link action on every chat.
+
 ## 2026-10-09
 
 ### Improved

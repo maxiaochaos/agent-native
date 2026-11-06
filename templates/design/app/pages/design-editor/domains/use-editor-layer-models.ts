@@ -43,7 +43,6 @@ import {
 } from "../derive/layer-model-coverage";
 import { NO_SELECTORS } from "../design-editor-shared";
 import { withMeasuredGeometry } from "../editor-helpers";
-import { getDesignEditorStateUrlSearch } from "../editor-state";
 import { layerStateIdsForScreen } from "../layer-state-scope";
 import {
   shouldPreferRuntimeLayerProjection,
@@ -55,9 +54,7 @@ import type { EditorActiveScreenAndGeometry } from "./use-editor-active-screen-a
 import type { EditorCanvasAndScreens } from "./use-editor-canvas-and-screens";
 import type { EditorContentAndComponents } from "./use-editor-content-and-components";
 import type { EditorCore } from "./use-editor-core";
-import type { EditorExportAndHandoff } from "./use-editor-export-and-handoff";
 import type { EditorFilesAndSaving } from "./use-editor-files-and-saving";
-import type { EditorGenerationAndAccess } from "./use-editor-generation-and-access";
 import type { EditorHistory } from "./use-editor-history";
 import type { EditorLiveEditsAndPresence } from "./use-editor-live-edits-and-presence";
 import type { EditorSelectionAndStyles } from "./use-editor-selection-and-styles";
@@ -77,40 +74,29 @@ type CodeLayerFileModel = {
 export function useEditorLayerModels({
   editorCore,
   editorHistory,
-  editorGenerationAndAccess,
   editorFilesAndSaving,
   editorActiveScreenAndGeometry,
   editorCanvasAndScreens,
   editorLiveEditsAndPresence,
   editorContentAndComponents,
   editorSelectionAndStyles,
-  editorExportAndHandoff,
 }: {
   editorCore: EditorCore;
   editorHistory: EditorHistory;
-  editorGenerationAndAccess: EditorGenerationAndAccess;
   editorFilesAndSaving: EditorFilesAndSaving;
   editorActiveScreenAndGeometry: EditorActiveScreenAndGeometry;
   editorCanvasAndScreens: EditorCanvasAndScreens;
   editorLiveEditsAndPresence: EditorLiveEditsAndPresence;
   editorContentAndComponents: EditorContentAndComponents;
   editorSelectionAndStyles: EditorSelectionAndStyles;
-  editorExportAndHandoff: EditorExportAndHandoff;
 }) {
+  const { t, initialSearchParams, viewMode, selectedElement, activeFileId } =
+    editorCore;
   const {
-    t,
-    location,
-    initialSearchParams,
-    mode,
-    activeTool,
-    viewMode,
-    selectedElement,
-    activeFileId,
-  } = editorCore;
-  const {
-    setActiveLeftPanel,
     expandedLayerIds,
     selectedLayerIdsState,
+    renderedElementInfoByLayerKeyRef,
+    renderedElementInfoVersion,
     codeLayerOwnerByNodeIdRef,
     overviewSelectedScreenIds,
     createdOverviewLayerSelection,
@@ -119,17 +105,15 @@ export function useEditorLayerModels({
     lockedLayerIds,
     hiddenLayerIds,
   } = editorHistory;
-  const { design } = editorGenerationAndAccess;
   const {
-    navigate,
     files,
+    overviewFiles,
     codeLayerSourceForScreen,
     runtimeLayerSnapshotsById,
     designSourceType,
     canvasFrameGeometryById,
     boardFileId,
     overviewScreens,
-    editorShareUrl,
   } = editorFilesAndSaving;
   const { activeFile } = editorActiveScreenAndGeometry;
   const {
@@ -138,7 +122,6 @@ export function useEditorLayerModels({
     getProjectionContentForScreen,
   } = editorCanvasAndScreens;
   const {
-    zoom,
     activeCodeLayerProjection,
     selectedElementLayerId,
     selectedCanvasSelectorCandidates,
@@ -153,12 +136,6 @@ export function useEditorLayerModels({
     nonActiveProjectionCacheRef,
     getCodeLayerProjectionForScreen,
   } = editorSelectionAndStyles;
-  const {
-    codingHandoffResult,
-    codingHandoffError,
-    codingHandoffLoading,
-    getCodingHandoffClipboardText,
-  } = editorExportAndHandoff;
 
   const initialRouteScreenTarget =
     initialSearchParams.get("screen") ??
@@ -169,19 +146,6 @@ export function useEditorLayerModels({
 
   const [shareExportFormat, setShareExportFormat] =
     useState<ShareExportFormat>("html");
-  const codingHandoffPreviewFallback = [
-    "Copy this prompt into your agent to import this design:",
-    editorShareUrl,
-    "",
-    `Implement: ${activeFile?.filename ?? design?.title ?? "current design"}`,
-  ].join("\n");
-  const codingHandoffPreviewText =
-    getCodingHandoffClipboardText(codingHandoffResult) ||
-    (codingHandoffError
-      ? `Unable to create agent prompt: ${codingHandoffError}`
-      : codingHandoffLoading
-        ? "Preparing agent prompt..."
-        : codingHandoffPreviewFallback);
   const activeCodeLayerTree = useMemo(
     () => cachedCodeLayerTree(activeCodeLayerProjection),
     [activeCodeLayerProjection],
@@ -215,8 +179,10 @@ export function useEditorLayerModels({
             hiddenLayerIds,
             routeSelectionFileId:
               initialRouteSelectionId && initialRouteScreenTarget
-                ? findDesignFileByScreenTarget(files, initialRouteScreenTarget)
-                    ?.id
+                ? findDesignFileByScreenTarget(
+                    overviewFiles,
+                    initialRouteScreenTarget,
+                  )?.id
                 : undefined,
             selectedLayerIds: [
               ...selectedLayerIdsState,
@@ -465,7 +431,7 @@ export function useEditorLayerModels({
   const resolvedInitialRouteSelectionId = useMemo(() => {
     if (!initialRouteSelectionId) return null;
     const targetFile = initialRouteScreenTarget
-      ? findDesignFileByScreenTarget(files, initialRouteScreenTarget)
+      ? findDesignFileByScreenTarget(overviewFiles, initialRouteScreenTarget)
       : null;
     if (initialRouteScreenTarget && !targetFile) return null;
     const directOwner = codeLayerOwnerByNodeId.get(initialRouteSelectionId);
@@ -687,14 +653,14 @@ export function useEditorLayerModels({
   );
   const canonicalVisualFiles = useMemo(() => {
     const visualFileById = new Map(
-      files
+      overviewFiles
         .filter((file) => visualScreenFileIds.has(file.id))
         .map((file) => [file.id, file] as const),
     );
     return canonicalOverviewScreenIds
       .map((screenId) => visualFileById.get(screenId))
       .filter((file): file is (typeof files)[number] => Boolean(file));
-  }, [canonicalOverviewScreenIds, files, visualScreenFileIds]);
+  }, [canonicalOverviewScreenIds, overviewFiles, visualScreenFileIds]);
   const layerPanelFiles = useMemo<LayersPanelFile[]>(
     () =>
       canonicalVisualFiles.map((file) => ({
@@ -726,7 +692,9 @@ export function useEditorLayerModels({
           lockable: true,
           hideable: true,
           renamable: true,
-          childrenPending: !model && screenBodyHasElements(file.content ?? ""),
+          childrenPending:
+            (file.sourceState !== undefined && file.sourceState !== "ready") ||
+            (!model && screenBodyHasElements(file.content)),
           layers: cachedCodeLayerTreeToPanelNodes(
             model?.tree ?? [],
             layerStateIdsForScreen(lockedLayerIds, file.id),
@@ -820,7 +788,7 @@ export function useEditorLayerModels({
           ? activeNodeById.has(layerId)
           : activeCodeLayerProjection.nodes.some((node) => node.id === layerId);
     const extraValidIds = new Set<string>();
-    const fileIds = new Set(files.map((file) => file.id));
+    const fileIds = new Set(overviewFiles.map((file) => file.id));
     const pendingOverviewScreenId = pendingOverviewScreenSelectionRef.current;
     const pendingOverviewLayerId = pendingOverviewLayerSelectionRef.current;
     if (pendingOverviewScreenId) {
@@ -865,7 +833,7 @@ export function useEditorLayerModels({
     codeLayerModelByFileId,
     codeLayerModelsByFile,
     createdOverviewLayerSelection,
-    files,
+    overviewFiles,
     overviewSelectedScreenIds,
     selectedElementLayerId,
     selectedLayerIdsState,
@@ -896,46 +864,6 @@ export function useEditorLayerModels({
     [codeLayerOwnerByNodeId, selectedElementLayerId, selectedLayerIds],
   );
 
-  const handleShaderEditCode = useCallback(
-    (_shaderId: string) => {
-      const targetFileId = activeFile?.id ?? activeFileId;
-      if (!targetFileId) return;
-      setActiveLeftPanel("code");
-      const nextSearch = getDesignEditorStateUrlSearch({
-        currentSearch: location.search,
-        viewMode,
-        screenId: activeFile?.id ?? activeFileId ?? undefined,
-        leftPanel: "code",
-        codeFileId: targetFileId,
-        selectionId: selectedUrlSelectionId,
-        zoom,
-        tool: activeTool,
-        mode,
-      });
-      if (nextSearch === location.search) return;
-      void navigate(
-        {
-          pathname: location.pathname,
-          search: nextSearch,
-          hash: location.hash,
-        },
-        { replace: true, preventScrollReset: true },
-      );
-    },
-    [
-      activeFile?.id,
-      activeFileId,
-      activeTool,
-      location.hash,
-      location.pathname,
-      location.search,
-      navigate,
-      selectedUrlSelectionId,
-      mode,
-      viewMode,
-      zoom,
-    ],
-  );
   const selectedLayerIdsRef = useRef<string[]>(selectedLayerIds);
 
   const selectedElementScreenId = useMemo(() => {
@@ -954,13 +882,35 @@ export function useEditorLayerModels({
         .map((layerId) => {
           const owner = codeLayerOwnerByNodeId.get(layerId);
           if (!owner) return null;
+          // A bridge selection made before its screen's layers loaded carries
+          // no layer identity, yet this layer was resolved from it.
+          const selectedInfo =
+            selectedElement &&
+            !selectedElement.sourceLayerIdentity &&
+            layerId === selectedElementLayerId &&
+            owner.fileId === activeFile?.id
+              ? {
+                  ...selectedElement,
+                  sourceLayerIdentity: {
+                    screenId: owner.fileId,
+                    nodeId: owner.node.id,
+                  },
+                }
+              : selectedElement;
+          const ownsSelectedElement =
+            selectedInfo?.sourceLayerIdentity?.screenId === owner.fileId &&
+            selectedInfo.sourceLayerIdentity.nodeId === owner.node.id;
           return {
             layerId,
             fileId: owner.fileId,
             node: owner.node,
             tree: owner.tree,
             elementInfo: elementInfoForOwnedCodeLayerNode({
-              info: selectedElement,
+              info: ownsSelectedElement
+                ? selectedInfo
+                : (renderedElementInfoByLayerKeyRef.current.get(
+                    `${owner.fileId}:${owner.node.id}`,
+                  ) ?? null),
               node: owner.node,
               ownerFileId: owner.fileId,
             }),
@@ -968,8 +918,12 @@ export function useEditorLayerModels({
         })
         .filter((target): target is SelectedLayerTarget => Boolean(target)),
     [
+      activeFile?.id,
       codeLayerOwnerByNodeId,
+      renderedElementInfoByLayerKeyRef,
+      renderedElementInfoVersion,
       selectedElement,
+      selectedElementLayerId,
       selectedElementScreenId,
       selectedLayerIds,
     ],
@@ -1049,7 +1003,6 @@ export function useEditorLayerModels({
     setLayersSearchQuery,
     shareExportFormat,
     setShareExportFormat,
-    codingHandoffPreviewText,
     activeCodeLayerTree,
     recentLayerModelFileIdsRef,
     setCoveredLayerModelFileIds,
@@ -1082,7 +1035,6 @@ export function useEditorLayerModels({
     canEditSelectedLiveLayer,
     canEditSingleSelectedLiveLayer,
     selectedUrlSelectionId,
-    handleShaderEditCode,
     selectedLayerIdsRef,
     selectedElementScreenId,
     selectedLayerTargets,

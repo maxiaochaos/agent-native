@@ -1,7 +1,11 @@
 import fs from "fs";
 import path from "path";
 
-import { defineAction, fail } from "@agent-native/core/action";
+import {
+  defineAction,
+  fail,
+  noteExternalWrite,
+} from "@agent-native/core/action";
 import {
   hydrateBuilderDesignSystemReference,
   parseBuilderDesignSystemProxyReference,
@@ -39,6 +43,10 @@ import {
   SLIDE_NUMBER_CSS,
   slideNumberInlineStyle,
 } from "../shared/slide-number.js";
+import {
+  projectRenderingDesignSystemData,
+  readDeckLinkedDesignSystem,
+} from "./_linked-design-system.js";
 
 function safeCssToken(
   value: unknown,
@@ -674,15 +682,20 @@ export default defineAction({
     let designSystem: DesignSystemData | undefined;
     let builderTokenValues: Record<string, string> | undefined;
     if (typeof designSystemId === "string" && designSystemId.trim()) {
-      const designSystemAccess = await resolveAccess(
-        "design-system",
+      const designSystemAccess = await readDeckLinkedDesignSystem(
+        row,
         designSystemId,
       );
-      const rawData = designSystemAccess?.resource?.data;
+      // Deck-only readers get the rendering projection and no Builder token
+      // hydration: the token map is emitted whole into the exported HTML.
+      const rawData = designSystemAccess?.viaDeck
+        ? projectRenderingDesignSystemData(designSystemAccess.resource.data)
+        : designSystemAccess?.resource?.data;
       if (typeof rawData === "string") {
         designSystem = parseStoredDesignSystem(rawData);
-        const builderReference =
-          parseBuilderDesignSystemProxyReference(rawData);
+        const builderReference = designSystemAccess?.viaDeck
+          ? null
+          : parseBuilderDesignSystemProxyReference(rawData);
         if (builderReference) {
           try {
             builderTokenValues = (
@@ -710,6 +723,7 @@ export default defineAction({
     let filePath: string | undefined;
     if (!isServerless()) {
       const exportDir = tenantExportDir(userEmail);
+      noteExternalWrite("local-disk");
       fs.mkdirSync(exportDir, { recursive: true });
       filePath = path.join(exportDir, filename);
       fs.writeFileSync(filePath, html);

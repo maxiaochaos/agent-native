@@ -1,25 +1,40 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { canonicalA2AAudience, signA2AToken } from "@agent-native/core/a2a";
-import { isActionContractError } from "@agent-native/core/action";
-import { describeErrorWithCauses } from "@agent-native/core/agent/engine/error-detail";
-import { getDbExec } from "@agent-native/core/db";
 import {
+  canonicalA2AAudience,
+  getGlobalA2ASecret,
+  signA2AToken,
+} from "@agent-native/core/a2a";
+import {
+  ActionContractError,
+  isActionContractError,
+  noteExternalWrite,
+} from "@agent-native/core/action";
+import { describeErrorWithCauses } from "@agent-native/core/agent/engine/error-detail";
+import { getAppConfig } from "@agent-native/core/app-config";
+import { getDbExec } from "@agent-native/core/db";
+import { and, eq, inArray } from "@agent-native/core/db/schema";
+import {
+  getOrgA2ASecret,
   getOrgDomain,
   isWorkspaceAppAccessAllowed,
+  workspaceApps,
 } from "@agent-native/core/org";
 import {
   CredentialStoreUnavailableError,
   FeatureNotConfiguredError,
   createBuilderProject,
   getBuilderBranchProjectId,
+  getBuilderWorkspaceUrl,
+  getConfiguredAppBasePath,
   getRequestContext,
   inferWorkspaceAppRootHomePath,
   isIntegrationCallerRequest,
   readConfiguredWorkspaceAppHomePath,
+  readOrgMemberRole,
   resolveAppRuntimeUrl,
   resolveVercelDeploymentProtectionHeaders,
   normalizeBuilderAgentAttachments,
@@ -38,11 +53,13 @@ import {
   assertValidWorkspaceAppId,
   connectRequiredResult,
   normalizeWorkspaceAppHomePath,
+  parseAgentProfileMetadata,
   type ConnectRequiredCard,
 } from "@agent-native/core/shared";
-import { resolveAccess } from "@agent-native/core/sharing";
+import { resolveAccessMany } from "@agent-native/core/sharing";
 
-import "../../db/index.js";
+import { getDb } from "../../db/index.js";
+import { workspaceAppRoute } from "../../shared/workspace-app-route.js";
 import { isWorkspaceSsoAppUrl } from "../../shared/workspace-sso.js";
 import { getDispatchDefaultOwnerEmail } from "./admin-config.js";
 import { identityKeyForIncoming } from "./dispatch-integrations.js";
@@ -56,6 +73,7 @@ import {
   projectEnvironmentUrl,
   requestEnvironmentLane,
 } from "./environment-lane.js";
+import { invalidateOrgAppsDirectoryCache } from "./org-apps-directory-cache.js";
 import { createRequest, listSecretOptions } from "./vault-store.js";
 import { WORKSPACE_APPS_ACTION_PATH } from "./workspace-app-action-auth.js";
 import {
@@ -68,6 +86,8 @@ const SETTINGS_KEY = "dispatch-app-creation-settings";
 const DEFAULT_BUILDER_WORKSPACE_PROJECT_NAME = "Agent-Native Workspace";
 const APP_CREATION_SETTINGS_AUTHORIZATION_MESSAGE =
   "Only organization owners and admins can update app creation settings.";
+const WORKSPACE_APP_METADATA_AUTHORIZATION_MESSAGE =
+  "Only organization owners and admins can update workspace app details.";
 const APP_CREATION_SETTINGS_REQUIRED_MESSAGE =
   "An organization owner or admin must configure the Builder workspace project before members can create apps.";
 const WORKSPACE_APP_METADATA_SETTINGS_KEY = "workspace-app-metadata";
@@ -76,7 +96,6 @@ const WORKSPACE_APPS_ENV_KEY = "AGENT_NATIVE_WORKSPACE_APPS_JSON";
 const WORKSPACE_APPS_MANIFEST_FILE = "workspace-apps.json";
 const WORKSPACE_APPS_GATEWAY_PATH = "/_workspace/apps";
 const WORKSPACE_APPS_GATEWAY_TIMEOUT_MS = 2_500;
-const WORKSPACE_APP_ACCESS_CONCURRENCY = 8;
 const MAX_PENDING_APPS = 50;
 const PENDING_WORKSPACE_APP_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const AGENT_CARD_PATH = "/.well-known/agent-card.json";
@@ -108,6 +127,26 @@ class AppCreationSettingsAuthorizationError extends Error {
   }
 }
 
+class WorkspaceAppMetadataAuthorizationError extends Error {
+  statusCode = 403;
+
+  constructor() {
+    super(WORKSPACE_APP_METADATA_AUTHORIZATION_MESSAGE);
+    this.name = "WorkspaceAppMetadataAuthorizationError";
+  }
+}
+
+class AppCreationOwnerRoleUnavailableError extends Error {
+  statusCode = 503;
+
+  constructor(cause: unknown) {
+    super("Could not verify the organization role. Try again shortly.", {
+      cause,
+    });
+    this.name = "AppCreationOwnerRoleUnavailableError";
+  }
+}
+
 class WorkspaceAppOrgRequiredError extends Error {
   statusCode = 400;
 
@@ -119,23 +158,30 @@ class WorkspaceAppOrgRequiredError extends Error {
   }
 }
 
+class WorkspaceGatewayConfigurationError extends Error {
+  constructor(cause?: unknown) {
+    super("WORKSPACE_GATEWAY_URL must be a valid absolute HTTP(S) URL.", {
+      cause,
+    });
+    this.name = "WorkspaceGatewayConfigurationError";
+  }
+}
+
 function requireWorkspaceAppOrgId(): string {
   const orgId = currentOrgId();
   if (!orgId) throw new WorkspaceAppOrgRequiredError();
   return orgId;
 }
 
-class WorkspaceAppsGatewayAuthorizationError extends Error {
+class WorkspaceAppsGatewayAuthorizationError extends ActionContractError {
   constructor(
-    statusCode: 401 | 403,
+    statusCode: 401 | 403 | 503,
+    errorCode = "workspace_gateway_rejected",
     message = `Workspace apps gateway rejected the request with HTTP ${statusCode}.`,
   ) {
-    super(message);
+    super(message, { statusCode, errorCode });
     this.name = "WorkspaceAppsGatewayAuthorizationError";
-    this.statusCode = statusCode;
   }
-
-  statusCode: 401 | 403;
 }
 
 function warnWorkspaceAppsGatewayDenial(
@@ -148,6 +194,51 @@ function warnWorkspaceAppsGatewayDenial(
   );
 }
 
+interface WorkspaceAppsGatewayAttempt {
+  startedAt: number;
+  gateway: string;
+  upstream?: { status: number; requestId?: string };
+}
+
+function noteWorkspaceAppsGatewayResponse(
+  attempt: WorkspaceAppsGatewayAttempt,
+  response: Response,
+): void {
+  const requestId = response.headers.get("x-agent-native-request-id");
+  attempt.upstream = {
+    status: response.status,
+    ...(requestId ? { requestId } : {}),
+  };
+}
+
+// The action route returns a typed contract error without capturing it, so a
+// refusal, a timeout and an outage would all read as one 503 with no trace.
+// `upstreamRequestId` is the id the workspace stamped on its own answer: it
+// opens that side's log for the same read.
+function logWorkspaceAppsGatewayFailure(
+  failure: ActionContractError,
+  attempt: WorkspaceAppsGatewayAttempt,
+  cause: unknown,
+): void {
+  const requestId = getRequestContext()?.requestId;
+  console.warn("[dispatch] workspace apps gateway read failed:", {
+    errorCode: failure.errorCode,
+    status: failure.statusCode,
+    ...(requestId ? { requestId } : {}),
+    gateway: attempt.gateway,
+    elapsedMs: Date.now() - attempt.startedAt,
+    ...(attempt.upstream
+      ? {
+          upstreamStatus: attempt.upstream.status,
+          ...(attempt.upstream.requestId
+            ? { upstreamRequestId: attempt.upstream.requestId }
+            : {}),
+        }
+      : {}),
+    ...(cause === undefined ? {} : { cause: describeErrorWithCauses(cause) }),
+  });
+}
+
 type WorkspaceAppAudience = "internal" | "public";
 type WorkspaceAppVisibility = "private" | "org";
 
@@ -155,6 +246,8 @@ export interface WorkspaceAppSummary {
   id: string;
   name: string;
   description: string;
+  whenToUse?: string[];
+  communitySourceId?: string;
   path: string;
   homePath?: string;
   url: string | null;
@@ -185,9 +278,9 @@ interface FinalizeWorkspaceAppsOptions {
   persist?: boolean;
 }
 
-interface WorkspaceAppDiscovery {
-  apps: WorkspaceAppSummary[];
-}
+type WorkspaceAppDiscovery =
+  | { kind: "apps"; apps: WorkspaceAppSummary[] }
+  | { kind: "domainless" };
 
 export interface ListWorkspaceAppsOptions {
   includeAgentCards?: boolean;
@@ -218,6 +311,11 @@ export interface WorkspaceInfo {
   displayName: string | null;
   rootPath: string | null;
   appCount: number;
+  /**
+   * Set when this workspace is linked to Builder: apps are created there, so
+   * Dispatch links to it instead of offering its own create-app flow.
+   */
+  builderWorkspaceUrl: string | null;
 }
 
 interface PendingWorkspaceApp {
@@ -232,6 +330,7 @@ interface PendingWorkspaceApp {
   contextLabel: string | null;
   audience?: WorkspaceAppAudience;
   visibility?: WorkspaceAppVisibility;
+  communitySourceId?: string;
   createdBy?: string | null;
   owner?: string | null;
   teams?: string[];
@@ -243,12 +342,14 @@ interface PendingWorkspaceApp {
 interface WorkspaceAppMetadataOverride {
   name?: string;
   description?: string;
+  whenToUse?: string[];
   generated?: boolean;
   sourcePrompt?: string;
   updatedAt?: string;
   updatedBy?: string;
   createdBy?: string;
   visibility?: WorkspaceAppVisibility;
+  communitySourceId?: string;
 }
 
 interface WorkspaceAppMetadataSettings {
@@ -256,17 +357,22 @@ interface WorkspaceAppMetadataSettings {
 }
 
 function readJson(file: string): any {
-  try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return null;
-  }
+  if (!fs.existsSync(file)) return null;
+  return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
 function findWorkspaceRoot(startDir = process.cwd()): string | null {
   let dir = path.resolve(startDir);
   for (let i = 0; i < 20; i++) {
-    const pkg = readJson(path.join(dir, "package.json"));
+    let pkg: any;
+    try {
+      pkg = readJson(path.join(dir, "package.json"));
+    } catch (error) {
+      console.warn(
+        `[dispatch] Could not read workspace package metadata in ${dir}; continuing parent search`,
+        error,
+      );
+    }
     if (typeof pkg?.["agent-native"]?.workspaceCore === "string") {
       return dir;
     }
@@ -378,7 +484,7 @@ function pendingWorkspaceAppContext(): { id: string; label: string } | null {
 }
 
 async function readSettingsRecord(): Promise<Record<string, any>> {
-  const raw = await getSetting(scopedSettingsKey()).catch(() => null);
+  const raw = await getSetting(scopedSettingsKey());
   return raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as Record<string, any>)
     : {};
@@ -386,6 +492,17 @@ async function readSettingsRecord(): Promise<Record<string, any>> {
 
 function cleanOptionalText(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function normalizeCommunitySourceId(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length > 100 ||
+    !/^community-[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(value)
+  ) {
+    return undefined;
+  }
+  return value.toLowerCase();
 }
 
 function parseWorkspaceAppMetadataSettings(
@@ -409,18 +526,29 @@ function parseWorkspaceAppMetadataSettings(
     const override: WorkspaceAppMetadataOverride = {};
     const name = cleanOptionalText(item.name);
     const description = cleanOptionalText(item.description);
+    const profile = parseAgentProfileMetadata({
+      whenToUse: item.whenToUse,
+    });
     const sourcePrompt = cleanOptionalText(item.sourcePrompt);
     const updatedAt = cleanOptionalText(item.updatedAt);
     const updatedBy = cleanOptionalText(item.updatedBy);
     const createdBy = cleanOptionalText(item.createdBy);
+    const communitySourceId = normalizeCommunitySourceId(
+      item.communitySourceId,
+    );
 
     if (name) override.name = name;
     if (description) override.description = description;
+    if (profile?.whenToUse) override.whenToUse = profile.whenToUse;
+    else if (Array.isArray(item.whenToUse) && item.whenToUse.length === 0) {
+      override.whenToUse = [];
+    }
     if (item.generated === true) override.generated = true;
     if (sourcePrompt) override.sourcePrompt = sourcePrompt;
     if (updatedAt) override.updatedAt = updatedAt;
     if (updatedBy) override.updatedBy = updatedBy;
     if (createdBy) override.createdBy = createdBy;
+    if (communitySourceId) override.communitySourceId = communitySourceId;
     if (item.visibility === "private" || item.visibility === "org") {
       override.visibility = item.visibility;
     }
@@ -432,9 +560,7 @@ function parseWorkspaceAppMetadataSettings(
 }
 
 async function readWorkspaceAppMetadataSettings(): Promise<WorkspaceAppMetadataSettings> {
-  const raw = await getSetting(workspaceAppMetadataSettingsKey()).catch(
-    () => null,
-  );
+  const raw = await getSetting(workspaceAppMetadataSettingsKey());
   return parseWorkspaceAppMetadataSettings(raw);
 }
 
@@ -442,37 +568,73 @@ async function writeWorkspaceAppMetadataOverride(input: {
   appId: string;
   name?: string | null;
   description?: string | null;
+  whenToUse?: string[] | null;
   generated?: boolean;
   sourcePrompt?: string | null;
   updatedBy?: string | null;
   createdBy?: string | null;
   visibility?: WorkspaceAppVisibility | null;
+  communitySourceId?: string | null;
 }): Promise<WorkspaceAppMetadataSettings> {
   const key = workspaceAppMetadataSettingsKey();
-  const current = parseWorkspaceAppMetadataSettings(
-    await getSetting(key).catch(() => null),
-  );
+  const current = parseWorkspaceAppMetadataSettings(await getSetting(key));
   const appId = input.appId.trim();
   const existing = current.apps[appId] ?? {};
   const next: WorkspaceAppMetadataOverride = {
     ...existing,
     updatedAt: new Date().toISOString(),
   };
+  const hasName = Object.hasOwn(input, "name") && input.name !== undefined;
+  const hasDescription =
+    Object.hasOwn(input, "description") && input.description !== undefined;
+  const hasWhenToUse =
+    Object.hasOwn(input, "whenToUse") && input.whenToUse !== undefined;
   const name = cleanOptionalText(input.name);
   const description = cleanOptionalText(input.description);
+  const whenToUse = input.whenToUse;
   const sourcePrompt = cleanOptionalText(input.sourcePrompt);
   const updatedBy = cleanOptionalText(input.updatedBy);
   const createdBy = cleanOptionalText(input.createdBy);
+  const communitySourceId = normalizeCommunitySourceId(input.communitySourceId);
 
-  if (name) next.name = name;
-  else delete next.name;
-  if (description) next.description = description;
-  else delete next.description;
+  if (hasName) {
+    if (name) next.name = name;
+    else delete next.name;
+  }
+  if (hasDescription) {
+    if (description) next.description = description;
+    else delete next.description;
+  }
+  if (hasWhenToUse) {
+    const examples = whenToUse ?? [];
+    const profile = parseAgentProfileMetadata({
+      description: description ?? next.description,
+      whenToUse: examples,
+    });
+    if (!profile) {
+      throw new Error(
+        "Workspace app when-to-use entries must contain up to 6 non-empty examples of 140 characters or fewer.",
+      );
+    }
+    next.whenToUse = profile.whenToUse ?? [];
+  }
+  if (description && description.length > 1000) {
+    throw new Error(
+      "Workspace app descriptions must be 1,000 characters or fewer.",
+    );
+  }
   if (input.generated === true) next.generated = true;
   else if (input.generated === false) delete next.generated;
   if (sourcePrompt) next.sourcePrompt = sourcePrompt;
   if (updatedBy) next.updatedBy = updatedBy;
   if (createdBy) next.createdBy = createdBy;
+  if (input.communitySourceId !== undefined) {
+    if (input.communitySourceId === null || !communitySourceId) {
+      delete next.communitySourceId;
+    } else {
+      next.communitySourceId = communitySourceId;
+    }
+  }
   if (input.visibility) next.visibility = input.visibility;
 
   current.apps[appId] = next;
@@ -489,18 +651,30 @@ function applyWorkspaceAppMetadataOverride(
 
   const name = cleanOptionalText(override.name);
   const description = cleanOptionalText(override.description);
+  const whenToUse = override.whenToUse;
   const generated = override.generated === true;
   const shouldApplyName = !!name && !generated;
   const shouldApplyDescription =
     !!description && (!generated || !cleanOptionalText(app.description));
   const visibility = override.visibility;
-  if (!shouldApplyName && !shouldApplyDescription && !visibility) return app;
+  const communitySourceId = override.communitySourceId;
+  if (
+    !shouldApplyName &&
+    !shouldApplyDescription &&
+    whenToUse === undefined &&
+    !visibility &&
+    !communitySourceId
+  ) {
+    return app;
+  }
 
   return {
     ...app,
     ...(shouldApplyName ? { name } : {}),
     ...(shouldApplyDescription ? { description } : {}),
+    ...(whenToUse !== undefined ? { whenToUse } : {}),
     ...(visibility ? { visibility } : {}),
+    ...(communitySourceId ? { communitySourceId } : {}),
     ...(app.status === "pending" &&
     !app.createdBy &&
     (override.createdBy || override.updatedBy)
@@ -520,16 +694,85 @@ function applyWorkspaceAppMetadataOverride(
 // code belongs here; changes to authorship, content trust, or sharing require
 // an explicit auth, origin, or sandbox boundary before this invariant changes.
 function workspaceAppUrl(appPath: string): string | null {
+  const gateway = workspaceGatewayBaseUrl();
+  if (gateway) return appendWorkspaceAppPath(gateway, appPath);
+
   const base = resolveAppRuntimeUrl();
   if (!base) return null;
   try {
-    return new URL(
-      appPath,
-      `${projectEnvironmentUrl(base).replace(/\/$/, "")}/`,
-    ).toString();
+    const baseUrl = new URL(
+      addBasePath(projectEnvironmentUrl(base), getConfiguredAppBasePath()),
+    );
+    return appendWorkspaceAppPath(baseUrl, appPath);
   } catch {
     return null;
   }
+}
+
+function appendWorkspaceAppPath(baseUrl: URL, appPath: string): string {
+  const parsedPath = new URL(appPath, "http://agent-native.invalid");
+  const basePath = baseUrl.pathname.replace(/\/+$/, "");
+  let appPathname = parsedPath.pathname;
+  if (
+    basePath &&
+    (appPathname === basePath || appPathname.startsWith(`${basePath}/`))
+  ) {
+    appPathname = appPathname.slice(basePath.length) || "/";
+  }
+  baseUrl.pathname =
+    `${basePath}${appPathname.startsWith("/") ? appPathname : `/${appPathname}`}` ||
+    "/";
+  baseUrl.search = parsedPath.search;
+  baseUrl.hash = parsedPath.hash;
+  return baseUrl.toString().replace(/\/$/, "");
+}
+
+function workspaceGatewayBaseUrl(): URL | null {
+  const configured = getAppConfig().workspace.gatewayUrl?.trim();
+  if (!configured) return null;
+  let configuredUrl: URL;
+  try {
+    configuredUrl = new URL(configured);
+  } catch (error) {
+    throw new WorkspaceGatewayConfigurationError(error);
+  }
+  if (
+    configuredUrl.protocol !== "http:" &&
+    configuredUrl.protocol !== "https:"
+  ) {
+    throw new WorkspaceGatewayConfigurationError();
+  }
+  let url: URL;
+  try {
+    url = new URL(projectEnvironmentUrl(configuredUrl.toString()));
+  } catch (error) {
+    throw new WorkspaceGatewayConfigurationError(error);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new WorkspaceGatewayConfigurationError();
+  }
+  return new URL(addBasePath(url.toString(), getConfiguredAppBasePath()));
+}
+
+function workspaceGatewayAppUrl(appPath: string): string | null {
+  const baseUrl = workspaceGatewayBaseUrl();
+  if (!baseUrl) return null;
+  const requestOrigin = getRequestContext()?.requestOrigin;
+  if (requestOrigin && new URL(requestOrigin).origin === baseUrl.origin) {
+    return null;
+  }
+  return appendWorkspaceAppPath(baseUrl, appPath);
+}
+
+function addBasePath(urlValue: string, basePath: string): string {
+  if (!basePath) return urlValue;
+  const url = new URL(urlValue);
+  const pathname = url.pathname.replace(/\/+$/, "") || "/";
+  if (pathname === basePath || pathname.startsWith(`${basePath}/`)) {
+    return url.toString();
+  }
+  url.pathname = `${basePath}${pathname === "/" ? "" : pathname}` || "/";
+  return url.toString();
 }
 
 function isLocalWorkspaceGateway(url: URL): boolean {
@@ -542,18 +785,50 @@ function isLocalWorkspaceGateway(url: URL): boolean {
   );
 }
 
-function workspaceAppLink(
-  appPath: string,
-  explicitUrl?: unknown,
-): string | null {
+function workspaceAppPagePath(appId: string, urlValue?: string): string {
+  const route = workspaceAppRoute(appId);
+  if (!urlValue) return route;
+  const parsed = new URL(urlValue, "https://agent-native.invalid");
+  return `${route}${parsed.search}${parsed.hash}`;
+}
+
+function workspaceAppLink(appId: string, explicitUrl?: unknown): string {
   const urlValue = typeof explicitUrl === "string" ? explicitUrl.trim() : "";
-  if (!urlValue) return workspaceAppUrl(appPath);
-  if (urlValue.startsWith("/")) return workspaceAppUrl(urlValue) ?? urlValue;
-  try {
-    return projectEnvironmentUrl(new URL(urlValue).toString());
-  } catch {
-    return urlValue;
+  const routePath = workspaceAppPagePath(appId, urlValue || undefined);
+  if (!urlValue) {
+    return (
+      workspaceGatewayAppUrl(routePath) ??
+      workspaceAppUrl(routePath) ??
+      routePath
+    );
   }
+  if (urlValue.startsWith("/")) {
+    return (
+      workspaceGatewayAppUrl(routePath) ??
+      workspaceAppUrl(routePath) ??
+      routePath
+    );
+  }
+  const resolved = projectEnvironmentUrl(new URL(urlValue).toString());
+  const gateway = workspaceGatewayBaseUrl();
+  if (gateway && new URL(resolved).origin === gateway.origin) {
+    return (
+      workspaceGatewayAppUrl(routePath) ??
+      workspaceAppUrl(routePath) ??
+      routePath
+    );
+  }
+  const runtimeBase = resolveAppRuntimeUrl();
+  if (runtimeBase && new URL(resolved).origin === new URL(runtimeBase).origin) {
+    const runtimeUrl = new URL(
+      addBasePath(
+        projectEnvironmentUrl(runtimeBase),
+        getConfiguredAppBasePath(),
+      ),
+    );
+    return appendWorkspaceAppPath(runtimeUrl, routePath);
+  }
+  return resolved;
 }
 
 function normalizeWorkspaceAppAudience(value: unknown): WorkspaceAppAudience {
@@ -601,8 +876,17 @@ function normalizeWorkspaceAppTeams(value: unknown): string[] {
 
 function workspaceAppMetadataFromRecord(
   record: Record<string, any>,
-): Pick<WorkspaceAppSummary, "createdAt" | "createdBy" | "owner" | "teams"> {
+): Pick<
+  WorkspaceAppSummary,
+  "createdAt" | "createdBy" | "owner" | "teams" | "whenToUse"
+> {
   const config = record["agent-native"] ?? record.agentNative;
+  const profile = parseAgentProfileMetadata({
+    whenToUse:
+      config && typeof config === "object" && !Array.isArray(config)
+        ? config.whenToUse
+        : undefined,
+  });
   const workspaceConfig =
     config && typeof config === "object" && !Array.isArray(config)
       ? (config.workspaceApp ?? config.workspace ?? config)
@@ -650,6 +934,7 @@ function workspaceAppMetadataFromRecord(
       workspaceConfig.ownerEmail,
     ),
     teams,
+    ...(profile?.whenToUse ? { whenToUse: profile.whenToUse } : {}),
   };
 }
 
@@ -704,7 +989,10 @@ function workspaceAppRouteAccessFromPackageJson(pkg: unknown): {
   };
 }
 
-function parseWorkspaceAppsManifest(parsed: any): WorkspaceAppSummary[] | null {
+function parseWorkspaceAppsManifest(
+  parsed: any,
+  onInvalidAppUrl?: () => void,
+): WorkspaceAppSummary[] | null {
   const rawApps = Array.isArray(parsed?.apps)
     ? parsed.apps
     : Array.isArray(parsed)
@@ -718,7 +1006,23 @@ function parseWorkspaceAppsManifest(parsed: any): WorkspaceAppSummary[] | null {
       const id = typeof entry.id === "string" ? entry.id.trim() : "";
       const pathValue = typeof entry.path === "string" ? entry.path.trim() : "";
       if (!id || !pathValue.startsWith("/")) return null;
+      const profile = parseAgentProfileMetadata({
+        whenToUse: entry.whenToUse,
+      });
+      if (!profile) return null;
       const metadata = workspaceAppMetadataFromRecord(entry);
+      let url: string | null;
+      try {
+        url = workspaceAppLink(id, entry.url);
+      } catch (error) {
+        if (error instanceof WorkspaceGatewayConfigurationError) throw error;
+        onInvalidAppUrl?.();
+        console.warn(
+          `[dispatch] Could not resolve Workspace app ${id}; skipping app`,
+          error,
+        );
+        return null;
+      }
       return {
         id,
         name:
@@ -727,9 +1031,10 @@ function parseWorkspaceAppsManifest(parsed: any): WorkspaceAppSummary[] | null {
             : titleCase(id),
         description:
           typeof entry.description === "string" ? entry.description : "",
+        ...(profile.whenToUse ? { whenToUse: profile.whenToUse } : {}),
         path: pathValue,
         homePath: normalizeWorkspaceAppHomePath(entry.homePath),
-        url: workspaceAppLink(pathValue, entry.url),
+        url,
         isDispatch:
           typeof entry.isDispatch === "boolean"
             ? entry.isDispatch
@@ -754,6 +1059,24 @@ function parseWorkspaceAppsManifest(parsed: any): WorkspaceAppSummary[] | null {
     .sort(sortWorkspaceApps);
 
   return apps.length ? apps : null;
+}
+
+function parseWorkspaceAppsGatewayResponse(
+  parsed: unknown,
+): WorkspaceAppSummary[] | null {
+  const rawApps =
+    parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as { apps?: unknown }).apps
+      : parsed;
+  if (!Array.isArray(rawApps)) return null;
+  if (rawApps.length === 0) return [];
+  let invalidUrlCount = 0;
+  const apps = parseWorkspaceAppsManifest(parsed, () => {
+    invalidUrlCount += 1;
+  });
+  if (!apps || apps.length + invalidUrlCount !== rawApps.length) return null;
+  const ids = new Set(apps.map((app) => app.id.toLowerCase()));
+  return ids.size === apps.length ? apps : null;
 }
 
 function parseDateMs(value: string | null | undefined): number | null {
@@ -849,6 +1172,9 @@ function parsePendingWorkspaceApps(value: unknown): PendingWorkspaceApp[] {
       if (!id || !pathValue.startsWith("/")) return null;
       const now = new Date().toISOString();
       const createdAt = cleanOptionalString(record.createdAt) ?? now;
+      const communitySourceId = normalizeCommunitySourceId(
+        record.communitySourceId,
+      );
       return {
         id,
         name:
@@ -883,6 +1209,7 @@ function parsePendingWorkspaceApps(value: unknown): PendingWorkspaceApp[] {
         ...(record.visibility === "private" || record.visibility === "org"
           ? { visibility: record.visibility }
           : {}),
+        ...(communitySourceId ? { communitySourceId } : {}),
         createdAt,
         updatedAt:
           typeof record.updatedAt === "string" && record.updatedAt.trim()
@@ -986,11 +1313,13 @@ async function reservePendingWorkspaceApp(input: {
   description: string;
   projectId: string | null;
   visibility: WorkspaceAppVisibility;
+  communitySourceId?: string;
 }): Promise<void> {
   await assertWorkspaceAppIdRegisteredFree(input.appId);
   const now = new Date().toISOString();
   const context = pendingWorkspaceAppContext();
   const creatorEmail = currentOwnerEmail();
+  const communitySourceId = normalizeCommunitySourceId(input.communitySourceId);
 
   await mutateSetting(scopedSettingsKey(), async (current) => {
     const raw =
@@ -1026,6 +1355,7 @@ async function reservePendingWorkspaceApp(input: {
       contextId: context?.id ?? null,
       contextLabel: context?.label ?? null,
       visibility: input.visibility,
+      ...(communitySourceId ? { communitySourceId } : {}),
       createdBy: creatorEmail,
       owner: creatorEmail,
       createdAt: now,
@@ -1082,6 +1412,7 @@ export async function archiveWorkspaceApp(input: {
   const current = parseArchivedAppIds(raw.archivedAppIds);
   if (!current.includes(appId)) current.push(appId);
   await putSetting(scopedSettingsKey(), { ...raw, archivedAppIds: current });
+  invalidateOrgAppsDirectoryCache();
   await recordAudit({
     action: "workspace-app.archived",
     targetType: "workspace-app",
@@ -1101,6 +1432,7 @@ export async function unarchiveWorkspaceApp(input: {
     (id) => id !== appId,
   );
   await putSetting(scopedSettingsKey(), { ...raw, archivedAppIds: current });
+  invalidateOrgAppsDirectoryCache();
   await recordAudit({
     action: "workspace-app.unarchived",
     targetType: "workspace-app",
@@ -1147,6 +1479,7 @@ function pendingAppToSummary(app: PendingWorkspaceApp): WorkspaceAppSummary {
     status: "pending",
     statusLabel: "Pending Builder branch",
     visibility: app.visibility,
+    communitySourceId: app.communitySourceId,
     builderUrl: app.builderUrl,
     branchName: app.branchName,
     createdAt: app.createdAt,
@@ -1556,37 +1889,53 @@ async function filterWorkspaceAppsByAccess(
     candidates.push(app);
   }
 
-  for (
-    let start = 0;
-    start < candidates.length;
-    start += WORKSPACE_APP_ACCESS_CONCURRENCY
-  ) {
-    const batch = candidates.slice(
-      start,
-      start + WORKSPACE_APP_ACCESS_CONCURRENCY,
-    );
-    const decisions = await Promise.all(
-      batch.map(async (app) => {
-        try {
-          const access = await resolveAccess(
-            "workspace-app",
-            app.id,
-            { userEmail, orgId },
-            { skipResourceBody: true },
-          );
-          return { app, allowed: Boolean(access) };
-        } catch (error) {
-          console.warn("[dispatch] workspace app access lookup failed", error);
-          return { app, allowed: false };
-        }
-      }),
-    );
-    for (const decision of decisions) {
-      if (decision.allowed) visibleIds.add(decision.app.id);
+  if (candidates.length > 0) {
+    try {
+      const access = await resolveAccessMany(
+        "workspace-app",
+        candidates.map((app) => app.id),
+        { userEmail, ...(orgId ? { orgId } : {}) },
+        { skipResourceBody: true },
+      );
+      for (const id of access.keys()) visibleIds.add(id);
+    } catch (error) {
+      console.warn("[dispatch] workspace app access lookup failed", error);
     }
   }
 
   return apps.filter((app) => visibleIds.has(app.id));
+}
+
+async function filterOrganizationVisibleWorkspaceApps(
+  apps: WorkspaceAppSummary[],
+  orgId: string,
+): Promise<WorkspaceAppSummary[]> {
+  const readyApps = apps.filter(
+    (app) => app.status === "ready" && !app.archived,
+  );
+  const visibleIds = new Set<string>();
+  const db = getDb();
+
+  for (let start = 0; start < readyApps.length; start += 500) {
+    const batch = readyApps.slice(start, start + 500);
+    const rows = await db
+      .select({ id: workspaceApps.id })
+      .from(workspaceApps)
+      .where(
+        and(
+          eq(workspaceApps.orgId, orgId),
+          eq(workspaceApps.visibility, "org"),
+          eq(workspaceApps.orgEnabled, true),
+          inArray(
+            workspaceApps.id,
+            batch.map((app) => app.id),
+          ),
+        ),
+      );
+    for (const row of rows) visibleIds.add(row.id);
+  }
+
+  return readyApps.filter((app) => visibleIds.has(app.id));
 }
 
 async function recordPendingWorkspaceApp(input: {
@@ -1595,6 +1944,7 @@ async function recordPendingWorkspaceApp(input: {
   description: string;
   sourcePrompt: string;
   visibility: WorkspaceAppVisibility;
+  communitySourceId?: string;
   branchName?: string | null;
   builderUrl?: string | null;
 }) {
@@ -1611,6 +1961,9 @@ async function recordPendingWorkspaceApp(input: {
     .find(samePendingEntry);
   const creatorEmail = currentOwnerEmail();
   const existingOwnerEmail = existing?.createdBy ?? existing?.owner;
+  const communitySourceId =
+    normalizeCommunitySourceId(input.communitySourceId) ??
+    normalizeCommunitySourceId(existing?.communitySourceId);
   if (
     existingOwnerEmail &&
     existingOwnerEmail.trim().toLowerCase() !== creatorEmail.toLowerCase()
@@ -1632,6 +1985,7 @@ async function recordPendingWorkspaceApp(input: {
     contextId: context?.id ?? null,
     contextLabel: context?.label ?? null,
     visibility: input.visibility,
+    ...(communitySourceId ? { communitySourceId } : {}),
     createdBy: existing?.createdBy ?? existing?.owner ?? creatorEmail,
     owner: existing?.owner ?? existing?.createdBy ?? creatorEmail,
     createdAt: existing?.createdAt || now,
@@ -1649,12 +2003,14 @@ async function recordPendingWorkspaceApp(input: {
 
   await writeWorkspaceAppMetadataOverride({
     appId: input.appId,
+    name: null,
     description: input.description,
     generated: true,
     sourcePrompt: input.sourcePrompt,
     updatedBy: creatorEmail,
     createdBy: next.createdBy,
     visibility: input.visibility,
+    communitySourceId,
   });
 
   await recordAudit({
@@ -1675,58 +2031,111 @@ function readWorkspaceAppsFromEnv(): WorkspaceAppSummary[] | null {
   const raw = process.env[WORKSPACE_APPS_ENV_KEY];
   if (!raw) return null;
   try {
-    return parseWorkspaceAppsManifest(JSON.parse(raw));
-  } catch {
-    return null;
+    const apps = parseWorkspaceAppsManifest(JSON.parse(raw));
+    if (apps) return apps;
+    console.warn(
+      `[dispatch] Could not parse Workspace app manifest from ${WORKSPACE_APPS_ENV_KEY}; skipping source`,
+    );
+  } catch (error) {
+    if (error instanceof WorkspaceGatewayConfigurationError) throw error;
+    console.warn(
+      `[dispatch] Could not read Workspace app manifest from ${WORKSPACE_APPS_ENV_KEY}; skipping source`,
+    );
   }
+  return null;
 }
 
 async function readWorkspaceAppsFromGateway(): Promise<WorkspaceAppDiscovery | null> {
-  const configuredBase = process.env.WORKSPACE_GATEWAY_URL;
+  const configuredBase = getAppConfig().workspace.gatewayUrl?.trim();
   if (!configuredBase) return null;
-  const base = projectEnvironmentUrl(configuredBase);
-
-  let baseUrl: URL;
-  try {
-    baseUrl = new URL(base);
-  } catch {
-    // coercion-ok: malformed gateway configuration is an unavailable registry
-    // and falls back to local sources.
-    return null;
-  }
-  if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
-    return null;
-  }
+  const baseUrl = workspaceGatewayBaseUrl();
+  if (!baseUrl) return null;
 
   const requestContext = getRequestContext();
+  const isLocalGateway = isLocalWorkspaceGateway(baseUrl);
+  const requestOrigin = requestContext?.requestOrigin;
+  const isSameOriginGateway = requestOrigin
+    ? (() => {
+        try {
+          return new URL(requestOrigin).origin === baseUrl.origin;
+        } catch {
+          // coercion-ok: an invalid request origin cannot prove a self-fetch.
+          return false;
+        }
+      })()
+    : false;
+  if (isSameOriginGateway && !isLocalGateway) return null;
+
   const authHeaders: Record<string, string> = {};
   if (requestContext?.userEmail) {
-    const orgDomain = requestContext.orgId
-      ? (await getOrgDomain(requestContext.orgId))?.trim().toLowerCase()
-      : undefined;
-    if (requestContext.orgId && !orgDomain) {
+    let orgDomain: string | undefined;
+    let orgSecret: string | undefined;
+    if (requestContext.orgId) {
+      try {
+        orgDomain =
+          (await getOrgDomain(requestContext.orgId))?.trim().toLowerCase() ||
+          undefined;
+      } catch {
+        throw new WorkspaceAppsGatewayAuthorizationError(
+          503,
+          "workspace_gateway_org_domain_unavailable",
+          "Workspace apps gateway organization domain could not be read.",
+        );
+      }
+    }
+    // The hosted registry is keyed by organization domain, so an org that has
+    // none (a new Builder-connected account) has no hosted workspace to read.
+    // A failed domain lookup still throws above.
+    if (requestContext.orgId && !orgDomain) return { kind: "domainless" };
+    if (requestContext.orgId) {
+      try {
+        orgSecret =
+          (await getOrgA2ASecret(requestContext.orgId))?.trim() || undefined;
+      } catch {
+        throw new WorkspaceAppsGatewayAuthorizationError(
+          503,
+          "workspace_gateway_org_a2a_secret_unavailable",
+          "Workspace apps gateway organization A2A secret could not be read.",
+        );
+      }
+    }
+    // The receiver drops the user from any user token that verifies only with an
+    // organization secret, so a member's own request is signed with the
+    // deployment secret to stay named.
+    const delegatedMember =
+      requestContext.a2aIdentityAssurance === "org-member";
+    const signingSecret = delegatedMember ? orgSecret : getGlobalA2ASecret();
+    const allowLocalUnauthenticatedRequest = isLocalGateway && !signingSecret;
+    if (!signingSecret && !allowLocalUnauthenticatedRequest) {
       throw new WorkspaceAppsGatewayAuthorizationError(
-        401,
-        "Workspace apps gateway cannot authenticate without a resolved organization domain.",
+        503,
+        "workspace_gateway_a2a_secret_missing",
+        "Workspace apps gateway cannot authenticate because no A2A secret is configured.",
       );
     }
-    try {
-      const token = await signA2AToken(
-        requestContext.userEmail,
-        orgDomain,
-        undefined,
-        {
-          expiresIn: "1m",
-          preferGlobalSecret: true,
-          audience: canonicalA2AAudience(baseUrl.toString()),
-        },
-      );
-      authHeaders.Authorization = `Bearer ${token}`;
-    } catch {
-      // coercion-ok: absent signing credentials keep local unauthenticated
-      // gateway discovery available and make hosted discovery fail closed.
-      // Keep the unauthenticated local-dev gateway path available. A hosted
-      // gateway will fail closed below when its action route needs identity.
+    if (!allowLocalUnauthenticatedRequest) {
+      try {
+        const token = await signA2AToken(
+          requestContext.userEmail,
+          orgDomain,
+          delegatedMember ? orgSecret : undefined,
+          {
+            expiresIn: "1m",
+            preferGlobalSecret: !delegatedMember,
+            audience: canonicalA2AAudience(
+              baseUrl.toString(),
+              getConfiguredAppBasePath() || undefined,
+            ),
+          },
+        );
+        authHeaders.Authorization = `Bearer ${token}`;
+      } catch {
+        throw new WorkspaceAppsGatewayAuthorizationError(
+          503,
+          "workspace_gateway_token_signing_failed",
+          "Workspace apps gateway could not sign the authenticated request.",
+        );
+      }
     }
   }
 
@@ -1735,6 +2144,10 @@ async function readWorkspaceAppsFromGateway(): Promise<WorkspaceAppDiscovery | n
     () => controller.abort(),
     WORKSPACE_APPS_GATEWAY_TIMEOUT_MS,
   );
+  const attempt: WorkspaceAppsGatewayAttempt = {
+    startedAt: Date.now(),
+    gateway: `${baseUrl.origin}${baseUrl.pathname.replace(/\/+$/, "")}`,
+  };
 
   const gatewayUrl = (pathname: string): URL => {
     const url = new URL(baseUrl.toString());
@@ -1756,9 +2169,34 @@ async function readWorkspaceAppsFromGateway(): Promise<WorkspaceAppDiscovery | n
   const protectedRedirect = protectionHeaders["x-vercel-protection-bypass"]
     ? { redirect: "manual" as const }
     : {};
+  const readAppsResponse = async (response: Response) => {
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new ActionContractError(
+        "Workspace apps gateway returned an unreadable response.",
+        {
+          statusCode: 503,
+          errorCode: "workspace_gateway_invalid_response",
+        },
+      );
+    }
+    const apps = parseWorkspaceAppsGatewayResponse(payload);
+    if (!apps) {
+      throw new ActionContractError(
+        "Workspace apps gateway returned an invalid response.",
+        {
+          statusCode: 503,
+          errorCode: "workspace_gateway_invalid_response",
+        },
+      );
+    }
+    return { kind: "apps" as const, apps };
+  };
 
   try {
-    if (isLocalWorkspaceGateway(baseUrl)) {
+    if (isLocalGateway) {
       const localResponse = await fetch(
         gatewayUrl(WORKSPACE_APPS_GATEWAY_PATH),
         {
@@ -1767,30 +2205,27 @@ async function readWorkspaceAppsFromGateway(): Promise<WorkspaceAppDiscovery | n
           signal: controller.signal,
         },
       );
+      noteWorkspaceAppsGatewayResponse(attempt, localResponse);
       if (localResponse.status === 401 || localResponse.status === 403) {
-        throw new WorkspaceAppsGatewayAuthorizationError(localResponse.status);
-      }
-      if (localResponse.ok) {
-        const apps = parseWorkspaceAppsManifest(
-          // coercion-ok: malformed gateway JSON is an unavailable registry and
-          // must fall through to the local manifest sources.
-          await localResponse.json().catch(() => null),
+        throw new WorkspaceAppsGatewayAuthorizationError(
+          localResponse.status,
+          "workspace_gateway_rejected",
         );
-        return apps ? { apps } : null;
+      }
+      if (localResponse.status !== 404 && localResponse.status !== 200) {
+        throw new ActionContractError(
+          `Workspace apps gateway returned HTTP ${localResponse.status}.`,
+          {
+            statusCode: 503,
+            errorCode: `workspace_gateway_http_${localResponse.status}`,
+          },
+        );
+      }
+      if (localResponse.status === 200) {
+        return await readAppsResponse(localResponse);
       }
     }
 
-    const requestOrigin = requestContext?.requestOrigin;
-    const isSameOriginGateway = requestOrigin
-      ? (() => {
-          try {
-            return new URL(requestOrigin).origin === baseUrl.origin;
-          } catch {
-            // coercion-ok: an invalid request origin cannot prove a self-fetch.
-            return false;
-          }
-        })()
-      : false;
     if (isSameOriginGateway || !authHeaders.Authorization) return null;
     const actionUrl = gatewayUrl(WORKSPACE_APPS_ACTION_PATH);
     actionUrl.searchParams.set("includeAgentCards", "false");
@@ -1800,19 +2235,43 @@ async function readWorkspaceAppsFromGateway(): Promise<WorkspaceAppDiscovery | n
       ...protectedRedirect,
       signal: controller.signal,
     });
+    noteWorkspaceAppsGatewayResponse(attempt, actionResponse);
     if (actionResponse.status === 401 || actionResponse.status === 403) {
-      throw new WorkspaceAppsGatewayAuthorizationError(actionResponse.status);
+      throw new WorkspaceAppsGatewayAuthorizationError(
+        actionResponse.status,
+        "workspace_gateway_rejected",
+      );
     }
-    if (!actionResponse.ok) return null;
-    const apps = parseWorkspaceAppsManifest(
-      // coercion-ok: malformed gateway JSON is an unavailable registry and
-      // must fall through to the local manifest sources.
-      await actionResponse.json().catch(() => null),
-    );
-    return apps ? { apps } : null;
+    if (actionResponse.status === 404) return null;
+    if (actionResponse.status !== 200) {
+      throw new ActionContractError(
+        `Workspace apps gateway returned HTTP ${actionResponse.status}.`,
+        {
+          statusCode: 503,
+          errorCode: `workspace_gateway_http_${actionResponse.status}`,
+        },
+      );
+    }
+    return await readAppsResponse(actionResponse);
   } catch (error) {
-    if (error instanceof WorkspaceAppsGatewayAuthorizationError) throw error;
-    return null;
+    if (error instanceof ActionContractError) {
+      logWorkspaceAppsGatewayFailure(error, attempt, undefined);
+      throw error;
+    }
+    const timedOut = controller.signal.aborted;
+    const failure = new ActionContractError(
+      timedOut
+        ? "Workspace apps gateway did not answer in time."
+        : "Workspace apps gateway could not be reached.",
+      {
+        statusCode: 503,
+        errorCode: timedOut
+          ? "workspace_gateway_timeout"
+          : "workspace_gateway_unavailable",
+      },
+    );
+    logWorkspaceAppsGatewayFailure(failure, attempt, error);
+    throw failure;
   } finally {
     clearTimeout(timeout);
   }
@@ -1844,8 +2303,15 @@ function workspaceAppsManifestCandidates(): string[] {
 function readWorkspaceAppsFromManifestFile(): WorkspaceAppSummary[] | null {
   for (const file of workspaceAppsManifestCandidates()) {
     if (!fs.existsSync(file)) continue;
-    const apps = parseWorkspaceAppsManifest(readJson(file));
-    if (apps) return apps;
+    try {
+      const apps = parseWorkspaceAppsManifest(readJson(file));
+      if (apps) return apps;
+    } catch (error) {
+      if (error instanceof WorkspaceGatewayConfigurationError) throw error;
+      console.warn(
+        `[dispatch] Could not read Workspace app manifest ${file}; skipping source`,
+      );
+    }
   }
   return null;
 }
@@ -1861,7 +2327,16 @@ async function readWorkspaceAppsFromFilesystem(
     .readdirSync(appsDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))) {
     const appDir = path.join(appsDir, entry.name);
-    const pkg = readJson(path.join(appDir, "package.json"));
+    let pkg: any;
+    try {
+      pkg = readJson(path.join(appDir, "package.json"));
+    } catch (error) {
+      console.warn(
+        `[dispatch] Could not read workspace app ${entry.name}; skipping app`,
+        error,
+      );
+      continue;
+    }
     if (!pkg) continue;
     const routeAccess = workspaceAppRouteAccessFromPackageJson(pkg);
     const metadata = workspaceAppMetadataFromRecord(pkg);
@@ -1887,7 +2362,7 @@ async function readWorkspaceAppsFromFilesystem(
       homePath: normalizeWorkspaceAppHomePath(
         configuredHomePath ?? inferredHomePath,
       ),
-      url: workspaceAppUrl(`/${entry.name}`),
+      url: workspaceAppUrl(workspaceAppRoute(entry.name)),
       isDispatch: entry.name === "dispatch",
       audience:
         workspaceAppAudienceFromPackageJson(pkg) ??
@@ -1915,7 +2390,13 @@ export function getEnvBuilderProjectId(): string | null {
 export function getWorkspaceInfo(): WorkspaceInfo {
   const rootPath = findWorkspaceRoot();
   if (!rootPath) {
-    return { name: null, displayName: null, rootPath: null, appCount: 0 };
+    return {
+      name: null,
+      displayName: null,
+      rootPath: null,
+      appCount: 0,
+      builderWorkspaceUrl: getBuilderWorkspaceUrl(),
+    };
   }
   const pkg = readJson(path.join(rootPath, "package.json"));
   const rawName = typeof pkg?.name === "string" ? pkg.name.trim() : "";
@@ -1939,6 +2420,7 @@ export function getWorkspaceInfo(): WorkspaceInfo {
     displayName,
     rootPath,
     appCount,
+    builderWorkspaceUrl: getBuilderWorkspaceUrl(),
   };
 }
 
@@ -1985,10 +2467,15 @@ export async function updateWorkspaceAppMetadata(input: {
   appId: string;
   name?: string | null;
   description?: string | null;
+  whenToUse?: string[] | null;
 }): Promise<WorkspaceAppSummary> {
   const appId = input.appId.trim();
   assertValidWorkspaceAppId(appId);
   requireWorkspaceAppOrgId();
+  const role = await requestOwnerRole();
+  if (role !== "owner" && role !== "admin") {
+    throw new WorkspaceAppMetadataAuthorizationError();
+  }
 
   const apps = await listWorkspaceApps({
     includeAgentCards: false,
@@ -1997,27 +2484,42 @@ export async function updateWorkspaceAppMetadata(input: {
   const app = apps.find((candidate) => candidate.id === appId);
   if (!app) throw new Error(`Workspace app "${appId}" was not found.`);
 
-  const name = input.name == null ? app.name : input.name.trim();
-  const description =
-    input.description == null
-      ? (app.description ?? undefined)
-      : input.description.trim();
-  await writeWorkspaceAppMetadataOverride({
+  const nameProvided = Object.hasOwn(input, "name") && input.name !== undefined;
+  const descriptionProvided =
+    Object.hasOwn(input, "description") && input.description !== undefined;
+  const whenToUseProvided =
+    Object.hasOwn(input, "whenToUse") && input.whenToUse !== undefined;
+  const name = nameProvided ? (input.name?.trim() ?? null) : app.name;
+  const description = descriptionProvided
+    ? (input.description?.trim() ?? null)
+    : (app.description ?? undefined);
+  const whenToUse = whenToUseProvided ? (input.whenToUse ?? []) : app.whenToUse;
+  const metadataOverride: Parameters<
+    typeof writeWorkspaceAppMetadataOverride
+  >[0] = {
     appId,
-    name,
-    description,
-    generated: false,
     updatedBy: currentOwnerEmail(),
+  };
+  if (nameProvided) metadataOverride.name = input.name?.trim() ?? null;
+  if (descriptionProvided) {
+    metadataOverride.description = input.description?.trim() ?? null;
+  }
+  if (whenToUseProvided) metadataOverride.whenToUse = input.whenToUse ?? [];
+  if (nameProvided || descriptionProvided) metadataOverride.generated = false;
+  await writeWorkspaceAppMetadataOverride({
+    ...metadataOverride,
   });
+  invalidateOrgAppsDirectoryCache();
 
   await recordAudit({
     action: "workspace-app.metadata-updated",
     targetType: "workspace-app",
     targetId: appId,
-    summary: `Updated workspace app details for ${name}`,
+    summary: `Updated workspace app details for ${name ?? app.name}`,
     metadata: {
-      name,
+      name: name ?? app.name,
       descriptionConfigured: !!description,
+      whenToUseCount: whenToUse?.length ?? 0,
     },
   });
 
@@ -2027,11 +2529,19 @@ export async function updateWorkspaceAppMetadata(input: {
       includeArchived: true,
     })
   ).find((candidate) => candidate.id === appId);
-  return updated ?? { ...app, name, description };
+  return (
+    updated ?? {
+      ...app,
+      name: name ?? app.name,
+      description: description ?? app.description,
+      whenToUse,
+    }
+  );
 }
 
-export async function listWorkspaceApps(
+async function listWorkspaceAppsWithPrincipal(
   options: ListWorkspaceAppsOptions = {},
+  principal: "user" | "organization" = "user",
 ): Promise<WorkspaceAppSummary[]> {
   const finalize = async (
     apps: WorkspaceAppSummary[],
@@ -2044,9 +2554,14 @@ export async function listWorkspaceApps(
     const listed = options.includeArchived
       ? recorded
       : recorded.filter((app) => !app.archived);
-    const visible = await filterWorkspaceAppsByAccess(
-      filterAppsByAudience(listed, options.audience),
-    );
+    const candidates = filterAppsByAudience(listed, options.audience);
+    const visible =
+      principal === "organization"
+        ? await filterOrganizationVisibleWorkspaceApps(
+            candidates,
+            requireWorkspaceAppOrgId(),
+          )
+        : await filterWorkspaceAppsByAccess(candidates);
     return maybeIncludeAgentCards(visible, options);
   };
   let gatewayDenial: WorkspaceAppsGatewayAuthorizationError | null = null;
@@ -2057,10 +2572,14 @@ export async function listWorkspaceApps(
     if (!(error instanceof WorkspaceAppsGatewayAuthorizationError)) throw error;
     gatewayDenial = error;
   }
-  if (gatewayApps) {
+  if (gatewayApps?.kind === "apps") {
     return finalize(gatewayApps.apps);
   }
-  const unverified = gatewayDenial !== null;
+  if (gatewayDenial && gatewayDenial.statusCode >= 500) {
+    throw gatewayDenial;
+  }
+  const unverified =
+    gatewayDenial !== null || gatewayApps?.kind === "domainless";
 
   const workspaceRoot = findWorkspaceRoot();
   const localFilesystemApps =
@@ -2084,7 +2603,9 @@ export async function listWorkspaceApps(
   // means the registry will not show this reader its apps, so they get the
   // deployment's own list instead, and none of it is recorded. (A manifest
   // answers earlier for both, with the warning above.)
-  if (gatewayDenial?.statusCode === 401) throw gatewayDenial;
+  if (gatewayDenial && gatewayDenial.statusCode !== 403) {
+    throw gatewayDenial;
+  }
   warnWorkspaceAppsGatewayDenial(gatewayDenial, "deployment's own app list");
 
   if (!workspaceRoot) {
@@ -2111,6 +2632,22 @@ export async function listWorkspaceApps(
   const apps = await readWorkspaceAppsFromFilesystem(workspaceRoot);
   if (apps) return finalize(apps, { persist: !unverified });
   return finalize([], { persist: !unverified });
+}
+
+export function listWorkspaceApps(
+  options: ListWorkspaceAppsOptions = {},
+): Promise<WorkspaceAppSummary[]> {
+  return listWorkspaceAppsWithPrincipal(options, "user");
+}
+
+export async function listOrganizationVisibleWorkspaceApps(): Promise<
+  WorkspaceAppSummary[]
+> {
+  requireWorkspaceAppOrgId();
+  return listWorkspaceAppsWithPrincipal(
+    { includeAgentCards: false, includeArchived: false, audience: "all" },
+    "organization",
+  );
 }
 
 const ADDABLE_TEMPLATES: AvailableWorkspaceTemplate[] = [
@@ -2232,6 +2769,10 @@ export async function scaffoldWorkspaceAppFromTemplate(input: {
   template: string;
   appId?: string | null;
 }): Promise<{ appId: string; template: string; output: string }> {
+  const builderWorkspaceUrl = getBuilderWorkspaceUrl();
+  if (builderWorkspaceUrl) {
+    throw new Error(builderManagedCreationResult(builderWorkspaceUrl).message);
+  }
   if (!isLocalAppCreationRuntime()) {
     throw new Error(
       "Scaffolding from Dispatch is only available in local development. " +
@@ -2270,6 +2811,7 @@ export async function scaffoldWorkspaceAppFromTemplate(input: {
     });
   } catch (error) {
     if (fs.existsSync(appDir)) {
+      noteExternalWrite("local-disk");
       fs.rmSync(appDir, { recursive: true, force: true });
     }
     throw error;
@@ -2278,12 +2820,15 @@ export async function scaffoldWorkspaceAppFromTemplate(input: {
   try {
     await writeWorkspaceAppMetadataOverride({
       appId,
+      name: null,
+      description: null,
       updatedBy: creatorEmail,
       createdBy: creatorEmail,
       visibility,
     });
   } catch (error) {
     if (fs.existsSync(appDir)) {
+      noteExternalWrite("local-disk");
       fs.rmSync(appDir, { recursive: true, force: true });
     }
     throw error;
@@ -2304,7 +2849,7 @@ export async function scaffoldWorkspaceAppFromTemplate(input: {
       description: "",
       path: `/${appId}`,
       homePath: "/home",
-      url: workspaceAppUrl(`/${appId}`),
+      url: workspaceAppUrl(workspaceAppRoute(appId)),
       isDispatch: false,
       audience: DEFAULT_WORKSPACE_APP_AUDIENCE,
       publicPaths: [],
@@ -2314,6 +2859,7 @@ export async function scaffoldWorkspaceAppFromTemplate(input: {
       visibility,
     },
   ]);
+  invalidateOrgAppsDirectoryCache();
 
   return { appId, template, output };
 }
@@ -2323,11 +2869,22 @@ function runScaffoldCli(input: {
   args: string[];
 }): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("pnpm", ["exec", "agent-native", ...input.args], {
-      cwd: input.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, CI: "1", FORCE_COLOR: "0" },
-    });
+    noteExternalWrite("child-process");
+    // pnpm is a pnpm.cmd shim on Windows, which Node starts only through a
+    // shell. The app id is validated and the template comes from an allowlist,
+    // so one joined command line is safe there.
+    const args = ["exec", "agent-native", ...input.args];
+    const windows = process.platform === "win32";
+    const child = spawn(
+      windows ? ["pnpm", ...args].join(" ") : "pnpm",
+      windows ? [] : args,
+      {
+        cwd: input.cwd,
+        shell: windows,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, CI: "1", FORCE_COLOR: "0" },
+      },
+    );
     let stdout = "";
     let stderr = "";
     child.stdout?.on("data", (chunk) => {
@@ -2337,7 +2894,15 @@ function runScaffoldCli(input: {
       stderr += String(chunk);
     });
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
+      if (windows && child.pid) {
+        // The child is cmd.exe, so stop its whole tree before the caller
+        // removes the app folder. taskkill returns once the tree is gone.
+        spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+          stdio: "ignore",
+        });
+      } else {
+        child.kill("SIGTERM");
+      }
       reject(
         new Error(
           `Scaffold timed out after ${Math.round(SCAFFOLD_TIMEOUT_MS / 1000)}s`,
@@ -2496,20 +3061,11 @@ function isSyntheticIntegrationOwner(ownerEmail: string): boolean {
 
 async function requestOwnerRole(): Promise<string | null> {
   const orgId = currentOrgId();
-  const ownerEmail = currentOwnerEmail();
   if (!orgId) return null;
   try {
-    const { rows } = await getDbExec().execute({
-      sql: `SELECT role FROM org_members
-            WHERE org_id = ? AND LOWER(email) = ?
-              AND federation_removal_pending_at IS NULL
-            LIMIT 1`,
-      args: [orgId, ownerEmail.toLowerCase()],
-    });
-    const role = (rows[0] as any)?.role;
-    return typeof role === "string" ? role : null;
-  } catch {
-    return null;
+    return await readOrgMemberRole(orgId, currentOwnerEmail());
+  } catch (error) {
+    throw new AppCreationOwnerRoleUnavailableError(error);
   }
 }
 
@@ -2673,8 +3229,8 @@ function buildWorkspaceAppPrompt(input: {
       `Dispatch workspace resources selected for this app:\n${resourceList}`,
       `Dispatch workspace resources with scope=all are global. After the app exists, sync workspace resources to appId "${appId}" so global skills, guardrail instructions, and reference resources reach the new app even when no per-app resources were selected.`,
       "",
-      `Use the workspace app layout: create it under apps/${appId}, mount it at /${appId}, keep it on the shared workspace database/hosting model, and avoid table-name collisions by namespacing any new domain tables to the app.`,
-      `Important routing rule: from outside the app, link to /${appId}; inside apps/${appId}, React Router routes are app-local. Use <Link to="/review"> and navigate("/review"), not "/${appId}/review"; APP_BASE_PATH supplies the mounted prefix, and hardcoding it causes doubled URLs like /${appId}/${appId}/review.`,
+      `Use the workspace app layout: create it under apps/${appId}; Dispatch mounts it at /apps/${appId}. Keep it on the shared workspace database/hosting model, and avoid table-name collisions by namespacing any new domain tables to the app.`,
+      `Important routing rule: from outside the app, link to /apps/${appId}; inside apps/${appId}, React Router routes are app-local. Use <Link to="/review"> and navigate("/review"), not "/apps/${appId}/review"; APP_BASE_PATH supplies the mounted prefix, and hardcoding it causes doubled URLs.`,
       `Home route contract: Dispatch opens the registered app.homePath. If the main screen is app/routes/_index.tsx and there is no app/routes/home.tsx or app/routes/_app.home.tsx, set app.homePath to "/" in server/plugins/config.ts. If the app uses a /home route, keep the default "/home". Never leave the registry pointing at /home when that route does not exist.`,
       "Existing first-party apps are neighbors, not implementation details for this app. If the user prompt mentions Mail, Calendar, Analytics, Dispatch, or other templates, treat them as existing hosted/connected apps that this app can link to or call through A2A/default connected agents. For example, Mail, Calendar, and Analytics already exist at https://mail.agent-native.com, https://calendar.agent-native.com, and https://analytics.agent-native.com.",
       `Do not create wrapper apps or scaffold child apps/routes for Mail, Calendar, Analytics, etc. inside apps/${appId} just so this app can access them. If the request is a cross-app dashboard or overview, build only the new dashboard/overview app and delegate to the existing apps for domain work.`,
@@ -2693,7 +3249,7 @@ function buildWorkspaceAppPrompt(input: {
       "- Use Tabler Icons (@tabler/icons-react) for every icon. Never use emojis as icons.",
       `- Expose what the user is looking at via application_state (navigation.view, selection, etc.) so the agent has live context. Mirror the patterns in templates/mail or templates/slides.`,
       "- Optimistic UI for every mutation: update the React Query cache immediately, navigate immediately, run the mutation in the background, roll back on error. Don't await a server round-trip before re-rendering.",
-      `- Commit an agent-native.json at apps/${appId}/agent-native.json with { "version": 1, "onboarding": { "firstRun": { "development": "connect", "production": "connect-and-integrations" } } }. Keep the shared Use Builder.io / Add your own keys onboarding visible; never build a second, custom credential form or hardcode a provider key.`,
+      `- Commit an agent-native.json at apps/${appId}/agent-native.json with { "version": 1, "onboarding": { "firstRun": { "development": "off", "production": "connect-and-integrations" } } }, as the first-party templates do, so local runs open straight into the app. Keep the shared Use Builder.io / Add your own keys onboarding for production; never build a second, custom credential form or hardcode a provider key.`,
       "- Every AI-labeled button must call sendToAgentChat with openSidebar: true — plus submit: true for one-click work, or submit: false when the user should review/edit the proposed prompt first. Keep follow-ups in that same sidebar thread; don't add a second freeform input beside the result. Never use sparkle, wand, magic, robot, or other decorative AI icons on those buttons — a message or neutral action icon, or no icon, instead.",
       "- Choose a named visual direction in DESIGN.md before styling the first screen and build to it. Don't inherit a sibling app's palette unbuilt.",
       '- Left navigation must name real domain destinations, not "Chat" as the only or default entry.',
@@ -2849,6 +3405,12 @@ export interface AppCreationLocalAgentResult {
   appId: string;
   prompt: string;
   message: string;
+  attachments?: Array<{
+    type: "file";
+    name: string;
+    contentType: string;
+    text: string;
+  }>;
 }
 
 export interface AppCreationComingSoonResult {
@@ -2877,7 +3439,25 @@ export interface AppCreationBuilderResult {
   message: string;
 }
 
+/** A Builder-linked workspace: apps are built in Builder, so nothing was created. */
+export interface AppCreationBuilderManagedResult {
+  mode: "builder-managed";
+  url: string;
+  message: string;
+}
+
+export function builderManagedCreationResult(
+  url: string,
+): AppCreationBuilderManagedResult {
+  return {
+    mode: "builder-managed",
+    url,
+    message: `Apps in this workspace are built in Builder. Open ${url} and choose New app.`,
+  };
+}
+
 export type StartWorkspaceAppCreationResult =
+  | AppCreationBuilderManagedResult
   | AppCreationIdentityUnavailableResult
   | AppCreationBuilderUnavailableResult
   | AppCreationAppIdTakenResult
@@ -2893,13 +3473,23 @@ export async function startWorkspaceAppCreation(input: {
   secretIds?: string[];
   resourceIds?: string[];
   attachments?: BuilderAgentAttachment[];
+  communitySourceId?: string;
 }): Promise<StartWorkspaceAppCreationResult> {
+  const builderWorkspaceUrl = getBuilderWorkspaceUrl();
+  if (builderWorkspaceUrl)
+    return builderManagedCreationResult(builderWorkspaceUrl);
   const initial = buildWorkspaceAppPrompt({
     prompt: input.prompt,
     appId: input.appId,
     description: input.description,
     template: input.template,
   });
+  if (
+    input.communitySourceId !== undefined &&
+    !normalizeCommunitySourceId(input.communitySourceId)
+  ) {
+    throw new Error("Community source ids must be valid bounded identifiers.");
+  }
   assertValidWorkspaceAppId(initial.appId);
   requireWorkspaceAppOrgId();
   normalizeBuilderAgentAttachments(input.attachments);
@@ -2951,15 +3541,39 @@ export async function startWorkspaceAppCreation(input: {
     generateWorkspaceAppDescription(input.prompt, built.appId);
 
   if (isLocal) {
-    await writeWorkspaceAppMetadataOverride({
-      appId: built.appId,
-      description: appDescription,
-      generated: true,
-      sourcePrompt: input.prompt,
-      updatedBy: currentOwnerEmail(),
-      createdBy: currentOwnerEmail(),
-      visibility: creationVisibility,
-    });
+    if (input.communitySourceId) {
+      try {
+        await reservePendingWorkspaceApp({
+          appId: built.appId,
+          description: appDescription,
+          projectId: null,
+          visibility: creationVisibility,
+          communitySourceId: input.communitySourceId,
+        });
+      } catch (err) {
+        if (err instanceof WorkspaceAppIdTakenError)
+          return appIdTakenResult(err);
+        throw err;
+      }
+    }
+    try {
+      await writeWorkspaceAppMetadataOverride({
+        appId: built.appId,
+        name: null,
+        description: appDescription,
+        generated: true,
+        sourcePrompt: input.prompt,
+        updatedBy: currentOwnerEmail(),
+        createdBy: currentOwnerEmail(),
+        visibility: creationVisibility,
+        communitySourceId: input.communitySourceId,
+      });
+    } catch (error) {
+      if (input.communitySourceId) {
+        await releasePendingWorkspaceAppReservation(built.appId);
+      }
+      throw error;
+    }
     await requestSelectedVaultKeys({
       appId: built.appId,
       selectedKeys,
@@ -2972,6 +3586,22 @@ export async function startWorkspaceAppCreation(input: {
       mode: "local-agent",
       appId: built.appId,
       prompt,
+      ...(input.communitySourceId && input.attachments?.length
+        ? {
+            attachments: input.attachments.flatMap((attachment) =>
+              attachment.type === "upload" && attachment.text !== undefined
+                ? [
+                    {
+                      type: "file" as const,
+                      name: attachment.name,
+                      contentType: attachment.contentType,
+                      text: attachment.text,
+                    },
+                  ]
+                : [],
+            ),
+          }
+        : {}),
       message:
         "Use the local code agent to create this app in the workspace, then open it from /dispatch/apps.",
     };
@@ -3014,10 +3644,32 @@ export async function startWorkspaceAppCreation(input: {
       description: appDescription,
       projectId: builderProjectId,
       visibility: creationVisibility,
+      ...(normalizeCommunitySourceId(input.communitySourceId)
+        ? { communitySourceId: input.communitySourceId }
+        : {}),
     });
   } catch (err) {
     if (err instanceof WorkspaceAppIdTakenError) return appIdTakenResult(err);
     throw err;
+  }
+
+  if (input.communitySourceId) {
+    try {
+      await writeWorkspaceAppMetadataOverride({
+        appId: built.appId,
+        communitySourceId: input.communitySourceId,
+      });
+    } catch (error) {
+      try {
+        await releasePendingWorkspaceAppReservation(built.appId);
+      } catch (cleanupError) {
+        console.warn(
+          "[dispatch] failed to release pending workspace app reservation",
+          cleanupError,
+        );
+      }
+      throw error;
+    }
   }
 
   let result: {
@@ -3059,6 +3711,7 @@ export async function startWorkspaceAppCreation(input: {
     description: appDescription,
     sourcePrompt: input.prompt,
     visibility: creationVisibility,
+    communitySourceId: input.communitySourceId,
     branchName: result.branchName,
     builderUrl: result.url,
   });
@@ -3079,7 +3732,7 @@ export async function startWorkspaceAppCreation(input: {
     projectId: builderProjectId,
     branchName: result.branchName,
     url: result.url,
-    workspaceUrl: workspaceAppUrl(`/${built.appId}`),
+    workspaceUrl: workspaceAppUrl(workspaceAppRoute(built.appId)),
     status: result.status,
     message:
       `Builder started a branch for /${built.appId}. Use the Builder branch URL to track creation now. ` +

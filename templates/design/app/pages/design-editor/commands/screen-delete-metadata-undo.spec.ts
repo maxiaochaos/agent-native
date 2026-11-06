@@ -294,8 +294,6 @@ describe("screen deletion metadata history", () => {
       pendingVisualStyleUndoStackRef: ref([]),
       queryClient,
       redoOrderRef,
-      selectionRedoStackRef: ref([]),
-      selectionUndoStackRef: ref([]),
       setActiveFileId: noop,
       setOverviewSelectedScreenIds: noop,
       setSelectedLayerIdsState: noop,
@@ -308,7 +306,11 @@ describe("screen deletion metadata history", () => {
 
     await vi.waitFor(() =>
       expect(cancelQueries).toHaveBeenCalledWith({
-        queryKey: ["action", "get-design", { id: "design" }],
+        queryKey: [
+          "action",
+          "get-design",
+          { id: "design", includeFileContent: false },
+        ],
         exact: true,
       }),
     );
@@ -584,8 +586,6 @@ describe("screen deletion metadata history", () => {
           pendingVisualStyleUndoStackRef: ref([]),
           queryClient,
           redoOrderRef,
-          selectionRedoStackRef: ref([]),
-          selectionUndoStackRef: ref([]),
           setActiveFileId: vi.fn(),
           setOverviewSelectedScreenIds: vi.fn(),
           setSelectedLayerIdsState: vi.fn(),

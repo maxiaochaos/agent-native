@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 
+import * as hubspotEmail from "@shared/hubspot-email";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ElementInfo } from "@/components/design/types";
@@ -27,6 +28,7 @@ function argsFor(overrides: Partial<Args> = {}): Args {
     activeFile: {
       id: "screen-1",
       filename: "index.html",
+      content: "<!doctype html><html><body>Welcome</body></html>",
     } as Args["activeFile"],
     activeLeftPanel: null,
     activeTool: "move" as Args["activeTool"],
@@ -47,6 +49,7 @@ function argsFor(overrides: Partial<Args> = {}): Args {
       previewing: false,
       selectedTrackId: null,
       selectedKeyframeIds: [],
+      selectedEasingSegment: null,
     },
     motionDurationMs: 2000,
     motionPlayhead: 0,
@@ -57,6 +60,7 @@ function argsFor(overrides: Partial<Args> = {}): Args {
     persistedSelectionStateRef: { current: null },
     persistedSelectionWriteTimerRef: { current: null },
     responsiveEditScope: "base" as Args["responsiveEditScope"],
+    reviewThreadId: null,
     selectedElement: null,
     selectedScreenIds: [],
     selectedStateId: null,
@@ -161,6 +165,7 @@ describe("runPublishAgentSelectionContext layout grid", () => {
         motionDockLiveState: {
           previewing: true,
           selectedTrackId: "node-1\u001ftranslate",
+          selectedEasingSegment: null,
           selectedKeyframeIds: [
             '["node-1\\u001ftranslate",0.5]',
             '["node-1\\u001ftranslate",1]',
@@ -182,6 +187,7 @@ describe("runPublishAgentSelectionContext layout grid", () => {
       autoKeyframe: true,
       selectedTrackId: "node-1\u001ftranslate",
       selectedKeyframeId: null,
+      selectedEasingSegment: null,
       selectedKeyframeIds: [
         '["node-1\\u001ftranslate",0.5]',
         '["node-1\\u001ftranslate",1]',
@@ -204,6 +210,43 @@ describe("runPublishAgentSelectionContext inspector", () => {
   it("publishes no inspector tab: the inspector has none", () => {
     runPublishAgentSelectionContext(argsFor());
     expect(publishedSelection()).not.toHaveProperty("inspectorTab");
+  });
+});
+
+describe("runPublishAgentSelectionContext frame classification", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("reuses unchanged screen classifications while reflecting edits and replacement files", () => {
+    const classify = vi.spyOn(hubspotEmail, "isHubSpotEmailHtml");
+    const first = argsFor().activeFile!;
+    const second = { ...first, id: "screen-2", filename: "second.html" };
+    const args = argsFor({ activeFile: first, files: [first, second] });
+
+    runPublishAgentSelectionContext(args);
+    expect(publishedSelection().activeFrameType).toBeNull();
+    expect(classify).toHaveBeenCalledTimes(2);
+
+    runPublishAgentSelectionContext({ ...args, zoom: 60 });
+    runPublishAgentSelectionContext({ ...args, activeFile: second });
+    expect(classify).toHaveBeenCalledTimes(2);
+
+    second.content = hubspotEmail.createHubSpotEmailHtml();
+    runPublishAgentSelectionContext({ ...args, activeFile: second });
+    expect(publishedSelection().activeFrameType).toBe("hubspot-email");
+    expect(publishedSelection().screens).toEqual([
+      expect.objectContaining({ id: "screen-1", frameType: null }),
+      expect.objectContaining({ id: "screen-2", frameType: "hubspot-email" }),
+    ]);
+    expect(classify).toHaveBeenCalledTimes(3);
+
+    const replacement = { ...second, content: first.content };
+    runPublishAgentSelectionContext({
+      ...args,
+      activeFile: replacement,
+      files: [first, replacement],
+    });
+    expect(publishedSelection().activeFrameType).toBeNull();
+    expect(classify).toHaveBeenCalledTimes(4);
   });
 });
 
@@ -260,6 +303,7 @@ describe("runPublishAgentSelectionContext application state write", () => {
       id: `screen-${index}`,
       filename: `nested-${index}.html`,
       fileType: "html",
+      content: "<!doctype html><html><body>Nested screen</body></html>",
     })) as Args["files"];
     runPublishAgentSelectionContext(
       argsFor({ files, selectedElement: deepScreenElement() }),
@@ -284,6 +328,43 @@ describe("runPublishAgentSelectionContext application state write", () => {
     expect(JSON.stringify(value).length).toBeLessThan(16_000);
   });
 
+  it("marks both persisted selection keys as this browser tab while retaining immediate context", () => {
+    const args = argsFor();
+    runPublishAgentSelectionContext(args);
+
+    expect(publishedSelection().designId).toBe("design-1");
+    expect(vi.mocked(setClientAppState).mock.calls).toHaveLength(2);
+    expect(
+      vi
+        .mocked(setClientAppState)
+        .mock.calls.map(([key, , options]) => [key, options?.requestSource]),
+    ).toEqual([
+      ["design-selection:tab-123", "tab-123"],
+      ["design-selection", "tab-123"],
+    ]);
+    expect(args.persistedSelectionStateRef.current).not.toBeNull();
+  });
+
+  it("publishes the open review thread, and null when none is open", () => {
+    runPublishAgentSelectionContext(argsFor({ reviewThreadId: "thread-9" }));
+    expect(publishedSelection().reviewThreadId).toBe("thread-9");
+    expect(writtenSelection().reviewThreadId).toBe("thread-9");
+
+    runPublishAgentSelectionContext(argsFor());
+    expect(publishedSelection().reviewThreadId).toBeNull();
+    expect(writtenSelection().reviewThreadId).toBeNull();
+  });
+
+  it("writes again right away when the open thread changes, not on the zoom debounce", () => {
+    const args = argsFor({ reviewThreadId: null });
+    runPublishAgentSelectionContext(args);
+    const afterFirst = vi.mocked(setClientAppState).mock.calls.length;
+
+    runPublishAgentSelectionContext({ ...args, reviewThreadId: "thread-9" });
+    expect(vi.mocked(setClientAppState).mock.calls.length).toBe(afterFirst * 2);
+    expect(writtenSelection().reviewThreadId).toBe("thread-9");
+  });
+
   it("sends a bounded selection as keepalive so a write just before navigating away lands", () => {
     runPublishAgentSelectionContext(
       argsFor({ selectedElement: deepScreenElement() }),
@@ -299,6 +380,7 @@ describe("runPublishAgentSelectionContext application state write", () => {
       id: `screen-${index}`,
       filename: `${"long-screen-name-".repeat(4)}${index}.html`,
       fileType: "html",
+      content: "<!doctype html><html><body>Screen</body></html>",
     })) as Args["files"];
     runPublishAgentSelectionContext(argsFor({ files }));
 

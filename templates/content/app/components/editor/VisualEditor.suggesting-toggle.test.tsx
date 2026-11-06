@@ -72,7 +72,7 @@ describe("Toggles while suggesting", () => {
     vi.unstubAllGlobals();
   });
 
-  async function mount(suggesting: boolean) {
+  async function mount(suggesting: boolean, editable = true, content = PAGE) {
     await act(async () =>
       root.render(
         createElement(
@@ -85,10 +85,10 @@ describe("Toggles while suggesting", () => {
               QueryClientProvider,
               { client: queryClient },
               createElement(VisualEditor, {
-                content: PAGE,
+                content,
                 onChange: vi.fn(),
                 ydoc: null,
-                editable: true,
+                editable,
                 suggesting,
               }),
             ),
@@ -114,7 +114,7 @@ describe("Toggles while suggesting", () => {
   async function clickToggle() {
     await act(async () => {
       container
-        .querySelector<HTMLElement>(".notion-toggle__summary-row")!
+        .querySelector<HTMLElement>(".content-toggle__summary-row")!
         .click();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
@@ -122,15 +122,15 @@ describe("Toggles while suggesting", () => {
 
   function bodyCollapsed(): boolean {
     return container
-      .querySelector(".notion-toggle__body")!
-      .classList.contains("notion-toggle__body--collapsed");
+      .querySelector(".content-toggle__body")!
+      .classList.contains("content-toggle__body--collapsed");
   }
 
   it("opens and closes a Toggle without changing the draft", async () => {
     const editor = await mount(true);
     expect(storedOpen(editor)).toBe(false);
     expect(bodyCollapsed()).toBe(true);
-    expect(container.querySelector("input.notion-toggle__summary")).toBeNull();
+    expect(container.querySelector("input.content-toggle__summary")).toBeNull();
 
     await clickToggle();
     expect(bodyCollapsed()).toBe(false);
@@ -141,9 +141,49 @@ describe("Toggles while suggesting", () => {
     expect(storedOpen(editor)).toBe(false);
   });
 
+  it.each([
+    { who: "someone editing", suggesting: false, editable: true, drags: true },
+    {
+      who: "someone suggesting",
+      suggesting: true,
+      editable: true,
+      drags: false,
+    },
+    {
+      who: "someone who can't edit",
+      suggesting: false,
+      editable: false,
+      drags: false,
+    },
+  ])(
+    "lets $who select a Toggle's text unless they can drag it",
+    async ({ suggesting, editable, drags }) => {
+      await mount(suggesting, editable);
+      const toggle = container.querySelector(".content-toggle");
+      expect(toggle?.getAttribute("draggable")).toBe(drags ? "true" : null);
+      expect(toggle?.hasAttribute("data-drag-handle")).toBe(drags);
+    },
+  );
+
+  it("moves a titled Toggle only by its drag handle", async () => {
+    await mount(
+      false,
+      true,
+      [
+        '<details markdown="1">',
+        "<summary>Toggle title</summary>",
+        "\tHidden text",
+        "</details>",
+      ].join("\n"),
+    );
+    const toggle = container.querySelector(".content-toggle--titled");
+    expect(toggle).not.toBeNull();
+    expect(toggle?.hasAttribute("draggable")).toBe(false);
+  });
+
   it("stores the open state outside suggesting", async () => {
     const editor = await mount(false);
-    expect(container.querySelector("input.notion-toggle__summary")).not.toBe(
+    expect(container.querySelector("input.content-toggle__summary")).not.toBe(
       null,
     );
 

@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import * as Y from "yjs";
 
 import { trace } from "@/components/design/design-trace";
-import { isShaderWriteInFlight } from "@/components/design/inspector/GlslShaderPanel";
+import { isShaderWriteInFlight } from "@/components/design/shader-source-coordination";
 import type { ClipboardContentMutationPublication } from "@/lib/clipboard-content-lineage";
 import {
   canWriteCollabText,
@@ -22,10 +22,12 @@ import type {
   ContentHistoryEntry,
   YjsUndoSelectionSnapshot,
 } from "@/pages/design-editor/history";
+import { captureYjsUndoHistoryUpdate } from "@/pages/design-editor/history";
 import { designSaveErrorMessage } from "@/pages/design-editor/save-failure";
 import { prepareAcceptedSourceContent } from "@/pages/design-editor/source-publication";
 import type { DesignFile } from "@/pages/design-editor/types";
 
+import { designMetadataQueryKey } from "../design-query-key";
 import type { FileContentSaveCompletion } from "./save-file-content";
 
 export interface ApplyLocalContentUpdateArgs {
@@ -34,7 +36,7 @@ export interface ApplyLocalContentUpdateArgs {
     nextContent: string;
     publication?: ClipboardContentMutationPublication;
   }) => void;
-  activeFile: DesignFile;
+  activeFile: DesignFile | undefined;
   canEditDesignRef: RefObject<boolean>;
   cancelQueuedFileContentSave: (fileId: string) => void;
   clearPendingLocalFileContent: (
@@ -52,6 +54,10 @@ export interface ApplyLocalContentUpdateArgs {
     content: string,
     baseUpdatedAt?: string | null,
     identityMigrationSourceContent?: string,
+  ) => void;
+  primeAcceptedSource: (
+    fileId: string,
+    source: { content: string; updatedAt: string },
   ) => void;
   queryClient: QueryClient;
   queueFileContentSave: (
@@ -92,6 +98,7 @@ export type ApplyLocalContentUpdateResult =
       status: "accepted";
       content: string;
       nodeIdMap: ReadonlyMap<string, string>;
+      yjsHistoryRecorded?: boolean;
       saveCompletion?: Promise<FileContentSaveCompletion>;
     }
   | { status: "refused" };
@@ -110,6 +117,7 @@ export function runApplyLocalContentUpdate(
     lastLocalContentRef,
     latestActiveContentRef,
     markPendingLocalFileContent,
+    primeAcceptedSource,
     queryClient,
     queueFileContentSave,
     recordContentHistoryEntry,
@@ -146,7 +154,12 @@ export function runApplyLocalContentUpdate(
     serverAccepted?: boolean;
   } = {},
 ): ApplyLocalContentUpdateResult {
-  if (!activeFile || !canEditDesignRef.current) return { status: "refused" };
+  if (
+    !activeFile ||
+    !canEditDesignRef.current ||
+    activeFile.sourceState === "error"
+  )
+    return { status: "refused" };
   if (isShaderWriteInFlight(activeFile.id) && !options.shaderWriteCompletion) {
     toast.error(t("designEditor.toasts.saveConflict"), {
       id: `design-source-shader-conflict:${activeFile.id}`,
@@ -159,7 +172,7 @@ export function runApplyLocalContentUpdate(
       : collabContentFileIdRef.current === activeFile.id &&
           typeof collabContentRef.current === "string"
         ? collabContentRef.current
-        : (activeFile.content ?? "");
+        : activeFile.content;
   let prepared: ReturnType<typeof prepareAcceptedSourceContent>;
   try {
     prepared = prepareAcceptedSourceContent(inputContent, {
@@ -192,7 +205,8 @@ export function runApplyLocalContentUpdate(
         : null,
   });
   const shouldRecordHistory =
-    options.recordHistory !== false && !options.updatedAt;
+    options.recordHistory === true ||
+    (options.recordHistory !== false && !options.updatedAt);
 
   if (!previewOnly) {
     acknowledgeAuthoritativeClipboardMutation({
@@ -206,6 +220,7 @@ export function runApplyLocalContentUpdate(
     canWriteCollabText(ydoc, isSynced, previousContent);
   const yjsHistoryAvailable = Boolean(
     shouldRecordHistory &&
+    !(options.serverAccepted && options.shaderWriteCompletion) &&
     viewModeRef.current !== "overview" &&
     writeLiveDoc &&
     undoManagerRef.current,
@@ -220,6 +235,9 @@ export function runApplyLocalContentUpdate(
       fileId: activeFile.id,
       before: previousContent,
       after: nextContent,
+      ...(options.shaderWriteCompletion && options.serverAccepted
+        ? { isCheckpoint: true }
+        : {}),
     };
     if (viewModeRef.current === "overview") {
       recordContentHistoryEntry(
@@ -242,10 +260,17 @@ export function runApplyLocalContentUpdate(
       fileId: activeFile.id,
       before: previousContent,
       after: nextContent,
+      ...(options.shaderWriteCompletion && options.serverAccepted
+        ? { isCheckpoint: true }
+        : {}),
       selectionBefore: options.selectionBefore,
     });
   }
   if (options.updatedAt && !needsIdentityMigration) {
+    primeAcceptedSource(activeFile.id, {
+      content: nextContent,
+      updatedAt: options.updatedAt,
+    });
     clearPendingLocalFileContent(activeFile.id);
   } else {
     markPendingLocalFileContent(
@@ -262,23 +287,27 @@ export function runApplyLocalContentUpdate(
   lastLocalContentRef.current = nextContent;
   latestActiveContentRef.current = nextContent;
   if (id) {
-    queryClient.setQueryData(["action", "get-design", { id }], (old: any) => {
-      if (!old || typeof old !== "object" || !Array.isArray(old.files)) {
-        return old;
-      }
-      return {
-        ...old,
-        files: old.files.map((file: DesignFile) =>
-          file.id === activeFile.id
-            ? {
-                ...file,
-                content: nextContent,
-                ...(options.updatedAt ? { updatedAt: options.updatedAt } : {}),
-              }
-            : file,
-        ),
-      };
-    });
+    queryClient.setQueryData(
+      designMetadataQueryKey(id),
+      (old: Record<string, unknown> | undefined) => {
+        if (!old || typeof old !== "object" || !Array.isArray(old.files)) {
+          return old;
+        }
+        return {
+          ...old,
+          files: old.files.map((file: DesignFile) =>
+            file.id === activeFile.id
+              ? {
+                  ...file,
+                  ...(options.updatedAt
+                    ? { updatedAt: options.updatedAt }
+                    : {}),
+                }
+              : file,
+          ),
+        };
+      },
+    );
   }
   const forceRefresh = options.refreshPreview === true;
   const replacedPreview = options.skipPreview
@@ -300,18 +329,33 @@ export function runApplyLocalContentUpdate(
   if (renderFallback) {
     setContentRenderRevision((revision) => revision + 1);
   }
-  if (ydoc && writeLiveDoc && !previewOnly) {
+  let yjsHistoryRecorded = false;
+  if (
+    ydoc &&
+    writeLiveDoc &&
+    !previewOnly &&
+    !(options.serverAccepted && options.shaderWriteCompletion)
+  ) {
     const ytext = ydoc.getText("content");
     if (ytext.toJSON() !== nextContent) {
       if (!yjsHistoryAvailable) {
         undoManagerRef.current?.clear(true, false);
       }
-      writeCollabText(
-        ydoc,
-        ytext,
-        nextContent,
-        yjsHistoryAvailable ? LOCAL_EDIT_ORIGIN : TAB_ID,
-      );
+      const write = () =>
+        writeCollabText(
+          ydoc,
+          ytext,
+          nextContent,
+          yjsHistoryAvailable ? LOCAL_EDIT_ORIGIN : TAB_ID,
+        );
+      if (yjsHistoryAvailable) {
+        yjsHistoryRecorded = captureYjsUndoHistoryUpdate(
+          undoManagerRef.current,
+          write,
+        ).recorded;
+      } else {
+        write();
+      }
     }
   }
   let saveCompletion: Promise<FileContentSaveCompletion> | undefined;
@@ -336,6 +380,7 @@ export function runApplyLocalContentUpdate(
     status: "accepted",
     content: nextContent,
     nodeIdMap: prepared.nodeIdMap,
+    yjsHistoryRecorded,
     ...(options.awaitSave && saveCompletion instanceof Promise
       ? { saveCompletion }
       : {}),

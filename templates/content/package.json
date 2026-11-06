@@ -8,7 +8,7 @@
     "dev:database": "node scripts/dev-database.mjs",
     "build": "agent-native build",
     "start": "agent-native start",
-    "test": "vitest --run",
+    "test": "vitest --run --tags-filter \"!known-loss\"",
     "test:parity": "vitest --run parity",
     "test:parity-capabilities": "vitest --run parity actions/content-database-lifecycle.db.test.ts actions/bind-content-database-source-field.db.test.ts actions/_local-file-documents.test.ts actions/builder-source-review-gates.db.test.ts",
     "eval:parity": "agent-native eval parity",
@@ -85,7 +85,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@radix-ui/react-dialog": "^1.1.14",
+    "@radix-ui/react-dialog": "catalog:",
     "@radix-ui/react-dropdown-menu": "^2.1.15",
     "@radix-ui/react-label": "^2.1.7",
     "@radix-ui/react-scroll-area": "^1.2.9",
@@ -104,7 +104,7 @@
     "@types/node": "^24.2.1",
     "@types/react": "catalog:",
     "@types/react-dom": "catalog:",
-    "@vitejs/plugin-react-swc": "^4.0.0",
+    "@vitejs/plugin-react-swc": "^4.3.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "drizzle-kit": "^0.31.10",

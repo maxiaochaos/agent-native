@@ -1,9 +1,4 @@
-import {
-  ActionContractError,
-  defineAction,
-  embedApp,
-  fail,
-} from "@agent-native/core";
+import { ActionContractError, defineAction, fail } from "@agent-native/core";
 import { buildDeepLink, getRequestContext } from "@agent-native/core/server";
 import { assertAccess } from "@agent-native/core/sharing";
 import { track } from "@agent-native/core/tracking";
@@ -21,6 +16,7 @@ import { z } from "zod";
 import { normalizeSlidePadding } from "../app/lib/normalize-slide-padding.js";
 import { getDb, schema } from "../server/db/index.js";
 import { notifyClients } from "../server/handlers/decks.js";
+import { deckDataColumns } from "../server/lib/deck-list-columns.js";
 import {
   createDeckVersionSnapshot,
   deckVersionChangeGroupFromAction,
@@ -39,6 +35,12 @@ import {
   createLayoutFitRevision,
   hashSlideContent,
 } from "../shared/slide-fit.js";
+import { withUniqueSlideIds } from "../shared/slide-ids.js";
+import {
+  normalizeSlideTransition,
+  SLIDE_TRANSITION_INPUTS,
+  SLIDE_TRANSITION_SPEED,
+} from "../shared/slide-transitions.js";
 import { slideLabelFor, touchAgentSlidePresence } from "./_agent-presence.js";
 import { getDeckUrl } from "./_app-url.js";
 import {
@@ -122,6 +124,7 @@ export default defineAction({
     "Pass presenter-only speaker notes in `notes`; keep them out of the slide HTML. " +
     "Every new slide must be a fully styled composition with the exact padded `fmd-slide` wrapper, a clear type hierarchy, intentional alignment, readable contrast, and at least one visual or structural treatment beyond plain text. If no design system is linked, follow one deliberate deck-level visual contract expressed with semantic --deck-* values on every slide; keep the canvas, type system, spacing, surfaces, and accent treatment consistent instead of alternating themes or using a stock provider/brand palette. " +
     "Use `patch-deck` for edits to existing slides or deck structure, not for appending newly generated slides in this workflow. " +
+    'Exception: when the user asks for a blank or empty slide, pass layout="blank" with an empty padded `fmd-slide` wrapper (reuse the deck background if one exists) and skip the get-deck preflight, the styling requirement, and fit/contrast checks. ' +
     "Returns the new slide ID, 1-based slideNumber, updated slide count, realSlideCount (real non-blank slides after the write, present when the deck has a target slide count; compare it, not slideCount, with the target), and pending layoutFit identity. Do not check fit after each write: finish all slide edits, then call get-layout-overflows once, and once more only after a repair. If measurements are unknown, report the unmeasured slides and do not recheck this turn unless the editor has produced a new measurement. If the slide is saved but client notification fails, the result includes notificationStatus='failed' and notificationErrorType; the write already succeeded, so do not retry it." +
     HYGIENE_ACTION_DESCRIPTION,
   schema: z.object({
@@ -150,6 +153,23 @@ export default defineAction({
       .string()
       .optional()
       .describe("Optional presenter-only speaker notes; keep them out of HTML"),
+    background: z
+      .string()
+      .optional()
+      .describe(
+        "Slide background; read it with get-deck compact=false when duplicating",
+      ),
+    transition: z.enum(SLIDE_TRANSITION_INPUTS).optional(),
+    transitionSpeed: z
+      .number()
+      .int()
+      .min(SLIDE_TRANSITION_SPEED.min)
+      .max(SLIDE_TRANSITION_SPEED.max)
+      .optional(),
+    skipped: z
+      .boolean()
+      .optional()
+      .describe("Exclude this slide from Present/Presenter playback"),
     position: z
       .preprocess((value) => {
         if (typeof value !== "string") return value;
@@ -198,22 +218,18 @@ export default defineAction({
   }),
   mcpApp: {
     compactCatalog: true,
-    resource: embedApp({
-      title: "Deck editor",
-      description: "Open the updated deck in the real Slides editor.",
-      iframeTitle: "Agent-Native Slides",
-      openLabel: "Open deck",
-      height: 680,
-    }),
   },
-  // Not retrySafe, even with a caller slideId: run inserts without checking for
-  // an existing id, so a replay appends a second copy of the slide.
+  // Not retrySafe: a replay with no slideId appends a second copy, and a replay
+  // with one is refused as slide_id_taken even though the first write succeeded.
   http: { method: "POST" },
   mcpAnnotations: {
     readOnlyHint: false,
     destructiveHint: false,
     openWorldHint: false,
   },
+  eagerInputStreaming: true,
+  // Only creates a slide; `reuseLabels: []` is the default and inherits labels.
+  emptyListsEraseNothing: true,
   run: async (
     {
       deckId,
@@ -222,6 +238,10 @@ export default defineAction({
       layout,
       notes,
       position,
+      background,
+      transition,
+      transitionSpeed,
+      skipped,
       contextPackId,
       contextModeOverride,
       reuseLabels,
@@ -229,8 +249,9 @@ export default defineAction({
       generationComplete,
     },
     ctx,
-  ) =>
-    withDeckLock(deckId, async () => {
+  ) => {
+    let shouldTrackActionGenerationCompletion = false;
+    return withDeckLock(deckId, async () => {
       await assertAccess("deck", deckId, "editor");
       const db = getDb();
 
@@ -239,15 +260,15 @@ export default defineAction({
         .from(schema.decks)
         .where(eq(schema.decks.id, deckId));
 
-      if (!rows.length) {
+      const row = rows.at(0);
+      if (!row) {
         fail(`Deck ${deckId} not found`, {
           errorCode: "deck_not_found",
           statusCode: 404,
         });
       }
 
-      const row = rows[0];
-      const deck = JSON.parse(row.data);
+      const deck = withUniqueSlideIds(deckId, JSON.parse(row.data));
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const slides: any[] = Array.isArray(deck.slides) ? deck.slides : [];
       const generationContext =
@@ -281,45 +302,51 @@ export default defineAction({
         realSlideCount === null
           ? null
           : realSlideCount + (isRealSlide({ content }) ? 1 : 0);
-      if (targetSlideCountOverride !== undefined) {
-        if (!isAgentPatchCaller(ctx?.caller)) {
-          throw new ActionContractError(
-            "targetSlideCountOverride is only available to agent calls after an explicit user request for more slides.",
-            { errorCode: "target_slide_count_override_agent_only" },
-          );
-        }
-        if (
-          targetSlideCount === null ||
-          realSlideCount === null ||
-          targetSlideCountOverride <= targetSlideCount ||
+      if (
+        targetSlideCountOverride !== undefined &&
+        !isAgentPatchCaller(ctx?.caller)
+      ) {
+        throw new ActionContractError(
+          "targetSlideCountOverride is only available to agent calls after an explicit user request for more slides.",
+          { errorCode: "target_slide_count_override_agent_only" },
+        );
+      }
+      // An override extends a persisted target. A deck without one has no cap
+      // to lift, so the override is dropped rather than saved as a new target
+      // that would refuse later slides.
+      const slideCountOverride =
+        targetSlideCount === null ? undefined : targetSlideCountOverride;
+      if (
+        slideCountOverride !== undefined &&
+        targetSlideCount !== null &&
+        realSlideCount !== null &&
+        (slideCountOverride <= targetSlideCount ||
           realSlideCount < targetSlideCount ||
-          targetSlideCountOverride <= realSlideCount
-        ) {
-          throw new ActionContractError(
-            targetSlideCount === null || realSlideCount === null
-              ? "targetSlideCountOverride requires a persisted target slide count."
-              : realSlideCount < targetSlideCount
-                ? `targetSlideCountOverride is only valid after the deck reaches its persisted target of ${targetSlideCount} slides; it has ${realSlideCount} real slides (blank placeholders do not count).`
-                : `targetSlideCountOverride must extend both the persisted target of ${targetSlideCount} and the current real slide count of ${realSlideCount}.`,
-            {
-              errorCode: "target_slide_count_override_invalid",
-              details: {
-                deckId,
-                currentSlideCount: slides.length,
-                realSlideCount,
-                targetSlideCount,
-                targetSlideCountOverride,
-              },
+          slideCountOverride <= realSlideCount)
+      ) {
+        throw new ActionContractError(
+          realSlideCount < targetSlideCount
+            ? `targetSlideCountOverride is only valid after the deck reaches its persisted target of ${targetSlideCount} slides; it has ${realSlideCount} real slides (blank placeholders do not count).`
+            : `targetSlideCountOverride must extend both the persisted target of ${targetSlideCount} and the current real slide count of ${realSlideCount}.`,
+          {
+            errorCode: "target_slide_count_override_invalid",
+            details: {
+              deckId,
+              currentSlideCount: slides.length,
+              realSlideCount,
+              targetSlideCount,
+              targetSlideCountOverride: slideCountOverride,
             },
-          );
-        }
+          },
+        );
       }
       if (
         isAgentPatchCaller(ctx?.caller) &&
         targetSlideCount !== null &&
         realSlideCount !== null &&
         realSlideCount >= targetSlideCount &&
-        targetSlideCountOverride === undefined
+        postWriteRealSlideCount !== realSlideCount &&
+        slideCountOverride === undefined
       ) {
         fail(
           `No slide was added: this deck already has ${realSlideCount} real slides against its requested target of ${targetSlideCount}. Re-read the deck. If the target is satisfied, stop authoring and finish the response; do not retry. Only if the user explicitly asked for more than ${targetSlideCount} slides, call add-slide again with targetSlideCountOverride set to the new total of real slides.`,
@@ -336,8 +363,7 @@ export default defineAction({
         );
       }
 
-      const effectiveTargetSlideCount =
-        targetSlideCountOverride ?? targetSlideCount;
+      const effectiveTargetSlideCount = slideCountOverride ?? targetSlideCount;
       if (
         generationComplete &&
         effectiveTargetSlideCount !== null &&
@@ -360,16 +386,41 @@ export default defineAction({
         );
       }
 
-      if (targetSlideCountOverride !== undefined) {
+      if (slideCountOverride !== undefined) {
         deck.generationContext = {
           ...(generationContext ?? {}),
-          targetSlideCount: targetSlideCountOverride,
+          targetSlideCount: slideCountOverride,
+        };
+      }
+
+      const generationAttemptId =
+        typeof generationContext?.generationAttemptId === "string"
+          ? generationContext.generationAttemptId
+          : undefined;
+      shouldTrackActionGenerationCompletion = Boolean(
+        generationComplete &&
+        generationAttemptId &&
+        generationContext?.generationMode === "action" &&
+        generationContext.completedAttemptId !== generationAttemptId,
+      );
+      if (shouldTrackActionGenerationCompletion && generationAttemptId) {
+        deck.generationContext = {
+          ...((deck.generationContext as Record<string, unknown> | undefined) ??
+            generationContext ??
+            {}),
+          completedAttemptId: generationAttemptId,
         };
       }
 
       const newSlideId =
         slideId ??
         `slide-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      if (slideId !== undefined && slides.some((s) => s.id === slideId)) {
+        fail(
+          `Slide ${slideId} already exists in deck ${deckId}. Nothing was added; use a new slideId or omit it to generate one.`,
+          { errorCode: "slide_id_taken", statusCode: 409 },
+        );
+      }
 
       const existingContext = deckCreativeContext(deck.creativeContext);
       if (
@@ -483,6 +534,28 @@ export default defineAction({
       };
       if (layout) newSlide.layout = layout;
       if (notes !== undefined) newSlide.notes = notes;
+      if (background !== undefined) newSlide.background = background;
+      if (transition !== undefined)
+        newSlide.transition = normalizeSlideTransition(transition);
+      if (transitionSpeed !== undefined)
+        newSlide.transitionSpeed = transitionSpeed;
+      if (skipped !== undefined) newSlide.skipped = skipped;
+
+      const shouldTrackNonActionFirstOutput = Boolean(
+        generationAttemptId &&
+        generationContext &&
+        generationContext.generationMode !== "action" &&
+        generationContext.firstOutputAttemptId !== generationAttemptId &&
+        isRealSlide(newSlide),
+      );
+      if (shouldTrackNonActionFirstOutput && generationAttemptId) {
+        deck.generationContext = {
+          ...((deck.generationContext as Record<string, unknown> | undefined) ??
+            generationContext ??
+            {}),
+          firstOutputAttemptId: generationAttemptId,
+        };
+      }
 
       const insertIndex =
         typeof position === "number"
@@ -533,7 +606,7 @@ export default defineAction({
           .update(schema.decks)
           .set({
             ...(repairedTitle ? { title: repairedTitle } : {}),
-            data: JSON.stringify(deck),
+            ...deckDataColumns(deck),
             updatedAt: now,
           })
           .where(deckRevisionWhere(schema.decks, deckId, row.updatedAt));
@@ -572,10 +645,6 @@ export default defineAction({
           error instanceof Error && error.name ? error.name : "unknown_error";
       }
 
-      const generationAttemptId =
-        typeof generationContext?.generationAttemptId === "string"
-          ? generationContext.generationAttemptId
-          : undefined;
       const generationStartedAt =
         typeof generationContext?.generationStartedAt === "number" &&
         Number.isFinite(generationContext.generationStartedAt) &&
@@ -583,11 +652,7 @@ export default defineAction({
           ? generationContext.generationStartedAt
           : undefined;
       const browserSessionId = getRequestContext()?.browserSessionId;
-      if (
-        shouldRepairTitle &&
-        generationAttemptId &&
-        generationContext?.generationMode !== "action"
-      ) {
+      if (generationAttemptId && shouldTrackNonActionFirstOutput) {
         noteGenerationFirstOutput(ctx?.turnId || ctx?.runId, {
           deckId,
           generationAttemptId,
@@ -629,11 +694,7 @@ export default defineAction({
           ctx,
         );
       }
-      if (
-        generationComplete &&
-        generationAttemptId &&
-        generationContext?.generationMode === "action"
-      ) {
+      if (shouldTrackActionGenerationCompletion && generationAttemptId) {
         const generationEndedAt = Date.now();
         track(
           "generation_completed",
@@ -683,7 +744,8 @@ export default defineAction({
       };
 
       return base;
-    }),
+    });
+  },
   link: ({ result, args }) => {
     const deckId =
       result && typeof result === "object"

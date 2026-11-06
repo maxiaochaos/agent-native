@@ -10,6 +10,8 @@ import {
   isLocalDatabase,
   isTransientDatabaseError,
 } from "../db/client.js";
+import { AppSecretDecryptionError } from "../secrets/errors.js";
+import type { ReadSecretResult } from "../secrets/storage.js";
 import { getOrgSetting } from "../settings/org-settings.js";
 import { BUILDER_CREDENTIAL_KEYS } from "./builder-credential-keys.js";
 import {
@@ -20,7 +22,10 @@ import {
 } from "./builder-oauth.js";
 import { readsOrgCredentialFirst } from "./credential-read-order.js";
 import { decideCredentialWriteScope } from "./credential-write-scope.js";
-import { isHostedWorkspaceRuntime } from "./deployment-protection.js";
+import {
+  isFusionPreviewRuntime,
+  isHostedWorkspaceRuntime,
+} from "./deployment-protection.js";
 import {
   isPersonalProviderKeyUseRestricted,
   isPersonalProviderPolicyKey,
@@ -143,7 +148,7 @@ export class CredentialStoreUnavailableError extends Error {
 
   constructor(cause?: unknown) {
     super(
-      "Could not read your saved connections — the app database did not answer. This is temporary; try again in a moment.",
+      "Could not read your saved connections. Try again, or reconnect the connection if the issue continues.",
       { cause },
     );
     this.name = "CredentialStoreUnavailableError";
@@ -154,7 +159,12 @@ export function assertCredentialStoreReadable(result: {
   lookupFailed: boolean;
   cause?: unknown;
 }): void {
-  if (result.lookupFailed && isTransientDatabaseError(result.cause)) {
+  if (
+    result.lookupFailed &&
+    (isTransientDatabaseError(result.cause) ||
+      result.cause instanceof AppSecretDecryptionError ||
+      result.cause instanceof CredentialStoreUnavailableError)
+  ) {
     throw new CredentialStoreUnavailableError(result.cause);
   }
 }
@@ -179,6 +189,7 @@ export function readDeployCredentialEnv(key: string): string | undefined {
   ) {
     return undefined;
   }
+  if (isNetlifyAiGatewayInjected(key)) return undefined;
   return process.env[key] || undefined;
 }
 
@@ -195,6 +206,40 @@ const DEPLOY_LLM_PROVIDER_ENV_KEYS = new Set([
   "TYPESAFE_API_KEY",
   "VOYAGE_API_KEY",
 ]);
+
+const DEPLOY_LLM_BASE_URL_ENV_KEYS = new Set([
+  "ANTHROPIC_BASE_URL",
+  "GOOGLE_GEMINI_BASE_URL",
+  "OPENAI_BASE_URL",
+  "OPENROUTER_BASE_URL",
+  "TYPESAFE_BASE_URL",
+]);
+
+const NETLIFY_AI_GATEWAY_PATH = "/.netlify/ai";
+
+/**
+ * Netlify AI Gateway fills these provider vars at runtime on every credit-based
+ * team that has not opted out, billing the deployer's Netlify credits. They
+ * are not a model credential the app owner chose, and counting them hides the
+ * Connect AI step. Netlify never writes them when the owner set their own, so a
+ * match is always the gateway's.
+ */
+function isNetlifyAiGatewayInjected(key: string): boolean {
+  const value = process.env[key]?.trim();
+  if (!value) return false;
+  if (DEPLOY_LLM_PROVIDER_ENV_KEYS.has(key)) {
+    const gatewayKey = process.env.NETLIFY_AI_GATEWAY_KEY?.trim();
+    return !!gatewayKey && value === gatewayKey;
+  }
+  if (DEPLOY_LLM_BASE_URL_ENV_KEYS.has(key)) {
+    const gatewayUrl = process.env.NETLIFY_AI_GATEWAY_URL?.trim();
+    return (
+      value.includes(NETLIFY_AI_GATEWAY_PATH) ||
+      (!!gatewayUrl && value.startsWith(gatewayUrl))
+    );
+  }
+  return false;
+}
 
 const BUILDER_CREDITS_DEPLOY_ENV_KEYS = new Set([
   "BUILDER_GATEWAY_SPACE_ID",
@@ -249,8 +294,9 @@ export function canUseDeployCredentialFallbackForRequest(
   ) {
     return false;
   }
+  if (key && isNetlifyAiGatewayInjected(key)) return false;
   if (key && BUILDER_CREDITS_DEPLOY_ENV_KEYS.has(key)) {
-    return isTrustedSelfHostedRuntime();
+    return isBuilderCreditsPairAllowedInRuntime();
   }
   if (key && DEPLOY_LLM_PROVIDER_ENV_KEYS.has(key)) {
     const hostedWorkspace = isHostedWorkspaceRuntime();
@@ -300,6 +346,36 @@ export function isTrustedSelfHostedRuntime(): boolean {
   return isLocalDatabase();
 }
 
+// Fusion mints the preview pod's pair for the project's own space, so the
+// hosted-workspace block on deploy keys must not reach it.
+function isBuilderCreditsPairAllowedInRuntime(): boolean {
+  return isTrustedSelfHostedRuntime() || isFusionPreviewRuntime();
+}
+
+/** Deployed but refused by runtime policy, which is not the same as absent. */
+function isBuilderCreditsPairRefusedByRuntime(): boolean {
+  return (
+    Boolean(process.env[BUILDER_GATEWAY_TOKEN_ENV_VAR]?.trim()) &&
+    Boolean(process.env[BUILDER_GATEWAY_SPACE_ID_ENV_VAR]?.trim()) &&
+    !isBuilderCreditsPairAllowedInRuntime()
+  );
+}
+
+export function builderCreditsRefusalStatus(chatEligible: boolean): {
+  builderCreditsRefused?: true;
+} {
+  return !chatEligible && isBuilderCreditsPairRefusedByRuntime()
+    ? { builderCreditsRefused: true }
+    : {};
+}
+
+let warnedBuilderCreditsRefused = false;
+
+/** @internal Test isolation for the once-per-process refusal warning. */
+export function resetBuilderCreditsRefusedWarningForTests(): void {
+  warnedBuilderCreditsRefused = false;
+}
+
 function canUseBuilderDeployCredentialFallbackForRequest(): boolean {
   const email = getRequestUserEmail();
   if (!email) return true;
@@ -338,6 +414,15 @@ function shouldTraceCredentialResolve(): boolean {
 // ---------------------------------------------------------------------------
 
 type BuilderCredentialSource = "user" | "org" | "workspace" | "env";
+const BUILDER_CONNECTION_KEYS = [
+  "BUILDER_PRIVATE_KEY",
+  "BUILDER_PUBLIC_KEY",
+] as const;
+const BUILDER_CONNECTION_KEY_SET = new Set<string>(BUILDER_CONNECTION_KEYS);
+const BUILDER_METADATA_KEYS = BUILDER_CREDENTIAL_KEYS.filter(
+  (key) => !BUILDER_CONNECTION_KEY_SET.has(key),
+);
+
 interface BuilderResolvedCredentials {
   privateKey: string | null;
   publicKey: string | null;
@@ -350,6 +435,7 @@ interface BuilderResolvedCredentials {
   isEnterprise: boolean | null;
   isFreeAccount: boolean | null;
   source: Exclude<BuilderCredentialSource, "env">;
+  optionalMetadataLookupFailure?: "unreadable" | "unavailable";
 }
 
 async function isCompleteBuilderConnection(
@@ -379,11 +465,38 @@ async function readBuilderCredentialScope(
   scope: "user" | "org" | "workspace",
   scopeId: string,
 ): Promise<BuilderResolvedCredentials> {
-  const secrets = await readAppSecrets({
-    keys: BUILDER_CREDENTIAL_KEYS,
-    scope,
-    scopeId,
-  });
+  const args = { scope, scopeId };
+  let optionalMetadataLookupFailure: "unreadable" | "unavailable" | undefined;
+  let secrets: Map<string, ReadSecretResult>;
+  try {
+    secrets = await readAppSecrets({
+      keys: BUILDER_CREDENTIAL_KEYS,
+      ...args,
+    });
+  } catch (error) {
+    if (!(error instanceof AppSecretDecryptionError)) throw error;
+
+    // A batch failure does not identify which row was unreadable. Re-read the
+    // required pair together so corruption there still fails this scope, then
+    // isolate optional metadata reads and report their failure separately.
+    secrets = await readAppSecrets({ keys: BUILDER_CONNECTION_KEYS, ...args });
+    const metadata = await Promise.all(
+      BUILDER_METADATA_KEYS.map(async (key) => {
+        try {
+          return await readAppSecrets({ keys: [key], ...args });
+        } catch (metadataError) {
+          if (!(metadataError instanceof AppSecretDecryptionError)) {
+            throw metadataError;
+          }
+          optionalMetadataLookupFailure ??= "unreadable";
+          return new Map<string, ReadSecretResult>();
+        }
+      }),
+    );
+    for (const result of metadata) {
+      for (const [key, secret] of result) secrets.set(key, secret);
+    }
+  }
   const value = (key: string): string | null => secrets.get(key)?.value ?? null;
   return {
     privateKey: value("BUILDER_PRIVATE_KEY"),
@@ -397,6 +510,7 @@ async function readBuilderCredentialScope(
     isEnterprise: readOptionalBuilderBoolean(value("BUILDER_IS_ENTERPRISE")),
     isFreeAccount: readOptionalBuilderBoolean(value("BUILDER_IS_FREE_ACCOUNT")),
     source: scope === "workspace" ? "workspace" : scope,
+    ...(optionalMetadataLookupFailure ? { optionalMetadataLookupFailure } : {}),
   };
 }
 
@@ -450,6 +564,8 @@ interface ScopedCredentialResult {
   source: "user" | "org" | "workspace" | null;
   cause?: unknown;
   lookupFailed: boolean;
+  /** A host-managed user with no credential: no fallback may stand in. */
+  hostManagedWithoutCredential?: boolean;
 }
 
 const NOT_FOUND: ScopedCredentialResult = {
@@ -458,6 +574,56 @@ const NOT_FOUND: ScopedCredentialResult = {
   lookupFailed: false,
 };
 
+/**
+ * Host hook: an app hosted inside Builder, with Builder as its identity
+ * provider, already holds the caller's own Builder credential. When a
+ * provider answers for the request's user, every Builder-backed feature (the
+ * AI gateway engine, Fusion containers, credits, deploys) uses that
+ * credential instead of a stored per-app Builder connection, so Builder sees
+ * and authorizes the real user in the real space.
+ */
+export interface DelegatedBuilderCredentials {
+  /** The user's own bearer (e.g. a Builder Firebase ID token). */
+  token: string;
+  /** The Builder space the user is acting in. */
+  spaceId: string;
+  userId?: string;
+}
+
+/**
+ * What a host's provider says about a user:
+ * - credentials: the caller's own Builder credential, used for every Builder
+ *   feature;
+ * - `null`: not a host-managed user, so ordinary stored credentials apply;
+ * - `"none"`: a host-managed user with no usable credential right now (it
+ *   expired, or was never exchanged). Lookup stops: a shared or stored
+ *   credential must never stand in for the user's own, and the host asks them
+ *   to sign in again.
+ * A provider that throws is an outage, reported as a failed lookup rather than
+ * as the absence of a credential.
+ * It may answer asynchronously, so a host on serverless can keep the
+ * credential in shared storage rather than per-instance memory.
+ */
+export type DelegatedBuilderCredentialsResult =
+  | DelegatedBuilderCredentials
+  | null
+  | "none";
+
+type DelegatedBuilderCredentialsProvider = (
+  email: string,
+) =>
+  | DelegatedBuilderCredentialsResult
+  | Promise<DelegatedBuilderCredentialsResult>;
+
+let delegatedBuilderCredentials: DelegatedBuilderCredentialsProvider | null =
+  null;
+
+export function registerDelegatedBuilderCredentials(
+  provider: DelegatedBuilderCredentialsProvider | null,
+): void {
+  delegatedBuilderCredentials = provider;
+}
+
 async function resolveScopedBuilderCredential(
   key: string,
   identity?: BuilderCredentialLookupIdentity,
@@ -465,6 +631,38 @@ async function resolveScopedBuilderCredential(
   const email =
     identity === undefined ? getRequestUserEmail() : identity.userEmail?.trim();
   if (!email) return NOT_FOUND;
+  // Without a provider (nearly every deployment) this stays synchronous.
+  let delegated: DelegatedBuilderCredentialsResult = null;
+  if (delegatedBuilderCredentials) {
+    try {
+      delegated = await delegatedBuilderCredentials(email);
+    } catch (cause) {
+      // A host's provider failing is an unreadable store like any other: no
+      // deployment credential may stand in for the user's own.
+      return {
+        value: null,
+        source: null,
+        cause: new CredentialStoreUnavailableError(cause),
+        lookupFailed: true,
+      };
+    }
+  }
+  if (delegated === "none") {
+    return {
+      value: null,
+      source: null,
+      lookupFailed: false,
+      hostManagedWithoutCredential: true,
+    };
+  }
+  if (delegated) {
+    if (key === "BUILDER_PRIVATE_KEY") {
+      return { value: delegated.token, source: "user", lookupFailed: false };
+    }
+    if (key === "BUILDER_PUBLIC_KEY") {
+      return { value: delegated.spaceId, source: "user", lookupFailed: false };
+    }
+  }
 
   const traceLookup = shouldTraceCredentialResolve();
   let scopeAttempted = "user";
@@ -547,8 +745,19 @@ async function resolveScopedBuilderCredential(
         cause: orgLookupCause,
       };
     }
-    const personal = await readPersonal();
-    if (personal && !(await readsOrgCredentialFirst(orgId, email))) {
+    let personal: ScopedCredentialResult | null = null;
+    let personalReadError: AppSecretDecryptionError | undefined;
+    try {
+      personal = await readPersonal();
+    } catch (error) {
+      if (!(error instanceof AppSecretDecryptionError)) throw error;
+      personalReadError = error;
+    }
+    const orgCredentialFirst =
+      Boolean(personal || personalReadError) &&
+      (await readsOrgCredentialFirst(orgId, email));
+    if (personalReadError && !orgCredentialFirst) throw personalReadError;
+    if (personal && !orgCredentialFirst) {
       return personal;
     }
 
@@ -597,6 +806,7 @@ async function resolveScopedBuilderCredential(
         );
       }
     }
+    if (personalReadError) throw personalReadError;
     if (personal) return personal;
 
     // 3. Solo-workspace fallback: always checked, even when an org id was
@@ -634,7 +844,12 @@ async function resolveScopedBuilderCredential(
         `[builder-credential] key=${key} email=${email} scope=${scopeAttempted} error=${(err as Error)?.message ?? err}`,
       );
     }
-    return { value: null, source: null, lookupFailed: true, cause: err };
+    return {
+      value: null,
+      source: null,
+      lookupFailed: true,
+      cause: err,
+    };
   }
   return {
     value: null,
@@ -647,12 +862,10 @@ async function resolveScopedBuilderCredential(
 interface ScopedBuilderCredentialsResult {
   creds: BuilderResolvedCredentials | null;
   cause?: unknown;
-  /**
-   * True when reading the credential store itself threw (db timeout, etc),
-   * as opposed to the store answering cleanly with "no row". Callers must
-   * report this as retryable rather than "not configured".
-   */
+  /** True when a lookup failed, rather than answering cleanly with "no row". */
   lookupFailed: boolean;
+  /** A host-managed user with no credential: no fallback may stand in. */
+  hostManagedWithoutCredential?: boolean;
 }
 
 export interface BuilderCredentialLookupIdentity {
@@ -666,6 +879,43 @@ async function resolveScopedBuilderCredentials(
   const email =
     identity === undefined ? getRequestUserEmail() : identity.userEmail?.trim();
   if (!email) return { creds: null, lookupFailed: false };
+  let delegated: DelegatedBuilderCredentialsResult = null;
+  if (delegatedBuilderCredentials) {
+    try {
+      delegated = await delegatedBuilderCredentials(email);
+    } catch (cause) {
+      return {
+        creds: null,
+        cause: new CredentialStoreUnavailableError(cause),
+        lookupFailed: true,
+      };
+    }
+  }
+  if (delegated === "none") {
+    return {
+      creds: null,
+      lookupFailed: false,
+      hostManagedWithoutCredential: true,
+    };
+  }
+  if (delegated) {
+    return {
+      creds: {
+        privateKey: delegated.token,
+        publicKey: delegated.spaceId,
+        userId: delegated.userId ?? null,
+        orgName: null,
+        orgKind: null,
+        subscription: null,
+        subscriptionLevel: null,
+        subscriptionName: null,
+        isEnterprise: null,
+        isFreeAccount: null,
+        source: "user",
+      },
+      lookupFailed: false,
+    };
+  }
 
   const traceLookup = shouldTraceCredentialResolve();
   let scopeAttempted = "user";
@@ -768,12 +1018,27 @@ async function resolveScopedBuilderCredentials(
     if (orgLookupCause !== undefined) {
       return { creds: null, lookupFailed: true, cause: orgLookupCause };
     }
-    const personal = await tryPersonal();
-    if (personal && !(await readsOrgCredentialFirst(orgId, email))) {
+    let personal: BuilderResolvedCredentials | null = null;
+    let personalReadError: AppSecretDecryptionError | undefined;
+    try {
+      personal = await tryPersonal();
+    } catch (error) {
+      if (!(error instanceof AppSecretDecryptionError)) throw error;
+      personalReadError = error;
+    }
+    const orgCredentialFirst =
+      Boolean(personal || personalReadError) &&
+      (await readsOrgCredentialFirst(orgId, email));
+    // A member's unreadable personal row still has precedence over shared
+    // keys; returning an org value would silently change the credential used.
+    if (personalReadError && !orgCredentialFirst) throw personalReadError;
+    if (personal && !orgCredentialFirst) {
       return { creds: personal, lookupFailed: false };
     }
-    const creds = (await tryOrg()) ?? personal;
+    const creds = await tryOrg();
     if (creds) return { creds, lookupFailed: false };
+    if (personalReadError) throw personalReadError;
+    if (personal) return { creds: personal, lookupFailed: false };
 
     scopeAttempted = "workspace-solo";
     const soloScopeId = `solo:${email}`;
@@ -812,21 +1077,17 @@ export async function resolveBuilderCredential(
   identity?: BuilderCredentialLookupIdentity,
 ): Promise<string | null> {
   const scoped = await resolveScopedBuilderCredential(key, identity);
+  if (scoped.lookupFailed)
+    throw new CredentialStoreUnavailableError(scoped.cause);
   if (scoped.value) return scoped.value;
+  if (scoped.hostManagedWithoutCredential) return null;
   const storageOnly =
     identity === undefined && getRequestBuilderCredentialScope().storageOnly;
   const envValue =
     !storageOnly && canUseBuilderDeployCredentialFallbackForRequest()
       ? (readDeployCredentialEnv(key) ?? null)
       : null;
-  if (envValue) {
-    // A deploy fallback is still useful, but it must not turn a transient
-    // credential-store failure into a clean connected result for Builder.
-    assertCredentialStoreReadable(scoped);
-    return envValue;
-  }
-  assertCredentialStoreReadable(scoped);
-  return null;
+  return envValue;
 }
 
 export function isBuilderEnvManaged(): boolean {
@@ -875,12 +1136,13 @@ export interface BuilderCredentialsDetailed {
   isEnterprise: boolean | null;
   isFreeAccount: boolean | null;
   source: BuilderCredentialSource | null;
-  /**
-   * True when reading the credential store itself failed (db timeout, etc).
-   * Callers must report this as retryable rather than "not configured".
-   */
+  /** True when a lookup failed, rather than answering cleanly with "no row". */
   lookupFailed: boolean;
+  /** Optional Builder profile metadata failed after the required key pair was read. */
+  optionalMetadataLookupFailure?: "unreadable" | "unavailable";
   cause?: unknown;
+  /** A host-managed user with no credential: no fallback may stand in. */
+  hostManagedWithoutCredential?: boolean;
 }
 
 export async function resolveBuilderCredentialsDetailed(
@@ -890,6 +1152,7 @@ export async function resolveBuilderCredentialsDetailed(
     creds: scoped,
     lookupFailed,
     cause,
+    hostManagedWithoutCredential,
   } = await resolveScopedBuilderCredentials(identity);
   if (scoped) {
     const {
@@ -918,6 +1181,45 @@ export async function resolveBuilderCredentialsDetailed(
       isFreeAccount,
       source,
       lookupFailed: false,
+      ...(scoped.optionalMetadataLookupFailure
+        ? {
+            optionalMetadataLookupFailure: scoped.optionalMetadataLookupFailure,
+          }
+        : {}),
+    };
+  }
+  if (lookupFailed) {
+    return {
+      privateKey: null,
+      publicKey: null,
+      userId: null,
+      orgName: null,
+      orgKind: null,
+      subscription: null,
+      subscriptionLevel: null,
+      subscriptionName: null,
+      isEnterprise: null,
+      isFreeAccount: null,
+      source: null,
+      lookupFailed: true,
+      cause,
+    };
+  }
+  if (hostManagedWithoutCredential) {
+    return {
+      privateKey: null,
+      publicKey: null,
+      userId: null,
+      orgName: null,
+      orgKind: null,
+      subscription: null,
+      subscriptionLevel: null,
+      subscriptionName: null,
+      isEnterprise: null,
+      isFreeAccount: null,
+      source: null,
+      lookupFailed: false,
+      hostManagedWithoutCredential: true,
     };
   }
   const canUseEnv =
@@ -1012,6 +1314,8 @@ export async function resolveBuilderCredentials(
   subscriptionName: string | null;
   isEnterprise: boolean | null;
   isFreeAccount: boolean | null;
+  lookupFailed?: boolean;
+  optionalMetadataLookupFailure?: "unreadable" | "unavailable";
 }> {
   const {
     privateKey,
@@ -1024,6 +1328,8 @@ export async function resolveBuilderCredentials(
     subscriptionName,
     isEnterprise,
     isFreeAccount,
+    lookupFailed,
+    optionalMetadataLookupFailure,
   } = await resolveBuilderCredentialsDetailed(identity);
   return {
     privateKey,
@@ -1036,6 +1342,8 @@ export async function resolveBuilderCredentials(
     subscriptionName,
     isEnterprise,
     isFreeAccount,
+    ...(lookupFailed ? { lookupFailed: true } : {}),
+    ...(optionalMetadataLookupFailure ? { optionalMetadataLookupFailure } : {}),
   };
 }
 
@@ -1059,7 +1367,18 @@ export async function resolveUsableBuilderGatewayDeployCredentials(): Promise<{
   )
     ? readDeployCredentialEnv(BUILDER_GATEWAY_SPACE_ID_ENV_VAR)
     : undefined;
-  if (!token || !spaceId) return null;
+  if (!token || !spaceId) {
+    if (
+      !warnedBuilderCreditsRefused &&
+      isBuilderCreditsPairRefusedByRuntime()
+    ) {
+      warnedBuilderCreditsRefused = true;
+      console.warn(
+        "[agent-native] BUILDER_GATEWAY_TOKEN and BUILDER_GATEWAY_SPACE_ID are set, but this runtime does not allow Builder.io credits, so chat will ask for an AI connection.",
+      );
+    }
+    return null;
+  }
   const failure = await getProviderCredentialAuthFailure({
     key: BUILDER_GATEWAY_TOKEN_ENV_VAR,
     value: token,
@@ -1068,6 +1387,8 @@ export async function resolveUsableBuilderGatewayDeployCredentials(): Promise<{
 }
 
 export function isBuilderGatewayDeployConfigured(): boolean {
+  // The preview carries the published site's token but is read by the owner.
+  if (isFusionPreviewRuntime()) return false;
   return (
     canUseDeployCredentialFallbackForRequest(BUILDER_GATEWAY_TOKEN_ENV_VAR) &&
     Boolean(readDeployCredentialEnv(BUILDER_GATEWAY_TOKEN_ENV_VAR))
@@ -1092,6 +1413,9 @@ export async function resolveBuilderGatewayCredentialsDetailed(
   identity?: BuilderCredentialLookupIdentity,
 ): Promise<BuilderGatewayCredentialsDetailed> {
   const scoped = await resolveBuilderCredentialsDetailed(identity);
+  // A host-managed user with no credential gets none: the shared gateway
+  // deploy credential must not act in their place.
+  if (scoped.hostManagedWithoutCredential) return { ...scoped, lane: null };
   if (scoped.source && scoped.source !== "env") {
     return { ...scoped, lane: "identity" };
   }
@@ -1935,9 +2259,18 @@ export async function resolveSecretPairs(
 
   let lookupFailed = false;
   let cause: unknown;
+  let personal: [string, string] | null = null;
+  let personalReadError: AppSecretDecryptionError | undefined;
   try {
     let pair: [string, string] | null = null;
-    const personal = allowUserScope ? await readPairs("user", email) : null;
+    if (allowUserScope) {
+      try {
+        personal = await readPairs("user", email);
+      } catch (error) {
+        if (!(error instanceof AppSecretDecryptionError)) throw error;
+        personalReadError = error;
+      }
+    }
 
     let orgId: string | null | undefined = getRequestOrgId();
     if (!orgId) {
@@ -1948,13 +2281,18 @@ export async function resolveSecretPairs(
     }
     // Before the personal answer: without the org, an owner's role is unknown.
     if (lookupFailed) {
+      if (personalReadError) throw personalReadError;
       const environmentPair = readEnvironmentPairs();
       if (environmentPair) return environmentPair;
       assertCredentialStoreReadable({ lookupFailed, cause });
       return null;
     }
 
-    if (personal && !(await readsOrgCredentialFirst(orgId, email))) {
+    const orgCredentialFirst =
+      Boolean(personal || personalReadError) &&
+      (await readsOrgCredentialFirst(orgId, email));
+    if (personalReadError && !orgCredentialFirst) throw personalReadError;
+    if (personal && !orgCredentialFirst) {
       return personal;
     }
 
@@ -1970,6 +2308,7 @@ export async function resolveSecretPairs(
         if (pair) return pair;
       }
     }
+    if (personalReadError) throw personalReadError;
     if (personal) return personal;
 
     if (allowUserScope) {
@@ -2014,6 +2353,13 @@ export async function resolveSecretPairs(
     cause = error;
   }
 
+  const unreadableSavedCredential = personalReadError ?? cause;
+  if (unreadableSavedCredential instanceof AppSecretDecryptionError) {
+    assertCredentialStoreReadable({
+      lookupFailed: true,
+      cause: unreadableSavedCredential,
+    });
+  }
   const environmentPair = readEnvironmentPairs();
   if (environmentPair) return environmentPair;
   assertCredentialStoreReadable({ lookupFailed, cause });
@@ -2055,14 +2401,20 @@ export async function resolveSecretDetailed(
         isPersonalProviderPolicyKey(key) &&
         (await isPersonalProviderKeyUseRestricted({ email }));
 
-      const userSecret =
-        options.skipUserScope || personalRestricted
-          ? null
-          : await readAppSecret({
-              key,
-              scope: "user",
-              scopeId: email,
-            });
+      let personalReadError: AppSecretDecryptionError | undefined;
+      let userSecret: ReadSecretResult | null = null;
+      if (!options.skipUserScope && !personalRestricted) {
+        try {
+          userSecret = await readAppSecret({
+            key,
+            scope: "user",
+            scopeId: email,
+          });
+        } catch (error) {
+          if (!(error instanceof AppSecretDecryptionError)) throw error;
+          personalReadError = error;
+        }
+      }
       const personal: ResolvedSecretDetail | null = userSecret?.value
         ? {
             value: userSecret.value,
@@ -2079,8 +2431,12 @@ export async function resolveSecretDetailed(
 
       // The beta suite writes one user-scoped credential and must never turn a
       // rejected or missing test key into a charge against a shared scope.
-      if (syntheticTraffic)
+      if (syntheticTraffic) {
+        if (personalReadError) {
+          return { value: null, lookupFailed: true, cause: personalReadError };
+        }
         return personal ?? { value: null, lookupFailed: false };
+      }
 
       let orgId: string | null | undefined = getRequestOrgId();
       if (!orgId) {
@@ -2096,7 +2452,13 @@ export async function resolveSecretDetailed(
       }
 
       // An owner or admin runs on the organization's key ahead of their own.
-      if (personal && !(await readsOrgCredentialFirst(orgId, email))) {
+      const orgCredentialFirst =
+        Boolean(personal || personalReadError) &&
+        (await readsOrgCredentialFirst(orgId, email));
+      if (personalReadError && !orgCredentialFirst) {
+        return { value: null, lookupFailed: true, cause: personalReadError };
+      }
+      if (personal && !orgCredentialFirst) {
         return personal;
       }
 
@@ -2139,6 +2501,9 @@ export async function resolveSecretDetailed(
             scopeId: orgId,
           };
         }
+      }
+      if (personalReadError) {
+        return { value: null, lookupFailed: true, cause: personalReadError };
       }
       if (personal) return personal;
 
@@ -2226,7 +2591,11 @@ export async function resolveSecretDetailed(
       lookupFailed = true;
       cause = err;
     }
-    if (lookupFailed && !isTrustedSelfHostedRuntime()) {
+    if (
+      lookupFailed &&
+      (cause instanceof AppSecretDecryptionError ||
+        !isTrustedSelfHostedRuntime())
+    ) {
       return { value: null, lookupFailed: true, cause };
     }
     const envFallback = (

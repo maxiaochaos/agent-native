@@ -27,9 +27,13 @@ import {
   useSetOrgDomain,
 } from "@agent-native/core/client/org";
 import { fetchOrgMemberPage } from "@agent-native/core/client/sharing";
-import { buildSignInReturnHref } from "@agent-native/core/client/sign-in-return";
+import {
+  buildSignInReturnHref,
+  serverAuthReturnPath,
+} from "@agent-native/core/client/sign-in-return";
 import { type ErrorReportDebugItem } from "@agent-native/core/client/ui";
 import { isFreeEmailProvider } from "@agent-native/core/org/free-email-providers";
+import { commentExcerpt } from "@agent-native/core/review/plain-text";
 import { docsUrl } from "@agent-native/core/shared";
 import {
   useSetHeaderActions,
@@ -38,8 +42,9 @@ import {
 import { PromptComposer } from "@agent-native/toolkit/app/chat/composer/index";
 import { ErrorReportActions } from "@agent-native/toolkit/app/feedback";
 import {
-  InlineMarkdown,
-  type InlineMarkdownProtectedSpan,
+  CommentBody,
+  isComposingKey,
+  isCommentSendKey,
 } from "@agent-native/toolkit/app/review";
 import { ShareButton } from "@agent-native/toolkit/app/sharing";
 import { writeClipboardText } from "@agent-native/toolkit/clipboard";
@@ -349,15 +354,19 @@ export {
 };
 export type { NativeMarkerPlacement } from "@/lib/plan-native-anchors";
 export type { PlanOrgAccessPrompt } from "@/lib/plan-access-prompt";
-export { canSubmitInlineCommentDraft, mentionQueryAtCaret };
+export {
+  AnnotationPopover,
+  canSubmitInlineCommentDraft,
+  CommentMentionEditor,
+  mentionQueryAtCaret,
+};
 export type { CommentDraft } from "@/lib/plan-comment-editor-helpers";
 
 export function buildPlanEmailVerificationCallbackURL(
   location: Pick<Location, "pathname" | "search" | "hash">,
 ): string {
-  return buildSignInReturnHref({
-    returnTo: appPath(planReturnPathFromLocation(location)),
-  });
+  const returnTo = appPath(planReturnPathFromLocation(location));
+  return serverAuthReturnPath(returnTo, buildSignInReturnHref({ returnTo }));
 }
 
 function isPlanEmailVerificationPendingMessage(message: string): boolean {
@@ -1005,46 +1014,6 @@ export function defaultInlineCommentDraftForPlanContext(input: {
   };
 }
 
-function safeDecodeURIComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function renderCommentMessage(message: string) {
-  const protectedSpans: InlineMarkdownProtectedSpan[] = [];
-  const pattern = /@\[([^\]]+)\]\(mailto:([^)]+)\)/g;
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(message)) !== null) {
-    const label = match[1] ?? "";
-    const email = safeDecodeURIComponent(match[2] ?? "");
-    protectedSpans.push({
-      source: match[0],
-      label: label || email,
-      title: email,
-    });
-  }
-  return (
-    <InlineMarkdown
-      content={message}
-      inline
-      protectedSpans={protectedSpans}
-      renderProtectedSpan={(span, children) => (
-        <span
-          key={span.source}
-          className="mx-0.5 inline-flex max-w-[14rem] translate-y-[2px] items-center gap-1 rounded-full border border-primary/20 bg-primary/10 px-1.5 py-0.5 text-xs font-medium text-primary"
-          title={span.title}
-        >
-          <IconAt className="size-3" />
-          <span className="truncate">{children}</span>
-        </span>
-      )}
-    />
-  );
-}
-
 function CommentAvatar({
   author,
   size = "sm",
@@ -1422,7 +1391,7 @@ function runtimeParticipantPresentation(
   };
 }
 
-function runtimeAnnotationMarkerTitle(annotation: RuntimeAnnotation) {
+export function runtimeAnnotationMarkerTitle(annotation: RuntimeAnnotation) {
   const names = annotation.participants
     .map((participant) => runtimeParticipantPresentation(participant).name)
     .filter(Boolean)
@@ -1431,9 +1400,12 @@ function runtimeAnnotationMarkerTitle(annotation: RuntimeAnnotation) {
   const countLabel = `${annotation.commentCount} comment${
     annotation.commentCount === 1 ? "" : "s"
   }`;
+  // The marker's tooltip and accessible name are plain text, so they read
+  // the comment's words, not its Markdown.
+  const excerpt = commentExcerpt(annotation.message);
   return names
-    ? `${countLabel} by ${names}: ${annotation.message}`
-    : `${countLabel}: ${annotation.message}`;
+    ? `${countLabel} by ${names}: ${excerpt}`
+    : `${countLabel}: ${excerpt}`;
 }
 
 function planExportFilename(
@@ -2347,7 +2319,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
     const returnPath = planReturnPathFromLocation(window.location);
     try {
       const res = await fetch(
-        `${agentNativePath("/_agent-native/google/auth-url")}?return=${encodeURIComponent(returnPath)}`,
+        `${agentNativePath("/_agent-native/google/auth-url")}?return=${encodeURIComponent(serverAuthReturnPath(appPath(returnPath), returnPath))}`,
         { cache: "no-store" },
       );
       const data = (await res.json().catch(() => null)) as {
@@ -3887,7 +3859,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
           )?.type
         : undefined;
       const quoteContext = textQuoteContextForBlock({
-        block: blockElement,
+        block: blockElement ?? null,
         quote: textQuote,
       });
       const snippet = textQuote.slice(0, 220);
@@ -4326,6 +4298,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
         await nextFrame();
         setNativeMarkerVersion((version) => version + 1);
         const point = nativePointForAnchor(anchor, reader);
+        if (!point) continue;
         const surfaceRect = surface.getBoundingClientRect();
         const readerRect = reader.getBoundingClientRect();
         const pointX = readerRect.left - surfaceRect.left + point.left;
@@ -4720,7 +4693,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
       createdBy: "human",
       authorEmail: collabUser?.email ?? null,
       authorName: collabUser?.name ?? null,
-      resolutionTarget: thread.root.resolutionTarget ?? null,
+      resolutionTarget: thread.root.resolutionTarget ?? undefined,
       mentions: [],
       mentionsJson: null,
       resolvedBy: null,
@@ -4975,7 +4948,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
               accessRequestSent={accessRequestSentPlanId === selectedId}
               viewerEmail={session?.email ?? null}
             />
-          ) : showInitialPlanSkeleton ? (
+          ) : showInitialPlanSkeleton || !bundle ? (
             <PlanSkeleton isRecap={location.pathname.includes("/recaps/")} />
           ) : (
             <div
@@ -5742,6 +5715,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                   ) : (
                     <InlineCommentPopover
                       key={failedCommentDraft ? "retry" : "new"}
+                      anchor={pendingAnnotation}
                       position={inlineCommentPosition}
                       initialDraft={
                         failedCommentDraft ?? defaultInlineCommentDraft
@@ -5749,6 +5723,7 @@ export function PlansPage({ localPlanSlug }: { localPlanSlug?: string } = {}) {
                       onCancel={closeInlineComment}
                       onSubmit={submitInlineComment}
                       lockToAgent={localPlanMode}
+                      reopened={Boolean(failedCommentDraft)}
                     />
                   )}
                 </>
@@ -5951,15 +5926,12 @@ const buildShareVisibilityCopy = (
   noun: string,
 ) => ({
   private: {
-    label: t("plansPage.share.visibility.private.label"),
     description: t("plansPage.share.visibility.private.description", { noun }),
   },
   org: {
-    label: t("plansPage.share.visibility.org.label"),
     description: t("plansPage.share.visibility.org.description"),
   },
   public: {
-    label: t("plansPage.share.visibility.public.label"),
     description: t("plansPage.share.visibility.public.description"),
   },
 });
@@ -6262,12 +6234,6 @@ function PlanShareControl({
         shareUrlPlacement="top"
         peopleAccessLabel={t("plansPage.share.peopleAccess", { noun })}
         generalAccessLabel={t("plansPage.share.generalAccess", { noun })}
-        roleCopy={{
-          commenter: {
-            label: t("plansPage.share.commenterRoleLabel"),
-            description: t("plansPage.share.commenterRoleDescription"),
-          },
-        }}
         accessNote={buildShareAccessNote(t, noun)}
         visibilityCopy={buildShareVisibilityCopy(t, noun)}
         triggerClassName="pointer-events-auto h-8 px-2"
@@ -7090,7 +7056,8 @@ export function PlanLoadError({
       ? t("plansPage.loadError.orgTitle", { orgName })
       : null;
 
-  const returnPath = () => appPath(planReturnPathFromLocation(window.location));
+  const returnPath = () =>
+    serverAuthReturnPath(appPath(planReturnPathFromLocation(window.location)));
 
   const readAuthError = async (res: Response, fallback: string) => {
     const data = (await res.json().catch(() => null)) as {
@@ -8930,9 +8897,26 @@ function CreatePlanDialog({
   );
 }
 
+/** Nothing on the page holds focus, so taking it moves nobody's caret. */
+function focusIsFree() {
+  const active = document.activeElement;
+  return !active || active === document.body;
+}
+
+function focusCommentEditorAtEnd(root: HTMLElement) {
+  root.focus();
+  const selection = window.getSelection();
+  const range = document.createRange();
+  range.selectNodeContents(root);
+  range.collapse(false);
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
 function CommentMentionEditor({
   initialMessage,
   resetKey,
+  focusKey,
   placeholder,
   className,
   autoFocus,
@@ -8941,9 +8925,12 @@ function CommentMentionEditor({
 }: {
   initialMessage?: string;
   resetKey?: string;
+  /** A new value puts the caret back in the editor and keeps its text. */
+  focusKey?: unknown;
   placeholder: string;
   className?: string;
-  autoFocus?: boolean;
+  /** "if-free" only takes focus nobody holds, for a box reopened after a failed save. */
+  autoFocus?: boolean | "if-free";
   onChange: (draft: Pick<CommentDraft, "message" | "mentions">) => void;
   onSubmitShortcut?: () => void;
 }) {
@@ -8975,18 +8962,35 @@ function CommentMentionEditor({
   useEffect(() => {
     const root = editorRef.current;
     if (!root) return;
+    const hadFocus = root.contains(document.activeElement);
     appendMessageToEditor(root, initialMessage ?? "");
     emitChange();
-    if (autoFocus) {
-      root.focus();
-      const selection = window.getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(root);
-      range.collapse(false);
-      selection?.removeAllRanges();
-      selection?.addRange(range);
-    }
+    // Reloading the text keeps the caret in an editor that had it.
+    if (hadFocus) focusCommentEditorAtEnd(root);
+    if (!autoFocus || (autoFocus === "if-free" && !focusIsFree())) return;
+    // An Edit menu item mounts this editor while its menu still traps focus,
+    // so keep trying for a few frames until focus lands.
+    let attempts = 0;
+    let frame = 0;
+    const focusEditor = () => {
+      focusCommentEditorAtEnd(root);
+      if (document.activeElement !== root && ++attempts < 10)
+        frame = requestAnimationFrame(focusEditor);
+    };
+    focusEditor();
+    return () => cancelAnimationFrame(frame);
   }, [autoFocus, emitChange, initialMessage, resetKey]);
+
+  // Only a new key moves the caret; mounting is autoFocus's job.
+  const focusKeyRef = useRef(focusKey);
+  useEffect(() => {
+    if (focusKeyRef.current === focusKey) return;
+    focusKeyRef.current = focusKey;
+    const root = editorRef.current;
+    if (!root || focusKey === undefined) return;
+    if (root.contains(document.activeElement)) return;
+    focusCommentEditorAtEnd(root);
+  }, [focusKey]);
 
   const selectMember = (member: OrgMemberSuggestion) => {
     const root = editorRef.current;
@@ -9036,6 +9040,9 @@ function CommentMentionEditor({
         onKeyUp={emitChange}
         onMouseUp={emitChange}
         onKeyDown={(event) => {
+          // While an input method is composing, its keys (arrows to pick a
+          // candidate, Enter to confirm, Escape to cancel) belong to it.
+          if (isComposingKey(event)) return;
           if (suggestionsOpen && event.key === "ArrowDown") {
             event.preventDefault();
             setSelectedIndex((index) =>
@@ -9062,12 +9069,7 @@ function CommentMentionEditor({
             setQuery(null);
             return;
           }
-          if (event.key === "Enter" && !event.shiftKey) {
-            event.preventDefault();
-            onSubmitShortcut?.();
-            return;
-          }
-          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          if (isCommentSendKey(event)) {
             event.preventDefault();
             onSubmitShortcut?.();
           }
@@ -9158,17 +9160,22 @@ function ResolutionTargetToggle({
 }
 
 function InlineCommentPopover({
+  anchor,
   position,
   initialDraft,
   onCancel,
   onSubmit,
   lockToAgent = false,
+  reopened = false,
 }: {
+  anchor: PlanAnnotationAnchor;
   position: InlineCommentPosition;
   initialDraft: CommentDraft;
   onCancel: () => void;
   onSubmit: (draft: CommentDraft) => Promise<void>;
   lockToAgent?: boolean;
+  /** Shown again after a failed save, when the person may have moved on. */
+  reopened?: boolean;
 }) {
   const t = useT();
   const initialMessageRef = useRef(initialDraft.message);
@@ -9249,7 +9256,10 @@ function InlineCommentPopover({
         <CommentMentionEditor
           initialMessage={initialMessageRef.current}
           placeholder={t("plansPage.comments.addPlaceholder")}
-          autoFocus
+          autoFocus={reopened ? "if-free" : true}
+          // Commenting somewhere else moves this popover instead of
+          // remounting it, so the draft keeps its text and gets the caret.
+          focusKey={anchor}
           onSubmitShortcut={submit}
           onChange={(value) =>
             setDraft((current) => {
@@ -9350,7 +9360,7 @@ function CommentThreadMessage({
           )}
         </div>
         <div className="mt-1 text-sm leading-6">
-          {renderCommentMessage(comment.message)}
+          <CommentBody body={comment.message} />
         </div>
       </div>
       {action}
@@ -9387,42 +9397,110 @@ function CommentDeleteButton({
   );
 }
 
+/** What a reply box shows: the editor reloads `loadedMessage` when `version` changes. */
+function loadReplyBox({
+  threadId,
+  message,
+  version,
+  takeFocus,
+}: {
+  threadId: string;
+  message: string;
+  version: number;
+  takeFocus: boolean;
+}) {
+  const draft: Pick<CommentDraft, "message" | "mentions"> = {
+    message,
+    mentions: extractCommentMentions(message),
+  };
+  return { threadId, loadedMessage: message, version, takeFocus, draft };
+}
+
 function ReplyComposer({
   author,
   isPending,
   placeholder,
+  autoFocus,
+  threadId = "",
   onSubmit,
 }: {
   author: CommentAuthorPresentation;
   isPending: boolean;
   placeholder?: string;
+  autoFocus?: boolean;
+  /** One box can reply to several threads in turn; each keeps its own draft. */
+  threadId?: string;
   onSubmit: (message: string) => Promise<void>;
 }) {
   const t = useT();
-  const [draft, setDraft] = useState<
-    Pick<CommentDraft, "message" | "mentions">
-  >({
-    message: "",
-    mentions: [],
-  });
-  const [submitError, setSubmitError] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [resetKey, setResetKey] = useState(0);
+  // Unsent replies by thread, including the one on screen.
+  const [drafts] = useState(() => new Map<string, string>());
+  // The thread on screen and its draft change together, so Send always
+  // pairs them.
+  const [box, setBox] = useState(() =>
+    loadReplyBox({ threadId, message: "", version: 0, takeFocus: true }),
+  );
+  const [sendingThreadIds, setSendingThreadIds] = useState<string[]>([]);
+  const [failedThreadIds, setFailedThreadIds] = useState<string[]>([]);
 
+  if (box.threadId !== threadId) {
+    // Opening another thread brings back that thread's own reply.
+    setBox(
+      loadReplyBox({
+        threadId,
+        message: drafts.get(threadId) ?? "",
+        version: box.version + 1,
+        takeFocus: true,
+      }),
+    );
+  }
+
+  const isSubmitting = sendingThreadIds.includes(box.threadId);
   const canSubmit =
-    commentBodyText(draft.message).length > 0 && !isSubmitting && !isPending;
+    commentBodyText(box.draft.message).length > 0 &&
+    !isSubmitting &&
+    !isPending;
   const submit = async () => {
     if (!canSubmit) return;
-    setSubmitError(false);
-    setIsSubmitting(true);
+    const sentThreadId = box.threadId;
+    const message = box.draft.message;
+    setFailedThreadIds((ids) => ids.filter((id) => id !== sentThreadId));
+    setSendingThreadIds((ids) => [...ids, sentThreadId]);
+    // Empty the box right away. The reply shows in the thread while it
+    // sends, and anything typed meanwhile is a new draft.
+    drafts.set(sentThreadId, "");
+    setBox((current) =>
+      loadReplyBox({
+        threadId: current.threadId,
+        message: "",
+        version: current.version + 1,
+        takeFocus: true,
+      }),
+    );
     try {
-      await onSubmit(draft.message.trim());
-      setDraft({ message: "", mentions: [] });
-      setResetKey((key) => key + 1);
+      await onSubmit(message.trim());
     } catch {
-      setSubmitError(true);
+      // Put the reply back in its thread's box, ahead of anything typed
+      // since, wherever that box is now.
+      const typedSince = drafts.get(sentThreadId)?.trim();
+      const restored = typedSince ? `${message} ${typedSince}` : message;
+      drafts.set(sentThreadId, restored);
+      setFailedThreadIds((ids) => [
+        ...ids.filter((id) => id !== sentThreadId),
+        sentThreadId,
+      ]);
+      setBox((current) =>
+        current.threadId === sentThreadId
+          ? loadReplyBox({
+              threadId: sentThreadId,
+              message: restored,
+              version: current.version + 1,
+              takeFocus: false,
+            })
+          : current,
+      );
     } finally {
-      setIsSubmitting(false);
+      setSendingThreadIds((ids) => ids.filter((id) => id !== sentThreadId));
     }
   };
 
@@ -9435,9 +9513,16 @@ function ReplyComposer({
             placeholder={
               placeholder ?? t("plansPage.comments.replyPlaceholder")
             }
-            resetKey={`reply-${resetKey}`}
+            initialMessage={box.loadedMessage}
+            resetKey={`reply-${box.version}`}
+            // Only opening the thread or pressing Send pulls focus here; a
+            // reply put back after a failed send takes only free focus.
+            autoFocus={!autoFocus ? false : box.takeFocus ? true : "if-free"}
             className="min-h-10 border-0 bg-transparent px-0 py-2 shadow-none focus-visible:ring-0"
-            onChange={setDraft}
+            onChange={(next) => {
+              setBox((current) => ({ ...current, draft: next }));
+              drafts.set(box.threadId, next.message);
+            }}
             onSubmitShortcut={() => void submit()}
           />
           <Button
@@ -9456,7 +9541,7 @@ function ReplyComposer({
           </Button>
         </div>
       </div>
-      {submitError && (
+      {failedThreadIds.includes(box.threadId) && (
         <p className="ml-11 text-xs text-destructive">
           {t("plansPage.comments.sendFailed")}
         </p>
@@ -9500,6 +9585,7 @@ function AnnotationPopover({
 }) {
   const t = useT();
   const popoverRef = useRef<HTMLDivElement>(null);
+  const editChosenFromMenuRef = useRef(false);
   const [editing, setEditing] = useState(false);
   const [messageDraft, setMessageDraft] = useState<
     Pick<CommentDraft, "message" | "mentions">
@@ -9612,6 +9698,12 @@ function AnnotationPopover({
                 align="end"
                 className="w-48 rounded-xl"
                 data-comment-popover-portal
+                onCloseAutoFocus={(event) => {
+                  // Edit puts focus in its editor; leave it there. Other
+                  // actions return to the button.
+                  if (editChosenFromMenuRef.current) event.preventDefault();
+                  editChosenFromMenuRef.current = false;
+                }}
               >
                 {canResolve && (
                   <DropdownMenuItem
@@ -9629,7 +9721,10 @@ function AnnotationPopover({
                 {canEditRootComment && (
                   <DropdownMenuItem
                     className="gap-2"
-                    onClick={() => setEditing(true)}
+                    onClick={() => {
+                      editChosenFromMenuRef.current = true;
+                      setEditing(true);
+                    }}
                   >
                     <IconPencil className="size-4" />
                     {t("plansPage.comments.editFirstComment")}
@@ -9759,6 +9854,9 @@ function AnnotationPopover({
           <ReplyComposer
             author={pendingAuthor}
             isPending={isPending}
+            autoFocus
+            // Opening another thread reuses this popover and its reply box.
+            threadId={annotation.id}
             onSubmit={(reply) => onReply(annotation.id, reply)}
           />
         </div>

@@ -1,12 +1,16 @@
+import { getAppConfig } from "../app-config/index.js";
 import { getDbExec, isLocalDatabase, type DbExec } from "../db/client.js";
-import { ensureIndexExists, ensureTableExists } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import {
+  ensureColumnExists,
+  ensureIndexExists,
+  ensureTableExists,
+} from "../db/ddl-guard.js";
+import { defineStore } from "../db/store-registry.js";
 import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import type { StoreWriteOptions } from "../settings/store.js";
 import { assertNoInlineImageBytes } from "../shared/inline-bytes.js";
 import { emitAppStateChange, emitAppStateDelete } from "./emitter.js";
 
-let _initPromise: Promise<void> | undefined;
 const MAX_HOSTED_APP_STATE_VALUE_BYTES = 1024 * 1024;
 
 function utf8ByteLength(value: string): number {
@@ -17,36 +21,83 @@ function escapeLike(s: string): string {
   return s.replace(/[!%_]/g, (match) => `!${match}`);
 }
 
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const createSql = `
-        CREATE TABLE IF NOT EXISTS application_state (
-          session_id TEXT NOT NULL,
-          key TEXT NOT NULL,
-          value TEXT NOT NULL,
-          updated_at BIGINT NOT NULL,
-          PRIMARY KEY (session_id, key)
-        )
-      `;
+export const applicationStateStore = defineStore({
+  id: "application_state",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createSql = `
+          CREATE TABLE IF NOT EXISTS application_state (
+            session_id TEXT NOT NULL,
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            updated_at BIGINT NOT NULL,
+            PRIMARY KEY (session_id, key)
+          )
+        `;
+        await ensureTableExists("application_state", createSql);
+      },
+    },
+    {
+      name: "widen-bigint",
+      run: async () => {
+        await widenIntColumnsToBigInt("application_state", ["updated_at"]);
+      },
+    },
+    {
+      name: "indexes",
+      run: async () => {
+        await ensureIndexExists(
+          "app_state_updated_at_idx",
+          `CREATE INDEX IF NOT EXISTS app_state_updated_at_idx ON application_state (updated_at)`,
+        );
+        await ensureIndexExists(
+          "app_state_key_updated_idx",
+          `CREATE INDEX IF NOT EXISTS app_state_key_updated_idx ON application_state (key, updated_at)`,
+        );
+      },
+    },
+    {
+      // The page and number of the last ordered write applied to a row (see
+      // AppStateWriteOrder). Both stay null on rows nothing ordered wrote.
+      name: "write-order",
+      run: async () => {
+        await ensureColumnExists(
+          "application_state",
+          "writer",
+          `ALTER TABLE application_state ADD COLUMN IF NOT EXISTS writer TEXT`,
+        );
+        await ensureColumnExists(
+          "application_state",
+          "writer_seq",
+          `ALTER TABLE application_state ADD COLUMN IF NOT EXISTS writer_seq BIGINT`,
+        );
+      },
+    },
+  ],
+});
 
-      await ensureTableExists("application_state", createSql);
-      await widenIntColumnsToBigInt("application_state", ["updated_at"]);
-      await ensureIndexExists(
-        "app_state_updated_at_idx",
-        `CREATE INDEX IF NOT EXISTS app_state_updated_at_idx ON application_state (updated_at)`,
-      );
-      await ensureIndexExists(
-        "app_state_key_updated_idx",
-        `CREATE INDEX IF NOT EXISTS app_state_key_updated_idx ON application_state (key, updated_at)`,
-      );
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+/**
+ * Where a write sits in its writer's order. A browser page numbers its writes
+ * in the order it makes them; a write numbered at or below the last one the
+ * store applied to its row from the same writer is skipped, so a request that
+ * lands late can't undo a newer write from that page. Writes from another
+ * writer, or with no order (agents, scripts, older clients), always apply,
+ * and unordered writes leave the row's last order in place.
+ */
+export interface AppStateWriteOrder {
+  writer: string;
+  seq: number;
+}
+
+export interface AppStateWriteOptions {
+  requestSource?: string | undefined;
+  order?: AppStateWriteOrder | undefined;
+}
+
+export function ensureTable(): Promise<void> {
+  return applicationStateStore.ready();
 }
 
 export async function appStateGet(
@@ -95,33 +146,61 @@ export async function appStateGetMany(
   return values;
 }
 
+/**
+ * Stores `value` under `key`. With an `order`, a write older than the last one
+ * applied to the row from the same writer is skipped (see AppStateWriteOrder):
+ * nothing changes and no change event fires.
+ */
 export async function appStatePut(
   sessionId: string,
   key: string,
   value: Record<string, unknown>,
-  options?: StoreWriteOptions,
+  options?: AppStateWriteOptions,
 ): Promise<void> {
   const serialized = serializeAppStateValue(key, value);
   await ensureTable();
   const client = getDbExec();
-  await client.execute({
-    sql: `INSERT INTO application_state (session_id, key, value, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (session_id, key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`,
-    args: [sessionId, key, serialized, Date.now()],
-  });
+  const order = options?.order;
+  if (!order) {
+    await client.execute({
+      sql: `INSERT INTO application_state (session_id, key, value, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT (session_id, key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at`,
+      args: [sessionId, key, serialized, Date.now()],
+    });
+  } else {
+    // Postgres rechecks the WHERE against the locked row, so two writes
+    // racing on one row still end on the newer.
+    const result = await client.execute({
+      sql: `INSERT INTO application_state (session_id, key, value, updated_at, writer, writer_seq) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at, writer=EXCLUDED.writer, writer_seq=EXCLUDED.writer_seq WHERE application_state.writer IS NULL OR application_state.writer <> EXCLUDED.writer OR application_state.writer_seq < EXCLUDED.writer_seq`,
+      args: [sessionId, key, serialized, Date.now(), order.writer, order.seq],
+    });
+    if (result.rowsAffected === 0) return;
+  }
   emitAppStateChange(key, options?.requestSource, sessionId);
 }
 
+/**
+ * Deletes `key`. With an `order`, a delete older than the last write applied
+ * to the row from the same writer is skipped. Deleting leaves no record, so
+ * an older ordered write that lands after a delete writes the row again.
+ */
 export async function appStateDelete(
   sessionId: string,
   key: string,
-  options?: StoreWriteOptions,
+  options?: AppStateWriteOptions,
 ): Promise<boolean> {
   await ensureTable();
   const client = getDbExec();
-  const result = await client.execute({
-    sql: `DELETE FROM application_state WHERE session_id = ? AND key = ?`,
-    args: [sessionId, key],
-  });
+  const order = options?.order;
+  const result = order
+    ? await client.execute({
+        // Rows with no ordered write yet, another writer's, or an older one.
+        sql: `DELETE FROM application_state WHERE session_id = ? AND key = ? AND (writer IS NULL OR writer <> ? OR writer_seq < ?)`,
+        args: [sessionId, key, order.writer, order.seq],
+      })
+    : await client.execute({
+        sql: `DELETE FROM application_state WHERE session_id = ? AND key = ?`,
+        args: [sessionId, key],
+      });
   const deleted = result.rowsAffected > 0;
   if (deleted) emitAppStateDelete(key, options?.requestSource, sessionId);
   return deleted;
@@ -314,6 +393,40 @@ export async function appStateListByKeyPrefix(
     key: row.key as string,
     value: JSON.parse(row.value as string),
   }));
+}
+
+/** Lists metadata for maintenance keys within the current app namespace. */
+export async function appStateListKeysByKeySuffixPrefix(
+  suffixPrefix: string,
+  limit = 100,
+): Promise<Array<{ sessionId: string; key: string }>> {
+  if (!suffixPrefix || suffixPrefix.startsWith(":")) {
+    throw new Error(
+      "Cross-session application-state scans require a non-empty key suffix prefix.",
+    );
+  }
+  const keyPrefix = `${getAppStateMaintenanceNamespacePrefix()}${suffixPrefix}`;
+  await ensureTable();
+  const client = getDbExec();
+  const boundedLimit = Math.max(1, Math.min(Math.floor(limit), 2_048));
+  const { rows } = await client.execute({
+    sql: `SELECT session_id, key FROM application_state WHERE key LIKE ? ESCAPE '!' ORDER BY updated_at ASC LIMIT ?`,
+    args: [escapeLike(keyPrefix) + "%", boundedLimit],
+  });
+  return rows.map((row) => ({
+    sessionId: row.session_id as string,
+    key: row.key as string,
+  }));
+}
+
+function getAppStateMaintenanceNamespacePrefix(): string {
+  const namespace = getAppConfig().app.slug;
+  if (!namespace || namespace !== namespace.trim() || namespace.includes(":")) {
+    throw new Error(
+      "Application-state maintenance requires a configured app namespace.",
+    );
+  }
+  return `${namespace}:`;
 }
 
 export async function appStateDeleteByPrefix(

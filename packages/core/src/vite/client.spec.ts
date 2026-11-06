@@ -11,7 +11,6 @@ import { parseChangelog } from "../changelog/parse.js";
 import { DEV_SERVER_RECOVERY_EXIT_CODE } from "../cli/process.js";
 import { signEmbedSessionToken } from "../server/embed-session.js";
 import { getMissingCoreOptionalPeers } from "../shared/optional-peer-ssr.js";
-import { AGENT_NATIVE_TYPEGEN_ENV } from "../shared/runtime-config.js";
 import { readAgentNativeBuildConfigMarker } from "./agent-native-config-loader.js";
 import {
   _debounceNitroFullReloadHotUpdate,
@@ -37,12 +36,17 @@ import {
   isFrameworkDevPath,
   stripMountedDevApiPath,
 } from "./client.js";
+import {
+  callHookHandler,
+  callPluginHook,
+  hookIdFilter,
+} from "./plugin-hook.test-helpers.js";
 
 const mockWriteDevActionDiscoveryFile = vi.hoisted(() => vi.fn());
 const mockHashDatabaseKey = vi.hoisted(() =>
   vi.fn((url: string) => `hash:${url}`),
 );
-const mockResolveEmbedSessionTokenForHost = vi.hoisted(() => vi.fn());
+const mockResolveEmbedSessionTokenForOrigin = vi.hoisted(() => vi.fn());
 
 vi.mock("../server/dev-action-bridge.js", () => ({
   hashDatabaseKey: (...args: unknown[]) => mockHashDatabaseKey(...args),
@@ -56,8 +60,8 @@ vi.mock("../server/embed-session.js", async (importOriginal) => {
     await importOriginal<typeof import("../server/embed-session.js")>();
   return {
     ...actual,
-    resolveEmbedSessionTokenForHost: (...args: unknown[]) =>
-      mockResolveEmbedSessionTokenForHost(...args),
+    resolveEmbedSessionTokenForOrigin: (...args: unknown[]) =>
+      mockResolveEmbedSessionTokenForOrigin(...args),
   };
 });
 
@@ -71,6 +75,22 @@ function nitroStartupRecoveryMiddlewares(): unknown[] {
   } as never);
   if (typeof afterNitro === "function") afterNitro();
   return middlewares;
+}
+
+/**
+ * The repository root, found by walking up to `pnpm-workspace.yaml` rather
+ * than a fixed number of levels, so a copy of Core such as the mutation
+ * test's sandbox (`packages/core/.stryker-tmp/sandbox-*`) still finds
+ * `templates/`.
+ */
+function repositoryRoot(): string {
+  let directory = import.meta.dirname;
+  while (!fs.existsSync(path.join(directory, "pnpm-workspace.yaml"))) {
+    const parent = path.dirname(directory);
+    if (parent === directory) throw new Error("no pnpm-workspace.yaml above");
+    directory = parent;
+  }
+  return directory;
 }
 
 describe("Nitro dev startup recovery", () => {
@@ -122,11 +142,7 @@ describe("Nitro dev startup recovery", () => {
   });
 
   it("finds the fetchable Nitro SSR wrapper before React Router's virtual build", () => {
-    const repositoryRoot = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "../../../..",
-    );
-    const rootDir = path.join(repositoryRoot, "templates/chat");
+    const rootDir = path.join(repositoryRoot(), "templates/chat");
 
     expect(_resolveNitroSsrServiceEntry(rootDir)).toBe(
       path.join(rootDir, "ssr-entry.ts"),
@@ -449,14 +465,28 @@ describe("client optional peer stubs", () => {
         JSON.stringify({ name: "external-app", dependencies: {} }),
       );
       const plugin = _clientOptionalPeerStubPlugin(cwd);
-      const resolveId = plugin?.resolveId as
-        | ((id: string) => string | null)
-        | undefined;
-      const load = plugin?.load as ((id: string) => string | null) | undefined;
-      const id = resolveId?.("@rrweb/record");
+      const id = callPluginHook(plugin?.resolveId, undefined, "@rrweb/record");
       expect(id).toBe("\0agent-native-client-optional-peer-stub:@rrweb/record");
-      expect(load?.(String(id))).toContain(
+      expect(callPluginHook(plugin?.load, undefined, String(id))).toContain(
         'new OptionalPeerDependencyError("@rrweb/record")',
+      );
+      expect(
+        callPluginHook(
+          plugin?.load,
+          undefined,
+          "\0agent-native-client-optional-peer-stub:mermaid",
+        ),
+      ).toContain("export default mermaid;");
+      expect(hookIdFilter(plugin?.resolveId).test("@rrweb/record/x")).toBe(
+        true,
+      );
+      for (const other of ["react", "@rrweb/recorder", "./@rrweb/record"]) {
+        expect(hookIdFilter(plugin?.resolveId).test(other), other).toBe(false);
+        expect(callHookHandler(plugin?.resolveId, undefined, other)).toBe(null);
+      }
+      expect(hookIdFilter(plugin?.load).test("/app/root.tsx")).toBe(false);
+      expect(callHookHandler(plugin?.load, undefined, "/app/root.tsx")).toBe(
+        null,
       );
 
       fs.writeFileSync(
@@ -467,10 +497,9 @@ describe("client optional peer stubs", () => {
         }),
       );
       const presentPlugin = _clientOptionalPeerStubPlugin(cwd);
-      const presentResolveId = presentPlugin?.resolveId as
-        | ((id: string) => string | null)
-        | undefined;
-      expect(presentResolveId?.("@rrweb/record")).toBe(null);
+      expect(
+        callPluginHook(presentPlugin?.resolveId, undefined, "@rrweb/record"),
+      ).toBe(null);
 
       fs.writeFileSync(
         path.join(cwd, "package.json"),
@@ -480,10 +509,9 @@ describe("client optional peer stubs", () => {
         }),
       );
       const optionalPlugin = _clientOptionalPeerStubPlugin(cwd);
-      const optionalResolveId = optionalPlugin?.resolveId as
-        | ((id: string) => string | null)
-        | undefined;
-      expect(optionalResolveId?.("@rrweb/record")).toBe(null);
+      expect(
+        callPluginHook(optionalPlugin?.resolveId, undefined, "@rrweb/record"),
+      ).toBe(null);
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
     }
@@ -512,10 +540,9 @@ describe("client optional peer stubs", () => {
         }),
       );
       const plugin = _clientOptionalPeerStubPlugin(cwd);
-      const resolveId = plugin?.resolveId as
-        | ((id: string) => string | null)
-        | undefined;
-      expect(resolveId?.("linkedom/worker")).toBe(null);
+      expect(
+        callPluginHook(plugin?.resolveId, undefined, "linkedom/worker"),
+      ).toBe(null);
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true });
     }
@@ -626,10 +653,7 @@ describe("design system theme plugin", () => {
   it("emits normalized build-time CSS from a virtual module", async () => {
     const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), "an-theme-app-"));
     fs.writeFileSync(path.join(appRoot, "package.json"), "{}");
-    const toolkitRoot = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "../../../toolkit",
-    );
+    const toolkitRoot = path.join(repositoryRoot(), "packages/toolkit");
     const toolkitLink = path.join(
       appRoot,
       "node_modules/@agent-native/toolkit",
@@ -658,10 +682,28 @@ describe("design system theme plugin", () => {
 
       expect(plugin).toBeDefined();
       await plugin.configResolved?.({} as never);
-      const resolved = await plugin.resolveId("virtual:agent-native-theme.css");
-      const css = await plugin.load(resolved);
+      const resolved = await callPluginHook(
+        plugin.resolveId,
+        undefined,
+        "virtual:agent-native-theme.css",
+      );
+      const css = await callPluginHook(
+        plugin.load,
+        undefined,
+        String(resolved),
+      );
       expect(css).toContain("--primary:");
       expect(css).toContain("--background: 0 0% 6.275%");
+      for (const other of ["react", "virtual:agent-native-theme.css.map"]) {
+        expect(hookIdFilter(plugin.resolveId).test(other), other).toBe(false);
+        expect(callHookHandler(plugin.resolveId, undefined, other)).toBe(
+          undefined,
+        );
+      }
+      for (const other of ["virtual:agent-native-theme.css", "/app/a.css"]) {
+        expect(hookIdFilter(plugin.load).test(other), other).toBe(false);
+        expect(callHookHandler(plugin.load, undefined, other)).toBe(undefined);
+      }
       expect(await plugin.transformIndexHtml()).toEqual([
         expect.objectContaining({
           tag: "style",
@@ -831,7 +873,7 @@ describe("dev server mounted path helpers", () => {
   const previousSecret = process.env.OAUTH_STATE_SECRET;
 
   beforeEach(() => {
-    mockResolveEmbedSessionTokenForHost.mockReset();
+    mockResolveEmbedSessionTokenForOrigin.mockReset();
   });
 
   afterEach(() => {
@@ -976,7 +1018,7 @@ describe("dev server mounted path helpers", () => {
 
   it("serves base-prefixed Vite module requests for embed sessions", async () => {
     process.env.OAUTH_STATE_SECRET = "vite-embed-test-secret";
-    mockResolveEmbedSessionTokenForHost.mockResolvedValue({});
+    mockResolveEmbedSessionTokenForOrigin.mockResolvedValue({});
     const plugin = findPlugin("agent-native-base-redirect-guard");
     let middleware: Function | null = null;
     const server = {
@@ -1000,7 +1042,7 @@ describe("dev server mounted path helpers", () => {
     const token = signEmbedSessionToken({
       ownerEmail: "owner@example.com",
       targetPath: "/picker?mediaType=image",
-      audienceHost: "beta.calendar.agent-native.com",
+      audienceHost: "http://beta.calendar.agent-native.com",
       ttlSeconds: 60,
     });
     const req = {
@@ -1009,6 +1051,7 @@ describe("dev server mounted path helpers", () => {
         `/assets/@id/__x00__virtual:react-router/browser-manifest` +
         `?__an_embed_token=${token}&__an_mcp_chat_bridge=1`,
       headers: { host: "beta.calendar.agent-native.com" },
+      socket: { remoteAddress: "203.0.113.20" },
     };
     const res = {
       headersSent: false,
@@ -1024,9 +1067,9 @@ describe("dev server mounted path helpers", () => {
     await vi.waitFor(() => expect(res.end).toHaveBeenCalledOnce());
 
     expect(next).not.toHaveBeenCalled();
-    expect(mockResolveEmbedSessionTokenForHost).toHaveBeenCalledWith(
+    expect(mockResolveEmbedSessionTokenForOrigin).toHaveBeenCalledWith(
       token,
-      "beta.calendar.agent-native.com",
+      "http://beta.calendar.agent-native.com",
     );
     expect(server.transformRequest).toHaveBeenCalledWith(
       "\0virtual:react-router/browser-manifest",
@@ -1115,7 +1158,7 @@ describe("dev server mounted path helpers", () => {
 
   it("keeps Vite module queries for mounted static files", async () => {
     process.env.OAUTH_STATE_SECRET = "vite-embed-test-secret";
-    mockResolveEmbedSessionTokenForHost.mockResolvedValue({});
+    mockResolveEmbedSessionTokenForOrigin.mockResolvedValue({});
     const plugin = findPlugin("agent-native-base-redirect-guard");
     let middleware: Function | null = null;
     const server = {
@@ -1134,7 +1177,7 @@ describe("dev server mounted path helpers", () => {
     const token = signEmbedSessionToken({
       ownerEmail: "owner@example.com",
       targetPath: "/picker?mediaType=image",
-      audienceHost: "beta.calendar.agent-native.com",
+      audienceHost: "http://beta.calendar.agent-native.com",
       ttlSeconds: 60,
     });
     const res = {
@@ -1152,6 +1195,7 @@ describe("dev server mounted path helpers", () => {
         method: "GET",
         url: `/assets/app/global.css?url&__an_embed_token=${token}`,
         headers: { host: "beta.calendar.agent-native.com" },
+        socket: { remoteAddress: "203.0.113.20" },
       },
       res,
       next,
@@ -1167,7 +1211,7 @@ describe("dev server mounted path helpers", () => {
   });
 
   it("does not serve a mounted module when its token audience does not match the host", async () => {
-    mockResolveEmbedSessionTokenForHost.mockResolvedValue(null);
+    mockResolveEmbedSessionTokenForOrigin.mockResolvedValue(null);
     const plugin = findPlugin("agent-native-base-redirect-guard");
     let middleware: Function | null = null;
     const server = {
@@ -1183,13 +1227,14 @@ describe("dev server mounted path helpers", () => {
     const token = signEmbedSessionToken({
       ownerEmail: "owner@example.com",
       targetPath: "/picker?mediaType=image",
-      audienceHost: "beta.calendar.agent-native.com",
+      audienceHost: "http://beta.calendar.agent-native.com",
       ttlSeconds: 60,
     });
     const req = {
       method: "GET",
       url: `/assets/@id/__x00__virtual:react-router/browser-manifest?__an_embed_token=${token}`,
       headers: { host: "other.example.com" },
+      socket: { remoteAddress: "203.0.113.20" },
     };
     const res = { headersSent: false, setHeader: vi.fn(), end: vi.fn() };
     const next = vi.fn();
@@ -1197,16 +1242,16 @@ describe("dev server mounted path helpers", () => {
     middleware!(req, res, next);
     await vi.waitFor(() => expect(next).toHaveBeenCalledOnce());
 
-    expect(mockResolveEmbedSessionTokenForHost).toHaveBeenCalledWith(
+    expect(mockResolveEmbedSessionTokenForOrigin).toHaveBeenCalledWith(
       token,
-      "other.example.com",
+      "http://other.example.com",
     );
     expect(server.transformRequest).not.toHaveBeenCalled();
     expect(res.end).not.toHaveBeenCalled();
   });
 
   it("does not serve a mounted module for a revoked embed identity", async () => {
-    mockResolveEmbedSessionTokenForHost.mockResolvedValue(null);
+    mockResolveEmbedSessionTokenForOrigin.mockResolvedValue(null);
     const plugin = findPlugin("agent-native-base-redirect-guard");
     let middleware: Function | null = null;
     const server = {
@@ -1222,7 +1267,7 @@ describe("dev server mounted path helpers", () => {
     const token = signEmbedSessionToken({
       ownerEmail: "owner@example.com",
       targetPath: "/picker?mediaType=image",
-      audienceHost: "beta.calendar.agent-native.com",
+      audienceHost: "http://beta.calendar.agent-native.com",
       ttlSeconds: 60,
     });
     const req = {
@@ -1232,6 +1277,7 @@ describe("dev server mounted path helpers", () => {
         host: "beta.calendar.agent-native.com",
         cookie: `an_embed_session=${encodeURIComponent(token)}`,
       },
+      socket: { remoteAddress: "203.0.113.20" },
     };
     const res = { headersSent: false, setHeader: vi.fn(), end: vi.fn() };
     const next = vi.fn();
@@ -1239,9 +1285,9 @@ describe("dev server mounted path helpers", () => {
     middleware!(req, res, next);
     await vi.waitFor(() => expect(next).toHaveBeenCalledOnce());
 
-    expect(mockResolveEmbedSessionTokenForHost).toHaveBeenCalledWith(
+    expect(mockResolveEmbedSessionTokenForOrigin).toHaveBeenCalledWith(
       token,
-      "beta.calendar.agent-native.com",
+      "http://beta.calendar.agent-native.com",
     );
     expect(server.transformRequest).not.toHaveBeenCalled();
     expect(res.end).not.toHaveBeenCalled();
@@ -1249,7 +1295,7 @@ describe("dev server mounted path helpers", () => {
 
   it("passes embed validation failures to Vite's error handling", async () => {
     const failure = new Error("revocation lookup failed");
-    mockResolveEmbedSessionTokenForHost.mockRejectedValue(failure);
+    mockResolveEmbedSessionTokenForOrigin.mockRejectedValue(failure);
     const plugin = findPlugin("agent-native-base-redirect-guard");
     let middleware: Function | null = null;
     const server = {
@@ -1265,13 +1311,14 @@ describe("dev server mounted path helpers", () => {
     const token = signEmbedSessionToken({
       ownerEmail: "owner@example.com",
       targetPath: "/picker?mediaType=image",
-      audienceHost: "beta.calendar.agent-native.com",
+      audienceHost: "http://beta.calendar.agent-native.com",
       ttlSeconds: 60,
     });
     const req = {
       method: "GET",
       url: `/assets/@id/__x00__virtual:react-router/browser-manifest?__an_embed_token=${token}`,
       headers: { host: "beta.calendar.agent-native.com" },
+      socket: { remoteAddress: "203.0.113.20" },
     };
     const res = { headersSent: false, setHeader: vi.fn(), end: vi.fn() };
     const next = vi.fn();
@@ -2232,9 +2279,13 @@ describe("agent-native app config", () => {
     }
   });
 
-  it("skips build diagnostics only for React Router typegen", async () => {
+  // oracle-change: the AGENT_NATIVE_TYPEGEN skip is gone because typecheck's
+  // typegen no longer loads this plugin; the production warning still fires.
+  it("warns about production configuration errors during a production build", async () => {
     const previousCwd = process.cwd();
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "an-typegen-config-"));
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), "an-production-config-"),
+    );
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     fs.writeFileSync(
       path.join(tmpDir, "agent-native.json"),
@@ -2248,11 +2299,6 @@ describe("agent-native app config", () => {
       const configPlugin = flatPlugins(agentNative()).find(
         (plugin) => plugin?.name === "agent-native-config",
       );
-      vi.stubEnv(AGENT_NATIVE_TYPEGEN_ENV, "1");
-      await configPlugin.config({}, { command: "build", mode: "production" });
-      expect(warn).not.toHaveBeenCalled();
-
-      vi.stubEnv(AGENT_NATIVE_TYPEGEN_ENV, undefined);
       await configPlugin.config({}, { command: "build", mode: "production" });
       expect(warn).toHaveBeenCalledOnce();
       expect(warn.mock.calls[0][0]).toContain(
@@ -2260,7 +2306,6 @@ describe("agent-native app config", () => {
       );
     } finally {
       warn.mockRestore();
-      vi.unstubAllEnvs();
       process.chdir(previousCwd);
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -2470,9 +2515,7 @@ describe("agentNative Vite plugin preset", () => {
 
     const previousCwd = process.cwd();
     let config: any;
-    process.chdir(
-      path.resolve(import.meta.dirname, "../../../..", "templates/chat"),
-    );
+    process.chdir(path.join(repositoryRoot(), "templates/chat"));
     try {
       config = await configPlugin.config(
         {
@@ -2771,13 +2814,24 @@ describe("app changelog raw imports", () => {
     try {
       const plugin = findPlugin("agent-native-app-changelog-raw");
       const importer = path.join(appDir, "root.tsx");
-      const resolved = await plugin.resolveId("../CHANGELOG.md?raw", importer);
+      const resolved = await callPluginHook(
+        plugin.resolveId,
+        undefined,
+        "../CHANGELOG.md?raw",
+        importer,
+      );
       expect(resolved).toBe(`${path.join(tmpDir, "CHANGELOG.md")}?raw`);
+      expect(hookIdFilter(plugin.resolveId).test("./root.tsx")).toBe(false);
+      expect(hookIdFilter(plugin.load).test("/app/root.tsx")).toBe(false);
+      expect(
+        callHookHandler(plugin.load, undefined, "/app/CHANGELOG.md?url"),
+      ).toBeNull();
 
       const watched: string[] = [];
-      const code = await plugin.load.call(
+      const code = await callPluginHook(
+        plugin.load,
         { addWatchFile: (file: string) => watched.push(file) },
-        resolved,
+        String(resolved),
       );
       const markdown = JSON.parse(
         String(code)
@@ -2811,6 +2865,126 @@ describe("app changelog raw imports", () => {
     }
   });
 
+  it("loads an empty changelog without watching a missing CHANGELOG.md", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "an-changelog-raw-"));
+    const appDir = path.join(tmpDir, "app");
+    fs.mkdirSync(appDir, { recursive: true });
+
+    try {
+      const plugin = findPlugin("agent-native-app-changelog-raw");
+      const importer = path.join(appDir, "root.tsx");
+      const resolved = await callPluginHook(
+        plugin.resolveId,
+        undefined,
+        "../CHANGELOG.md?raw",
+        importer,
+      );
+      expect(resolved).toBe(`${path.join(tmpDir, "CHANGELOG.md")}?raw`);
+
+      const watched: string[] = [];
+      const code = await callPluginHook(
+        plugin.load,
+        { addWatchFile: (file: string) => watched.push(file) },
+        String(resolved),
+      );
+
+      expect(code).toBe('export default "";');
+      expect(watched).toEqual([]);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("picks up a CHANGELOG.md created after the dev server first served it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "an-changelog-raw-"));
+    const routesDir = path.join(root, "app", "routes");
+    fs.mkdirSync(routesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(routesDir, "settings.ts"),
+      'import changelog from "../../CHANGELOG.md?raw";\nexport default changelog;\n',
+    );
+    // A real dev server, because Vite 8 never calls `handleHotUpdate` for a
+    // created file; its module graph has to invalidate the raw module itself.
+    const server = await createServer({
+      root,
+      configFile: false,
+      logLevel: "silent",
+      plugins: [findPlugin("agent-native-app-changelog-raw")],
+      server: {
+        middlewareMode: true,
+        ws: false,
+        watch: { usePolling: true, interval: 20 },
+      },
+      optimizeDeps: { noDiscovery: true, include: [] },
+    });
+    try {
+      const client = server.environments.client;
+      const route = await client.transformRequest("/app/routes/settings.ts");
+      const rawUrl = /from\s+"([^"]*CHANGELOG\.md\?[^"]*)"/.exec(
+        String(route?.code),
+      )?.[1];
+      expect(rawUrl).toBeTruthy();
+      // Main failed here: the watched missing file became an unresolvable import.
+      expect((await client.transformRequest(rawUrl!))?.code).toContain(
+        'export default ""',
+      );
+
+      await vi.waitFor(() => {
+        expect(server.watcher.getWatched()[root]).toContain("app");
+      });
+      fs.writeFileSync(
+        path.join(root, "CHANGELOG.md"),
+        "# Changelog\n\n## 2026-07-01\n\n### Added\n\n- Created later.\n",
+      );
+      await vi.waitFor(
+        async () => {
+          expect((await client.transformRequest(rawUrl!))?.code).toContain(
+            "Created later.",
+          );
+        },
+        { timeout: 5000, interval: 100 },
+      );
+    } finally {
+      await server.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("watches pending changelog entries when CHANGELOG.md is missing", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "an-changelog-raw-"));
+    const pendingDir = path.join(tmpDir, "changelog");
+    fs.mkdirSync(pendingDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pendingDir, "2026-07-01-first-entry.md"),
+      "---\ntype: added\n---\n\nFirst visible thing.\n",
+    );
+
+    try {
+      const plugin = findPlugin("agent-native-app-changelog-raw");
+      const watched: string[] = [];
+      const code = await callPluginHook(
+        plugin.load,
+        { addWatchFile: (file: string) => watched.push(file) },
+        `${path.join(tmpDir, "CHANGELOG.md")}?raw`,
+      );
+      const entries = parseChangelog(
+        JSON.parse(
+          String(code)
+            .replace(/^export default /, "")
+            .replace(/;$/, ""),
+        ),
+      );
+
+      expect(watched).toEqual([
+        path.join(pendingDir, "2026-07-01-first-entry.md"),
+      ]);
+      expect(entries.map((entry) => entry.title)).toEqual(["2026-07-01"]);
+      expect(entries[0].body).toContain("First visible thing.");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps changelog directories visible to the dev watcher", () => {
     const ignored =
       (
@@ -2836,6 +3010,17 @@ describe("app changelog raw imports", () => {
     expect(ignored(path.join(app, ".claude", "settings.json"))).toBe(true);
     expect(ignored(path.join(app, "node_modules", "x", "index.js"))).toBe(true);
     expect(ignored(path.join(app, ".data", "base", "1"))).toBe(true);
+    expect(ignored(path.join(app, ".generated"))).toBe(false);
+    expect(ignored(path.join(app, ".generated", "bridge"))).toBe(false);
+    expect(
+      ignored(path.join(app, ".generated", "bridge", "runtime.generated.ts")),
+    ).toBe(false);
+    expect(
+      ignored(path.join(app, ".generated", "bridge", "node_modules", "x.ts")),
+    ).toBe(true);
+    expect(ignored(path.join(app, ".generated", "actions-registry.ts"))).toBe(
+      true,
+    );
   });
 });
 
@@ -2844,9 +3029,13 @@ describe("Vite runtime data watcher", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "an-vite-watch-"));
     const database = path.join(root, ".data", "base", "5", "16453");
     const source = path.join(root, "app.ts");
+    const bridgeDir = path.join(root, ".generated", "bridge");
+    const bridge = path.join(bridgeDir, "runtime.generated.ts");
     fs.mkdirSync(path.dirname(database), { recursive: true });
+    fs.mkdirSync(bridgeDir, { recursive: true });
     fs.writeFileSync(database, "initial database page");
     fs.writeFileSync(source, "export const value = 1;");
+    fs.writeFileSync(bridge, "export const bridge = 1;");
     const server = await createServer({
       root,
       configFile: false,
@@ -2855,6 +3044,7 @@ describe("Vite runtime data watcher", () => {
         ws: false,
         watch: {
           ...defineConfig().server?.watch,
+          ignored: [defaultViteWatchIgnored(root)],
           usePolling: true,
           interval: 20,
         },
@@ -2866,11 +3056,16 @@ describe("Vite runtime data watcher", () => {
     try {
       await vi.waitFor(() => {
         expect(server.watcher.getWatched()[root]).toContain("app.ts");
+        expect(server.watcher.getWatched()[bridgeDir]).toContain(
+          "runtime.generated.ts",
+        );
       });
       fs.writeFileSync(database, "updated database page");
       fs.writeFileSync(path.join(path.dirname(database), "16454"), "new page");
       fs.writeFileSync(source, "export const value = 2;");
+      fs.writeFileSync(bridge, "export const bridge = 2;");
       await vi.waitFor(() => expect(changes).toContain(source));
+      await vi.waitFor(() => expect(changes).toContain(bridge));
       expect(
         changes.filter((file) => file.includes(`${path.sep}.data${path.sep}`)),
       ).toEqual([]);
@@ -3188,6 +3383,35 @@ describe("Vite connection reset noise", () => {
     expect(() =>
       socketErrorHandler?.(Object.assign(new Error("real socket failure"), {})),
     ).toThrow("real socket failure");
+  });
+
+  it("keeps the dev server up when Windows cancels a write to a closed request", () => {
+    const plugin = findPlugin("agent-native-silence-connection-resets");
+    let connectionHandler: ((socket: { on: Function }) => void) | undefined;
+    let socketErrorHandler: ((err: Error) => void) | undefined;
+    const server = {
+      httpServer: {
+        on: vi.fn((event: string, handler: typeof connectionHandler) => {
+          if (event === "connection") connectionHandler = handler;
+        }),
+      },
+      config: { logger: { error: vi.fn() } },
+    };
+
+    plugin.configureServer(server);
+    connectionHandler?.({
+      on: vi.fn((event: string, handler: typeof socketErrorHandler) => {
+        if (event === "error") socketErrorHandler = handler;
+      }),
+    });
+
+    const err = Object.assign(new Error("write ECANCELED"), {
+      errno: -4081,
+      code: "ECANCELED",
+      syscall: "write",
+    });
+
+    expect(() => socketErrorHandler?.(err)).not.toThrow();
   });
 });
 
@@ -3571,15 +3795,38 @@ describe("Vite SSR stubs", () => {
     );
 
     expect(plugin).toBeDefined();
-    expect(await plugin.resolveId("yjs", undefined, { ssr: true })).toBe(
-      "\0agent-native-ssr-stub",
-    );
     expect(
-      await plugin.resolveId("react", undefined, { ssr: true }),
+      await callPluginHook(plugin.resolveId, undefined, "yjs", undefined, {
+        ssr: true,
+      }),
+    ).toBe("\0agent-native-ssr-stub");
+    expect(
+      await callPluginHook(plugin.resolveId, undefined, "react", undefined, {
+        ssr: true,
+      }),
     ).toBeNull();
-    expect(await plugin.resolveId("yjs", undefined, { ssr: false })).toBeNull();
+    expect(
+      await callPluginHook(plugin.resolveId, undefined, "yjs", undefined, {
+        ssr: false,
+      }),
+    ).toBeNull();
+    expect(hookIdFilter(plugin.resolveId).test("yjs/dist/yjs.mjs")).toBe(true);
+    for (const other of ["react", "yjs-extra", "./yjs"]) {
+      expect(hookIdFilter(plugin.resolveId).test(other), other).toBe(false);
+      expect(
+        callHookHandler(plugin.resolveId, undefined, other, undefined, {
+          ssr: true,
+        }),
+      ).toBeNull();
+    }
+    expect(hookIdFilter(plugin.load).test("\0agent-native-ssr-stub2")).toBe(
+      false,
+    );
+    expect(callHookHandler(plugin.load, undefined, "/app/root.tsx")).toBeNull();
 
-    const code = await plugin.load("\0agent-native-ssr-stub");
+    const code = String(
+      await callPluginHook(plugin.load, undefined, "\0agent-native-ssr-stub"),
+    );
     const stubs = await import(
       `data:text/javascript,${encodeURIComponent(code)}`
     );
@@ -3627,13 +3874,26 @@ describe("Vite SSR stubs", () => {
     ) as any;
 
     expect(plugin).toBeDefined();
-    expect(plugin.resolveId("@better-auth/sso")).toBe(
-      "\0agent-native-enterprise-auth-adapter-stub:@better-auth/sso",
+    expect(
+      callPluginHook(plugin.resolveId, undefined, "@better-auth/sso"),
+    ).toBe("\0agent-native-enterprise-auth-adapter-stub:@better-auth/sso");
+    expect(
+      callPluginHook(plugin.resolveId, undefined, "@better-auth/scim"),
+    ).toBe("\0agent-native-enterprise-auth-adapter-stub:@better-auth/scim");
+    expect(
+      callPluginHook(plugin.resolveId, undefined, "@better-auth/core"),
+    ).toBeNull();
+    for (const other of ["@better-auth/ssox", "react", "@better-auth/core"]) {
+      expect(hookIdFilter(plugin.resolveId).test(other), other).toBe(false);
+      expect(callHookHandler(plugin.resolveId, undefined, other)).toBeNull();
+    }
+    const stubId =
+      "\0agent-native-enterprise-auth-adapter-stub:@better-auth/sso";
+    expect(callPluginHook(plugin.load, undefined, stubId)).toBe(
+      "export const sso = undefined; export const scim = undefined;",
     );
-    expect(plugin.resolveId("@better-auth/scim")).toBe(
-      "\0agent-native-enterprise-auth-adapter-stub:@better-auth/scim",
-    );
-    expect(plugin.resolveId("@better-auth/core")).toBeNull();
+    expect(hookIdFilter(plugin.load).test("/app/root.tsx")).toBe(false);
+    expect(callHookHandler(plugin.load, undefined, "/app/root.tsx")).toBeNull();
     vi.unstubAllEnvs();
   });
 });
@@ -3981,9 +4241,13 @@ describe("Vite SSR optional dependencies", () => {
       expect(clientConfig.build.rolldownOptions.external).not.toContain(
         "@sentry/browser",
       );
-      expect(clientStubPlugin.resolveId("@sentry/browser")).toBe(
-        "\0agent-native-client-optional-peer-stub:@sentry/browser",
-      );
+      expect(
+        callPluginHook(
+          clientStubPlugin.resolveId,
+          undefined,
+          "@sentry/browser",
+        ),
+      ).toBe("\0agent-native-client-optional-peer-stub:@sentry/browser");
       const buildResult: any = await build({
         configFile: false,
         logLevel: "silent",
@@ -4016,10 +4280,7 @@ describe("Vite SSR optional dependencies", () => {
 
   it("keeps the browser-only Tabler icon loader out of SSR chunks", async () => {
     const appRoot = fs.mkdtempSync(path.join(os.tmpdir(), "an-tabler-ssr-"));
-    const coreRoot = path.resolve(
-      path.dirname(fileURLToPath(import.meta.url)),
-      "../..",
-    );
+    const coreRoot = path.join(repositoryRoot(), "packages/core");
     fs.writeFileSync(
       path.join(appRoot, "package.json"),
       JSON.stringify({
@@ -4042,17 +4303,58 @@ describe("Vite SSR optional dependencies", () => {
 
       expect(plugin).toBeDefined();
       expect(
-        await plugin.resolveId("./tabler-chunk-loaders.js", importer, {
-          ssr: true,
-        }),
+        await callPluginHook(
+          plugin.resolveId,
+          undefined,
+          "./tabler-chunk-loaders.js",
+          importer,
+          {
+            ssr: true,
+          },
+        ),
       ).toBe(stubId);
       expect(
-        await plugin.resolveId("./tabler-chunk-loaders.js", importer, {
-          ssr: false,
-        }),
+        await callPluginHook(
+          plugin.resolveId,
+          undefined,
+          "./tabler-chunk-loaders.js",
+          importer,
+          {
+            ssr: false,
+          },
+        ),
       ).toBeNull();
+      const ssr = { ssr: true };
+      const loaders = "./tabler-chunk-loaders.js";
+      expect(
+        callHookHandler(
+          plugin.resolveId,
+          undefined,
+          loaders,
+          `${importer}?v=1`,
+          ssr,
+        ),
+      ).toBe(stubId);
+      for (const [id, from] of [
+        ["./tabler-chunks/a.js", importer],
+        [loaders, path.join(toolkitRoot, "src/icons/ResourceIcon.tsx")],
+        [loaders, path.join(toolkitRoot, "src/icons/missing.ts")],
+        [loaders, undefined],
+      ] as const) {
+        expect(
+          callHookHandler(plugin.resolveId, undefined, id, from, ssr),
+        ).toBeNull();
+      }
+      for (const other of [
+        "./tabler-chunks/a.js",
+        "../tabler-chunk-loaders.js",
+      ]) {
+        expect(hookIdFilter(plugin.resolveId).test(other), other).toBe(false);
+      }
+      expect(hookIdFilter(plugin.load).test(`${stubId}2`)).toBe(false);
+      expect(callHookHandler(plugin.load, undefined, "/app/a.ts")).toBeNull();
       const stub = await import(
-        `data:text/javascript,${encodeURIComponent(await plugin.load(stubId))}`
+        `data:text/javascript,${encodeURIComponent(String(await callPluginHook(plugin.load, undefined, stubId)))}`
       );
       expect(() => stub.default()).toThrow(
         "Tabler icons are available only in the browser",
@@ -4100,17 +4402,29 @@ describe("Vite SSR optional dependencies", () => {
 
       expect(plugin).toBeDefined();
       expect(
-        await plugin.resolveId("./tabler-chunk-loaders.js", catalogPath, {
-          ssr: true,
-        }),
+        await callPluginHook(
+          plugin.resolveId,
+          undefined,
+          "./tabler-chunk-loaders.js",
+          catalogPath,
+          {
+            ssr: true,
+          },
+        ),
       ).toBe(stubId);
       expect(
-        await plugin.resolveId("./tabler-chunk-loaders.js", catalogPath, {
-          ssr: false,
-        }),
+        await callPluginHook(
+          plugin.resolveId,
+          undefined,
+          "./tabler-chunk-loaders.js",
+          catalogPath,
+          {
+            ssr: false,
+          },
+        ),
       ).toBeNull();
       const stub = await import(
-        `data:text/javascript,${encodeURIComponent(await plugin.load(stubId))}`
+        `data:text/javascript,${encodeURIComponent(String(await callPluginHook(plugin.load, undefined, stubId)))}`
       );
       expect(() => stub.default()).toThrow(
         "Tabler icons are available only in the browser",
@@ -4129,20 +4443,59 @@ describe("external store client compatibility", () => {
     ) as any;
 
     expect(plugin).toBeDefined();
-    const directEntry = await plugin.resolveId(
+    const directEntry = await callPluginHook(
+      plugin.resolveId,
+      undefined,
       "use-sync-external-store/with-selector.js",
       undefined,
       { ssr: false },
     );
-    const shimEntry = await plugin.resolveId(
+    const shimEntry = await callPluginHook(
+      plugin.resolveId,
+      undefined,
       "use-sync-external-store/shim/with-selector.js",
       undefined,
       { ssr: false },
     );
     expect(directEntry).toMatch(/external-store-shim\.(?:ts|js)$/);
     expect(shimEntry).toBe(directEntry);
+    for (const specifier of [
+      "use-sync-external-store",
+      "use-sync-external-store/shim",
+      "use-sync-external-store/shim/index.js",
+      "use-sync-external-store/with-selector",
+      "use-sync-external-store/with-selector.js",
+      "use-sync-external-store/shim/with-selector",
+    ]) {
+      expect(
+        await callPluginHook(
+          plugin.resolveId,
+          undefined,
+          specifier,
+          undefined,
+          {
+            ssr: false,
+          },
+        ),
+        specifier,
+      ).toBe(directEntry);
+    }
     expect(
-      await plugin.resolveId(
+      callHookHandler(
+        plugin.resolveId,
+        undefined,
+        "use-sync-external-store/package.json",
+        undefined,
+        { ssr: false },
+      ),
+    ).toBeNull();
+    for (const other of ["use-sync-external-storex", "react"]) {
+      expect(hookIdFilter(plugin.resolveId).test(other), other).toBe(false);
+    }
+    expect(
+      await callPluginHook(
+        plugin.resolveId,
+        undefined,
         "use-sync-external-store/shim/with-selector.js",
         undefined,
         { ssr: true },
@@ -4189,14 +4542,13 @@ describe("local-core dev aliases and router dedupe", () => {
 
   it("pre-optimizes core client deps when core is source-aliased", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "an-vite-optimize-"));
-    const coreRoot = path.resolve(import.meta.dirname, "../..");
+    const coreRoot = path.join(repositoryRoot(), "packages/core");
     fs.writeFileSync(
       path.join(tmpDir, "package.json"),
       JSON.stringify({
         dependencies: {
           "@agent-native/core": pathToFileURL(coreRoot).href,
           "@agent-native/toolkit": "workspace:*",
-          "@paper-design/shaders-react": "0.0.76",
           html2canvas: "^1.4.1",
           "react-dom": "^19.2.7",
           "react-router": "^8.0.1",
@@ -4247,12 +4599,15 @@ describe("local-core dev aliases and router dedupe", () => {
     expect(deps).toContain("@agent-native/toolkit > react-i18next");
     expect(deps).not.toContain("@agent-native/core > react-i18next");
     expect(deps).toContain("@agent-native/toolkit > shiki/core");
-    expect(deps).toContain("@paper-design/shaders-react");
-    expect(deps).not.toContain(
-      "@agent-native/core > @paper-design/shaders-react",
-    );
     expect(deps).toContain("html2canvas");
     expect(deps).not.toContain("@agent-native/core > html2canvas");
+    expect(deps).toEqual(
+      expect.arrayContaining([
+        "@agent-native/core > mdast-util-from-markdown",
+        "@agent-native/core > mdast-util-gfm",
+        "@agent-native/core > micromark-extension-gfm",
+      ]),
+    );
     expect(deps).toContain("react-dom/server");
     expect(deps).toContain("react-router");
     expect(deps).not.toContain("@agent-native/core > react-router");
@@ -4334,6 +4689,22 @@ describe("local-core dev aliases and router dedupe", () => {
         },
       }),
     );
+    const corePackageDir = path.join(
+      tmpDir,
+      "node_modules",
+      "@agent-native",
+      "core",
+    );
+    fs.mkdirSync(corePackageDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(corePackageDir, "package.json"),
+      JSON.stringify({
+        name: "@agent-native/core",
+        main: "index.js",
+        dependencies: { "cron-parser": "^5.5.0", ajv: "^8.20.0" },
+      }),
+    );
+    fs.writeFileSync(path.join(corePackageDir, "index.js"), "export {};\n");
 
     try {
       process.chdir(tmpDir);
@@ -4399,6 +4770,9 @@ describe("local-core dev aliases and router dedupe", () => {
           "@agent-native/toolkit/ui/sheet",
           "@agent-native/toolkit/ui/sonner",
           "@agent-native/toolkit/ui/tooltip",
+          "@agent-native/core/jobs/cron",
+          "@agent-native/core > ajv",
+          "@agent-native/core > ajv/dist/2020.js",
           "@agent-native/toolkit > lowlight > highlight.js/lib/core",
           "@agent-native/toolkit > highlight.js/lib/core",
           "@agent-native/toolkit > highlight.js/lib/languages/bash",
@@ -4940,11 +5314,7 @@ describe("local-core dev aliases and router dedupe", () => {
 
   it("aliases file:@agent-native/toolkit conditional exports to source", () => {
     const previousCwd = process.cwd();
-    const toolkitRoot = path.resolve(
-      import.meta.dirname,
-      "../../..",
-      "toolkit",
-    );
+    const toolkitRoot = path.join(repositoryRoot(), "packages/toolkit");
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "an-vite-toolkit-"));
     fs.writeFileSync(
       path.join(tmpDir, "package.json"),
@@ -4984,17 +5354,9 @@ describe("local-core dev aliases and router dedupe", () => {
 
   it("source-aliases workspace package dependencies during app builds", () => {
     const previousCwd = process.cwd();
-    const agentkitRoot = path.resolve(
-      import.meta.dirname,
-      "../../..",
-      "agentkit",
-    );
-    const toolkitRoot = path.resolve(
-      import.meta.dirname,
-      "../../..",
-      "toolkit",
-    );
-    const workspaceRoot = path.resolve(import.meta.dirname, "../../../..");
+    const workspaceRoot = repositoryRoot();
+    const agentkitRoot = path.join(workspaceRoot, "packages/agentkit");
+    const toolkitRoot = path.join(workspaceRoot, "packages/toolkit");
     const tmpDir = fs.mkdtempSync(
       path.join(workspaceRoot, ".tmp-an-vite-workspace-"),
     );

@@ -85,7 +85,9 @@ export default function NotificationsRoute() {
   async function handleSendReply() {
     if (!replyFor) return;
     const content = replyText.trim();
-    if (!content) return;
+    // Enter sends, so a second press while the first reply is on its way
+    // would send it again.
+    if (!content || addComment.isPending) return;
     try {
       await addComment.mutateAsync({
         recordingId: replyFor.recordingId,
@@ -193,6 +195,9 @@ export default function NotificationsRoute() {
             </div>
             <div className="flex items-end gap-2">
               <CommentComposer
+                // A reply to another notification gets its own composer, so
+                // the cursor moves to it.
+                key={replyFor.id}
                 value={replyText}
                 onChange={setReplyText}
                 onMentionAdd={(mention) =>
@@ -206,7 +211,6 @@ export default function NotificationsRoute() {
                 onSubmit={() => void handleSendReply()}
                 placeholder={t("notificationsRoute.replyPlaceholder")}
                 autoFocus
-                submitOnEnter
                 className="min-h-10 flex-1 resize-none bg-background text-sm"
               />
               <Button

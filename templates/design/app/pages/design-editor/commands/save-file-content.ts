@@ -7,6 +7,12 @@ import type { QueryClient } from "@tanstack/react-query";
 import type { Dispatch, RefObject, SetStateAction } from "react";
 import { toast } from "sonner";
 
+import {
+  recordCanvasOutcome,
+  runDetachedCanvasOperation,
+  type CanvasOperationHandle,
+  type CanvasOutcomeReason,
+} from "@/lib/canvas-outcome-tracking";
 import type { DesignSaveOutboxEntry } from "@/lib/design-save-outbox";
 import { updateFileResultPersistedContent } from "@/lib/design-save-outbox";
 import type { PatchProofState } from "@/pages/design-editor/command-types";
@@ -23,8 +29,11 @@ import {
   isContentPatchRejection,
   isDesignSaveSuccessConflict,
   patchProofStatusAfterPersistedSave,
+  type DesignSaveFailureKind,
 } from "@/pages/design-editor/save-failure";
 import { threeWayMergeContent } from "@/pages/design-editor/three-way-merge";
+
+import { designMetadataQueryKey } from "../design-query-key";
 
 const warnedVersionHistoryDesigns = new Set<string>();
 
@@ -79,6 +88,7 @@ export interface SaveFileContentArgs {
     baseUpdatedAt?: string | null,
     identityMigrationSourceContent?: string,
     deferCollabReconcile?: boolean,
+    identityMigrationRefused?: boolean,
   ) => void;
   /** The server content the file's first unsaved local edit was made from. */
   getPendingBaseContent?: (fileId: string) => string | undefined;
@@ -315,6 +325,23 @@ export function runFileContentSaveKeepalive(
     .catch(() => {});
 }
 
+function isAccessRefusal(error: unknown): boolean {
+  const status =
+    error && typeof error === "object"
+      ? (error as { status?: unknown }).status
+      : undefined;
+  return status === 401 || status === 403;
+}
+
+const SAVE_FAILURE_REASONS: Record<DesignSaveFailureKind, CanvasOutcomeReason> =
+  {
+    conflict: "conflict",
+    "intentional-abort": "aborted",
+    "invalid-html": "invalid_html",
+    offline: "offline",
+    other: "error",
+  };
+
 export function runSaveFileContent(
   {
     acknowledgeOutboxEntry,
@@ -339,7 +366,10 @@ export function runSaveFileContent(
   outboxJournalPromise?: Promise<boolean>,
   onPersistedContent?: (acceptedContent: string) => void,
 ): Promise<FileContentSaveCompletion> {
-  if (!canEditDesignRef.current) return Promise.resolve("failed");
+  if (!canEditDesignRef.current) {
+    recordCanvasOutcome("save", "skipped", "no_edit_rights", { designId });
+    return Promise.resolve("failed");
+  }
   markPendingLocalFileContent(
     pending.id,
     pending.content,
@@ -420,6 +450,7 @@ export function runSaveFileContent(
   const attempt = async (
     pending: FileContentSaveRequest,
     mergesLeft: number,
+    op: CanvasOperationHandle,
   ): Promise<FileContentSaveCompletion> => {
     // An identity migration is disposable. Never send a queued old snapshot
     // after a newer source publication or user edit has replaced it.
@@ -429,6 +460,7 @@ export function runSaveFileContent(
     ) {
       if (queuedOutboxEntry)
         void acknowledgeOutboxEntry(queuedOutboxEntry).catch(() => {});
+      op.skip("superseded");
       return "failed";
     }
     try {
@@ -486,6 +518,7 @@ export function runSaveFileContent(
       ) {
         if (outboxEntry)
           void acknowledgeOutboxEntry(outboxEntry).catch(() => {});
+        op.skip("superseded");
         return "failed";
       }
       const resultInfo = result as
@@ -523,10 +556,10 @@ export function runSaveFileContent(
       ) {
         markPendingLocalFileContent(pending.id, pending.content);
       }
-      if (persistedContentMatches && outboxEntry)
-        void acknowledgeOutboxEntry(outboxEntry).catch(() => {});
+      // A save the server answered is settled even when it was rejected; a replay gets the same answer.
+      if (outboxEntry) void acknowledgeOutboxEntry(outboxEntry).catch(() => {});
       if (persistedContentMatches && designId) {
-        const designQueryKey = ["action", "get-design", { id: designId }];
+        const designQueryKey = designMetadataQueryKey(designId);
         const persistedUpdatedAt =
           typeof resultInfo?.updatedAt === "string"
             ? resultInfo.updatedAt
@@ -541,7 +574,8 @@ export function runSaveFileContent(
               file.id === pending.id
                 ? {
                     ...file,
-                    content: pending.content,
+                    contentBytes: new TextEncoder().encode(pending.content)
+                      .byteLength,
                     ...(persistedUpdatedAt !== undefined
                       ? { updatedAt: persistedUpdatedAt }
                       : {}),
@@ -613,6 +647,8 @@ export function runSaveFileContent(
             }
           : { ...prev, status };
       });
+      if (persistedContentMatches) op.succeed();
+      else op.fail("stale_mirror");
       return persistedContentMatches ? "persisted" : "conflict";
     } catch (error) {
       if (
@@ -621,6 +657,32 @@ export function runSaveFileContent(
       ) {
         if (queuedOutboxEntry)
           void acknowledgeOutboxEntry(queuedOutboxEntry).catch(() => {});
+        op.skip("superseded");
+        return "failed";
+      }
+      // An identity migration carries no user edit; a refused one is dropped
+      // quietly, and its marked pending entry stops the same source re-queuing.
+      if (
+        pending.identityMigrationSourceContent !== undefined &&
+        isAccessRefusal(error)
+      ) {
+        markPendingLocalFileContent(
+          pending.id,
+          pending.content,
+          undefined,
+          pending.identityMigrationSourceContent,
+          pending.deferCollabReconcile,
+          true,
+        );
+        if (queuedOutboxEntry)
+          void acknowledgeOutboxEntry(queuedOutboxEntry).catch(() => {});
+        if (latestFileSaveForUnloadRef.current[pending.id] === pending) {
+          delete latestFileSaveForUnloadRef.current[pending.id];
+        }
+        void queryClient.invalidateQueries({
+          queryKey: ["action", "get-design"],
+        });
+        op.skip("no_edit_rights");
         return "failed";
       }
       const failureKind = classifyDesignSaveFailure(error, navigator.onLine);
@@ -630,13 +692,16 @@ export function runSaveFileContent(
         pending.identityMigrationSourceContent === undefined
       ) {
         const mergedRequest = await mergeIntoLiveContent(pending);
-        if (mergedRequest) return attempt(mergedRequest, mergesLeft - 1);
+        if (mergedRequest) return attempt(mergedRequest, mergesLeft - 1, op);
       }
       if (failureKind === "conflict") {
         rollbackPendingLocalFileContent(pending.id, pending.content);
         if (latestFileSaveForUnloadRef.current[pending.id] === pending) {
           delete latestFileSaveForUnloadRef.current[pending.id];
         }
+        const rejectedOutboxEntry = createFileSaveOutboxEntry(pending);
+        if (rejectedOutboxEntry)
+          void acknowledgeOutboxEntry(rejectedOutboxEntry).catch(() => {});
       }
       void queryClient.invalidateQueries({
         queryKey: ["action", "get-design"],
@@ -668,6 +733,10 @@ export function runSaveFileContent(
             }
           : prev,
       );
+      if (failureKind === "intentional-abort") op.skip("aborted");
+      else if (failureKind === "offline" && outboxEntryJournaled) {
+        op.defer("offline_queued");
+      } else op.fail(SAVE_FAILURE_REASONS[failureKind]);
       return failureKind === "offline" && outboxEntryJournaled
         ? "retryable"
         : failureKind === "conflict"
@@ -678,7 +747,13 @@ export function runSaveFileContent(
   const previous = fileSaveChainsRef.current[pending.id] ?? Promise.resolve();
   const current = previous
     .catch(() => {})
-    .then(() => attempt(pending, MAX_CONFLICT_MERGES));
+    .then(() =>
+      runDetachedCanvasOperation(
+        "save",
+        (op) => attempt(pending, MAX_CONFLICT_MERGES, op),
+        { designId },
+      ),
+    );
   const chain = current.then(() => {});
   fileSaveChainsRef.current[pending.id] = chain;
   void current.finally(() => {

@@ -48,7 +48,8 @@ vi.mock("@agent-native/core/client/ui", () => ({
   buildSignInReturnHref: () => "/sign-in",
 }));
 
-vi.mock("@agent-native/core/shared", () => ({
+vi.mock("@agent-native/core/shared", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@agent-native/core/shared")>()),
   normalizeDocumentTitle: (title: string) => title,
 }));
 
@@ -110,6 +111,7 @@ vi.mock("@/components/visual-editor/ReviewCanvasPins", () => ({
 
 vi.mock("../components/design/design-canvas/local-runtime", () => ({
   withLocalRuntimes: (html: string) => html,
+  withNativeShaderRuntime: (html: string) => html,
 }));
 
 import Present from "./Present";

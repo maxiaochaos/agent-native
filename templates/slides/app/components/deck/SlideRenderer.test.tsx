@@ -1,3 +1,7 @@
+import {
+  resetGoogleFontsForTests,
+  setGoogleFontCatalogLoader,
+} from "@agent-native/toolkit/design-tweaks/google-fonts";
 import { cleanup, render, waitFor } from "@testing-library/react";
 // @vitest-environment happy-dom
 import React from "react";
@@ -247,6 +251,63 @@ describe("SlideInner source stamps", () => {
       ),
     );
   });
+
+  it("restores stored image frame geometry in place across move and undo", async () => {
+    const originalContent =
+      '<div class="fmd-slide"><video src="clip.mp4"></video><div class="fmd-pptx-image" data-slide-object-id="image-1" style="position:absolute;left:40px;top:24px;width:320px;height:180px;"><img src="image.png"></div><div class="fmd-shape" data-slide-object-id="shape-1" style="position:absolute;left:400px;top:24px;width:100px;height:80px;">Text</div></div>';
+    const slide = {
+      id: "slide-undo-image",
+      content: originalContent,
+      layout: "blank",
+    } as Slide;
+    const { rerender } = render(<SlideInner slide={slide} stampSource />);
+    const root = document.querySelector<HTMLElement>(".slide-content")!;
+    const frame = root.querySelector<HTMLElement>(".fmd-pptx-image")!;
+    const image = root.querySelector("img")!;
+    const video = root.querySelector("video")!;
+    const otherObject = root.querySelector(".fmd-shape")!;
+    const moved = originalContent.replace("left:40px", "left:90px");
+    frame.style.left = "90px";
+    rerender(<SlideInner slide={{ ...slide, content: moved }} stampSource />);
+    await waitFor(() =>
+      expect(getRenderedSlideSource(root)?.stored).toBe(moved),
+    );
+    expect(frame.style.left).toBe("90px");
+
+    rerender(<SlideInner slide={slide} stampSource />);
+    await waitFor(() => expect(frame.style.left).toBe("40px"));
+    expect(root.querySelector(".fmd-pptx-image")).toBe(frame);
+    expect(root.querySelector("img")).toBe(image);
+    expect(root.querySelector("video")).toBe(video);
+    expect(root.querySelector(".fmd-shape")).toBe(otherObject);
+  });
+
+  it("keeps sibling media mounted for a normal live image move", async () => {
+    const mediaContent =
+      '<div class="fmd-slide"><video src="clip.mp4"></video><img src="image.png" data-slide-object-id="image-1" style="position:absolute;left:40px;top:24px;width:320px;height:180px;"></div>';
+    const slide = {
+      id: "slide-live-image-move",
+      content: mediaContent,
+      layout: "blank",
+    } as Slide;
+    const { rerender } = render(<SlideInner slide={slide} stampSource />);
+    const root = document.querySelector<HTMLElement>(".slide-content")!;
+    const image = root.querySelector("img")!;
+    const video = root.querySelector("video")!;
+    image.style.left = "90px";
+    const movedContent = mediaContent.replace("left:40px", "left:90px");
+
+    rerender(
+      <SlideInner slide={{ ...slide, content: movedContent }} stampSource />,
+    );
+    await waitFor(() =>
+      expect(getRenderedSlideSource(root)?.stored).toBe(movedContent),
+    );
+
+    expect(root.querySelector("img")).toBe(image);
+    expect(root.querySelector("video")).toBe(video);
+  });
+
   it("never re-renders a root whose text is being edited", () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => {});
     const slide = { id: "slide-c", content, layout: "blank" } as Slide;
@@ -1267,6 +1328,7 @@ describe("imported deck webfonts", () => {
     cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    resetGoogleFontsForTests();
   });
 
   it("serves a family the deck names", () => {
@@ -1276,15 +1338,15 @@ describe("imported deck webfonts", () => {
     });
   });
 
-  it("asks a static-weight family for discrete weights, not a variable axis", () => {
+  it("asks a family only for the weight range it ships", () => {
     expect(resolveImportedFont("Open Sans")?.href).toBe(
-      "https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,400;0,700;1,400;1,700&display=swap",
+      "https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300..800;1,300..800&display=swap",
     );
   });
 
   it("serves the shared picker's JetBrains Mono family", () => {
     expect(resolveImportedFont("JetBrains Mono")?.href).toBe(
-      "https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap",
+      "https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&display=swap",
     );
   });
 
@@ -1329,7 +1391,7 @@ describe("imported deck webfonts", () => {
 
     expect(html).toContain('font-family: "Playfair Display", serif');
     expect(hrefs).toEqual([
-      "https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400;1,700&display=swap",
+      "https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400..900;1,400..900&display=swap",
     ]);
   });
 
@@ -1352,5 +1414,42 @@ describe("imported deck webfonts", () => {
         ),
       ).toBe(true);
     });
+  });
+
+  it("loads a catalog family the built-in list does not know", async () => {
+    const loader = vi.fn(async () => [
+      {
+        family: "Lobster",
+        category: "Display",
+        weights: [400],
+        italicWeights: [],
+        variable: false,
+      },
+    ]);
+    setGoogleFontCatalogLoader(loader);
+    expect(
+      prepareImportedFonts(`<p style="font-family: 'Lobster'">a</p>`),
+    ).toMatchObject({ hrefs: [], pendingFamilies: ["Lobster"] });
+
+    const slide: Slide = {
+      id: "catalog-font",
+      layout: "blank",
+      notes: "",
+      content: `<div class="fmd-slide" style="font-family: 'Lobster', cursive;">Hi</div>`,
+    };
+    render(<SlideInner slide={slide} />);
+
+    await waitFor(() => {
+      expect(
+        appendedToHead.some(
+          (node) =>
+            node instanceof HTMLLinkElement &&
+            node.href ===
+              "https://fonts.googleapis.com/css2?family=Lobster:wght@400&display=swap",
+        ),
+      ).toBe(true);
+    });
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(resolveImportedFont("Lobster")?.family).toBe("Lobster");
   });
 });

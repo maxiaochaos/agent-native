@@ -1,6 +1,10 @@
 import { isActionHiddenFromEveryAgentSurface } from "../action.js";
 import { parseMcpToolName } from "../mcp-client/manager.js";
 import { isMcpToolAllowedForRequest } from "../mcp-client/visibility.js";
+import {
+  frameworkMcpTool,
+  isFrameworkMcpTool,
+} from "../mcp/framework-tools.js";
 import { getRequestRunContext } from "../server/request-context.js";
 import { clipHead } from "./clip-text.js";
 import type { ActionEntry } from "./production-agent.js";
@@ -32,6 +36,8 @@ type ToolSearchResult = {
   score: number;
   callable: boolean;
   planAvailability: "read" | "conditional" | "act-only";
+  /** Present on a tool that deletes or cancels; absent on every other. */
+  destructive?: true;
   parameters: ToolParameterSummary[];
 };
 
@@ -45,6 +51,8 @@ const MAX_LIMIT = 10;
 const MAX_QUERIES = 5;
 const MAX_NAMES = 20;
 const EXACT_NAME_SCORE = 100;
+const MAX_SUGGESTIONS = 5;
+const MAX_SUGGESTION_DESCRIPTION_CHARS = 120;
 const MAX_MENU_DESCRIPTION_CHARS = 140;
 const MAX_DESCRIPTION_CHARS = 220;
 const MAX_PARAMETER_COUNT = 8;
@@ -64,23 +72,23 @@ export function createToolSearchEntry(
     1,
     Math.min(options.defaultLimit ?? DEFAULT_LIMIT, maxLimit),
   );
-  return {
+  return frameworkMcpTool({
     tool: {
       description:
-        "Find actions and connected MCP tools named `mcp__<server>__<tool>` by capability or name. A targeted search returns concise details and adds matches allowed in the current mode, with their full schemas, to the NEXT model step, not this one, so request every tool you need in one call (`queries` and/or `names`) and call them on the next step. If every match is already callable, call it directly instead of searching again. Omit query for a bounded alphabetical menu; menu entries are informational until you search for a capability or name.",
+        "Find actions and connected MCP tools by what they do or by exact name. The system prompt's Tool index lists every deferred tool name grouped by topic; loading several exact names in one call is the fastest path. A targeted search returns concise details and adds matches allowed in the current mode, with their full schemas, to the NEXT model step, not this one, so request every tool you need in one call (`queries` and/or `names`) and call them on the next step. If every match is already callable, call it directly instead of searching again. Results rank by words, not intent: before calling one marked `destructive`, confirm the user wants that change. Omit query for a bounded alphabetical menu; menu entries are informational until you search for a capability or name.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
             description:
-              "Capability or exact tool name to find. A targeted search adds matches allowed in the current mode, with their full schemas, to the next model step. Omit for a bounded alphabetical inventory.",
+              'The task in a few plain words ("edit auto-archive rules") or an exact tool name; the user\'s own words work. Omit for a bounded alphabetical inventory.',
           },
           queries: {
             type: "array",
             items: { type: "string" },
             maxItems: MAX_QUERIES,
-            description: `Up to ${MAX_QUERIES} capability searches run together; all matches load on the next step.`,
+            description: `Up to ${MAX_QUERIES} searches run together, one per task step; all matches load on the next step.`,
           },
           names: {
             type: "array",
@@ -110,7 +118,7 @@ export function createToolSearchEntry(
     readOnly: true,
     run: async (args: Record<string, string>, context) =>
       searchToolRegistryForRequest(getRegistry(), args, options, context),
-  };
+  });
 }
 
 export function attachToolSearch(
@@ -174,6 +182,7 @@ type ToolSearchOutput = {
   repeated?: boolean;
   message?: string;
   results: ToolSearchResult[];
+  suggestions?: Array<{ name: string; description: string }>;
 };
 
 /**
@@ -275,22 +284,33 @@ function searchOnce(
   });
   const runCtx = getRequestRunContext();
   const priorSearch = runCtx?.toolSearchReads?.[cacheKey];
-  if (priorSearch) {
+  // A repeated search that found nothing is recomputed so it keeps its
+  // close-name suggestions instead of a bare "use the earlier result".
+  if (priorSearch && priorSearch.resultNames.length > 0) {
+    const filteredNames = priorSearch.resultNames.filter((name) => {
+      const entry = registry[name];
+      if (!entry?.tool || isActionHiddenFromEveryAgentSurface(entry))
+        return false;
+      if (name.startsWith("mcp__") && !isMcpToolAllowedForRequest(name))
+        return false;
+      return true;
+    });
     return {
       query,
       totalTools: priorSearch.totalTools,
-      count: priorSearch.resultNames.length,
+      count: filteredNames.length,
       repeated: true,
       message:
         query.length > 0
           ? "This exact tool-search query already ran in this agent run. Use the earlier result; matches allowed in the current mode are already available with their full schemas."
           : "This tool inventory already ran in this agent run. Use the earlier list, then search once by capability or tool name to load a matching tool's full schema.",
-      results: priorSearch.resultNames.map((name) => ({
+      results: filteredNames.map((name) => ({
         name,
         kind: parseMcpToolName(name) ? ("mcp" as const) : ("action" as const),
         score: 0,
         callable: registry[name]?.allowInPlanMode !== false,
         planAvailability: getPlanAvailability(name, registry[name]),
+        ...destructiveMark(name, registry[name]),
         description:
           "Already returned by an earlier identical tool-search call.",
         parameters: [],
@@ -300,6 +320,7 @@ function searchOnce(
   const queryTokens = tokenize(query);
 
   const candidates: ToolSearchResult[] = [];
+  const rankable: RankableTool[] = [];
   let totalTools = 0;
 
   for (const [name, entry] of Object.entries(registry)) {
@@ -334,40 +355,46 @@ function searchOnce(
         score: 0,
         callable,
         planAvailability,
+        ...destructiveMark(name, entry),
         parameters: [],
       });
       continue;
     }
 
     const parameters = summarizeParameters(entry.tool.parameters);
-    const score = exactNames
-      ? exactNames.has(name.toLowerCase())
-        ? EXACT_NAME_SCORE
-        : 0
-      : scoreTool({
-          query,
-          queryTokens,
-          name,
-          source,
-          description,
-          parameters,
-          kind,
-        });
-
-    if (score <= 0) continue;
-
-    candidates.push({
+    const candidate: ToolSearchResult = {
       name,
       kind,
       ...(source ? { source } : {}),
       description: truncate(description, MAX_DESCRIPTION_CHARS),
-      score,
+      score: 0,
       callable,
       planAvailability,
+      ...destructiveMark(name, entry),
       parameters: parameters
         .slice(0, MAX_PARAMETER_COUNT)
         .map(boundParameterSummary),
+    };
+    if (exactNames) {
+      if (exactNames.has(name.toLowerCase())) {
+        candidates.push({ ...candidate, score: EXACT_NAME_SCORE });
+      }
+      continue;
+    }
+    rankable.push({
+      candidate,
+      prior: isFrameworkMcpTool(entry) ? FRAMEWORK_TOOL_PRIOR : 1,
+      fields: searchDocumentFields({
+        name,
+        source,
+        hints: entry.searchHints,
+        description,
+        parameters,
+      }),
     });
+  }
+  if (!listAll && !exactNames) {
+    candidates.push(...rankByBm25(query, queryTokens, rankable));
   }
 
   if (listAll) {
@@ -393,6 +420,18 @@ function searchOnce(
     candidates.map((candidate) => candidate.name.toLowerCase()),
   );
   const missing = names?.filter((name) => !found.has(name.toLowerCase()));
+
+  let suggestions: Array<{ name: string; description: string }> | undefined;
+  let fallbackMessage: string | undefined;
+  if (!exactNames && !listAll && candidates.length === 0) {
+    suggestions = suggestCloseTools(rankable, queryTokens);
+    if (suggestions.length > 0) {
+      fallbackMessage = `No tool matched "${query}". Closest tool names: ${suggestions.map((s) => s.name).join(", ")}. Load one by exact name with \`names\`, or search again with a different capability word — the Tool index in your instructions lists every tool by topic.`;
+    } else {
+      fallbackMessage = `No tool matched "${query}". Check the Tool index in your instructions for the right name, or search again with a different capability word.`;
+    }
+  }
+
   const result = {
     query,
     totalTools,
@@ -401,8 +440,12 @@ function searchOnce(
       ? {
           message: `No tool named ${missing.join(", ")} is available in the current mode.`,
         }
-      : {}),
+      : fallbackMessage
+        ? { message: fallbackMessage }
+        : {}),
     results: candidates.slice(0, cap),
+    ...(suggestions && suggestions.length > 0 ? { suggestions } : {}),
+    ...(priorSearch ? { repeated: true } : {}),
   };
   rememberToolSearchResult(cacheKey, result);
   return result;
@@ -659,70 +702,399 @@ function summarizeType(value: unknown): string | undefined {
   return undefined;
 }
 
-function scoreTool(input: {
-  query: string;
-  queryTokens: string[];
+const BM25_K1 = 1.2;
+const BM25_B = 0.75;
+const NAME_PHRASE_BONUS = 5;
+const SYNONYM_WEIGHT = 0.5;
+
+// BM25F: each field is length-normalised on its own, then weighted, so a long
+// description cannot drown a one-word name match. Search hints are words users
+// say for the action, so they rank just below the name; the first sentence of
+// a description says what the tool is for and outranks the caveats after it.
+const FIELD_WEIGHTS = {
+  name: 5,
+  hints: 4,
+  source: 2,
+  summary: 2,
+  details: 1,
+  parameters: 0.5,
+} as const;
+
+type SearchField = keyof typeof FIELD_WEIGHTS;
+const SEARCH_FIELDS = Object.keys(FIELD_WEIGHTS) as SearchField[];
+
+type FieldTerms = { counts: Map<string, number>; length: number };
+type RankableTool = {
+  candidate: ToolSearchResult;
+  /** Multiplies the text score; see `FRAMEWORK_TOOL_PRIOR`. */
+  prior: number;
+  fields: Record<SearchField, FieldTerms>;
+};
+
+// Framework tools (sharing, review comments, usage, settings) ship in every
+// app and share its vocabulary: in Mail, "email" also names transactional
+// email logs. A request made in an app is usually about that app's own work,
+// so on similar text the app's actions rank first. Exact names still win.
+const FRAMEWORK_TOOL_PRIOR = 0.8;
+
+// Stemming would fold these nouns into an unrelated word ("news" into "new",
+// which then expands to the create synonyms; "setting" into "set"), so they
+// are indexed as themselves. Declared before the stemmed set below, which
+// calls `stem` as the module loads.
+const PROTECTED_TERMS: ReadonlyMap<string, string> = new Map([
+  ["news", "news"],
+  ["setting", "setting"],
+  ["settings", "setting"],
+  ["recording", "recording"],
+  ["recordings", "recording"],
+  ["mapping", "mapping"],
+  ["mappings", "mapping"],
+  ["heading", "heading"],
+  ["headings", "heading"],
+]);
+
+// Verbs that lose data. "Remove" and "clear" also name reversible edits
+// (removing a tag, clearing a filter), so they count only through a declared
+// `destructiveHint`, as does "permanently remove" spelled any other way.
+// Verbs that lose data or undo something another person relies on. "Remove"
+// and "clear" also name reversible edits (removing a tag, clearing a filter),
+// so they count only through a declared `destructiveHint`.
+const DESTRUCTIVE_VERBS: ReadonlySet<string> = new Set(
+  ["delete", "destroy", "trash", "purge", "cancel"].map(stem),
+);
+
+/** "delete", "deleteNode", "delete-node", "delete_node": the value leads with one. */
+function leadsWithDestructiveVerb(value: string): boolean {
+  const verb = searchTerms(value).at(0);
+  return verb !== undefined && DESTRUCTIVE_VERBS.has(verb);
+}
+
+/**
+ * The `destructive` mark every result carries, on every path that builds one.
+ * Ranking ignores it: whether the user wants the change ("delete it" or "don't
+ * delete it") is the agent's call, so a search finds the tool either way and
+ * the mark tells the agent to check.
+ *
+ * Declared annotations decide, `destructiveHint: false` included. Without
+ * them, a read-only tool is never destructive (a `status: "cancelled"` filter
+ * on a list is not a write), and any other tool is when an `enum` or `const`
+ * value anywhere in its input schema leads with a destructive verb
+ * (`operation: "delete"`, `op: "delete"`, `kind: "deleteNode"`) or its own
+ * name does, since most delete actions declare no annotations.
+ */
+function destructiveMark(
+  name: string,
+  entry: ActionEntry | undefined,
+): { destructive?: true } {
+  if (!entry) return {};
+  if (entry.mcpAnnotations) {
+    return entry.mcpAnnotations.destructiveHint ? { destructive: true } : {};
+  }
+  if (entry.readOnly === true) return {};
+  return schemaHasDestructiveValue(entry.tool.parameters, 0) ||
+    leadsWithDestructiveVerb(parseMcpToolName(name)?.toolName ?? name)
+    ? { destructive: true }
+    : {};
+}
+
+// Deep enough for a list of tagged operations (properties → items → oneOf →
+// properties → op), shallow enough that a huge or cyclic schema cannot stall a
+// search.
+const MAX_SCHEMA_DEPTH = 6;
+
+function schemaHasDestructiveValue(schema: unknown, depth: number): boolean {
+  if (depth > MAX_SCHEMA_DEPTH || !schema || typeof schema !== "object") {
+    return false;
+  }
+  const node = schema as Record<string, unknown>;
+  const literals = [
+    ...(Array.isArray(node.enum) ? node.enum : []),
+    node.const,
+  ].filter((value): value is string => typeof value === "string");
+  if (literals.some(leadsWithDestructiveVerb)) return true;
+  const children = [
+    ...(node.properties && typeof node.properties === "object"
+      ? Object.values(node.properties)
+      : []),
+    ...(Array.isArray(node.items) ? node.items : [node.items]),
+    ...[node.oneOf, node.anyOf, node.allOf].flatMap((list) =>
+      Array.isArray(list) ? list : [],
+    ),
+  ];
+  return children.some((child) => schemaHasDestructiveValue(child, depth + 1));
+}
+
+function fieldTerms(value: string): FieldTerms {
+  const terms = searchTerms(value);
+  const counts = new Map<string, number>();
+  for (const term of terms) counts.set(term, (counts.get(term) ?? 0) + 1);
+  return { counts, length: terms.length };
+}
+
+function searchDocumentFields(doc: {
   name: string;
-  source?: string;
+  source: string | undefined;
+  hints: readonly string[] | undefined;
   description: string;
   parameters: ToolParameterSummary[];
-  kind: "action" | "mcp";
-}): number {
-  if (input.queryTokens.length === 0) return 1;
+}): Record<SearchField, FieldTerms> {
+  const sentenceEnd = doc.description.search(/[.!?](\s|$)/);
+  const summaryEnd = sentenceEnd < 0 ? doc.description.length : sentenceEnd + 1;
+  return {
+    name: fieldTerms(doc.name),
+    hints: fieldTerms((doc.hints ?? []).join(" ")),
+    source: fieldTerms(doc.source ?? ""),
+    summary: fieldTerms(doc.description.slice(0, summaryEnd)),
+    details: fieldTerms(doc.description.slice(summaryEnd)),
+    parameters: fieldTerms(
+      doc.parameters.map((p) => `${p.name} ${p.description ?? ""}`).join(" "),
+    ),
+  };
+}
 
-  const name = searchableText(input.name);
-  const source = searchableText(input.source ?? "");
-  const description = searchableText(input.description);
-  const params = searchableText(
-    input.parameters
-      .map((p) => `${p.name} ${p.type ?? ""} ${p.description ?? ""}`)
-      .join(" "),
-  );
-  const all = `${name} ${source} ${description} ${params} ${input.kind}`;
-  const phrase = searchableText(input.query);
+// Common verbs and nouns users say in place of the words tool names use. They
+// count for half of a literal match, so the user's own word still wins.
+const SYNONYM_GROUPS: readonly (readonly string[])[] = [
+  ["create", "make", "new", "add"],
+  ["delete", "remove", "trash", "erase", "clear"],
+  ["update", "change", "edit", "modify", "rename", "adjust"],
+  ["search", "find", "look", "lookup"],
+  ["list", "show"],
+  ["view", "see", "open"],
+  ["restore", "undo", "revert", "recover"],
+  ["export", "download"],
+  ["duplicate", "copy", "clone"],
+  ["reply", "respond", "answer"],
+  ["image", "picture", "photo"],
+  ["document", "doc", "page"],
+  ["email", "mail", "message"],
+  ["setting", "preference"],
+];
 
-  // A query that is a tool's whole name is a request for that tool, not for
-  // whatever else repeats its words.
-  let score =
-    input.name.toLowerCase() === input.query.trim().toLowerCase()
-      ? EXACT_NAME_SCORE
-      : 0;
-  if (name.includes(phrase)) score += 14;
-  if (source && source.includes(phrase)) score += 10;
-  if (description.includes(phrase)) score += 8;
-  if (params.includes(phrase)) score += 5;
-
-  for (const token of input.queryTokens) {
-    if (name.split(" ").includes(token)) score += 9;
-    else if (name.includes(token)) score += 6;
-
-    if (source) {
-      if (source.split(" ").includes(token)) score += 6;
-      else if (source.includes(token)) score += 3;
+const SYNONYMS: ReadonlyMap<string, readonly string[]> = (() => {
+  const map = new Map<string, string[]>();
+  for (const group of SYNONYM_GROUPS) {
+    const stems = group.map(stem);
+    for (const word of stems) {
+      const others = stems.filter((other) => other !== word);
+      map.set(word, [...(map.get(word) ?? []), ...others]);
     }
-
-    if (description.includes(token)) score += 3;
-    if (params.includes(token)) score += 2;
-    if (all.includes(token)) score += 1;
   }
+  return map;
+})();
 
-  return score;
+function weightedQueryTerms(queryTokens: string[]): Map<string, number> {
+  const weights = new Map(queryTokens.map((term) => [term, 1]));
+  for (const term of queryTokens) {
+    for (const synonym of SYNONYMS.get(term) ?? []) {
+      if (!weights.has(synonym)) weights.set(synonym, SYNONYM_WEIGHT);
+    }
+  }
+  return weights;
+}
+
+// Corpus statistics come from every tool that survived this call's filters, so
+// a word most tools share ("get", "list", "app") ranks below a rare one.
+function rankByBm25(
+  query: string,
+  queryTokens: string[],
+  docs: RankableTool[],
+): ToolSearchResult[] {
+  if (queryTokens.length === 0 || docs.length === 0) return [];
+  const queryTerms = weightedQueryTerms(queryTokens);
+  // Averaged over the tools that fill the field: most tools have no search
+  // hints, and counting them would make every hint list look too long.
+  const averageLength = Object.fromEntries(
+    SEARCH_FIELDS.map((field) => {
+      const lengths = docs
+        .map((doc) => doc.fields[field].length)
+        .filter((length) => length > 0);
+      return [
+        field,
+        lengths.reduce((sum, length) => sum + length, 0) / lengths.length || 1,
+      ];
+    }),
+  ) as Record<SearchField, number>;
+  const idf = new Map(
+    [...queryTerms.keys()].map((term) => {
+      const frequency = docs.filter((doc) =>
+        SEARCH_FIELDS.some((field) => doc.fields[field].counts.has(term)),
+      ).length;
+      return [
+        term,
+        Math.log(1 + (docs.length - frequency + 0.5) / (frequency + 0.5)),
+      ] as const;
+    }),
+  );
+  const wholeQuery = query.trim().toLowerCase();
+  return docs.flatMap((doc) => {
+    const { candidate } = doc;
+    if (candidate.name.toLowerCase() === wholeQuery) {
+      return [{ ...candidate, score: EXACT_NAME_SCORE }];
+    }
+    let score = 0;
+    for (const [term, queryWeight] of queryTerms) {
+      let weightedFrequency = 0;
+      for (const field of SEARCH_FIELDS) {
+        const count = doc.fields[field].counts.get(term);
+        if (!count) continue;
+        weightedFrequency +=
+          (FIELD_WEIGHTS[field] * count) /
+          (1 -
+            BM25_B +
+            (BM25_B * doc.fields[field].length) / averageLength[field]);
+      }
+      if (weightedFrequency === 0) continue;
+      score +=
+        queryWeight *
+        (idf.get(term) ?? 0) *
+        ((weightedFrequency * (BM25_K1 + 1)) / (weightedFrequency + BM25_K1));
+    }
+    if (score <= 0) return [];
+    if (
+      queryTokens.length > 1 &&
+      containsTokenRun(tokenize(candidate.name), queryTokens)
+    ) {
+      score += NAME_PHRASE_BONUS;
+    }
+    score *= doc.prior;
+    return [{ ...candidate, score: Math.round(score * 100) / 100 }];
+  });
+}
+
+// Whole tokens in order, so "view email" never matches inside "preview-email"
+// and "archive email" never matches inside "unarchive-email".
+function containsTokenRun(tokens: string[], run: string[]): boolean {
+  for (let start = 0; start + run.length <= tokens.length; start++) {
+    if (run.every((token, offset) => tokens[start + offset] === token)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Suggestions are never loaded, so a query with no exact term still points the
+// model at real names instead of an empty result.
+function suggestCloseTools(
+  docs: RankableTool[],
+  queryTokens: string[],
+): Array<{ name: string; description: string }> {
+  const prefixes = queryTokens
+    .filter((token) => token.length >= 3)
+    .map((token) => token.slice(0, 3));
+  if (prefixes.length === 0) return [];
+  return docs
+    .map(({ candidate, fields }) => {
+      const terms = [
+        ...fields.name.counts.keys(),
+        ...fields.hints.counts.keys(),
+        ...fields.summary.counts.keys(),
+        ...fields.details.counts.keys(),
+      ];
+      const overlap = prefixes.filter((prefix) =>
+        terms.some((term) => term.startsWith(prefix)),
+      ).length;
+      return { candidate, overlap };
+    })
+    .filter(({ overlap }) => overlap > 0)
+    .sort(
+      (a, b) =>
+        b.overlap - a.overlap ||
+        a.candidate.name.localeCompare(b.candidate.name),
+    )
+    .slice(0, MAX_SUGGESTIONS)
+    .map(({ candidate }) => ({
+      name: candidate.name,
+      description: truncate(
+        candidate.description,
+        MAX_SUGGESTION_DESCRIPTION_CHARS,
+      ),
+    }));
+}
+
+// Function words carry no capability, and conversational requests are full of
+// them ("can you show me what I have"). Indexed text drops them too, so a
+// description's "you can" never matches a request's.
+const STOP_WORDS: ReadonlySet<string> = new Set(
+  (
+    "a about after again also am an and any are as at be been before being " +
+    "but by can could did do does doing done for from had has have having " +
+    "he her here hers him his how i if in into is it its just let lets me " +
+    "mine my myself no not now of off on once only or our ours please she " +
+    "should so some such than thank thanks that the their theirs them then " +
+    "there these they this those to too up us very want was we were what " +
+    "when where which while who whom why will with would you your yours"
+  ).split(" "),
+);
+
+// Light, inflection-only stemming, the same on both sides of the match:
+// plurals, "-ed" and "-ing" (undoubling "running" to "run"), and a final
+// "-e", so "archived", "archiving" and "archive" meet at "archiv" and "saved"
+// meets "save". Full Porter stemming was measured on the benchmark and lost a
+// held-out case: it folds derivations together ("engineering" into "engine").
+function stem(term: string): string {
+  const protectedTerm = PROTECTED_TERMS.get(term);
+  if (protectedTerm) return protectedTerm;
+  let stemmed = term;
+  if (stemmed.length > 4 && stemmed.endsWith("ies")) {
+    stemmed = `${stemmed.slice(0, -3)}y`;
+  } else if (stemmed.length > 4 && /(ches|shes|sses|xes|zes)$/.test(stemmed)) {
+    stemmed = stemmed.slice(0, -2);
+  } else if (
+    stemmed.length > 3 &&
+    stemmed.endsWith("s") &&
+    !/(ss|us|is)$/.test(stemmed)
+  ) {
+    stemmed = stemmed.slice(0, -1);
+  }
+  if (/^[aeiou][^aeiouy](?:ing|ed)$/u.test(stemmed)) {
+    // "using" and "used" lost the "e" of "use", as "owing" did of "owe".
+    stemmed = `${stemmed.slice(0, 2)}e`;
+  } else if (stemmed.length > 5 && stemmed.endsWith("ing")) {
+    stemmed = undoubleFinalConsonant(stemmed.slice(0, -3));
+  } else if (stemmed.length > 4 && stemmed.endsWith("ied")) {
+    stemmed = `${stemmed.slice(0, -3)}y`;
+  } else if (stemmed.length > 4 && stemmed.endsWith("ed")) {
+    stemmed = undoubleFinalConsonant(stemmed.slice(0, -2));
+  }
+  if (stemmed.length >= 4 && stemmed.endsWith("e")) {
+    stemmed = stemmed.slice(0, -1);
+  }
+  return stemmed;
+}
+
+// "running" and "stopped" double the consonant before the suffix, so their
+// stems must drop it to meet "run" and "stop". Base words that end in a double
+// letter ("fill", "dress", "buzz", "stuff") keep it, as do stems that would
+// shrink to two letters ("adding" stays "add"). A long "-ell" stem is the
+// British doubling of "cancelled" and "labelled"; "spell" and "sell" are short.
+function undoubleFinalConsonant(stemmed: string): string {
+  return (stemmed.length >= 4 && /([bcdgkmnprt])\1$/.test(stemmed)) ||
+    (stemmed.length >= 6 && stemmed.endsWith("ell"))
+    ? stemmed.slice(0, -1)
+    : stemmed;
+}
+
+function searchTerms(value: string): string[] {
+  return value
+    .split(/[^A-Za-z0-9]+/)
+    .flatMap((word) => {
+      const parts = word
+        .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+        .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+        .toLowerCase()
+        .split(" ");
+      // Users type "PowerPoint" and "HubSpot" as one word, too.
+      return parts.length > 1 ? [...parts, word.toLowerCase()] : parts;
+    })
+    .filter(
+      (term) => (term.length > 1 || /\d/.test(term)) && !STOP_WORDS.has(term),
+    )
+    .map(stem);
 }
 
 function tokenize(value: string): string[] {
-  const seen = new Set<string>();
-  for (const token of searchableText(value).split(" ")) {
-    if (token.length > 0) seen.add(token);
-  }
-  return Array.from(seen);
-}
-
-function searchableText(value: string): string {
-  return value
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
+  return [...new Set(searchTerms(value))];
 }
 
 function normalizeWhitespace(value: string): string {

@@ -7,6 +7,15 @@ import {
   factoryDefinitions,
   factoryGraphVersions,
   factoryPollCursors,
+  factoryTripwires,
+  factoryWorkflowDrafts,
+  factoryWorkflowItemEvents,
+  factoryWorkflowItemState,
+  factoryWorkflowReceipts,
+  factoryWorkflowRuns,
+  factoryWorkflowSteps,
+  factoryWorkflowVersions,
+  factoryWorkflows,
   triageConfig,
   triageDecisions,
   triageFeedback,
@@ -34,8 +43,7 @@ vi.mock("../server/db/index.js", () => ({
   getDb: getDbMock,
 }));
 
-vi.mock("../server/factory-graph/store.js", () => ({
-  DEFAULT_FACTORY_ID: "product-feedback",
+vi.mock("../server/lib/factory-definitions.js", () => ({
   readFactoryDefinition: readFactoryDefinitionMock,
 }));
 
@@ -159,6 +167,15 @@ describe("delete-factory", () => {
       factoryAutomationVersions,
       factoryAuditEvents,
       factoryPollCursors,
+      factoryTripwires,
+      factoryWorkflowItemEvents,
+      factoryWorkflowItemState,
+      factoryWorkflowReceipts,
+      factoryWorkflowSteps,
+      factoryWorkflowRuns,
+      factoryWorkflowVersions,
+      factoryWorkflowDrafts,
+      factoryWorkflows,
       triageFeedback,
       triageDecisions,
       triageRuns,

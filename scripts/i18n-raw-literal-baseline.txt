@@ -18,6 +18,7 @@ packages/docs/app/components/blocks/steps.tsx|A numbered step-by-step procedure 
 packages/docs/app/components/blocks/steps.tsx|Step title
 packages/docs/app/components/docBlocks.tsx|| Extract
 templates/clips/app/components/workspace/notifications-list.tsx|["formatDate"], formatRelativeTime: ReturnType
+templates/content/app/components/ContentErrorBoundary.tsx|Go to page list
 templates/crm/app/components/crm/CreateCrmRecordDialog.tsx|This record lives in the local-authoritative Native SQL CRM. You can connect or mirror another CRM separately.
 templates/crm/app/components/crm/CrmSignalsPanel.tsx|Attach a bounded Clips evidence reference before running detectors.
 templates/crm/app/components/crm/CrmSignalsPanel.tsx|Confirm signal
@@ -78,8 +79,9 @@ templates/crm/app/routes/tasks.tsx|Task creation failed.
 templates/crm/app/routes/tasks.tsx|Task update failed.
 templates/crm/app/routes/tasks.tsx|Tasks are local by default and never write to the provider silently.
 templates/design/app/components/design/DesignCanvas.tsx|handle ? [
-templates/design/app/components/design/FusionAppBanner.tsx|Publish failed
-templates/design/app/components/design/FusionAppBanner.tsx|Push failed
+templates/design/app/components/design/FusionAppMenu.tsx|Publish failed
+templates/design/app/components/design/FusionAppMenu.tsx|Push failed
+templates/design/app/components/design/FusionAppMenu.tsx|Your app is live
 templates/design/app/components/design/bridge/editor-chrome.bridge.ts|parentRect.right || clientY
 templates/design/app/components/design/code-workbench/commands.ts|Command failed
 templates/design/app/components/design/code-workbench/commands.ts|Could not save file

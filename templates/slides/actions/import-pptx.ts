@@ -1,4 +1,4 @@
-import { defineAction, fail } from "@agent-native/core/action";
+import { defineAction, fail, NoWriteError } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import {
   getRequestUserEmail,
@@ -22,6 +22,7 @@ import {
   type ParsedImage,
   type ParsedPresentation,
 } from "../server/handlers/import/pptx-parser.js";
+import { deckDataColumns } from "../server/lib/deck-list-columns.js";
 import { trackSlides } from "../server/lib/slides-tracking.js";
 import { buildSourceImportMetadata } from "../server/lib/source-import.js";
 import {
@@ -106,6 +107,7 @@ export async function importPptxBufferToDeck(args: {
   fileBuffer: Buffer;
   title?: string;
   deckId?: string;
+  replaceExisting?: boolean;
   designSystemId?: string | null;
   source?: string;
   imageFallbacks?: ImportedImageFallback[];
@@ -117,6 +119,7 @@ export async function importPptxBufferToDeck(args: {
   theme: Awaited<ReturnType<typeof parsePptx>>["theme"];
   imported: true;
   url: string;
+  replacedExisting: boolean;
   imagesSkipped?: number;
   tablesDegraded?: number;
 }> {
@@ -124,13 +127,32 @@ export async function importPptxBufferToDeck(args: {
     fileBuffer,
     title,
     deckId,
+    replaceExisting = false,
     designSystemId,
     source = "import-pptx",
     imageFallbacks,
     parsedPresentation,
   } = args;
+  if (deckId && !replaceExisting) {
+    fail(
+      "Importing into an existing deck replaces all of its slides and title. Pass replaceExisting: true to confirm. No deck was written.",
+      { errorCode: SOURCE_IMPORT_NO_WRITE_ERROR_CODE },
+    );
+  }
+  if (replaceExisting && !deckId) {
+    fail(
+      "replaceExisting only applies when importing into a deckId. No deck was written.",
+      { errorCode: SOURCE_IMPORT_NO_WRITE_ERROR_CODE },
+    );
+  }
   const presentation =
     parsedPresentation ?? (await parsePptxBeforeDeckWrite(fileBuffer));
+  if (presentation.slides.length === 0) {
+    fail(
+      "This PowerPoint file has no slides, so nothing was imported. No deck was written.",
+      { errorCode: SOURCE_IMPORT_NO_WRITE_ERROR_CODE },
+    );
+  }
   applyImageFallbacks(presentation, imageFallbacks);
   const requestedTitle = title?.trim() || presentation.title || "";
   const ownerEmail = getRequestUserEmail();
@@ -199,7 +221,8 @@ export async function importPptxBufferToDeck(args: {
     0,
   );
   if (imagesSkipped > 0) {
-    fail(
+    // The images that did upload are orphan blobs, not saved deck data.
+    throw new NoWriteError(
       `Source-faithful PPTX import could not preserve ${imagesSkipped} image(s). No deck was written. Retry with browser-renderable images or use a PDF export for page-faithful preservation.`,
       { errorCode: SOURCE_IMPORT_NO_WRITE_ERROR_CODE },
     );
@@ -248,7 +271,7 @@ export async function importPptxBufferToDeck(args: {
         .update(schema.decks)
         .set({
           title: deckTitle,
-          data: JSON.stringify(data),
+          ...deckDataColumns(data),
           ...(designSystemId !== undefined
             ? { designSystemId }
             : { designSystemId: latestDeck.designSystemId }),
@@ -270,6 +293,7 @@ export async function importPptxBufferToDeck(args: {
         theme: presentation.theme,
         imported: true,
         url: getDeckUrl(deckId),
+        replacedExisting: true,
         ...(imagesSkipped > 0 ? { imagesSkipped } : {}),
         ...(tablesDegraded > 0 ? { tablesDegraded } : {}),
       };
@@ -289,7 +313,7 @@ export async function importPptxBufferToDeck(args: {
   await db.insert(schema.decks).values({
     id,
     title: deckTitle,
-    data: JSON.stringify(data),
+    ...deckDataColumns(data),
     ownerEmail,
     orgId: getRequestOrgId(),
     designSystemId: designSystemId ?? undefined,
@@ -307,6 +331,7 @@ export async function importPptxBufferToDeck(args: {
     theme: presentation.theme,
     imported: true,
     url: getDeckUrl(id),
+    replacedExisting: false,
     ...(imagesSkipped > 0 ? { imagesSkipped } : {}),
     ...(tablesDegraded > 0 ? { tablesDegraded } : {}),
   };
@@ -321,12 +346,20 @@ export default defineAction({
   schema: z.object({
     filePath: z
       .string()
-      .describe("Uploaded PPTX path or opaque hosted upload reference"),
+      .describe(
+        "Uploaded PPTX path, hosted reference, exact current attachment name, or a generic reference such as 'the attached presentation' when exactly one compatible PPTX is attached. Format-specific references must match PPTX.",
+      ),
     deckId: z
       .string()
       .optional()
       .describe(
-        "If provided, import slides into this existing deck (replaces all slides)",
+        "If provided, import slides into this existing deck. Requires replaceExisting: true.",
+      ),
+    replaceExisting: z
+      .boolean()
+      .optional()
+      .describe(
+        "Must be true with deckId to confirm the import replaces all slides and the title of that deck",
       ),
     designSystemId: z
       .string()
@@ -344,15 +377,28 @@ export default defineAction({
       .optional()
       .describe("Why the deck is being imported; used only for analytics"),
   }),
-  run: async ({ filePath, deckId, title, designSystemId, purpose }, ctx) => {
-    const { data: fileBuffer } = await readUserUploadedFile(filePath, ctx);
+  run: async (
+    { filePath, deckId, replaceExisting, title, designSystemId, purpose },
+    ctx,
+  ) => {
+    const { data: fileBuffer } = await readUserUploadedFile(filePath, ctx, {
+      expectedExtensions: [".pptx"],
+    });
     const result = await importPptxBufferToDeck({
       fileBuffer,
       deckId,
+      replaceExisting,
       title,
       designSystemId,
     });
-    trackPptxImport(result, { deckId, purpose }, ctx);
+    await trackPptxImport(
+      result,
+      {
+        ...(deckId ? { deckId } : {}),
+        ...(purpose ? { purpose } : {}),
+      },
+      ctx,
+    );
     return result;
   },
 });
@@ -361,13 +407,13 @@ export default defineAction({
  * A PPTX imported as a new deck is a creation; imported into an existing deck
  * it replaces that deck's slides, which is an edit.
  */
-export function trackPptxImport(
+export async function trackPptxImport(
   result: { id: string; slideCount: number },
   args: { deckId?: string; purpose?: "direct" | "reference" },
   source: Parameters<typeof trackSlides>[2],
-): void {
+): Promise<void> {
   if (!args.deckId) {
-    trackDeckCreated(
+    await trackDeckCreated(
       result.id,
       {
         creationMethod: "import_pptx",

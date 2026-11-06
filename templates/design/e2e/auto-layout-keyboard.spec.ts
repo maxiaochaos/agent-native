@@ -48,7 +48,10 @@ async function selectOnCanvas(app: App, nodeId: string, layerName: string) {
     rect.x + rect.width / 2,
     rect.y + rect.height / 2,
   );
+  // Cmd+click reaches a nested layer; a plain click takes the top-level one.
+  await app.page.keyboard.down(PRIMARY);
   await app.page.mouse.click(point.x, point.y);
+  await app.page.keyboard.up(PRIMARY);
   await expect.poll(() => app.selectedLayers()).toEqual([layerName]);
 }
 
@@ -109,8 +112,7 @@ test.describe("auto layout keyboard interactions", () => {
     expectOnlyChanged(before, up, []);
   });
 
-  // fixme: product bug: The pasted copy renders 360x42: as a block child it stretches to Free Frame's full width instead of keeping the original's size.
-  test.fixme("pasting into a selected frame puts one copy of Alpha inside it at Alpha's size", async ({
+  test("pasting into a selected frame puts one copy of Alpha inside it at Alpha's size", async ({
     app,
     page,
   }) => {

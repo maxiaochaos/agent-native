@@ -6,16 +6,11 @@ import { useOnboardingPreviewMode } from "@agent-native/core/client/onboarding/u
 import { useSessionPreloading } from "@agent-native/core/client/use-session";
 import { FIRST_RUN_ONBOARDING_COOKIE } from "@agent-native/core/shared/first-run-onboarding";
 import { Button } from "@agent-native/toolkit/ui/button";
-import React, {
-  Suspense,
-  createContext,
-  lazy,
-  useContext,
-  useEffect,
-  useState,
-} from "react";
+import React, { Suspense, lazy, useEffect, useState } from "react";
 
-import { AppShellSkeleton } from "../shared/AppShellSkeleton.js";
+import { FirstRunOnboardingGateContext } from "./first-run-startup-gate-context.js";
+
+export { useFirstRunOnboardingGateOwnsSurface } from "./first-run-startup-gate-context.js";
 
 const FirstRunOnboarding = lazy(() =>
   import("./FirstRunOnboarding.js").then((module) => ({
@@ -29,8 +24,11 @@ type FirstRunCookieState = "present" | "absent" | "unreadable";
 const FIRST_RUN_STATUS_MAX_ATTEMPTS = 2;
 const FIRST_RUN_STATUS_RETRY_DELAY_MS = 500;
 
-const FirstRunOnboardingGateContext = createContext(false);
-
+// A standalone app's Vite dev server pre-bundles `app/chat` (the sidebar and
+// panel) but serves `app/providers` (this gate) unbundled, so this module can
+// load twice. One context per copy left the sidebar reading `false` and
+// mounting a second questionnaire behind the gate, revealed at step 1 once
+// the gate stepped aside. Every copy shares one context through globalThis.
 function readFirstRunOnboardingCookieState(): FirstRunCookieState {
   if (typeof document === "undefined") return "present";
   const prefix = `${FIRST_RUN_ONBOARDING_COOKIE}=`;
@@ -48,17 +46,11 @@ function readFirstRunOnboardingCookieState(): FirstRunCookieState {
   }
 }
 
-export function useFirstRunOnboardingGateOwnsSurface(): boolean {
-  return useContext(FirstRunOnboardingGateContext);
-}
-
 export function FirstRunOnboardingStartupGate({
   children,
-  fallback = <AppShellSkeleton />,
   suppressSurface = false,
 }: {
   children: React.ReactNode;
-  fallback?: React.ReactNode;
   suppressSurface?: boolean;
 }) {
   const t = useT();
@@ -137,33 +129,22 @@ export function FirstRunOnboardingStartupGate({
 
   const ownsSurface = !suppressSurface && decision === "eligible";
   const gateOwnsSurface = !suppressSurface && decision !== "ineligible";
-  const hideApp = gateOwnsSurface;
-  const app = shouldResolve ? (
-    <div
-      aria-hidden={hideApp ? "true" : undefined}
-      data-first-run-app-hidden={hideApp ? "true" : undefined}
-      style={{
-        display: "contents",
-        ...(hideApp ? { visibility: "hidden" } : {}),
-      }}
-    >
-      {children}
-    </div>
-  ) : (
-    children
-  );
 
   return (
     <FirstRunOnboardingGateContext.Provider value={gateOwnsSurface}>
-      {app}
-      {!suppressSurface && decision === "pending" && (
-        <FirstRunOnboardingStartupLoading fallback={fallback} />
-      )}
+      <div
+        aria-hidden={gateOwnsSurface ? "true" : undefined}
+        data-first-run-app-inert={gateOwnsSurface ? "true" : undefined}
+        inert={gateOwnsSurface}
+        style={{ display: "contents" }}
+      >
+        {children}
+      </div>
       {!suppressSurface && decision === "unavailable" && (
         <div
           role="alert"
           data-first-run-status-error="true"
-          className="fixed inset-0 z-[110] flex flex-col items-center justify-center gap-2 bg-background px-6 text-center"
+          className="fixed inset-x-4 bottom-4 z-[110] mx-auto flex max-w-md items-center justify-between gap-3 rounded-lg border border-border bg-background px-4 py-3 text-start shadow-lg"
         >
           <span className="text-sm text-muted-foreground">
             {t("agentChat.common.chunkLoadFailed")}
@@ -179,29 +160,10 @@ export function FirstRunOnboardingStartupGate({
         </div>
       )}
       {ownsSurface && (
-        <Suspense
-          fallback={<FirstRunOnboardingStartupLoading fallback={fallback} />}
-        >
+        <Suspense fallback={null}>
           <FirstRunOnboarding initialFirstRun />
         </Suspense>
       )}
     </FirstRunOnboardingGateContext.Provider>
-  );
-}
-
-function FirstRunOnboardingStartupLoading({
-  fallback,
-}: {
-  fallback: React.ReactNode;
-}) {
-  return (
-    <div
-      role="status"
-      aria-label="Loading application"
-      data-first-run-startup-loading="true"
-      className="fixed inset-0 z-[110] bg-background"
-    >
-      <div inert>{fallback}</div>
-    </div>
   );
 }
