@@ -4157,6 +4157,117 @@ describe("createProductionAgentHandler", () => {
     }
   });
 
+  it("runs a second approval when the client turn id differs from the pending row", async () => {
+    const approvalId = "ask-second-approval";
+    const input = { to: "a@b.com" };
+    const approvalKey = toolCallCacheKey("send-email", input);
+    const resolveApproval = vi
+      .spyOn(toolApprovalStore, "resolveAgentToolApprovalTurnId")
+      .mockResolvedValue("turn-stored");
+    const consumeApproval = vi
+      .spyOn(toolApprovalStore, "consumeAgentToolApproval")
+      .mockResolvedValue(true);
+    const isTurnAborted = vi
+      .spyOn(runStore, "isTurnAborted")
+      .mockResolvedValue(false);
+    mockPersistRunEventsInMemory.enabled = true;
+    const runAction = vi.fn(async () => "sent");
+    const engine = engineWithUncalledStream();
+    const handler = createProductionAgentHandler({
+      systemPrompt: "Test",
+      engine,
+      actions: {
+        "send-email": {
+          ...actionEntry({ readOnly: false }),
+          needsApproval: true,
+          run: runAction,
+        },
+      },
+    });
+    try {
+      const response = await runWithRequestContext(
+        { userEmail: "alice@example.com", orgId: "acme", run: {} },
+        () =>
+          handler(
+            mockEvent(
+              new Request("http://app.example.com/_agent-native/agent-chat", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  message: "Approved. Go ahead and run the requested action.",
+                  threadId: "thread-second-approval",
+                  turnId: "turn-client-continuation",
+                  approvedToolCalls: [approvalKey],
+                  approvedToolCallAskIds: [approvalId],
+                  structuredHistory: [
+                    {
+                      role: "assistant",
+                      content: [
+                        {
+                          type: "tool-call",
+                          id: "call-second-approval",
+                          name: "send-email",
+                          input,
+                          approvalKey,
+                          approvalAskId: approvalId,
+                        },
+                      ],
+                    },
+                    {
+                      role: "user",
+                      content: [
+                        {
+                          type: "tool-result",
+                          toolCallId: "call-second-approval",
+                          toolName: "send-email",
+                          toolInput: JSON.stringify(input),
+                          content: "Awaiting human approval.",
+                          approvalPause: true,
+                          approvalAskId: approvalId,
+                        },
+                      ],
+                    },
+                  ],
+                }),
+              }),
+            ),
+          ),
+      );
+
+      expect(response).not.toEqual(
+        expect.objectContaining({
+          code: "approved_tool_call_not_pending",
+        }),
+      );
+      expect(response).toBeInstanceOf(ReadableStream);
+      if (response instanceof ReadableStream) {
+        await new Response(response).text();
+      }
+
+      expect(resolveApproval).toHaveBeenCalledWith({
+        ownerEmail: "alice@example.com",
+        orgId: "acme",
+        threadId: "thread-second-approval",
+        requestedTurnId: "turn-client-continuation",
+        approvalKeys: [approvalKey],
+        approvalId,
+      });
+      expect(runAction).toHaveBeenCalledOnce();
+      expect(consumeApproval).toHaveBeenCalledWith(
+        expect.objectContaining({
+          turnId: "turn-stored",
+          approvalId,
+        }),
+      );
+      expect(engine.stream).not.toHaveBeenCalled();
+    } finally {
+      resolveApproval.mockRestore();
+      consumeApproval.mockRestore();
+      isTurnAborted.mockRestore();
+      mockPersistRunEventsInMemory.enabled = false;
+    }
+  });
+
   it("rejects malformed approval ids instead of falling back to a key-only approval", async () => {
     const engine = engineWithUncalledStream();
     const handler = createProductionAgentHandler({
@@ -17782,6 +17893,20 @@ describe("runAgentLoop", () => {
       type: "text",
       text: "Waiting for your approval to run send-email.",
     });
+    const waitingIndex = events.findIndex(
+      (event) =>
+        event.type === "text" &&
+        event.text === "Waiting for your approval to run send-email.",
+    );
+    const approvalIndex = events.findIndex(
+      (event) => event.type === "approval_required",
+    );
+    const toolDoneIndex = events.findIndex(
+      (event) => event.type === "tool_done",
+    );
+    expect(waitingIndex).toBeGreaterThanOrEqual(0);
+    expect(waitingIndex).toBeLessThan(approvalIndex);
+    expect(waitingIndex).toBeLessThan(toolDoneIndex);
     expect(events.some((event) => event.type === "done")).toBe(false);
     expect(outcomes).toEqual([
       {

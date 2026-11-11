@@ -3,6 +3,7 @@ import type { AgentSuggestion } from "@agent-native/agentkit/protocol";
 
 import type { ActionChatUIConfig } from "../../action-ui.js";
 import {
+  APPROVED_TOOL_CALL_ALREADY_RAN_PROMPT,
   AUTO_CONTINUE_OF_RUN_METADATA_KEY,
   CONTINUE_OF_RUN_METADATA_KEY,
 } from "../../agent/auto-continue.js";
@@ -5132,9 +5133,7 @@ export function createAgentNativeChatRuntime(
       if (messageState) messageState.message.approvalPending = false;
       return startTurn({
         ...turnToContinue,
-        prompt:
-          continuation.prompt ??
-          "Approved. Go ahead and run the requested action.",
+        prompt: continuation.prompt ?? APPROVED_TOOL_CALL_ALREADY_RAN_PROMPT,
         metadata: {
           ...previousMetadata,
           ...continuationMetadata,

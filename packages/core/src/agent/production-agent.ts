@@ -184,6 +184,7 @@ import {
   formatAgentWarningsForToolResult,
 } from "./action-warnings.js";
 import {
+  APPROVED_TOOL_CALL_ALREADY_RAN_PROMPT,
   CONTINUE_UNAVAILABLE_CODE,
   type ContinueTrigger,
 } from "./auto-continue.js";
@@ -6507,10 +6508,12 @@ export async function runAgentLoop(opts: {
   let loopBreakerCloseout: TerminalActionStop | null = null;
   let loopBreakerStopped = false;
   const sendTerminalActionStop = (stop: TerminalActionStop) => {
-    if (
-      stop.errorCode === "needs-approval" ||
-      stop.errorCode === "awaiting-user-input"
-    ) {
+    if (stop.errorCode === "needs-approval") {
+      // Waiting copy is emitted at the pause so it stays before the approval
+      // card and the later approved result, including after the stream closes.
+      return;
+    }
+    if (stop.errorCode === "awaiting-user-input") {
       send({ type: "text", text: stop.transcriptMessage ?? stop.message });
       return;
     }
@@ -7871,6 +7874,8 @@ export async function runAgentLoop(opts: {
         if (mustApprove) {
           const askId =
             (await opts.onApprovalRequired?.(approvalBinding)) || undefined;
+          const waitingMessage = `Waiting for your approval to run ${toolCall.name}.`;
+          send({ type: "text", text: waitingMessage });
           send({
             type: "tool_start",
             id: toolCall.id,
@@ -7925,7 +7930,7 @@ export async function runAgentLoop(opts: {
           recordToolResult(result, false);
           turnYieldedToUser = true;
           requestedActionStop ??= {
-            message: `Waiting for your approval to run ${toolCall.name}.`,
+            message: waitingMessage,
             errorCode: "needs-approval",
           };
           return {
@@ -11135,6 +11140,17 @@ export function createProductionAgentHandler(
           ),
         ]
       : requestedApprovedToolCalls;
+    if (approvedToolCallsForExecution?.length) {
+      // The server runs the approved call itself. Keep the model from being
+      // told to "go ahead and run" that same action after its result.
+      requestMessage = APPROVED_TOOL_CALL_ALREADY_RAN_PROMPT;
+      mutableBody.message = APPROVED_TOOL_CALL_ALREADY_RAN_PROMPT;
+      requestContext = buildRecentUserRequestContext({
+        request: requestMessage,
+        history: requestHistory,
+        structuredHistory: requestStructuredHistory,
+      });
+    }
     const resolvedApprovalTurnId =
       ownerEmail && threadId && approvedToolCallsForExecution?.length
         ? await resolveAgentToolApprovalTurnId({
