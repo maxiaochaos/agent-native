@@ -68,10 +68,11 @@ Content makes arrival, navigation, and resumption feel dependable instead of ask
 - **Recent work:** Restores the objects and views a person was actually using, scoped by current access.
 - **Known links and invitations:** Land on the intended object with an honest access-denied state when permission is missing.
 - **Session resumption:** Reopens enough navigation and View state to pick up the work without reconstructing the route manually.
+- **Related work:** Suggests a few current, related Pages and records beside the open one, so people can move through a workspace without filing everything first. Suggestions never become declared links or Relationships on their own.
 
 **Required capability records:** [Content spaces and Files](capabilities/content.source.spaces-files.md), [Personal and organization contexts](capabilities/content.workspace.multi-scope.md), [Global Home](capabilities/content.home.global.md), [Personal sidebar](capabilities/content.navigation.sidebar.md), [Session resumption](capabilities/content.workspace.session-restore.md)
 
-**Enhancing capability records:** [Working set](capabilities/content.workspace.working-set.md), [View instances](capabilities/content.workspace.view-instance.md)
+**Enhancing capability records:** [Working set](capabilities/content.workspace.working-set.md), [View instances](capabilities/content.workspace.view-instance.md), [Related work](capabilities/content.knowledge.related.md)
 
 ### Feature 3: Living references
 
@@ -161,7 +162,7 @@ Comments, Discussion, messages, notifications, and history stay anchored to the 
 
 **Example workflow:** A teammate comments on an unclear paragraph, discusses the larger issue in the Page's Discussion, links the conversation to Slack, and returns later to see the Comment, replies, and resulting changes together.
 
-**What works today:** Content supports anchored Comment threads, replies, resolution, mentions, notifications substrate, document history, and revision-aware Page collaboration. October's two-tab convergence stack keeps more concurrent edits durable, reduces false conflict warnings, improves recovery and agent-edit visibility, and measures save outcomes (#6656, #6721, #6737, #6984, #7028, #7033, #7111). A reported beta two-tab check converged 18 edits with every save returning 200.
+**What works today:** Content supports anchored Comment threads, replies, resolution, mentions, notifications substrate, document history, and revision-aware Page collaboration. October's two-tab convergence stack keeps more concurrent edits durable, reduces false conflict warnings, improves recovery and agent-edit visibility, and measures save outcomes (#6656, #6721, #6737, #6984, #7028, #7033, #7111). A reported beta two-tab check converged 18 edits with every save returning 200. Collection tables show each row's open Comment count and mark cells with open threads, and a Comment can target one Property value while keeping the value it was written about.
 
 **What remains:** Every Page and Collection still needs universal Discussion, rich Blocks-field messages, stable permalinks, access-safe Slack continuation, and clearly attributable message revisions. Collaboration durability still needs the R01–R08 gate and authenticated beta acceptance.
 
@@ -285,7 +286,7 @@ Keep supported edits synchronized according to one plain-language policy without
 
 **Example workflow:** An editor updates a Builder article from Content; the supported changes synchronize, an unknown Builder component survives untouched, and changing Draft to Published remains a separate guarded action.
 
-**What works today:** Builder change sets, guarded writes, raw sidecars, local-folder synchronization, and source metadata already preserve several difficult round-trip and conflict boundaries.
+**What works today:** Builder change sets, guarded writes, raw sidecars, local-folder synchronization, and source metadata already preserve several difficult round-trip and conflict boundaries. A new Collection can follow a GitHub folder as View only, bringing in pushes within about a minute.
 
 **What remains:** Every adapter needs certification against one plain-language sync policy, seamless automatic synchronization where safe, faithful unknown-content preservation, explicit lifecycle changes, and dependable receipts.
 
@@ -564,11 +565,11 @@ Create a one-off artifact, then promote it into a governed reusable Custom Block
 
 Build Forms over the same schema, validation, and submission Actions as the Collection they populate.
 
-**Status:** In validation
+**Status:** Partially implemented
 
 **Example workflow:** A research team publishes an intake Form that validates required fields, lets an external participant submit without reading the Collection, creates exactly one record, and triggers the Collection's enrichment Rule.
 
-**What works today:** Content already has a Form View, ordered and required questions, schema-backed controls, and an atomic Action that creates and verifies an ordinary Collection record.
+**What works today:** Content already has a Form View, ordered and required questions, schema-backed controls, and an atomic Action that creates and verifies an ordinary Collection record. Only people who can edit the Collection can submit.
 
 **What remains:** Content and Agent-Native Forms need one shared engine, with polished public submission, richer validation, conditional behavior, permissions, spam protection, receipts, and dependable downstream Rule handoff.
 

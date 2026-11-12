@@ -48,6 +48,7 @@ vi.mock("./db/index.js", () => ({
 
 import { sourceContentHash } from "../shared/source-workspace.js";
 import {
+  findSourceWorkspaceFile,
   prepareInlineSourceEdit,
   readPreparedSourceText,
   readLiveSourceFile,
@@ -97,6 +98,28 @@ describe("resolveSourceWorkspace", () => {
     });
   });
 
+  it("tags an unverifiable live read with its own code, not the stale-file conflict code", async () => {
+    mocks.hasCollabState.mockResolvedValue(true);
+    mocks.getText.mockRejectedValue(new Error("collaboration unavailable"));
+    const file = sourceFiles[1];
+    if (!file) throw new Error("the fixture needs a second source file");
+
+    await expect(readLiveSourceFile(file)).rejects.toMatchObject({
+      statusCode: 409,
+      errorCode: "source_version_unverifiable",
+    });
+  });
+
+  it("defaults the conflict error code and accepts an explicit one", () => {
+    expect(new SourceWorkspaceEditConflictError("x")).toMatchObject({
+      statusCode: 409,
+      errorCode: "source_version_conflict",
+    });
+    expect(new SourceWorkspaceEditConflictError("x", "custom").errorCode).toBe(
+      "custom",
+    );
+  });
+
   it("fails closed when live collaboration returns a non-string snapshot", async () => {
     mocks.hasCollabState.mockResolvedValue(true);
     mocks.getText.mockResolvedValue(42);
@@ -125,6 +148,43 @@ describe("resolveSourceWorkspace", () => {
       content: currentContent,
       expectedVersionHash: sourceContentHash(persistedContent),
     });
+  });
+
+  it("accepts a lagging editor revision when its content matches the live source", async () => {
+    const currentContent = "<main>Latest saved source</main>";
+    const file = {
+      ...sourceFiles[1],
+      content: currentContent,
+      updatedAt: "revision-2",
+    };
+
+    const prepared = await prepareInlineSourceEdit({
+      file,
+      currentContent,
+      revision: "revision-1",
+    });
+
+    expect(prepared).toEqual({
+      content: currentContent,
+      expectedVersionHash: sourceContentHash(currentContent),
+    });
+  });
+
+  it("rejects a lagging editor revision when its working content is stale", async () => {
+    const currentContent = "<main>Older editor source</main>";
+    const file = {
+      ...sourceFiles[1],
+      content: "<main>Newer saved source</main>",
+      updatedAt: "revision-2",
+    };
+
+    await expect(
+      prepareInlineSourceEdit({
+        file,
+        currentContent,
+        revision: "revision-1",
+      }),
+    ).rejects.toBeInstanceOf(SourceWorkspaceEditConflictError);
   });
 
   it("rejects unsaved editor content when live content has a third version", async () => {
@@ -178,6 +238,17 @@ describe("resolveSourceWorkspace", () => {
       "missing-design",
     );
     expect(mocks.getDb).not.toHaveBeenCalled();
+  });
+
+  it("returns a 404 action error for a source file that no longer exists", () => {
+    expect(() =>
+      findSourceWorkspaceFile([], { fileId: "deleted-screen" }),
+    ).toThrow(
+      expect.objectContaining({
+        errorCode: "source_file_not_found",
+        statusCode: 404,
+      }),
+    );
   });
 
   it("includes the Board only for callers that opt in", async () => {

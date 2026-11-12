@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 
-import { act, useEffect } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, type ReactNode, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -21,9 +22,17 @@ vi.mock("@agent-native/core/client/i18n", () => ({
 
 const LARGE_BOARD_SCREEN_COUNT = OVERVIEW_LIVE_SCREEN_BUDGET + 1;
 
+let root: Root;
+let queryClient: QueryClient;
+
+function renderWithQueryClient(children: ReactNode) {
+  root.render(
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>,
+  );
+}
+
 describe("MultiScreenCanvas live boot budget", () => {
   let container: HTMLDivElement;
-  let root: Root;
   const liveScreenIds = () =>
     [...container.querySelectorAll("[data-live-screen]")].map((node) =>
       node.getAttribute("data-live-screen"),
@@ -52,6 +61,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       toJSON: () => ({}),
     });
     root = createRoot(container);
+    queryClient = new QueryClient();
   });
 
   afterEach(async () => {
@@ -74,7 +84,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const renderCalls: string[] = [];
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={100}
@@ -136,7 +146,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const startById = new Map<string, () => void>();
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={100}
@@ -195,7 +205,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const readyById = new Map<string, () => void>();
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={100}
@@ -219,17 +229,87 @@ describe("MultiScreenCanvas live boot budget", () => {
       );
     });
 
+    const coveredBy = (screenId: string) =>
+      container.querySelector(
+        `[data-frame-id="${screenId}"] iframe[data-screen-static-preview]`,
+      );
     await vi.waitFor(() => {
       expect(container.querySelectorAll("[data-live-screen]")).toHaveLength(4);
+      // Booting editors stay covered by their previews until they draw.
       expect(
         container.querySelectorAll("iframe[data-screen-iframe-id]"),
-      ).toHaveLength(LARGE_BOARD_SCREEN_COUNT - 4);
+      ).toHaveLength(LARGE_BOARD_SCREEN_COUNT);
     });
     expect(container.querySelector("[data-screen-placeholder]")).toBeNull();
+    for (const screenId of readyById.keys()) {
+      expect(coveredBy(screenId)).not.toBeNull();
+    }
 
-    await act(async () => readyById.values().next().value?.());
+    const first = readyById.entries().next().value;
+    if (!first) throw new Error("No editor was booting");
+    const [drawnId, drawn] = first;
+    await act(async () => drawn());
     await vi.waitFor(() => {
       expect(container.querySelectorAll("[data-live-screen]")).toHaveLength(5);
+      expect(coveredBy(drawnId)).toBeNull();
+    });
+  });
+
+  it("demands the source of a zoomed-out large board's preview-URL screens", async () => {
+    const screens = Array.from(
+      { length: LARGE_BOARD_SCREEN_COUNT },
+      (_, index) => ({
+        id: `url-${index}`,
+        filename: `url-${index}.html`,
+        content: "",
+        source: "localhost",
+        sourceType: "localhost",
+        previewUrl: `http://127.0.0.1:8084/route-${index}`,
+        sourceState: "unloaded" as const,
+      }),
+    );
+    const reported: {
+      latest?: { pinned: readonly string[]; preview: readonly string[] };
+    } = {};
+
+    await act(async () => {
+      renderWithQueryClient(
+        <MultiScreenCanvas
+          screens={screens}
+          zoom={5}
+          creation={{ activeTool: "move" }}
+          geometry={{
+            geometryById: Object.fromEntries(
+              screens.map((screen, index) => [
+                screen.id,
+                {
+                  x: (index % 8) * 400,
+                  y: Math.floor(index / 8) * 700,
+                  width: 320,
+                  height: 640,
+                },
+              ]),
+            ),
+          }}
+          renderScreenContent={(screen) => <div data-live-screen={screen.id} />}
+          onSourceDemandChange={(demand) => {
+            reported.latest = demand;
+          }}
+          onPick={() => {}}
+        />,
+      );
+    });
+
+    // At 5% every screen is far below the legible width, so none is pinned
+    // as a live editor; an unloaded one paints only its placeholder.
+    await vi.waitFor(() => {
+      expect(reported.latest).toBeDefined();
+      expect(
+        new Set([
+          ...(reported.latest?.pinned ?? []),
+          ...(reported.latest?.preview ?? []),
+        ]),
+      ).toEqual(new Set(screens.map((screen) => screen.id)));
     });
   });
 
@@ -238,7 +318,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const renderCalls: string[] = [];
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={10}
@@ -294,7 +374,7 @@ describe("MultiScreenCanvas live boot budget", () => {
         onPick={() => {}}
       />
     );
-    await act(async () => root.render(render({ "--accent": "red" })));
+    await act(async () => renderWithQueryClient(render({ "--accent": "red" })));
 
     const staticPreview = (id: string) =>
       container.querySelector<HTMLIFrameElement>(
@@ -321,15 +401,21 @@ describe("MultiScreenCanvas live boot budget", () => {
     await act(async () => {
       staticPreview("inline-0").dispatchEvent(new Event("load"));
     });
-    expect(post).toHaveBeenLastCalledWith(
+    const latestTweakMessage = () =>
+      post.mock.calls
+        .filter(([message]) => message.type === "tweak-values")
+        .slice(-1)[0];
+    expect(latestTweakMessage()).toEqual([
       { type: "tweak-values", values: { "--accent": "red" } },
       "*",
+    ]);
+    await act(async () =>
+      renderWithQueryClient(render({ "--accent": "blue" })),
     );
-    await act(async () => root.render(render({ "--accent": "blue" })));
-    expect(post).toHaveBeenLastCalledWith(
+    expect(latestTweakMessage()).toEqual([
       { type: "tweak-values", values: { "--accent": "blue" } },
       "*",
-    );
+    ]);
   });
 
   it("keeps a screen's painted preview over its editor until the editor boots", async () => {
@@ -362,7 +448,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       container.querySelector<HTMLIFrameElement>(
         'iframe[data-screen-static-preview][data-screen-iframe-id="inline-2"]',
       );
-    await act(async () => root.render(render("inline-1")));
+    await act(async () => renderWithQueryClient(render("inline-1")));
     await vi.waitFor(() => expect(staticPreview()).not.toBeNull());
     const preview = staticPreview()!;
     await act(async () => {
@@ -370,7 +456,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
     });
 
-    await act(async () => root.render(render("inline-2")));
+    await act(async () => renderWithQueryClient(render("inline-2")));
     await vi.waitFor(() => expect(liveScreenIds()).toContain("inline-2"));
     expect(staticPreview()).toBe(preview);
     expect(preview.className).toContain("z-[1]");
@@ -410,7 +496,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       container.querySelector<HTMLIFrameElement>(
         'iframe[data-screen-static-preview][data-screen-iframe-id="inline-2"]',
       );
-    await act(async () => root.render(render("inline-1")));
+    await act(async () => renderWithQueryClient(render("inline-1")));
     await vi.waitFor(() => expect(staticPreview()).not.toBeNull());
     const preview = staticPreview()!;
     await act(async () => {
@@ -419,7 +505,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     });
 
     vi.useFakeTimers();
-    await act(async () => root.render(render("inline-2")));
+    await act(async () => renderWithQueryClient(render("inline-2")));
     await vi.waitFor(() => expect(liveScreenIds()).toContain("inline-2"));
     await act(async () => {
       vi.advanceTimersByTime(9_000);
@@ -459,7 +545,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       "inline-4",
       "inline-5",
     ]) {
-      await act(async () => root.render(render(id)));
+      await act(async () => renderWithQueryClient(render(id)));
       await vi.waitFor(() => expect(liveScreenIds()).toContain(id));
     }
 
@@ -495,7 +581,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       />
     );
 
-    await act(async () => root.render(render("inline-0")));
+    await act(async () => renderWithQueryClient(render("inline-0")));
     await vi.waitFor(() => {
       expect(liveScreenIds()).toHaveLength(4);
     });
@@ -503,8 +589,8 @@ describe("MultiScreenCanvas live boot budget", () => {
       container.querySelector("iframe[data-screen-static-preview]"),
     ).toBeNull();
 
-    await act(async () => root.render(render("inline-1")));
-    await act(async () => root.render(render("inline-2")));
+    await act(async () => renderWithQueryClient(render("inline-1")));
+    await act(async () => renderWithQueryClient(render("inline-2")));
     expect(liveScreenIds()).toHaveLength(4);
     expect(unmounts).toEqual([]);
     expect(new Set(mounts)).toEqual(new Set(screens.map((s) => s.id)));
@@ -515,7 +601,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const readyById = new Map<string, () => void>();
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={10}
@@ -558,7 +644,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const onLayerMarqueeSelectionChange = vi.fn();
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={10}
@@ -663,8 +749,11 @@ describe("MultiScreenCanvas live boot budget", () => {
 
   it("mounts a zoomed-out large board's previews a few per frame without delaying the active editor", async () => {
     const screens = inlineScreens(LARGE_BOARD_SCREEN_COUNT);
+    // The active editor's boot cover is not one of the progressive previews.
     const staticPreviewCount = () =>
-      container.querySelectorAll("iframe[data-screen-static-preview]").length;
+      container.querySelectorAll(
+        '[data-frame-id]:not([data-frame-id="inline-1"]) iframe[data-screen-static-preview]',
+      ).length;
     const frames = new Map<number, FrameRequestCallback>();
     let nextFrameId = 0;
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
@@ -680,7 +769,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       });
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={10}
@@ -765,7 +854,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       />
     );
 
-    await act(async () => root.render(render(100)));
+    await act(async () => renderWithQueryClient(render(100)));
     for (let round = 0; round < LARGE_BOARD_SCREEN_COUNT; round += 1) {
       const pending = [...readyById.values()];
       readyById.clear();
@@ -778,7 +867,7 @@ describe("MultiScreenCanvas live boot budget", () => {
       OVERVIEW_IFRAME_ADMISSIONS_PER_FRAME * 2,
     );
 
-    await act(async () => root.render(render(50)));
+    await act(async () => renderWithQueryClient(render(50)));
     expect(liveScreenIds()).toEqual(editors);
     expect(unmounts).toEqual([]);
 
@@ -815,7 +904,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const screens = inlineScreens(LARGE_BOARD_SCREEN_COUNT);
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={10}
@@ -866,7 +955,7 @@ describe("MultiScreenCanvas live boot budget", () => {
     const screens = inlineScreens(3);
 
     await act(async () => {
-      root.render(
+      renderWithQueryClient(
         <MultiScreenCanvas
           screens={screens}
           zoom={10}

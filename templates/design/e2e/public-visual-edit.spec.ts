@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, readFile } from "node:fs/promises";
 import http, { type Server } from "node:http";
 import path from "node:path";
 
@@ -15,6 +16,7 @@ import {
   type Request,
 } from "@playwright/test";
 
+import { LOCAL_VISUAL_EDIT_PRINCIPAL_DOMAIN } from "../shared/local-visual-edit-principal";
 import { e2eBaseURL } from "./base-url";
 import {
   appPath,
@@ -407,15 +409,7 @@ test("visual-edit snapshot observer reads direct and batched responses", () => {
   expect(snapshotHtmlByFile.get("file-2")).toBe("<h1>Previously hydrated</h1>");
 });
 
-function ownScreenFrame(page: Page) {
-  return page
-    .locator("iframe[data-design-preview-iframe]")
-    .first()
-    .contentFrame();
-}
-
-// fixme: fails in CI on current main: beforeAll's open-visual-edit is rejected because browser requests can no longer include bridge credentials; re-author via a trusted bridge
-test.describe.fixme("public visual edit", () => {
+test.describe("public visual edit", () => {
   test.beforeAll(async ({ browser }) => {
     visualEditTargetServer = http.createServer((request, response) => {
       const requestUrl = new URL(request.url ?? "/", "http://localhost");
@@ -431,6 +425,7 @@ test.describe.fixme("public visual edit", () => {
       }
       if (pathname === "/slow-image.svg") {
         response.writeHead(200, {
+          "access-control-allow-origin": "*",
           "cache-control": "no-store",
           "content-type": "image/svg+xml",
         });
@@ -496,8 +491,7 @@ test.describe.fixme("public visual edit", () => {
     }
   });
 
-  // fixme: fails on current main after the merge: Error: open-visual-edit failed: 400 {"error":"Browser visual-edit requests cannot include bridge credentials.
-  test.fixme("loads the public /visual-edit route without a session and stays crash-free", async ({
+  test("loads the public /visual-edit route without a session and stays crash-free", async ({
     browser,
   }) => {
     const signedOut = await openSignedOutPage(
@@ -541,8 +535,7 @@ test.describe.fixme("public visual edit", () => {
     }
   });
 
-  // fixme: product bug: Both 'Preparing the live editor…' elements stay visible for 3s after editor-chrome-ready (bridge ready about 0.3s after mount); the frame
-  test.fixme("reveals the local frame as soon as its editor bridge is ready", async ({
+  test("reveals the local frame as soon as its editor bridge is ready", async ({
     browser,
     page,
   }) => {
@@ -755,8 +748,7 @@ test.describe.fixme("public visual edit", () => {
     }
   });
 
-  // fixme: fails in CI on current main: open-visual-edit failed: 400 {"error":"Browser visual-edit requests cannot include bridge credentials. Register the
-  test.fixme("stops preparing when live bridge registration is rejected", async ({
+  test("stops preparing when live bridge registration is rejected", async ({
     app,
     browser,
     page,
@@ -832,11 +824,7 @@ test.describe.fixme("public visual edit", () => {
     }
   });
 
-  // fixme: fails in CI on current main: open-visual-edit failed: 400 {"error":"Browser visual-edit requests cannot include bridge credentials. Register the
-  test.fixme("rejects forged bare-link editor access", async ({
-    app,
-    browser,
-  }) => {
+  test("rejects forged bare-link editor access", async ({ app, browser }) => {
     const before = await app.savedRecord(designId);
     const context = await browser.newContext({
       storageState: { cookies: [], origins: [] },
@@ -896,8 +884,7 @@ test.describe.fixme("public visual edit", () => {
     }
   });
 
-  // fixme: fails in CI on current main: open-visual-edit returns 400, browser requests can no longer include bridge credentials; re-author via a trusted bridge
-  test.fixme("public /visual-edit viewers cannot get local bridge credentials", async ({
+  test("public /visual-edit viewers cannot get local bridge credentials", async ({
     browser,
   }) => {
     const signedOut = await openSignedOutPage(
@@ -908,11 +895,6 @@ test.describe.fixme("public visual edit", () => {
     );
     const updateFileRequests: string[] = [];
     const bridgeResponses: string[] = [];
-    const bridgeAttestationResponses: Array<{
-      status: number;
-      hasPreviewToken: boolean;
-      hasAttestationChallenge: boolean;
-    }> = [];
     signedOut.page.on("request", (request) => {
       const requestUrl = new URL(request.url());
       if (requestUrl.pathname.endsWith("/_agent-native/actions/update-file")) {
@@ -923,32 +905,17 @@ test.describe.fixme("public visual edit", () => {
       if (!visualEditBridge) {
         throw new Error("visual-edit bridge is not running");
       }
+      await registerSignedOutBridgeThroughCli(visualEditBridge);
       const bridgeInput = {
         bridgeUrl: visualEditBridge.manifest.bridgeUrl,
-        bridgeToken: VISUAL_EDIT_BRIDGE_TOKEN,
         rootPath: visualEditBridge.manifest.rootPath,
       };
       const blockedOrigins = new Set([
         new URL(visualEditBridge.manifest.bridgeUrl).origin,
         new URL(visualEditTargetUrl).origin,
       ]);
-      const bridgeOrigin = new URL(visualEditBridge.manifest.bridgeUrl).origin;
       signedOut.page.on("response", (response) => {
         const responseUrl = new URL(response.url());
-        // open-visual-edit reads this token-protected manifest to attest the local connector.
-        if (
-          responseUrl.origin === bridgeOrigin &&
-          responseUrl.pathname === "/manifest.json"
-        ) {
-          bridgeAttestationResponses.push({
-            status: response.status(),
-            hasPreviewToken: responseUrl.searchParams.has("previewToken"),
-            hasAttestationChallenge: responseUrl.searchParams.has(
-              "attestationChallenge",
-            ),
-          });
-          return;
-        }
         if (blockedOrigins.has(responseUrl.origin)) {
           const request = response.request();
           bridgeResponses.push(
@@ -1101,13 +1068,6 @@ test.describe.fixme("public visual edit", () => {
       await expect(
         unavailableAlert.getByRole("button", { name: /retry/i }),
       ).toHaveCount(0);
-      expect(bridgeAttestationResponses.length).toBeGreaterThan(0);
-      expect(
-        bridgeAttestationResponses.every(
-          ({ status, hasPreviewToken, hasAttestationChallenge }) =>
-            status === 200 && hasPreviewToken && hasAttestationChallenge,
-        ),
-      ).toBe(true);
       expect(updateFileRequests).toEqual([]);
       expect(bridgeResponses).toEqual([]);
       await assertNoRuntimeErrors(signedOut);
@@ -1200,14 +1160,16 @@ test.describe.fixme("public visual edit", () => {
     browser,
   }) => {
     const savedBefore = await app.savedHtml(designId);
+    // Every screen in view paints, so the home screen is found by id, not
+    // by iframe order.
+    const homeScreenId = await indexScreenId(browser, designId);
     const signedOut = await openSignedOutPage(browser, `/design/${designId}`);
+    const homeFrame = () => designFrame(signedOut.page, homeScreenId);
     try {
-      await expect(
-        ownScreenFrame(signedOut.page).getByText("E2E Hero Heading"),
-      ).toBeVisible();
-      const publicIframe = signedOut.page
-        .locator("iframe[data-design-preview-iframe]")
-        .last();
+      await expect(homeFrame().getByText("E2E Hero Heading")).toBeVisible();
+      const publicIframe = signedOut.page.locator(
+        `iframe[data-design-preview-iframe][data-screen-iframe-id="${homeScreenId}"]`,
+      );
       await expect(publicIframe).toBeVisible();
       await publicIframe.evaluate((element) => {
         const frame = element as HTMLIFrameElement & {
@@ -1220,7 +1182,7 @@ test.describe.fixme("public visual edit", () => {
             (frame.__publicReadOnlyLoadCount ?? 0) + 1;
         });
       });
-      await ownScreenFrame(signedOut.page)
+      await homeFrame()
         .locator("body")
         .evaluate(() => {
           (window as any).__publicReadOnlyDocumentMarker =
@@ -1247,7 +1209,7 @@ test.describe.fixme("public visual edit", () => {
                   rect.height > 0,
               };
             });
-            const documentMarker = await ownScreenFrame(signedOut.page)
+            const documentMarker = await homeFrame()
               .locator("body")
               .evaluate(
                 () => (window as any).__publicReadOnlyDocumentMarker ?? null,
@@ -1274,9 +1236,7 @@ test.describe.fixme("public visual edit", () => {
       await signedOut.page.evaluate(() => {
         (window as any).__bridge = [];
       });
-      const heading = ownScreenFrame(signedOut.page)
-        .getByText("E2E Hero Heading")
-        .first();
+      const heading = homeFrame().getByText("E2E Hero Heading").first();
       const headingBox = await heading.boundingBox();
       expect(headingBox).toBeTruthy();
       await signedOut.page.mouse.click(
@@ -1303,9 +1263,7 @@ test.describe.fixme("public visual edit", () => {
           ),
         )
         .toBe(false);
-      await expect(
-        ownScreenFrame(signedOut.page).getByText("E2E Hero Heading"),
-      ).toBeVisible();
+      await expect(homeFrame().getByText("E2E Hero Heading")).toBeVisible();
       await expectStablePublicPreview();
 
       await signedOut.page.keyboard.press(SHORTCUT);
@@ -1411,7 +1369,8 @@ test.describe.fixme("public visual edit", () => {
               "the camera frames the linked screen at the linked 60% zoom, not the first screen",
           },
         )
-        .toEqual({ linkedWidth: 768, linkedInView: true, homeInView: false });
+        // 60% of the screen's own 1440px: zoom is 1:1 with screen pixels.
+        .toEqual({ linkedWidth: 864, linkedInView: true, homeInView: false });
       expect(signedOut.mutationRequests).toEqual([]);
       await assertNoRuntimeErrors(signedOut);
     } finally {
@@ -1451,8 +1410,7 @@ test.describe.fixme("public visual edit", () => {
     );
   });
 
-  // fixme: product bug: The Switch track's background is rgba(0,0,0,0) both off and on (the toolkit's data-[state] bg classes don't take effect), so the on/off
-  test.fixme("live collaboration can be enabled from Share by a signed-in editor", async ({
+  test("live collaboration can be enabled from Share by a signed-in editor", async ({
     browser,
     page,
   }) => {
@@ -1597,15 +1555,16 @@ test.describe.fixme("public visual edit", () => {
     await expect(allScreensButton).toHaveAttribute("aria-current", "page");
 
     await page.getByRole("button", { name: /^share$/i }).click();
-    await expect(
-      page.getByText("Live canvas link", { exact: true }),
-    ).toBeVisible();
+    const copyLiveCanvasLink = page
+      .getByRole("button", { name: "Copy link", exact: true })
+      .and(page.getByTitle("Live canvas link", { exact: true }));
+    await expect(copyLiveCanvasLink).toBeVisible();
     await page
       .context()
       .grantPermissions(["clipboard-read", "clipboard-write"], {
         origin: new URL(page.url()).origin,
       });
-    await page.getByRole("button", { name: "Copy", exact: true }).click();
+    await copyLiveCanvasLink.click();
     await expect
       .poll(() => page.evaluate(() => navigator.clipboard.readText()))
       .toContain(`/visual-edit/${collaborationDesignId}?share=1`);
@@ -1972,6 +1931,12 @@ async function setDesignVisibility(
 ): Promise<void> {
   const context = await browser.newContext({ storageState: AUTH_STATE_PATH });
   try {
+    // Making a resource public needs approval, which over HTTP only the
+    // signed-in app UI gives: a frontend call holding the UI capability.
+    const origin = new URL(BASE_URL).origin;
+    await context.request.get(`${BASE_URL}/_agent-native/ui-capability`, {
+      headers: { Origin: origin },
+    });
     const response = await context.request.post(
       `${BASE_URL}/_agent-native/actions/set-resource-visibility`,
       {
@@ -1980,6 +1945,7 @@ async function setDesignVisibility(
           resourceId: id,
           visibility,
         },
+        headers: { "X-Agent-Native-Frontend": "1", Origin: origin },
       },
     );
     if (!response.ok()) {
@@ -2067,6 +2033,43 @@ async function createLinkedScreen(browser: Browser, designId: string) {
   }
 }
 
+// `pnpm action connect-localhost`, run signed out from the bridge's root, forwards
+// here and registers for that folder's local workspace principal.
+async function registerSignedOutBridgeThroughCli(
+  bridge: DesignConnectBridge,
+): Promise<void> {
+  const discovery = JSON.parse(
+    await readFile(
+      path.join(import.meta.dirname, "..", ".agent-native", "dev-server.json"),
+      "utf8",
+    ),
+  ) as { token: string };
+  const rootPath = bridge.manifest.rootPath;
+  const workspaceId = createHash("sha256")
+    .update(path.resolve(rootPath))
+    .digest("hex")
+    .slice(0, 24);
+  const response = await fetch(appUrl("/_agent-native/dev/action"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Agent-Native-Dev-Token": discovery.token,
+      "X-Agent-Native-Dev-User": `workspace+${workspaceId}@${LOCAL_VISUAL_EDIT_PRINCIPAL_DOMAIN}`,
+    },
+    body: JSON.stringify({
+      name: "connect-localhost",
+      input: {
+        devServerUrl: visualEditTargetUrl,
+        bridgeUrl: bridge.manifest.bridgeUrl,
+        rootPath,
+        routeManifest: bridge.manifest,
+        bridgeToken: VISUAL_EDIT_BRIDGE_TOKEN,
+      },
+    }),
+  });
+  expect(response.status, await response.text()).toBe(200);
+}
+
 async function createOwnedVisualEditDesign(
   browser: Browser,
   options: { title?: string; paths?: string[] } = {},
@@ -2112,10 +2115,8 @@ async function createOwnedVisualEditDesign(
           navigate: false,
           publicReadOnly: false,
         },
-        headers: {
-          "Content-Type": "application/json",
-          "X-Agent-Native-Frontend": "1",
-        },
+        // Registers like the trusted CLI; frontend callers cannot send bridge credentials.
+        headers: { "Content-Type": "application/json" },
       },
     );
     if (!response.ok()) {

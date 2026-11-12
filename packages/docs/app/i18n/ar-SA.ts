@@ -1,6 +1,70 @@
-import enUS from "./en-US";
+import type { PluralLocaleMessages } from "./en-US";
 
 const arSA = {
+  siteContent: {
+    recipeWhen: "متى",
+    howOften: "معدل التكرار",
+    filterRole: "الدور",
+    filterAll: "الكل",
+    filterEngineering: "الهندسة",
+    filterProduct: "المنتج",
+    filterDesign: "التصميم",
+    filterMarketing: "التسويق",
+    filterRevops: "RevOps",
+    filterSales: "المبيعات",
+    filterFounders: "المؤسسون",
+    filterFinance: "الشؤون المالية",
+    filterEmpty: "لا توجد حالات استخدام تطابق هذه الفلاتر.",
+    filterClear: "مسح الفلاتر",
+    browseArticles: "أو تصفّح {{articles}} للعثور على القوالب والأدلة الإرشادية.",
+    articlesLink: "المقالات",
+    whatYouUse: "ما تستخدمه",
+    usedFor: "الغرض",
+    whereItBreaks: "أوجه القصور",
+    updatedDate: "آخر تحديث: {{date}}",
+    publishedDate: "تاريخ النشر: {{date}}",
+    useCases: "حالات الاستخدام",
+    useCasesDescription: "صفحات للمهام المتكررة، حسب التطبيق",
+    useCasesTitle:
+      "أنجز العمل المتكرر باستخدام تطبيق Agent-Native ووكيل الذكاء الاصطناعي",
+    useCasesIntro:
+      "اختر العمل الذي تنفذه مرارًا وتكرارًا، أو تصفّح {{articles}} للعثور على القوالب والأدلة الإرشادية.",
+    articles: "المقالات",
+    articlesIntro: "أدلة وشروحات للعمل المتكرر مع وكلاء الذكاء الاصطناعي.",
+    articleCount_zero: "{{count}} مقالات",
+    articleCount_one: "{{count}} مقال",
+    articleCount_two: "{{count}} مقالان",
+    articleCount_few: "{{count}} مقالات",
+    articleCount_many: "{{count}} مقالًا",
+    articleCount_other: "{{count}} مقال",
+    copyPage: "نسخ الصفحة",
+    enlargeImage: "تكبير الصورة",
+    closeImage: "إغلاق الصورة",
+    copyPrompt: "نسخ الموجّه",
+    promptHint: "الصق الموجّه في مربع الإدخال في {{app}}.",
+    copyLink: "نسخ الرابط",
+    copied: "تم النسخ",
+    copyFailed: "تعذّر النسخ. حاول مرة أخرى.",
+    breadcrumb: "مسار التنقل",
+    readTime_zero: "{{count}} دقيقة للقراءة",
+    readTime_one: "{{count}} دقيقة للقراءة",
+    readTime_two: "{{count}} دقيقتان للقراءة",
+    readTime_few: "{{count}} دقائق للقراءة",
+    readTime_many: "{{count}} دقيقة للقراءة",
+    readTime_other: "{{count}} دقيقة للقراءة",
+    partOf: "جزء من:",
+    moreArticles: "المزيد من مقالات {{category}}",
+    genericMore: "المزيد من المقالات",
+    showMore: "عرض المزيد من المقالات",
+    topics: {
+      clips:
+        "تسجيلات الشاشة والاجتماعات والإملاء التي يمكن لوكيل الذكاء الاصطناعي استخدامها",
+      design: "نماذج أولية تفاعلية مع وكيل الذكاء الاصطناعي",
+      slides: "عروض تقديمية متوافقة مع الهوية التجارية مع وكيل الذكاء الاصطناعي",
+      plans: "خطط وملخصات مرئية لوكيل البرمجة بالذكاء الاصطناعي",
+      analytics: "أسئلة بلغة بسيطة ورسوم بيانية ولوحات معلومات",
+    },
+  },
   agentChat: {
     setup: {
       providerStatusUnavailable: "تعذّر التأكد من جاهزية الذكاء الاصطناعي.",
@@ -643,6 +707,9 @@ const arSA = {
     waitlistUnavailable:
       "لا تتوفر عمليات التسجيل في قائمة الانتظار هنا بعد. يُرجى تجربة موقع المستندات المستضاف بدلًا من ذلك.",
     launchBuilder: "شغّل Builder",
+    newAppPrompt: "أنشئ تطبيقًا جديدًا باستخدام Agent-Native.",
+    customizeTemplatePrompt:
+      "خصّص قالب Agent-Native {{template}} ليناسب طريقة عملي.",
   },
   templateCard: {
     pasteIntoTerminal: "لصق في المحطة الخاصة بك.",
@@ -2590,6 +2657,7 @@ const arSA = {
     deploymentEnvironmentVariables: "النشر: متغيرات البيئة",
     updatingUiInProduction: "تحديث الواجهة في الإنتاج",
     environmentVariables: "متغيرات البيئة",
+    telemetry: "القياس عن بُعد",
     progress: "Progress",
     authentication: "Authentication",
     multiTenancy: "متعدد الإيجار",
@@ -2601,6 +2669,7 @@ const arSA = {
     auditLog: "سجل التدقيق",
     doctorCodeChecks: "Doctor (فحوصات الكود)",
     observability: "قابلية الملاحظة",
+    recorder: "المسجّل",
     observationalMemory: "ذاكرة ملاحظة",
     ciEvalGate: "بوابة تقييم CI",
     usingYourAgentOverview: "نظرة عامة",
@@ -2654,7 +2723,9 @@ const arSA = {
     blueprintInstaller: "مثبّت Blueprint",
     chat: "المحادثة",
     chatOverview: "نظرة عامة",
-    chatFirstEdits: "ميزتك الأولى",
+    chatFeatures: "الميزات",
+    chatAgent: "التحدث مع الوكيل",
+    chatIntegrations: "الاستخدام عبر التطبيقات",
     chatDevelopers: "دليل المطور",
     calendar: "التقويم",
     calendarOverview: "نظرة عامة",
@@ -2728,6 +2799,6 @@ const arSA = {
     docsComponents: "Docs Components",
     formsDevelopers: "دليل المطور",
   },
-} satisfies typeof enUS;
+} satisfies PluralLocaleMessages;
 
 export default arSA;

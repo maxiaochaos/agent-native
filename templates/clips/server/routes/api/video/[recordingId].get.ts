@@ -6,7 +6,8 @@
  * `recording-blob-:id` and points `recordings.video_url` at this route.
  *
  * Production fallback: the editor can also hit this route as an authenticated
- * media proxy for provider-hosted URLs (Builder.io / R2 / S3). This keeps
+ * media proxy for provider-hosted URLs (Builder.io / S3-compatible storage,
+ * including GCS interop for hosted trial clips). This keeps
  * browser-only consumers such as Web Audio waveform decoding from being blocked
  * by cross-origin CDN fetches.
  *
@@ -15,8 +16,13 @@
  *     supplied via `?password=<pw>`, `?t=<token>`, or the protected media
  *     cookie renewed by this route — otherwise 401.
  *   - non-public: caller must have a share grant (owner / viewer / editor /
- *     admin) via `resolveAccess`. Password is still enforced on top.
+ *     admin) via `resolveAccess`. Stored passwords do not gate this access.
  *   - expired recordings 410.
+ *   - a Content playback grant (`content_grant`, from the Content playback
+ *     route) names the reader in place of the browser session and never
+ *     unlocks a password; a grant that does not verify for this recording,
+ *     including an empty one, is a 404, and an expired one is a 403 with
+ *     code `content_grant_expired`.
  *   - earlier-screen-time footage is a private recording of its own that is
  *     shared with the clip it is attached to: every rule above is evaluated
  *     against that clip, and the footage's bytes are served on its behalf.
@@ -32,7 +38,6 @@
  *
  * Route: GET /api/video/:recordingId
  */
-
 import { readAppState } from "@agent-native/core/application-state";
 import {
   createSsrfSafeDispatcher,
@@ -66,14 +71,31 @@ import {
   loomEmbedUrlWithTimestamp,
   loomEmbedUrlForRecording,
 } from "../../../../shared/loom.js";
+import {
+  youtubeVideoIdForRecording,
+  youtubeWatchUrl,
+} from "../../../../shared/youtube.js";
 import { getDb, schema } from "../../../db/index.js";
+import {
+  readContentPlaybackGrant,
+  refusedContentPlayback,
+  runWithContentPlayback,
+} from "../../../lib/content-playback-grant.js";
 import { contextClipIdForFootage } from "../../../lib/context-footage.js";
 import { allowsLegacyS3ObjectForPersistedMedia } from "../../../lib/media-storage-provenance.js";
 import {
   isHeldForRedaction,
   REDACTION_HOLD_MESSAGE,
 } from "../../../lib/pending-redactions.js";
-import { isRecordingExpiredForViewer } from "../../../lib/recording-page-access.js";
+import {
+  RECORDING_DOWNLOAD_ACCESS_PARAM,
+  resolveRecordingDownloadAccess,
+} from "../../../lib/recording-download-link.js";
+import {
+  isRecordingExpiredForViewer,
+  isRecordingTrashedForViewer,
+  recordingUsesSharePassword,
+} from "../../../lib/recording-page-access.js";
 import { getOrganizationRoleForEmail } from "../../../lib/recordings.js";
 import { fetchS3ObjectByUrl } from "../../../lib/s3-upload-provider.js";
 import {
@@ -92,6 +114,8 @@ interface RecordingRow {
   updatedAt?: string | null;
   sourceAppName?: string | null;
   sourceWindowTitle?: string | null;
+  failureCode?: string | null;
+  storageMode?: "own" | "hosted" | null;
   videoUrl?: string | null;
   visibility?: string | null;
 }
@@ -149,6 +173,7 @@ function setProtectedMediaAccessCookie(
       scopeId,
       password,
       sharePasswordVersion,
+      "public",
     ),
     ttlSeconds: PROTECTED_MEDIA_ACCESS_TTL_SECONDS,
   });
@@ -323,17 +348,65 @@ export default defineEventHandler(async (event: H3Event) => {
     return { error: "Missing recordingId" };
   }
 
+  const contentGrant = await readContentPlaybackGrant(event, recordingId);
+  const refused = refusedContentPlayback(contentGrant);
+  if (refused) {
+    setResponseStatus(event, refused.status);
+    return refused.body;
+  }
+
   const session = await getSession(event).catch(() => null);
   const orgCtx = await getOrgContext(event).catch(() => null);
-  const orgId = orgCtx?.orgId ?? session?.orgId ?? undefined;
+  // A Content grant names the reader in place of the browser's own session.
+  const granted = contentGrant.status === "granted";
+  const orgId = granted
+    ? contentGrant.orgId
+    : (orgCtx?.orgId ?? session?.orgId ?? undefined);
+  const viewerEmail = granted
+    ? (contentGrant.viewerEmail ?? undefined)
+    : session?.email;
+  // Under a grant a 403 means only that the grant expired, so a media URL the
+  // server blocks is the 502 any other unfetchable source gets.
+  const notGrantExpiry = (status: number) =>
+    granted && status === 403 ? 502 : status;
 
-  return runWithRequestContext(
-    { userEmail: session?.email, orgId },
-    async () => {
-      const clipId = await contextClipIdForFootage(recordingId);
+  const requestContext = {
+    ...(viewerEmail !== undefined ? { userEmail: viewerEmail } : {}),
+    ...(orgId !== undefined ? { orgId } : {}),
+  };
+
+  return runWithRequestContext(requestContext, () =>
+    runWithContentPlayback(contentGrant, async () => {
+      const q = getQuery(event) as {
+        [LOOM_START_MS_QUERY_PARAM]?: unknown;
+        [RECORDING_DOWNLOAD_ACCESS_PARAM]?: unknown;
+        password?: string;
+        t?: string;
+      };
+      // A download link stands in for the owner, so it skips the session
+      // lookup entirely; a bad one is refused rather than falling back to it.
+      const downloadToken = firstQueryValue(q[RECORDING_DOWNLOAD_ACCESS_PARAM]);
+      const download = downloadToken
+        ? await resolveRecordingDownloadAccess(recordingId, downloadToken)
+        : null;
+      if (download && !download.ok) {
+        setResponseStatus(event, download.statusCode);
+        setResponseHeader(
+          event,
+          "Cache-Control",
+          "private, max-age=0, no-store",
+        );
+        return { error: download.message, errorCode: download.errorCode };
+      }
+
+      const clipId = download
+        ? null
+        : await contextClipIdForFootage(recordingId);
       // Access, expiry, redaction, and password are the clip's, not the footage's.
       const gateId = clipId ?? recordingId;
-      const access = await resolveAccess("recording", gateId);
+      const access = download
+        ? { role: "owner", resource: download.recording }
+        : await resolveAccess("recording", gateId);
       let recRow: RecordingRow | null =
         (access?.resource as RecordingRow | undefined) ?? null;
       let role: string | null = access?.role ?? null;
@@ -350,11 +423,11 @@ export default defineEventHandler(async (event: H3Event) => {
           return { error: "Not found" };
         }
         let viewerIsOrgMember = false;
-        if (session?.email && row.visibility === "org" && row.organizationId) {
+        if (viewerEmail && row.visibility === "org" && row.organizationId) {
           try {
             const orgRole = await getOrganizationRoleForEmail(
               row.organizationId,
-              session.email,
+              viewerEmail,
             );
             viewerIsOrgMember = Boolean(orgRole);
           } catch {
@@ -362,17 +435,22 @@ export default defineEventHandler(async (event: H3Event) => {
           }
         }
         if (row.visibility !== "public" && !viewerIsOrgMember) {
-          setResponseStatus(event, 403);
-          return { error: "Forbidden" };
+          // A Content reader gets the 404 a missing Clip gets; under a grant
+          // a 403 means only that the grant expired.
+          setResponseStatus(event, granted ? 404 : 403);
+          return { error: granted ? "Not found" : "Forbidden" };
         }
         recRow = row as RecordingRow;
         role = "viewer";
       }
 
       const gate = recRow;
-      // The owner's context panel lists items for a trashed Clip, so the owner
-      // can still play them.
-      if (clipId && gate.trashedAt && role !== "owner") {
+      if (
+        isRecordingTrashedForViewer({
+          trashedAt: gate.trashedAt,
+          viewerIsOwner: role === "owner",
+        })
+      ) {
         setResponseStatus(event, 404);
         return { error: "Not found" };
       }
@@ -392,6 +470,14 @@ export default defineEventHandler(async (event: H3Event) => {
           return { error: "Not found" };
         }
         rec = footage as RecordingRow;
+      }
+
+      if (
+        gate.failureCode === "taken_down" ||
+        rec.failureCode === "taken_down"
+      ) {
+        setResponseStatus(event, 404);
+        return { error: "Not found" };
       }
 
       if (
@@ -420,12 +506,17 @@ export default defineEventHandler(async (event: H3Event) => {
       //   - `?password=<pw>` — legacy fallback so existing share pages /
       //     bookmarks keep working during rollout.
       // (audit 11 F-07)
-      const q = getQuery(event) as {
-        [LOOM_START_MS_QUERY_PARAM]?: unknown;
-        password?: string;
-        t?: string;
-      };
-      if (gate.password && role !== "owner") {
+      if (
+        recordingUsesSharePassword(gate.visibility) &&
+        gate.password &&
+        role !== "owner"
+      ) {
+        // A document cannot supply a password, so nothing unlocks one for a
+        // Content reader; the Content playback route refuses it the same way.
+        if (granted) {
+          setResponseStatus(event, 401);
+          return { error: "Password required", passwordRequired: true };
+        }
         const token = typeof q.t === "string" ? q.t : "";
         const cookieToken =
           getCookie(event, protectedMediaCookieName(recordingId)) ?? "";
@@ -436,6 +527,7 @@ export default defineEventHandler(async (event: H3Event) => {
           gateId,
           gate.password,
           gate.sharePasswordVersion,
+          "public",
         );
         if (token) {
           const result = verifyShortLivedToken(token, scopedRecordingId);
@@ -465,6 +557,17 @@ export default defineEventHandler(async (event: H3Event) => {
         );
       }
 
+      const youtubeVideoId = youtubeVideoIdForRecording(rec);
+      if (youtubeVideoId) {
+        setResponseStatus(event, 422);
+        return {
+          error:
+            "This clip plays in YouTube's embedded player. Clips stores no video file for it.",
+          errorCode: "embed_backed_recording",
+          watchUrl: youtubeWatchUrl(youtubeVideoId),
+        };
+      }
+
       if (isLoomEmbedBackedRecording(rec)) {
         let embedUrl = loomEmbedUrlForRecording(rec);
         if (!embedUrl) {
@@ -479,9 +582,20 @@ export default defineEventHandler(async (event: H3Event) => {
         return loomEmbedResponse(embedUrl);
       }
 
-      const blob = await readAppState(`recording-blob-${recordingId}`).catch(
-        () => null,
-      );
+      // Without an upload provider the file sits in the owner's application
+      // state, which a download link (no session) has to read as the owner.
+      const readBlob = () =>
+        // coercion-ok: unchanged playback fallback; an unreadable blob is treated like a missing one and served from videoUrl below
+        readAppState(`recording-blob-${recordingId}`).catch(() => null);
+      const blob = download
+        ? await runWithRequestContext<Awaited<ReturnType<typeof readBlob>>>(
+            {
+              userEmail: download.recording.ownerEmail,
+              orgId: download.recording.organizationId,
+            },
+            readBlob,
+          )
+        : await readBlob();
       const b64 = typeof blob?.data === "string" ? blob.data : null;
       const rangeHeader = getRequestHeader(event, "range");
 
@@ -506,6 +620,7 @@ export default defineEventHandler(async (event: H3Event) => {
             .select({
               videoUrl: schema.recordings.videoUrl,
               editsJson: schema.recordings.editsJson,
+              storageMode: schema.recordings.storageMode,
             })
             .from(schema.recordings)
             .where(eq(schema.recordings.id, recordingId))
@@ -515,6 +630,9 @@ export default defineEventHandler(async (event: H3Event) => {
             persistedUrl: persistedMedia?.videoUrl,
             editsJson: persistedMedia?.editsJson,
           });
+          const storageMode = persistedMedia
+            ? persistedMedia.storageMode
+            : (rec.storageMode ?? null);
           const signedS3Response = await runWithRequestContext(
             {
               userEmail: rec.ownerEmail ?? undefined,
@@ -527,7 +645,10 @@ export default defineEventHandler(async (event: H3Event) => {
                   : undefined,
                 timeoutMs: PROVIDER_MEDIA_FETCH_TIMEOUT_MS,
                 recordingId,
-                ...(allowLegacyObjectKey ? { allowLegacyObjectKey } : {}),
+                storageMode: storageMode === "hosted" ? "hosted" : "own",
+                ...(storageMode !== "hosted" && allowLegacyObjectKey
+                  ? { allowLegacyObjectKey }
+                  : {}),
               }),
           );
           if (
@@ -536,19 +657,31 @@ export default defineEventHandler(async (event: H3Event) => {
             signedS3Response?.status === 416
           ) {
             upstream = signedS3Response;
+          } else if (storageMode === "hosted") {
+            await signedS3Response?.body?.cancel().catch(() => undefined);
+            upstream = {
+              status:
+                !signedS3Response || signedS3Response.status === 404
+                  ? 404
+                  : 502,
+              error: "The recording's media could not be loaded from storage.",
+            };
           } else {
             await signedS3Response?.body?.cancel().catch(() => undefined);
             upstream = await fetchProviderMedia(sourceUrl, rangeHeader);
           }
         } catch (err) {
-          setResponseStatus(event, statusCodeForProviderFetchError(err));
+          setResponseStatus(
+            event,
+            notGrantExpiry(statusCodeForProviderFetchError(err)),
+          );
           return { error: messageForProviderFetchError(err) };
         }
         if (!(upstream instanceof Response)) {
-          setResponseStatus(event, upstream.status);
+          setResponseStatus(event, notGrantExpiry(upstream.status));
           return { error: upstream.error };
         }
-        if (upstream.status >= 500) {
+        if (notGrantExpiry(upstream.status) >= 500) {
           captureRouteError(
             new Error(
               `Storage provider returned ${upstream.status} for recording media`,
@@ -651,6 +784,6 @@ export default defineEventHandler(async (event: H3Event) => {
 
       setResponseHeader(event, "Content-Length", String(total));
       return bytes;
-    },
+    }),
   );
 });

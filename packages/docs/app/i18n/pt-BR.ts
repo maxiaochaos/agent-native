@@ -1,6 +1,66 @@
-import enUS from "./en-US";
+import type { PluralLocaleMessages } from "./en-US";
 
 const ptBR = {
+  siteContent: {
+    recipeWhen: "Quando",
+    howOften: "Com que frequência",
+    filterRole: "Função",
+    filterAll: "Todas",
+    filterEngineering: "Engenharia",
+    filterProduct: "Produto",
+    filterDesign: "Design",
+    filterMarketing: "Marketing",
+    filterRevops: "RevOps",
+    filterSales: "Vendas",
+    filterFounders: "Fundadores",
+    filterFinance: "Finanças",
+    filterEmpty: "Nenhum caso de uso corresponde a esses filtros.",
+    filterClear: "Limpar filtros",
+    browseArticles:
+      "Ou explore os {{articles}} para encontrar modelos e tutoriais.",
+    articlesLink: "artigos",
+    whatYouUse: "O que você usa",
+    usedFor: "Para",
+    whereItBreaks: "Onde falha",
+    updatedDate: "Atualizado em {{date}}",
+    publishedDate: "Publicado em {{date}}",
+    useCases: "Casos de uso",
+    useCasesDescription: "Páginas para tarefas recorrentes, por app",
+    useCasesTitle:
+      "Trabalho recorrente, feito com um app Agent-Native e seu agente de IA",
+    useCasesIntro:
+      "Escolha o trabalho que você faz repetidamente, ou explore os {{articles}} para encontrar modelos e tutoriais.",
+    articles: "Artigos",
+    articlesIntro:
+      "Guias e explicações para trabalho recorrente com agentes de IA.",
+    articleCount_one: "{{count}} artigo",
+    articleCount_many: "{{count}} de artigos",
+    articleCount_other: "{{count}} artigos",
+    copyPage: "Copiar página",
+    enlargeImage: "Ampliar imagem",
+    closeImage: "Fechar imagem",
+    copyPrompt: "Copiar prompt",
+    promptHint: "Cole o prompt na caixa de prompt do {{app}}.",
+    copyLink: "Copiar link",
+    copied: "Copiado",
+    copyFailed: "Não foi possível copiar. Tente novamente.",
+    breadcrumb: "Caminho de navegação",
+    readTime_one: "{{count}} min de leitura",
+    readTime_many: "{{count}} min de leitura",
+    readTime_other: "{{count}} min de leitura",
+    partOf: "Parte de:",
+    moreArticles: "Mais artigos de {{category}}",
+    genericMore: "Mais artigos",
+    showMore: "Mostrar mais artigos",
+    topics: {
+      clips:
+        "Gravações de tela, reuniões e ditado que seu agente de IA pode usar",
+      design: "Protótipos interativos com seu agente de IA",
+      slides: "Apresentações alinhadas à marca com seu agente de IA",
+      plans: "Planos visuais e resumos para seu agente de programação com IA",
+      analytics: "Perguntas em linguagem natural, gráficos e painéis",
+    },
+  },
   agentChat: {
     setup: {
       providerStatusUnavailable:
@@ -650,6 +710,9 @@ const ptBR = {
     waitlistUnavailable:
       "As inscrições na lista de espera ainda não estão disponíveis neste ambiente. Tente o site de documentação hospedado.",
     launchBuilder: "Abrir o Builder",
+    newAppPrompt: "Crie um novo app Agent-Native.",
+    customizeTemplatePrompt:
+      "Personalize o modelo Agent-Native {{template}} para o meu fluxo de trabalho.",
   },
   templateCard: {
     pasteIntoTerminal: "Cole em seu terminal.",
@@ -2629,6 +2692,7 @@ const ptBR = {
     deploymentEnvironmentVariables: "Deploy: Variáveis de Ambiente",
     updatingUiInProduction: "Atualizando a UI em Produção",
     environmentVariables: "Variáveis de ambiente",
+    telemetry: "Telemetria",
     progress: "Progresso",
     authentication: "Autenticação",
     multiTenancy: "Multilocação",
@@ -2640,6 +2704,7 @@ const ptBR = {
     auditLog: "Log de auditoria",
     doctorCodeChecks: "Doctor (verificações de código)",
     observability: "Observabilidade",
+    recorder: "Gravador",
     observationalMemory: "Memória observacional",
     ciEvalGate: "Gate de evals no CI",
     usingYourAgentOverview: "Visão geral",
@@ -2693,7 +2758,9 @@ const ptBR = {
     blueprintInstaller: "Instalador Blueprint",
     chat: "Chat",
     chatOverview: "Visão geral",
-    chatFirstEdits: "Seu primeiro recurso",
+    chatFeatures: "Funcionalidades",
+    chatAgent: "Conversar com o Agent",
+    chatIntegrations: "Uso entre apps",
     chatDevelopers: "Guia do desenvolvedor",
     calendar: "Calendário",
     calendarOverview: "Visão geral",
@@ -2767,6 +2834,6 @@ const ptBR = {
     docsComponents: "Docs Components",
     formsDevelopers: "Guia do desenvolvedor",
   },
-} satisfies typeof enUS;
+} satisfies PluralLocaleMessages;
 
 export default ptBR;

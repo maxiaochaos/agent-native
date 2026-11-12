@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core/action";
+import { defineAction, fail } from "@agent-native/core/action";
 import { getRequestUserEmail } from "@agent-native/core/server";
 import { mutateUserSetting } from "@agent-native/core/settings";
 
@@ -10,6 +10,11 @@ import {
 } from "../shared/view-settings.js";
 
 export default defineAction({
+  mcpAnnotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
   description:
     "Change the current user's Design editor view settings. Pass only the settings to change; the rest keep their saved values.",
   schema: viewSettingsSchema.partial(),
@@ -17,7 +22,10 @@ export default defineAction({
   run: async (patch) => {
     const email = getRequestUserEmail();
     if (!email) {
-      throw Object.assign(new Error("Not authenticated"), { statusCode: 401 });
+      fail("Sign in to change your view settings.", {
+        errorCode: "unauthenticated",
+        statusCode: 401,
+      });
     }
     let next: ViewSettings | undefined;
     await mutateUserSetting(email, VIEW_SETTINGS_KEY, (current) => {

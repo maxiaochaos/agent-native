@@ -4,7 +4,7 @@ import { z } from "zod";
 
 import { resolveFactoryConnectorReadiness } from "../server/connectors/credentials.js";
 import { getDb } from "../server/db/index.js";
-import { DEFAULT_FACTORY_ID } from "../server/factory-graph/store.js";
+import { DEFAULT_FACTORY_ID } from "../server/lib/factory-ids.js";
 import {
   factoryIdSchema,
   readTriageConfigRow,
@@ -13,10 +13,14 @@ import {
   requireWorkspaceMember,
   workspaceMemberIdentityFromContext,
 } from "../server/lib/require-workspace-member.js";
+import {
+  SECRET_UNREADABLE_CODE,
+  isUnreadableSecret,
+} from "../server/lib/unreadable-secret.js";
 
 export default defineAction({
   description:
-    "Read Factory observation settings for the selected factory. Secret values are never returned. A connector outage is returned as readinessError and does not drop inbox or observation settings.",
+    "Read Factory observation settings for the selected factory. Secret values are never returned. A connector outage is returned as readinessError and does not drop inbox or observation settings; readinessErrorCode is app_secret_unreadable when a saved key cannot be decrypted here, which a person must fix and no retry heals.",
   schema: z.object({
     factoryId: factoryIdSchema.default(DEFAULT_FACTORY_ID),
   }),
@@ -32,6 +36,7 @@ export default defineAction({
       | Awaited<ReturnType<typeof resolveFactoryConnectorReadiness>>
       | undefined;
     let readinessError: string | undefined;
+    let readinessErrorCode: string | undefined;
     try {
       connections = await resolveFactoryConnectorReadiness(userEmail, {
         orgId,
@@ -41,12 +46,16 @@ export default defineAction({
         error instanceof Error
           ? error.message
           : "Connector readiness is unavailable.";
+      // Saved but undecryptable is a fix for a person, not an outage to wait out.
+      if (isUnreadableSecret(error))
+        readinessErrorCode = SECRET_UNREADABLE_CODE;
     }
     const readiness = connections
       ? { connections }
       : {
           readinessError:
             readinessError ?? "Connector readiness is unavailable.",
+          ...(readinessErrorCode ? { readinessErrorCode } : {}),
         };
     if (!row) {
       return {
@@ -54,7 +63,6 @@ export default defineAction({
         slackWorkspace: "primary",
         slackChannelId: null,
         slackChannelName: null,
-        builderSlackUserId: null,
         pollingEnabled: false,
         lastSlackTs: null,
         slackHistoryCursor: null,
@@ -71,8 +79,9 @@ export default defineAction({
         ...readiness,
       };
     }
+    const { builderSlackUserId: _builderSlackUserId, ...storedRow } = row;
     return {
-      ...row,
+      ...storedRow,
       factoryId,
       pollingEnabled: row.pollingEnabled === 1,
       githubPollingEnabled: row.githubPollingEnabled === 1,

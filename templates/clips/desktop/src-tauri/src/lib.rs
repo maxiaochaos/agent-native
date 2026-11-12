@@ -11,9 +11,13 @@ mod eventkit;
 mod logfile;
 mod meetings_watcher;
 mod mic_attribution;
+mod model_download;
 mod native_screen;
 mod native_speech;
 mod notifications;
+#[cfg(target_os = "macos")]
+mod parakeet_live;
+mod parakeet_model;
 mod permission_status;
 mod recording_indicator;
 mod remote_flags;
@@ -29,8 +33,12 @@ mod screen_memory_transcript;
 mod sentry_report;
 mod shortcuts;
 mod silence_detector;
+mod silero_vad;
+mod speech_capture_ownership;
 mod state;
 mod system_audio;
+#[cfg(target_os = "macos")]
+mod transcribe_engine;
 mod tray;
 mod tray_meetings;
 mod util;
@@ -50,12 +58,17 @@ use state::{
 };
 use util::{
     configure_overlay_behavior, is_recording_active, present_interactive_window,
-    restart_after_update, set_capture_excluded,
+    read_third_party_notices, restart_after_update, set_capture_excluded,
 };
 
 pub(crate) const TRAY_PNG: &[u8] = include_bytes!("../icons/tray.png");
 
 const POPOVER_BLUR_GUARD: Duration = Duration::from_millis(1500);
+/// How long quitting waits for transcription workers to hand their models
+/// back. A cancelled run stops at its next step and a load takes a second or
+/// two, so only a native call that never returns runs past this.
+#[cfg(target_os = "macos")]
+const MODEL_QUIT_WAIT: Duration = Duration::from_secs(3);
 const POPOVER_BLUR_SETTLE: Duration = Duration::from_millis(100);
 #[cfg(any(target_os = "macos", test))]
 const MACOS_CONTROL_CENTER_BUNDLE_IDENTIFIER: &str = "com.apple.controlcenter";
@@ -152,6 +165,10 @@ pub(crate) fn schedule_popover_dismissal(app_handle: &tauri::AppHandle) {
             // Control Center can close without sending another blur event to the popover.
             tokio::time::sleep(POPOVER_BLUR_SETTLE).await;
         }
+        if clips::bubble_is_focused(&delayed_app_handle) {
+            dlog!("[clips-tray] popover blur ignored — camera bubble focused");
+            return;
+        }
         clips::hide_popover(&delayed_app_handle);
     });
 }
@@ -220,6 +237,7 @@ pub fn run() {
             clips::set_bubble_capture_excluded,
             clips::hide_overlays,
             clips::hide_recording_chrome,
+            clips::dismiss_countdown_for_generation,
             clips::show_region_guides,
             clips::hide_region_guides,
             clips::show_region_record_border,
@@ -241,20 +259,26 @@ pub fn run() {
             clips::show_signin,
             clips::close_signin,
             clips::show_flow_bar,
+            clips::set_flow_bar_expanded,
             clips::hide_flow_bar,
             clips::complete_voice_dictation,
+            clips::copy_voice_dictation,
             clips::paste_last_dictation,
             clips::set_recording_state,
             clips::release_recording_state,
             clips::set_meeting_active,
             clips::get_active_meeting_id,
             clips::quit_teardown_done,
+            clips::quit_teardown_cancel,
+            clips::quit_teardown_force,
             clips::reset_state,
             clips::save_bubble_position,
             clips::bubble_drag_start,
             clips::bubble_drag_move,
             clips::bubble_drag_end,
             clips::set_bubble_size,
+            clips::set_bubble_hit_mask,
+            clips::recheck_bubble_hit,
             clips::load_bubble_size,
             config::get_feature_config,
             config::set_feature_config,
@@ -335,8 +359,10 @@ pub fn run() {
             recording_indicator::recording_pill_save_expanded_size,
             recording_indicator::recording_pill_set_detached,
             notifications::take_pending_meeting_notification,
+            notifications::meeting_notification_show,
             notifications::notify_meeting_starting,
             notifications::dismiss_meeting_notification,
+            notifications::debug_write_snapshot,
             meetings_watcher::meetings_watcher_set_server_url,
             meetings_watcher::meetings_watcher_set_session,
             meetings_watcher::meetings_watcher_resume_polling,
@@ -364,10 +390,15 @@ pub fn run() {
             whisper_model::whisper_model_download,
             whisper_model::whisper_downloaded_models,
             whisper_model::whisper_model_delete,
+            parakeet_model::parakeet_model_status,
+            parakeet_model::parakeet_model_prepare,
+            parakeet_model::parakeet_model_release,
+            silero_vad::speech_detector_prepare,
             permission_status::check_permission_statuses,
             logfile::frontend_log,
             logfile::open_logs,
             restart_after_update,
+            read_third_party_notices,
         ])
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -418,7 +449,14 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             {
-                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                // `CLIPS_TRAY_REGULAR_APP=1` runs the tray as a normal app with a
+                // Dock tile so window-automation tools can target it when testing.
+                let policy = if std::env::var_os("CLIPS_TRAY_REGULAR_APP").is_some() {
+                    tauri::ActivationPolicy::Regular
+                } else {
+                    tauri::ActivationPolicy::Accessory
+                };
+                app.set_activation_policy(policy);
             }
 
             util::build_popover_window(app).map_err(|err| {
@@ -462,6 +500,7 @@ pub fn run() {
             config::sync_launch_at_login(app.handle());
             let feature_config = config::feature_config(app.handle());
             screen_memory::sync_from_config(app.handle(), &feature_config);
+            screen_memory::spawn_retention_sweeper(app.handle().clone());
             clips::reconcile_region_guides(app.handle());
             shortcuts::register_shortcuts(app)?;
             shortcuts::install_countdown_local_key_monitor(app);
@@ -472,6 +511,8 @@ pub fn run() {
             adhoc_meetings_watcher::spawn_watcher(app.handle().clone());
             notifications::watch_meeting_notification_acks(app.handle());
             remote_flags::spawn_watcher(app.handle().clone());
+            #[cfg(target_os = "macos")]
+            parakeet_model::announce_slot_changes(app.handle());
 
             #[cfg(target_os = "macos")]
             {
@@ -557,36 +598,52 @@ pub fn run() {
                     .unwrap_or(false);
                 let teardown_state =
                     clips::QUIT_TEARDOWN_STATE.load(std::sync::atomic::Ordering::SeqCst);
-                if meeting_active && teardown_state == 0 {
-                    clips::QUIT_TEARDOWN_STATE.store(1, std::sync::atomic::Ordering::SeqCst);
+                if teardown_state == clips::QUIT_TEARDOWN_RECOVERY && clips::force_quit_teardown() {
+                    // A second explicit native quit request is the recovery
+                    // escape hatch if the WebView dialog cannot be shown.
+                } else if clips::quit_teardown_blocks_exit(teardown_state) {
                     api.prevent_exit();
-                    let _ = _app_handle.emit("meetings:quit-requested", ());
-                    let watchdog_handle = _app_handle.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        if clips::QUIT_TEARDOWN_STATE
-                            .compare_exchange(
-                                1,
-                                2,
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::SeqCst,
-                            )
-                            .is_ok()
-                        {
-                            eprintln!(
-                                "[clips-tray] quit-teardown watchdog fired — forcing exit after 3s"
-                            );
-                            watchdog_handle.exit(0);
-                        }
-                    });
+                } else if meeting_active && teardown_state == 0 {
+                    if let Some(quit_attempt) = clips::begin_quit_teardown() {
+                        api.prevent_exit();
+                        let _ = _app_handle.emit("meetings:quit-requested", ());
+                        let app_handle = _app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(15)).await;
+                            if clips::show_quit_teardown_recovery(quit_attempt) {
+                                clips::force_show_popover(&app_handle);
+                                let _ = app_handle.emit("meetings:quit-recovery-required", ());
+                            }
+                        });
+                    } else if clips::QUIT_TEARDOWN_STATE.load(std::sync::atomic::Ordering::SeqCst)
+                        == clips::QUIT_TEARDOWN_PENDING
+                    {
+                        api.prevent_exit();
+                    }
                 }
             }
             if let tauri::RunEvent::Exit = _event {
+                parakeet_model::shutdown();
                 whisper_speech::shutdown(_app_handle);
+                #[cfg(target_os = "macos")]
+                let models_freed = transcribe_engine::LOCAL_MODEL.shut_down(MODEL_QUIT_WAIT);
                 native_speech::shutdown();
                 let state = _app_handle.state::<native_screen::NativeFullscreenRecordingState>();
                 native_screen::kill_active_screencapture_child(&state);
                 mic_attribution::shutdown();
+                // ggml's Metal device is a C++ static whose destructor asserts
+                // every Metal buffer is gone, so `exit` aborts while a native
+                // call that never returned still holds a model. Everything
+                // above has cleaned up; skip the static destructors.
+                #[cfg(target_os = "macos")]
+                if let Err(error) = models_freed {
+                    eprintln!(
+                        "[models] {error} {} ms into quitting; exiting without static destructors",
+                        MODEL_QUIT_WAIT.as_millis()
+                    );
+                    // SAFETY: `_exit` ends the process at once; nothing runs after it.
+                    unsafe { libc::_exit(0) };
+                }
             }
         });
 }

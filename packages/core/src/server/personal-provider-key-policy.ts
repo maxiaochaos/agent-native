@@ -1,3 +1,4 @@
+import type { H3Event } from "h3";
 /**
  * "Restrict personal API keys": an organization policy that stops members from
  * using or adding their own model provider keys and personal Builder.io
@@ -9,14 +10,13 @@
  * `isPersonalProviderKeyUseRestricted`. Keep it the only place that decides.
  */
 
-import type { H3Event } from "h3";
-
 import {
   OLLAMA_BASE_URL_ENV_VAR,
   OPENAI_BASE_URL_ENV_VAR,
   PROVIDER_ENV_VARS,
 } from "../agent/engine/provider-env-vars.js";
 import { getDbExec } from "../db/client.js";
+import { withDatabaseErrorProvenance } from "../db/errors.js";
 import type { OrgRole } from "../org/types.js";
 import { getOrgSetting, mutateOrgSetting } from "../settings/org-settings.js";
 import { BUILDER_CREDENTIAL_KEYS } from "./builder-credential-keys.js";
@@ -138,22 +138,52 @@ function forgetRequestRestrictions(): void {
   if (ctx && typeof ctx === "object") _requestRestrictions.delete(ctx);
 }
 
+function isDelegatedRequestIdentityMismatch(
+  orgId: string,
+  email: string,
+): boolean {
+  const requestContext = getRequestContext();
+  return (
+    requestContext?.a2aIdentityAssurance === "org-member" &&
+    (requestContext.userEmail?.trim().toLowerCase() !==
+      email.trim().toLowerCase() ||
+      requestContext.orgId?.trim() !== orgId.trim())
+  );
+}
+
+/** Resolve the role visible to this request without changing unrelated role reads. */
+export function effectiveOrgMemberRole(
+  role: unknown,
+  orgId: string,
+  email: string,
+): OrgRole | null {
+  if (isDelegatedRequestIdentityMismatch(orgId, email)) return null;
+  const verifiedRole =
+    role === "owner" || role === "admin" || role === "member" ? role : null;
+  const requestContext = getRequestContext();
+  const isDelegatedRequest =
+    requestContext?.a2aIdentityAssurance === "org-member";
+
+  return verifiedRole && isDelegatedRequest ? "member" : verifiedRole;
+}
+
 /** The member's role in `orgId`, or null when not a member. Throws when unreadable. */
 export async function readOrgMemberRole(
   orgId: string,
   email: string,
 ): Promise<OrgRole | null> {
-  const { rows } = await getDbExec().execute({
-    sql: `SELECT role FROM org_members
+  if (isDelegatedRequestIdentityMismatch(orgId, email)) return null;
+  const normalizedEmail = email.trim().toLowerCase();
+  const { rows } = await withDatabaseErrorProvenance(async () =>
+    getDbExec().execute({
+      sql: `SELECT role FROM org_members
           WHERE org_id = ? AND LOWER(email) = ?
             AND federation_removal_pending_at IS NULL
           LIMIT 1`,
-    args: [orgId, email.toLowerCase()],
-  });
-  const role = rows[0]?.role;
-  return role === "owner" || role === "admin" || role === "member"
-    ? role
-    : null;
+      args: [orgId, normalizedEmail],
+    }),
+  );
+  return effectiveOrgMemberRole(rows[0]?.role, orgId, email);
 }
 
 async function resolvePolicyOrgId(

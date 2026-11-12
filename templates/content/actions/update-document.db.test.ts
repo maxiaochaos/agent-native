@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { parseIconValue } from "@agent-native/core/icons";
+import { registerLabs } from "@agent-native/core/labs/registry";
 import { runWithRequestContext } from "@agent-native/core/server";
+import { CREATIVE_CONTEXT_LIBRARY_LAB } from "@agent-native/creative-context";
 import { asc, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -41,6 +43,7 @@ const EDITOR = "editor@example.com";
 const VIEWER = "viewer@example.com";
 
 beforeAll(async () => {
+  registerLabs([CREATIVE_CONTEXT_LIBRARY_LAB]);
   process.env.DATABASE_URL = `pglite:${TEST_DB_PATH}`;
   const dbModule = await import("../server/db/index.js");
   getDb = dbModule.getDb;
@@ -1121,6 +1124,44 @@ describe("update-document compare-and-swap", () => {
     });
     expect(await documentRow(id)).toMatchObject({
       content: "After",
+      bodyRevision: 1,
+    });
+  });
+
+  it("saves an editor generation for a page over 500,000 characters", async () => {
+    // The body copies were capped at 500,000 while `content` was not, so the
+    // editor's every save of a longer page was refused and the page never opened.
+    const before = `${"A long working note.\n\n".repeat(30_000)}Before`;
+    const after = `${before}\n\nAfter`;
+    const id = await createDocument({ content: before });
+    const baseRevision = documentRevisionToken(0, before);
+    const args = {
+      id,
+      content: after,
+      baseRevision,
+      authoredBaseRevision: baseRevision,
+      authoredBaseContent: before,
+      authoredCandidateContent: after,
+      editorSessionId: nextId("long-page-session"),
+      editorEditGeneration: 1,
+      editorSnapshotTitle: "Untitled",
+      editorSnapshotContent: after,
+      browserSaveAttemptId: nextId("long-page-attempt"),
+    };
+
+    const parsed =
+      await updateDocumentAction.schema["~standard"].validate(args);
+    expect(parsed.issues).toBeUndefined();
+    const saved = await runWithRequestContext({ userEmail: OWNER }, () =>
+      updateDocumentAction.run(args, {
+        caller: "frontend",
+        userEmail: OWNER,
+      }),
+    );
+
+    expect(saved).toMatchObject({ browserSaveAttempt: { result: "applied" } });
+    expect(await documentRow(id)).toMatchObject({
+      content: after,
       bodyRevision: 1,
     });
   });

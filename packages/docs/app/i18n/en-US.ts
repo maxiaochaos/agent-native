@@ -1,4 +1,59 @@
 const enUS = {
+  siteContent: {
+    recipeWhen: "When",
+    howOften: "How often",
+    filterRole: "Role",
+    filterAll: "All",
+    filterEngineering: "Engineering",
+    filterProduct: "Product",
+    filterDesign: "Design",
+    filterMarketing: "Marketing",
+    filterRevops: "RevOps",
+    filterSales: "Sales",
+    filterFounders: "Founders",
+    filterFinance: "Finance",
+    filterEmpty: "No use cases match these filters.",
+    filterClear: "Clear filters",
+    browseArticles: "Or browse the {{articles}} for templates and how-tos.",
+    articlesLink: "articles",
+    whatYouUse: "What you use",
+    usedFor: "For",
+    whereItBreaks: "Where it breaks",
+    updatedDate: "Updated {{date}}",
+    publishedDate: "Published {{date}}",
+    useCases: "Use cases",
+    useCasesDescription: "Pages for recurring jobs, by app",
+    useCasesTitle:
+      "Recurring work, done with an Agent-Native app and your AI agent",
+    useCasesIntro:
+      "Pick the job you do again and again, or browse the {{articles}} for templates and how-tos.",
+    articles: "Articles",
+    articlesIntro: "Guides and explainers for recurring work with AI agents.",
+    articleCount_one: "{{count}} article",
+    articleCount_other: "{{count}} articles",
+    copyPage: "Copy page",
+    enlargeImage: "Enlarge image",
+    closeImage: "Close image",
+    copyPrompt: "Copy prompt",
+    promptHint: "Paste the prompt into the {{app}} prompt box.",
+    copyLink: "Copy link",
+    copied: "Copied",
+    copyFailed: "Could not copy. Please try again.",
+    breadcrumb: "Breadcrumb",
+    readTime_one: "{{count}} min read",
+    readTime_other: "{{count}} min read",
+    partOf: "Part of:",
+    moreArticles: "More {{category}} articles",
+    genericMore: "More articles",
+    showMore: "Show more articles",
+    topics: {
+      clips: "Screen recordings, meetings, and dictation your AI agent can use",
+      design: "Interactive prototypes with your AI agent",
+      slides: "On-brand presentations with your AI agent",
+      plans: "Visual plans and recaps for your AI coding agent",
+      analytics: "Plain-language questions, charts, and dashboards",
+    },
+  },
   agentChat: {
     setup: {
       providerStatusUnavailable: "Couldn't confirm AI is ready.",
@@ -648,6 +703,9 @@ const enUS = {
     waitlistUnavailable:
       "Waitlist signups aren't available in this environment yet. Please try the hosted docs site instead.",
     launchBuilder: "Launch Builder",
+    newAppPrompt: "Create a new Agent-Native app.",
+    customizeTemplatePrompt:
+      "Customize the Agent-Native {{template}} template for my workflow.",
   },
   templateCard: {
     pasteIntoTerminal: "Paste into your terminal.",
@@ -2604,6 +2662,7 @@ const enUS = {
     deploymentEnvironmentVariables: "Deployment: Environment Variables",
     updatingUiInProduction: "Updating UI in Production",
     environmentVariables: "Environment Variables",
+    telemetry: "Telemetry",
     progress: "Progress",
     authentication: "Authentication",
     multiTenancy: "Multi-Tenancy",
@@ -2615,6 +2674,7 @@ const enUS = {
     auditLog: "Audit Log",
     doctorCodeChecks: "Doctor (Code Checks)",
     observability: "Observability",
+    recorder: "Recorder",
     observationalMemory: "Observational Memory",
     ciEvalGate: "CI Eval Gate",
     usingYourAgentOverview: "Overview",
@@ -2671,7 +2731,9 @@ const enUS = {
     blueprintInstaller: "Blueprint Installer",
     chat: "Chat",
     chatOverview: "Overview",
-    chatFirstEdits: "Your First Feature",
+    chatFeatures: "Features",
+    chatAgent: "Talk to the Agent",
+    chatIntegrations: "Cross-App Use",
     chatDevelopers: "Developer Guide",
     calendar: "Calendar",
     calendarOverview: "Overview",
@@ -2744,6 +2806,18 @@ const enUS = {
     formsIntegrations: "Cross-App Use",
     formsDevelopers: "Developer Guide",
   },
+};
+
+type PluralKey =
+  `${string}_${"zero" | "one" | "two" | "few" | "many" | "other"}`;
+
+/** Locales supply only the plural categories their language uses. */
+export type PluralLocaleMessages = Omit<typeof enUS, "siteContent"> & {
+  siteContent: {
+    [K in keyof typeof enUS.siteContent as K extends PluralKey
+      ? never
+      : K]: (typeof enUS.siteContent)[K];
+  } & Record<PluralKey, string>;
 };
 
 export default enUS;

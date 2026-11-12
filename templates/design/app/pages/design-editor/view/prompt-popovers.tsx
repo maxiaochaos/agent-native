@@ -10,6 +10,8 @@ import { SaveTemplateDialog } from "@/components/design/editor/SaveTemplateDialo
 import PromptPopover, {
   type UploadedFile,
 } from "@/components/editor/PromptDialog";
+import { getDesignHostChannel } from "@/host/design-host-channel";
+import { figmaReferenceDirectives } from "@/lib/figma-attachment";
 import { patchPendingGeneration } from "@/lib/pending-generation";
 
 import { designPrecedentDirectives } from "../creative-context-precedent";
@@ -61,7 +63,7 @@ export function renderPromptPopovers({
   design: DesignData;
 }) {
   const { isSignedIn, t, queryClient } = editorCore;
-  const { isBuilderDesignEmbed, parentOriginRef } = editorHistory;
+  const { isBuilderDesignEmbed } = editorHistory;
   const {
     canEditDesign,
     creativeContextLab,
@@ -70,6 +72,7 @@ export function renderPromptPopovers({
     clearGenerationCompleteTimer,
     generationModelRef,
     setHasPendingGeneration,
+    generationOutputBaselineRef,
     agentSubmit,
     setGenerationChatTabId,
     generating,
@@ -125,17 +128,18 @@ export function renderPromptPopovers({
           const images = imageAttachmentsFromUploadedFiles(files);
           if (isBuilderDesignEmbed) {
             const data = builderDesignEmbedSubmitData(prompt, images);
-            window.parent.postMessage(
-              {
-                type: "agentNative.submitChat",
-                data,
-              },
-              parentOriginRef.current ?? window.location.origin,
-            );
+            getDesignHostChannel().send({
+              type: "agentNative.submitChat",
+              data,
+            });
             handlePromptOpenChange(false);
             return;
           }
           if (!canEditDesign) return;
+          const outputBaselineFiles = generationOutputBaselineRef.current?.();
+          if (outputBaselineFiles === undefined) {
+            throw new Error(t("promptDialog.failedToSubmitPrompt"));
+          }
           if (!creativeContextLab.isSuccess) {
             const issue = t("designEditor.generationStoppedRetry");
             setGenerationIssue(issue);
@@ -213,6 +217,7 @@ export function renderPromptPopovers({
             fileContext,
             "",
             ...generationDirectives,
+            ...figmaReferenceDirectives(options.contextItems),
           ].join("\n");
           clearGenerationCompleteTimer();
           setGenerationIssue(null);
@@ -232,6 +237,7 @@ export function renderPromptPopovers({
             ...options,
             attempt: 1,
             startedAt,
+            outputBaselineFiles,
           });
           setHasPendingGeneration(true);
           const runTabId = agentSubmit(prompt, context, {
@@ -249,6 +255,7 @@ export function renderPromptPopovers({
             runTabId,
             attempt: 1,
             startedAt,
+            outputBaselineFiles,
           });
           handlePromptOpenChange(false);
         }}
@@ -256,6 +263,7 @@ export function renderPromptPopovers({
           generating ||
           (designSystemsLoading && promptDesignSystemId === undefined)
         }
+        submissionDisabled={generationOutputBaselineRef.current === undefined}
         anchorRef={promptAnchorRef}
         designSystems={designSystemOptions}
         designSystemsLoading={designSystemsLoading}
@@ -313,7 +321,7 @@ export function renderPromptPopovers({
           canRestore={canEditDesign}
           onRestored={() => {
             void queryClient.invalidateQueries({
-              queryKey: ["action", "get-design", { id }],
+              queryKey: ["action", "get-design"],
             });
           }}
         />

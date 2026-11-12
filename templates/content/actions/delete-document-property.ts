@@ -5,8 +5,8 @@ import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
 
 import { getDb, schema } from "../server/db/index.js";
-import { bodyRevisionForContent } from "../server/lib/document-body-revision.js";
-import { withoutDatabaseColumnPresentation } from "../shared/database-table-columns.js";
+import { lockLegacyBodyWrites } from "../server/lib/document-body-revision.js";
+import { withoutDeletedDatabaseProperty } from "../shared/database-table-columns.js";
 import {
   isBlocksPropertyType,
   isPrimaryBlocksField,
@@ -19,16 +19,18 @@ import {
 } from "./_blocks-field-identity.js";
 import { lockContentDatabaseMutation } from "./_content-database-mutation-lock.js";
 import { lockDatabaseMemberships } from "./_database-membership-lock.js";
+import { lockPagesAndAssertAgentsMayEditText } from "./_document-agent-lock.js";
 import {
   listPropertiesForDocument,
   parseDatabaseViewConfig,
   resolvePropertyDatabaseForDocument,
   serializeDatabaseViewConfig,
 } from "./_property-utils.js";
+import { lockDocumentRows } from "./_row-lock-order.js";
 
 export default defineAction({
   description:
-    "Delete a Notion-style property definition and its stored document values.",
+    "Delete a Notion-style property definition and its stored document values. Deleting a `blocks` property removes that tab and its text from every row.",
   schema: z.object({
     documentId: z.string().describe("Document ID used to scope access"),
     databaseId: z
@@ -39,7 +41,7 @@ export default defineAction({
       ),
     propertyId: z.string().describe("Property definition ID to delete"),
   }),
-  run: async ({ documentId, databaseId, propertyId }) => {
+  run: async ({ documentId, databaseId, propertyId }, ctx) => {
     const access = await assertAccess("document", documentId, "editor");
     const document = access.resource;
     const db = getDb();
@@ -129,9 +131,23 @@ export default defineAction({
         );
       }
 
+      // A Blocks property holds rows' text, and its last one holds their bodies.
+      if (isBlocks)
+        await lockPagesAndAssertAgentsMayEditText(
+          tx as unknown as ReturnType<typeof getDb>,
+          items.map((item) => item.documentId),
+          ctx,
+        );
+
       await tx
         .delete(schema.documentPropertyValues)
         .where(eq(schema.documentPropertyValues.propertyId, propertyId));
+      // After the values: deleting them records a tombstone for each one.
+      await tx
+        .delete(schema.documentPropertyValueTombstones)
+        .where(
+          eq(schema.documentPropertyValueTombstones.propertyId, propertyId),
+        );
       await tx
         .delete(schema.contentDatabaseItemKeyClaims)
         .where(
@@ -151,7 +167,7 @@ export default defineAction({
           viewConfigJson: serializeDatabaseViewConfig({
             ...viewConfig,
             views: viewConfig.views.map((view) =>
-              withoutDatabaseColumnPresentation(view, propertyId),
+              withoutDeletedDatabaseProperty(view, propertyId),
             ),
           }),
           updatedAt: new Date().toISOString(),
@@ -196,12 +212,21 @@ export default defineAction({
             )
             .map((item) => item.documentId);
           if (documentsWithoutSurvivingPrimary.length > 0) {
+            const legacy = await lockLegacyBodyWrites(
+              tx,
+              documentsWithoutSurvivingPrimary,
+              { operation: "delete-document-property", content: "" },
+            );
             const now = new Date().toISOString();
+            await lockDocumentRows(
+              tx as unknown as ReturnType<typeof getDb>,
+              documentsWithoutSurvivingPrimary,
+            );
             await tx
               .update(schema.documents)
               .set({
                 content: "",
-                bodyRevision: bodyRevisionForContent(""),
+                bodyRevision: legacy.bodyRevision(""),
                 updatedAt: now,
               })
               .where(

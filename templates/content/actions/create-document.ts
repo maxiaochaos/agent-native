@@ -44,7 +44,7 @@ import {
   parseDocumentHideFromSearch,
 } from "../server/lib/documents.js";
 import {
-  syncPrivateCalloutReferences,
+  syncPrivateBodyReferences,
   syncPrivateIconReference,
   verifyPrivateIconAssignment,
 } from "../server/lib/private-icon-references.js";
@@ -56,11 +56,13 @@ import {
   documentContentHash,
   documentRevisionToken,
 } from "./_document-edit-mutation.js";
+import { NFM_CONTAINER_SYNTAX } from "./_nfm-syntax.js";
 import {
   documentsPositionScope,
   nextAppendPosition,
   withPositionLock,
 } from "./_position-utils.js";
+import { lockParentOfNewPage } from "./_row-lock-order.js";
 
 type CreationTransactionWrite = {
   documentId: string;
@@ -406,6 +408,7 @@ function parseDocumentCreationProvenance(
 }
 
 export default defineAction({
+  searchHints: ["new page", "write a doc", "notes page"],
   description:
     "Create and persist a new Markdown document in Content. Use parentId to nest it, or spaceId/spaceName to choose the workspace for a top-level page; with none of them the page is created in the caller's Personal workspace. Returns the stable document ID and resolved spaceId for subsequent get-document or edit-document calls. If creativeContextProjectionStatus is pending, the document is committed; retry the same arguments with the returned id to repair its projection without creating a duplicate.",
   deferLoading: false,
@@ -433,7 +436,8 @@ export default defineAction({
       .optional()
       .describe(
         "Initial Markdown body; omit to create an empty document. Plain Markdown, no admonition/callout " +
-          'shorthand like "> [!TIP]" — use <callout icon="💡">...</callout> with the body indented one tab.',
+          'shorthand like "> [!TIP]" — use a <callout icon="💡"> block. ' +
+          NFM_CONTAINER_SYNTAX,
       ),
     preserveLeadingTitleHeading: z
       .boolean()
@@ -831,7 +835,7 @@ export default defineAction({
               orgId,
             },
           );
-          await syncPrivateCalloutReferences(
+          await syncPrivateBodyReferences(
             tx as unknown as ReturnType<typeof getDb>,
             {
               documentId: id,
@@ -863,6 +867,15 @@ export default defineAction({
           const scoped = creationTransactionWrite.getStore();
           if (scoped?.documentId === id) {
             await scoped.write(tx as unknown as ReturnType<typeof getDb>);
+          }
+          if (parentId) {
+            // Last, after the import lock the write above can take, which
+            // undo-import holds while it locks pages.
+            await lockParentOfNewPage(
+              tx as unknown as ReturnType<typeof getDb>,
+              parentId,
+              { ownerEmail, spaceId, orgId, visibility },
+            );
           }
           return true;
         });

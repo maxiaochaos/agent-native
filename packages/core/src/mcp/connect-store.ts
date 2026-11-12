@@ -21,9 +21,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 import { getDbExec, isConnectionError, type DbExec } from "../db/client.js";
 import { ensureTableExists, ensureColumnExists } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
-
-let _initPromise: Promise<void> | undefined;
+import { defineStore } from "../db/store-registry.js";
 
 export const MCP_CONNECT_SCOPE = "mcp-connect";
 
@@ -39,78 +37,87 @@ export const MAX_SERVICE_TOKEN_TTL_DAYS = 3_650;
 export const DEVICE_START_MAX = 20;
 export const DEVICE_START_WINDOW_MS = 60_000;
 
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const createTokensSql = `
-        CREATE TABLE IF NOT EXISTS mcp_connect_tokens (
-          id TEXT PRIMARY KEY,
-          jti TEXT UNIQUE NOT NULL,
-          owner_email TEXT NOT NULL,
-          org_id TEXT,
-          label TEXT,
-          kind TEXT NOT NULL DEFAULT 'personal',
-          service_name TEXT,
-          created_by TEXT,
-          created_at BIGINT,
-          last_used_at BIGINT,
-          revoked_at BIGINT
-        )
-      `;
-      const createDeviceCodesSql = `
-        CREATE TABLE IF NOT EXISTS mcp_device_codes (
-          device_code TEXT PRIMARY KEY,
-          user_code TEXT NOT NULL,
-          owner_email TEXT,
-          org_id TEXT,
-          status TEXT NOT NULL DEFAULT 'pending',
-          token_jti TEXT,
-          catalog_scope TEXT,
-          created_at BIGINT,
-          expires_at BIGINT,
-          consumed_at BIGINT
-        )
-      `;
+export const mcpConnectStore = defineStore({
+  id: "mcp_connect",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createTokensSql = `
+          CREATE TABLE IF NOT EXISTS mcp_connect_tokens (
+            id TEXT PRIMARY KEY,
+            jti TEXT UNIQUE NOT NULL,
+            owner_email TEXT NOT NULL,
+            org_id TEXT,
+            label TEXT,
+            kind TEXT NOT NULL DEFAULT 'personal',
+            service_name TEXT,
+            created_by TEXT,
+            created_at BIGINT,
+            last_used_at BIGINT,
+            revoked_at BIGINT
+          )
+        `;
+        const createDeviceCodesSql = `
+          CREATE TABLE IF NOT EXISTS mcp_device_codes (
+            device_code TEXT PRIMARY KEY,
+            user_code TEXT NOT NULL,
+            owner_email TEXT,
+            org_id TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            token_jti TEXT,
+            catalog_scope TEXT,
+            created_at BIGINT,
+            expires_at BIGINT,
+            consumed_at BIGINT
+          )
+        `;
 
-      await ensureTableExists("mcp_connect_tokens", createTokensSql);
-      await ensureColumnExists(
-        "mcp_connect_tokens",
-        "kind",
-        `ALTER TABLE mcp_connect_tokens ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'personal'`,
-      );
-      await ensureColumnExists(
-        "mcp_connect_tokens",
-        "service_name",
-        `ALTER TABLE mcp_connect_tokens ADD COLUMN IF NOT EXISTS service_name TEXT`,
-      );
-      await ensureColumnExists(
-        "mcp_connect_tokens",
-        "created_by",
-        `ALTER TABLE mcp_connect_tokens ADD COLUMN IF NOT EXISTS created_by TEXT`,
-      );
-      await ensureTableExists("mcp_device_codes", createDeviceCodesSql);
-      await ensureColumnExists(
-        "mcp_device_codes",
-        "catalog_scope",
-        `ALTER TABLE mcp_device_codes ADD COLUMN IF NOT EXISTS catalog_scope TEXT`,
-      );
-      await ensureColumnExists(
-        "mcp_device_codes",
-        "client",
-        `ALTER TABLE mcp_device_codes ADD COLUMN IF NOT EXISTS client TEXT`,
-      );
-      await ensureColumnExists(
-        "mcp_device_codes",
-        "purpose",
-        `ALTER TABLE mcp_device_codes ADD COLUMN IF NOT EXISTS purpose TEXT`,
-      );
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+        await ensureTableExists("mcp_connect_tokens", createTokensSql);
+        await ensureColumnExists(
+          "mcp_connect_tokens",
+          "kind",
+          `ALTER TABLE mcp_connect_tokens ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'personal'`,
+        );
+        await ensureColumnExists(
+          "mcp_connect_tokens",
+          "service_name",
+          `ALTER TABLE mcp_connect_tokens ADD COLUMN IF NOT EXISTS service_name TEXT`,
+        );
+        await ensureColumnExists(
+          "mcp_connect_tokens",
+          "created_by",
+          `ALTER TABLE mcp_connect_tokens ADD COLUMN IF NOT EXISTS created_by TEXT`,
+        );
+        await ensureTableExists("mcp_device_codes", createDeviceCodesSql);
+        await ensureColumnExists(
+          "mcp_device_codes",
+          "catalog_scope",
+          `ALTER TABLE mcp_device_codes ADD COLUMN IF NOT EXISTS catalog_scope TEXT`,
+        );
+        await ensureColumnExists(
+          "mcp_device_codes",
+          "client",
+          `ALTER TABLE mcp_device_codes ADD COLUMN IF NOT EXISTS client TEXT`,
+        );
+        await ensureColumnExists(
+          "mcp_device_codes",
+          "purpose",
+          `ALTER TABLE mcp_device_codes ADD COLUMN IF NOT EXISTS purpose TEXT`,
+        );
+      },
+    },
+    {
+      name: "client-connection-metadata",
+      sql: `ALTER TABLE mcp_connect_tokens ADD COLUMN IF NOT EXISTS client_name TEXT,
+        ADD COLUMN IF NOT EXISTS resource TEXT,
+        ADD COLUMN IF NOT EXISTS expires_at BIGINT`,
+    },
+  ],
+});
+
+export function ensureTable(): Promise<void> {
+  return mcpConnectStore.ready();
 }
 
 export async function ensureConnectTables(): Promise<void> {
@@ -166,6 +173,9 @@ export async function recordMintedToken(
     ownerEmail: string;
     orgId?: string | null;
     label?: string | null;
+    clientName?: string | null;
+    resource?: string | null;
+    expiresAt?: number | null;
     kind?: "personal" | "service";
     serviceName?: string | null;
     createdBy?: string | null;
@@ -176,7 +186,7 @@ export async function recordMintedToken(
   const client = exec ?? getDbExec();
   const id = randomUUID();
   const result = await client.execute({
-    sql: `INSERT INTO mcp_connect_tokens (id, jti, owner_email, org_id, label, kind, service_name, created_by, created_at, last_used_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    sql: `INSERT INTO mcp_connect_tokens (id, jti, owner_email, org_id, label, kind, service_name, created_by, created_at, last_used_at, revoked_at, client_name, resource, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       id,
       params.jti,
@@ -189,6 +199,9 @@ export async function recordMintedToken(
       Date.now(),
       null,
       null,
+      params.clientName ?? null,
+      params.resource ?? null,
+      params.expiresAt ?? null,
     ],
   });
   if (result.rowsAffected !== 1) {

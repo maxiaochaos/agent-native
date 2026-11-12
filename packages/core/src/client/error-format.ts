@@ -12,6 +12,7 @@ import {
   BUILDER_GATEWAY_INTERNAL_ERROR_CODE,
   isBuilderGatewayInternalErrorMessage,
   isContextOverflowMessage,
+  isRejectedRequestErrorCode,
   PROVIDER_TRANSIENT_REJECTION_ERROR_CODE,
 } from "../agent/engine/error-detail.js";
 import {
@@ -62,6 +63,8 @@ const CREDENTIAL_CHAT_MESSAGES: Record<CredentialErrorCode, string | null> = {
   http_401: PROVIDER_CREDENTIAL_REJECTED_MESSAGE,
   http_403: PROVIDER_CREDENTIAL_REJECTED_MESSAGE,
   builder_auth_error: BUILDER_AUTHENTICATION_ERROR,
+  builder_oauth_lookup_failed: BUILDER_AUTHENTICATION_ERROR,
+  builder_oauth_refresh_failed: null,
   builder_oauth_reauthorization_required: null,
   credential_missing: null,
   credential_rejected: null,
@@ -88,10 +91,10 @@ const MALFORMED_REQUEST_MESSAGE =
   "The model provider rejected this request as malformed, so it was not retried. Retry, or start a new chat if it keeps happening.";
 export const CHAT_REQUEST_TOO_LARGE_MESSAGE =
   "This request exceeded the server's size limit (HTTP 413). Start a new chat or remove large attachments or references, then retry.";
-const MALFORMED_REQUEST_CODES = new Set([
-  "invalid_request",
-  "invalid_request_error",
-]);
+export const CHAT_CAPABILITY_UNAVAILABLE_MESSAGE =
+  "We couldn't send your message right now. Please try again shortly.";
+export const CHAT_CAPABILITY_UNSUPPORTED_MESSAGE =
+  "This app can't safely retry your saved prompt yet. Update the app, then try again.";
 const ATTACHMENT_REJECTION_PATTERN =
   /\b(?:file_url|image_url|file_data|input_file|media_type|mime\s?type|image\.source|document\s+block)\b/i;
 
@@ -163,6 +166,14 @@ const KNOWN_CHAT_ERROR_KEYS = new Map<string, string>([
   ],
   [INVALID_ATTACHMENT_MESSAGE, "agentChat.errorMessages.invalidAttachment"],
   [CHAT_REQUEST_TOO_LARGE_MESSAGE, "agentChat.errorMessages.requestTooLarge"],
+  [
+    CHAT_CAPABILITY_UNAVAILABLE_MESSAGE,
+    "agentChat.errorMessages.capabilityUnavailable",
+  ],
+  [
+    CHAT_CAPABILITY_UNSUPPORTED_MESSAGE,
+    "agentChat.errorMessages.capabilityUnsupported",
+  ],
   [
     "No LLM provider is connected. Open this app's Manage agent > LLM, then use Builder.io or add a provider key.",
     "agentChat.errorMessages.noProviderConnected",
@@ -531,7 +542,7 @@ export function normalizeChatError(
     };
   }
 
-  if (MALFORMED_REQUEST_CODES.has(code) && !isContextOverflowMessage(text)) {
+  if (isRejectedRequestErrorCode(code) && !isContextOverflowMessage(text)) {
     return {
       message: ATTACHMENT_REJECTION_PATTERN.test(text)
         ? MALFORMED_REQUEST_ATTACHMENT_MESSAGE

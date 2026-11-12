@@ -1,13 +1,15 @@
-import { defineAction } from "@agent-native/core/action";
+import { defineAction, fail } from "@agent-native/core/action";
 import { z } from "zod";
 
 import { snapshotDesignBeforeAgentEdit } from "../server/lib/design-versions.js";
+import { failOnSourceInputError } from "../server/lib/fail-on-source-input-error.js";
 import {
   findSourceWorkspaceFile,
   readLiveSourceFile,
   resolveSourceWorkspace,
   writeInlineSourceFile,
 } from "../server/source-workspace.js";
+import { designOutputWriteReceipt } from "../shared/generation-output-receipt.js";
 import {
   applySourceEdit,
   previewSourceDiff,
@@ -55,7 +57,10 @@ export default defineAction({
       includeContent: true,
     });
     if (workspace.sourceType !== "inline") {
-      throw new Error("Only inline Design files are editable in this MVP.");
+      fail("Only inline Design files are editable in this MVP.", {
+        errorCode: "source_not_inline",
+        statusCode: 400,
+      });
     }
     const file = findSourceWorkspaceFile(workspace.files, { fileId, path });
     await snapshotDesignBeforeAgentEdit(designId, context);
@@ -64,12 +69,18 @@ export default defineAction({
       expectedVersionHash !== undefined &&
       expectedVersionHash !== live.versionHash
     ) {
-      throw new Error(
+      fail(
         "Source file changed since it was read. Re-read the file and retry.",
+        {
+          errorCode: "source_version_conflict",
+          statusCode: 409,
+        },
       );
     }
 
-    const next = applySourceEdit(live.content, edit);
+    const next = failOnSourceInputError(() =>
+      applySourceEdit(live.content, edit),
+    );
     const write = await writeInlineSourceFile({
       designId,
       file,
@@ -83,6 +94,7 @@ export default defineAction({
       fileId: file.id,
       backendKind: "virtual-inline",
       changed: write.changed,
+      _receipt: designOutputWriteReceipt(designId, write.changed ? 1 : 0),
       editsApplied: next.editsApplied,
       versionHash: write.versionHash,
       updatedAt: write.updatedAt,

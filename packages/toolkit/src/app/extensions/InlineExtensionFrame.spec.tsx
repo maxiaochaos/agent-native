@@ -31,6 +31,16 @@ describe("InlineExtensionFrame", () => {
   let container: HTMLDivElement;
   let root: Root;
 
+  async function confirmPendingMessage() {
+    const dialog = document.querySelector('[role="alertdialog"]');
+    expect(dialog?.textContent).toContain("Send extension message to agent?");
+    const send = Array.from(dialog?.querySelectorAll("button") ?? []).find(
+      (button) => button.textContent === "Send to agent",
+    );
+    expect(send).toBeTruthy();
+    await act(async () => send?.click());
+  }
+
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     container = document.createElement("div");
@@ -43,6 +53,7 @@ describe("InlineExtensionFrame", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -63,7 +74,7 @@ describe("InlineExtensionFrame", () => {
 
     const iframe = container.querySelector("iframe");
     expect(iframe?.getAttribute("sandbox")).toBe(
-      "allow-scripts allow-forms allow-popups allow-downloads",
+      "allow-scripts allow-forms allow-downloads",
     );
     expect(iframe?.getAttribute("srcdoc")).toContain("Send choice");
     expect(iframe?.getAttribute("srcdoc")).toContain(
@@ -85,6 +96,12 @@ describe("InlineExtensionFrame", () => {
       );
     });
 
+    expect(sendToAgentChat).not.toHaveBeenCalled();
+    expect(iframe?.getAttribute("aria-disabled")).toBeNull();
+    expect(
+      document.querySelector('[role="alertdialog"]')?.textContent,
+    ).toContain('Context{"threshold":42}');
+    await confirmPendingMessage();
     expect(sendToAgentChat).toHaveBeenCalledWith({
       message: "Use this threshold",
       context: JSON.stringify({ threshold: 42 }),
@@ -107,6 +124,7 @@ describe("InlineExtensionFrame", () => {
       );
     });
     expect(sendToAgentChat).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
   });
 
   it("keeps extension chat messages draft-only without explicit submission", async () => {
@@ -180,6 +198,8 @@ describe("InlineExtensionFrame", () => {
       );
     });
 
+    expect(sendToAgentChat).not.toHaveBeenCalled();
+    await confirmPendingMessage();
     expect(sendToAgentChat).toHaveBeenCalledTimes(1);
     expect(sendToAgentChat).toHaveBeenCalledWith({
       message: "One-time action",
@@ -217,6 +237,8 @@ describe("InlineExtensionFrame", () => {
       );
     });
 
+    await confirmPendingMessage();
+
     await act(async () => {
       root.render(
         <InlineExtensionFrame
@@ -244,6 +266,8 @@ describe("InlineExtensionFrame", () => {
       );
     });
 
+    await confirmPendingMessage();
+
     expect(sendToAgentChat).toHaveBeenCalledTimes(2);
     expect(sendToAgentChat).toHaveBeenLastCalledWith({
       message: "Replacement action",
@@ -251,6 +275,141 @@ describe("InlineExtensionFrame", () => {
       submit: true,
       openSidebar: true,
     });
+  });
+
+  it("keeps opening links with the live document's token after a re-render that doesn't reload it", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const extension = {
+      id: "inline-links",
+      mode: "transient" as const,
+      name: "Links",
+      content: '<a href="https://app.hubspot.com/x" target="_blank">x</a>',
+    };
+    await act(async () => {
+      root.render(
+        <InlineExtensionFrame extension={extension} initialHeight={200} />,
+      );
+    });
+    const iframe = container.querySelector("iframe");
+    const frameWindow = iframe?.contentWindow as Window;
+    const post = (data: unknown) =>
+      act(() => {
+        window.dispatchEvent(
+          new MessageEvent("message", { source: frameWindow, data }),
+        );
+      });
+    const token = "c".repeat(32);
+    post({
+      type: "agent-native-extension-binding",
+      binding: { role: "owner", isAuthor: true },
+      openUrlToken: token,
+    });
+
+    // initialHeight resets the binding latch, but the iframe keeps its document.
+    await act(async () => {
+      root.render(
+        <InlineExtensionFrame extension={extension} initialHeight={320} />,
+      );
+    });
+    expect(container.querySelector("iframe")?.contentWindow).toBe(frameWindow);
+
+    post({
+      type: "agent-native-extension-open-url",
+      url: "https://app.hubspot.com/x",
+      token,
+    });
+    expect(open).toHaveBeenCalledWith(
+      "https://app.hubspot.com/x",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+
+  it("binds the open-url token to the document the host loaded, not to re-renders", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const extension = {
+      id: "inline-links-doc",
+      mode: "transient" as const,
+      name: "Links",
+      content: '<a href="https://app.hubspot.com/x" target="_blank">x</a>',
+    };
+    const render = async (props: {
+      content?: string;
+      initialHeight?: number;
+    }) =>
+      act(async () => {
+        root.render(
+          <InlineExtensionFrame
+            extension={{
+              ...extension,
+              content: props.content ?? extension.content,
+            }}
+            initialHeight={props.initialHeight ?? 200}
+          />,
+        );
+      });
+    const post = (data: unknown) =>
+      act(() => {
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            source: container.querySelector("iframe")?.contentWindow,
+            data,
+          }),
+        );
+      });
+    const bind = (token: string) =>
+      post({
+        type: "agent-native-extension-binding",
+        binding: { role: "owner", isAuthor: true },
+        openUrlToken: token,
+      });
+    const openWith = (token: string) =>
+      post({
+        type: "agent-native-extension-open-url",
+        url: "https://example.com/",
+        token,
+      });
+
+    await render({});
+    bind("a".repeat(32));
+
+    // The frame navigated to another page, then a host-only re-render reset
+    // the binding latch. That page's binding must not latch a new token.
+    const firstFrame = container.querySelector("iframe");
+    await render({ initialHeight: 320 });
+    expect(container.querySelector("iframe")).toBe(firstFrame);
+    bind("b".repeat(32));
+    openWith("b".repeat(32));
+    expect(open).not.toHaveBeenCalled();
+
+    // New content is a new document from the host, in a fresh iframe element.
+    // A binding still queued from the previous document's window is ignored,
+    // and the new document's token latches.
+    // (Browsers keep one window per iframe element across its documents, so
+    // the element itself must be new; happy-dom swaps windows on srcdoc
+    // changes regardless, which is why this checks the element.)
+    const previousFrame = container.querySelector("iframe");
+    const previousWindow = previousFrame?.contentWindow;
+    await render({ content: "<a href='https://example.com/'>y</a>" });
+    expect(container.querySelector("iframe")).not.toBe(previousFrame);
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          source: previousWindow,
+          data: {
+            type: "agent-native-extension-binding",
+            binding: { role: "owner", isAuthor: true },
+            openUrlToken: "d".repeat(32),
+          },
+        }),
+      );
+    });
+    bind("c".repeat(32));
+    openWith("d".repeat(32));
+    expect(open).not.toHaveBeenCalled();
+    openWith("c".repeat(32));
+    expect(open).toHaveBeenCalledTimes(1);
   });
 
   it("dispatches passive output events from generated UI", async () => {

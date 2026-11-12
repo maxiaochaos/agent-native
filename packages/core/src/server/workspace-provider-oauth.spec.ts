@@ -1,10 +1,17 @@
+import { mockEvent, type H3Event } from "h3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const resolveSecretMock = vi.hoisted(() => vi.fn());
+const sigmaSecretMocks = vi.hoisted(() => ({
+  readAppSecret: vi.fn(),
+  readAppSecretMeta: vi.fn(),
+  writeAppSecret: vi.fn(),
+}));
 const callbackMocks = vi.hoisted(() => ({
   getSession: vi.fn(),
   getOrgContext: vi.fn(),
   saveOAuthTokens: vi.fn(),
+  getOAuthTokens: vi.fn().mockResolvedValue(null),
   setOAuthDisplayName: vi.fn(),
   listWorkspaceConnections: vi.fn(),
   upsertWorkspaceConnection: vi.fn(),
@@ -14,6 +21,19 @@ const callbackMocks = vi.hoisted(() => ({
 vi.mock("./credential-provider.js", () => ({
   resolveSecret: (...args: unknown[]) => resolveSecretMock(...args),
 }));
+
+vi.mock("../secrets/storage.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../secrets/storage.js")>();
+  return {
+    ...actual,
+    readAppSecret: (...args: unknown[]) =>
+      sigmaSecretMocks.readAppSecret(...args),
+    readAppSecretMeta: (...args: unknown[]) =>
+      sigmaSecretMocks.readAppSecretMeta(...args),
+    writeAppSecret: (...args: unknown[]) =>
+      sigmaSecretMocks.writeAppSecret(...args),
+  };
+});
 
 vi.mock("./auth.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./auth.js")>();
@@ -38,6 +58,8 @@ vi.mock("../oauth-tokens/store.js", async (importOriginal) => {
     ...actual,
     saveOAuthTokens: (...args: unknown[]) =>
       callbackMocks.saveOAuthTokens(...args),
+    getOAuthTokens: (...args: unknown[]) =>
+      callbackMocks.getOAuthTokens(...args),
     setOAuthDisplayName: (...args: unknown[]) =>
       callbackMocks.setOAuthDisplayName(...args),
   };
@@ -57,10 +79,19 @@ vi.mock("../workspace-connections/store.js", async (importOriginal) => {
   };
 });
 
+import {
+  defineAppConfig,
+  resetAppConfigForTests,
+} from "../app-config/index.js";
 import { getWorkspaceConnectionProvider } from "../connections/catalog.js";
 import { OAuthAccountOwnedByOtherUserError } from "../oauth-tokens/store.js";
 import { decryptSecretValue, encryptSecretValue } from "../secrets/crypto.js";
+import { ForbiddenError } from "../sharing/errors.js";
 import { decodeOAuthState, encodeOAuthState } from "./google-oauth.js";
+import {
+  SessionResolutionUnavailableError,
+  SessionResolutionLookupError,
+} from "./session-resolution-errors.js";
 import {
   buildWorkspaceProviderAuthorizationUrl,
   canConnectWorkspaceProviderOAuth,
@@ -80,17 +111,156 @@ import {
   shouldUseRootGoogleOAuthCallback,
   salesforceOAuthEndpoint,
   scopedOAuthAccountId,
+  tokenScopes,
   type WorkspaceProviderOAuthFlow,
 } from "./workspace-provider-oauth.js";
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  resetAppConfigForTests();
   resolveSecretMock.mockReset();
+  sigmaSecretMocks.readAppSecret.mockReset();
+  sigmaSecretMocks.readAppSecretMeta.mockReset();
+  sigmaSecretMocks.writeAppSecret.mockReset();
   vi.clearAllMocks();
+  callbackMocks.getOAuthTokens.mockReset().mockResolvedValue(null);
 });
 
+function sigmaStartEvent(apiBaseUrl: string): H3Event {
+  const requestUrl = new URL(
+    "https://example.test/_agent-native/connections/oauth/sigma/start",
+  );
+  requestUrl.searchParams.set("appId", "analytics");
+  requestUrl.searchParams.set("scope", "user");
+  requestUrl.searchParams.set("baseUrl", apiBaseUrl);
+  return {
+    req: new Request(requestUrl),
+    res: { status: 200, headers: new Headers() },
+  } as never;
+}
+
+function sigmaMetadataResponse(apiBaseUrl: string): Response {
+  return new Response(
+    JSON.stringify({
+      issuer: `${apiBaseUrl}/`,
+      authorization_endpoint: `${apiBaseUrl}/mcp/authorize`,
+      token_endpoint: `${apiBaseUrl}/mcp/token`,
+      registration_endpoint: `${apiBaseUrl}/mcp/register`,
+      code_challenge_methods_supported: ["S256"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      response_types_supported: ["code"],
+      scopes_supported: ["api:access"],
+      token_endpoint_auth_methods_supported: ["none"],
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
 describe("workspace provider OAuth", () => {
+  it.each([
+    {
+      name: "unsigned-in",
+      signedIn: false,
+      orgId: null,
+      role: null,
+      status: 401,
+    },
+    { name: "Personal", signedIn: true, orgId: null, role: null, status: 403 },
+    {
+      name: "non-admin member",
+      signedIn: true,
+      orgId: "org-acme",
+      role: "member",
+      status: 403,
+    },
+  ])(
+    "retains the normal $name refusal",
+    async ({ signedIn, orgId, role, status }) => {
+      const email = "requester@example.test";
+      callbackMocks.getSession.mockResolvedValue(signedIn ? { email } : null);
+      callbackMocks.getOrgContext.mockResolvedValue({ email, orgId, role });
+      const event = mockEvent(
+        new Request(
+          "https://example.test/_agent-native/connections/oauth/jira/start?appId=brain&scope=organization",
+        ),
+      );
+      await handleWorkspaceProviderOAuthStart(event, "jira");
+      expect(event.res.status).toBe(status);
+      expect(resolveSecretMock).not.toHaveBeenCalled();
+      expect(callbackMocks.saveOAuthTokens).not.toHaveBeenCalled();
+    },
+  );
+
+  describe.each(["start", "callback"] as const)(
+    "%s org resolution",
+    (phase) => {
+      it.each(["transient", "permanent", "forbidden"] as const)(
+        "preserves %s failures before provider work",
+        async (kind) => {
+          vi.stubEnv("BETTER_AUTH_SECRET", "fake-oauth-test-encryption-key");
+          const email = "requester@example.test";
+          callbackMocks.getSession.mockResolvedValue({ email });
+          const cause = Object.assign(
+            new Error("fake private workspace lookup failure"),
+            { code: "57014" },
+          );
+          const failure =
+            kind === "transient"
+              ? new SessionResolutionUnavailableError({ cause })
+              : kind === "permanent"
+                ? new SessionResolutionLookupError(cause)
+                : new ForbiddenError();
+          callbackMocks.getOrgContext.mockRejectedValue(failure);
+          const fetchMock = vi.fn();
+          vi.stubGlobal("fetch", fetchMock);
+          const flow: WorkspaceProviderOAuthFlow = {
+            provider: "jira",
+            flowId: "fake-flow",
+            verifier: "fake-verifier",
+            redirectUri:
+              "https://example.test/_agent-native/connections/oauth/jira/callback",
+            owner: email,
+            orgId: "org-acme",
+            appId: "brain",
+            scope: "organization",
+            expiresAt: Date.now() + 60_000,
+          };
+          const state = encodeOAuthState({
+            redirectUri: flow.redirectUri,
+            owner: email,
+            orgId: flow.orgId,
+            app: flow.appId,
+            scope: flow.scope,
+            provider: flow.provider,
+            flowId: flow.flowId,
+          });
+          const url =
+            phase === "start"
+              ? "https://example.test/_agent-native/connections/oauth/jira/start?appId=brain&scope=organization"
+              : `${flow.redirectUri}?code=fake-code&state=${encodeURIComponent(state)}`;
+          const cookie = `an_workspace_oauth_jira=${encodeURIComponent(encryptSecretValue(JSON.stringify(flow)))}`;
+          const event = mockEvent(new Request(url, { headers: { cookie } }));
+          const result =
+            phase === "start"
+              ? handleWorkspaceProviderOAuthStart(event, "jira")
+              : handleWorkspaceProviderOAuthCallback(event, "jira");
+          await expect(result).rejects.toBe(failure);
+          expect(event.res.headers.getSetCookie()).toEqual([]);
+          expect(resolveSecretMock).not.toHaveBeenCalled();
+          expect(fetchMock).not.toHaveBeenCalled();
+          expect(callbackMocks.saveOAuthTokens).not.toHaveBeenCalled();
+          expect(
+            callbackMocks.upsertWorkspaceConnection,
+          ).not.toHaveBeenCalled();
+          expect(
+            callbackMocks.upsertWorkspaceConnectionGrant,
+          ).not.toHaveBeenCalled();
+        },
+      );
+    },
+  );
+
   it("keeps the return URL in the encrypted OAuth flow cookie", async () => {
     const email = "requester@example.com";
     const returnUrl = "/dispatch/chat/thread-1?private=value#selected";
@@ -127,7 +297,7 @@ describe("workspace provider OAuth", () => {
 
     const flowCookie = response.headers
       .getSetCookie()
-      .find((cookie) => cookie.startsWith("an_workspace_oauth_notion="));
+      .find((cookie) => cookie.startsWith("an_workspace_oauth_notion_"));
     expect(flowCookie).toBeDefined();
     const encryptedFlow = decodeURIComponent(
       flowCookie!.split(";", 1)[0]!.split("=", 2)[1]!,
@@ -135,6 +305,110 @@ describe("workspace provider OAuth", () => {
     expect(JSON.parse(decryptSecretValue(encryptedFlow))).toMatchObject({
       returnUrl,
     });
+  });
+
+  it("binds a start without an appId to the current app so its callback grants that app", async () => {
+    const email = "requester@example.com";
+    defineAppConfig({ app: { id: "content-test-app" } });
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+    resolveSecretMock.mockResolvedValue("test-only-oauth-client-value");
+    callbackMocks.getSession.mockResolvedValue({ email });
+    callbackMocks.getOrgContext.mockResolvedValue({
+      orgId: "org-1",
+      email,
+      role: "member",
+    });
+    const startUrl = new URL(
+      "https://example.test/_agent-native/connections/oauth/notion/start",
+    );
+    startUrl.searchParams.set("scope", "user");
+
+    const started = await handleWorkspaceProviderOAuthStart(
+      {
+        req: new Request(startUrl),
+        res: { status: 200, headers: new Headers() },
+      } as never,
+      "notion",
+    );
+
+    expect(started).toBeInstanceOf(Response);
+    const startResponse = started as Response;
+    const state = new URL(
+      startResponse.headers.get("Location")!,
+    ).searchParams.get("state")!;
+    expect(decodeOAuthState(state).app).toBe("content-test-app");
+    const flowCookie = startResponse.headers
+      .getSetCookie()
+      .find((cookie) =>
+        cookie.startsWith(
+          `an_workspace_oauth_notion_${decodeOAuthState(state).flowId}=`,
+        ),
+      )!
+      .split(";", 1)[0]!;
+    const flow = JSON.parse(
+      decryptSecretValue(decodeURIComponent(flowCookie.split("=", 2)[1]!)),
+    ) as WorkspaceProviderOAuthFlow;
+    expect(flow.appId).toBe("content-test-app");
+
+    callbackMocks.listWorkspaceConnections.mockResolvedValue([]);
+    callbackMocks.upsertWorkspaceConnection.mockResolvedValue({
+      id: "notion-connection-1",
+    } as never);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: "notion-access-token",
+            owner: { user: { id: "notion-user-1", person: { email } } },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+    const callbackUrl = new URL(flow.redirectUri);
+    callbackUrl.searchParams.set("code", "notion-code");
+    callbackUrl.searchParams.set("state", state);
+
+    await handleWorkspaceProviderOAuthCallback(
+      {
+        req: new Request(callbackUrl, { headers: { cookie: flowCookie } }),
+        res: { status: 200, headers: new Headers() },
+      } as never,
+      "notion",
+    );
+
+    expect(callbackMocks.upsertWorkspaceConnectionGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "notion-connection-1",
+        appId: "content-test-app",
+        provider: "notion",
+      }),
+    );
+  });
+
+  it("rejects an OAuth start when no app id can be resolved", async () => {
+    defineAppConfig({ app: {} });
+    callbackMocks.getSession.mockResolvedValue({
+      email: "requester@example.com",
+    });
+    const startUrl = new URL(
+      "https://example.test/_agent-native/connections/oauth/notion/start",
+    );
+    startUrl.searchParams.set("scope", "user");
+
+    const result = await handleWorkspaceProviderOAuthStart(
+      {
+        req: new Request(startUrl),
+        res: { status: 200, headers: new Headers() },
+      } as never,
+      "notion",
+    );
+
+    expect(result).toMatchObject({
+      error: "OAuth start requires an app id.",
+    });
+    expect(callbackMocks.getOrgContext).not.toHaveBeenCalled();
   });
 
   it("allows organization owners and admins to connect shared OAuth accounts", () => {
@@ -190,6 +464,722 @@ describe("workspace provider OAuth", () => {
     await expect(hasWorkspaceProviderOAuthCredentials("gmail")).resolves.toBe(
       true,
     );
+  });
+
+  it("registers a reusable per-user Sigma OAuth client for the chosen region", async () => {
+    const email = "requester@example.com";
+    const apiBaseUrl = "https://api.eu.aws.sigmacomputing.com";
+    defineAppConfig({ app: { id: "analytics", workspaceId: "analytics" } });
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+    callbackMocks.getSession.mockResolvedValue({ email });
+    callbackMocks.getOrgContext.mockResolvedValue({
+      orgId: "org-1",
+      email,
+      role: "member",
+    });
+    sigmaSecretMocks.readAppSecret.mockResolvedValue(null);
+    sigmaSecretMocks.readAppSecretMeta.mockResolvedValue(null);
+    sigmaSecretMocks.writeAppSecret.mockResolvedValue(
+      "sigma-client-secret-row",
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) {
+        return new Response(
+          JSON.stringify({
+            issuer: `${apiBaseUrl}/`,
+            authorization_endpoint: `${apiBaseUrl}/mcp/authorize`,
+            token_endpoint: `${apiBaseUrl}/mcp/token`,
+            registration_endpoint: `${apiBaseUrl}/mcp/register`,
+            code_challenge_methods_supported: ["S256"],
+            grant_types_supported: ["authorization_code", "refresh_token"],
+            response_types_supported: ["code"],
+            scopes_supported: ["api:access"],
+            token_endpoint_auth_methods_supported: ["none"],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          client_id: "sigma-dynamic-client",
+          token_endpoint_auth_method: "none",
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const requestUrl = new URL(
+      "https://example.test/_agent-native/connections/oauth/sigma/start",
+    );
+    requestUrl.searchParams.set("appId", "analytics");
+    requestUrl.searchParams.set("scope", "user");
+    requestUrl.searchParams.set("return", "/dashboards?openSigma=1");
+    requestUrl.searchParams.set("baseUrl", apiBaseUrl);
+    const event = {
+      req: new Request(requestUrl),
+      res: { status: 200, headers: new Headers() },
+    } as never;
+
+    const result = await handleWorkspaceProviderOAuthStart(event, "sigma");
+
+    expect(result).toBeInstanceOf(Response);
+    const response = result as Response;
+    const authorizationUrl = new URL(response.headers.get("Location")!);
+    expect(authorizationUrl.origin + authorizationUrl.pathname).toBe(
+      `${apiBaseUrl}/mcp/authorize`,
+    );
+    expect(authorizationUrl.searchParams.get("scope")).toBe("api:access");
+    expect(authorizationUrl.searchParams.get("resource")).toBe(
+      `${apiBaseUrl}/v2`,
+    );
+    expect(authorizationUrl.searchParams.get("code_challenge_method")).toBe(
+      "S256",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sigmaSecretMocks.writeAppSecret).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: "SIGMA_OAUTH_CLIENT_REGISTRATIONS",
+        scope: "user",
+        scopeId: email,
+      }),
+    );
+    const flowCookie = response.headers
+      .getSetCookie()
+      .find((cookie) => cookie.startsWith("an_workspace_oauth_sigma_"));
+    const encryptedFlow = decodeURIComponent(
+      flowCookie!.split(";", 1)[0]!.split("=", 2)[1]!,
+    );
+    expect(JSON.parse(decryptSecretValue(encryptedFlow))).toMatchObject({
+      sigmaApiBaseUrl: apiBaseUrl,
+      sigmaOAuthClientId: "sigma-dynamic-client",
+      sigmaTokenUrl: `${apiBaseUrl}/mcp/token`,
+    });
+  });
+
+  it.each([
+    { registrationStatus: 201, shouldPersist: true },
+    { registrationStatus: 503, shouldPersist: false },
+  ])(
+    "recovers an unreadable Sigma OAuth registration cache only after DCR succeeds ($registrationStatus)",
+    async ({ registrationStatus, shouldPersist }) => {
+      const email = "requester@example.com";
+      const apiBaseUrl = "https://api.eu.aws.sigmacomputing.com";
+      defineAppConfig({ app: { id: "analytics", workspaceId: "analytics" } });
+      vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+      callbackMocks.getSession.mockResolvedValue({ email });
+      callbackMocks.getOrgContext.mockResolvedValue({
+        orgId: "org-1",
+        email,
+        role: "member",
+      });
+      sigmaSecretMocks.readAppSecret.mockResolvedValue(null);
+      sigmaSecretMocks.readAppSecretMeta.mockResolvedValue({
+        key: "SIGMA_OAUTH_CLIENT_REGISTRATIONS",
+        scope: "user",
+        scopeId: email,
+        last4: "",
+        description:
+          "Sigma OAuth client registration for Analytics connections.",
+        urlAllowlist: null,
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/.well-known/oauth-authorization-server") {
+          return sigmaMetadataResponse(apiBaseUrl);
+        }
+        return new Response(
+          JSON.stringify({
+            client_id: "sigma-repaired-client",
+            token_endpoint_auth_method: "none",
+          }),
+          {
+            status: registrationStatus,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      const result = await handleWorkspaceProviderOAuthStart(
+        sigmaStartEvent(apiBaseUrl),
+        "sigma",
+      );
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(sigmaSecretMocks.writeAppSecret).toHaveBeenCalledTimes(
+        shouldPersist ? 1 : 0,
+      );
+      if (shouldPersist) {
+        expect(result).toBeInstanceOf(Response);
+        const savedValue =
+          sigmaSecretMocks.writeAppSecret.mock.calls[0]?.[0]?.value;
+        const savedRegistrations = JSON.parse(savedValue);
+        expect(Object.keys(savedRegistrations)).toHaveLength(1);
+        expect(Object.values(savedRegistrations)).toEqual([
+          expect.objectContaining({
+            clientId: "sigma-repaired-client",
+            tokenEndpointAuthMethod: "none",
+          }),
+        ]);
+      } else {
+        expect(result).toMatchObject({
+          error: "Sigma OAuth client registration failed (503).",
+        });
+      }
+    },
+  );
+
+  it("preserves distinct Sigma OAuth registrations created concurrently for one user", async () => {
+    const email = "requester@example.com";
+    const apiBaseUrls = [
+      "https://aws-api.sigmacomputing.com",
+      "https://api.eu.aws.sigmacomputing.com",
+    ];
+    defineAppConfig({ app: { id: "analytics", workspaceId: "analytics" } });
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+    callbackMocks.getSession.mockResolvedValue({ email });
+    callbackMocks.getOrgContext.mockResolvedValue({
+      orgId: "org-1",
+      email,
+      role: "member",
+    });
+    let savedValue: string | null = null;
+    sigmaSecretMocks.readAppSecret.mockImplementation(async () =>
+      savedValue ? { value: savedValue, last4: "", updatedAt: 1 } : null,
+    );
+    sigmaSecretMocks.readAppSecretMeta.mockImplementation(async () =>
+      savedValue
+        ? {
+            key: "SIGMA_OAUTH_CLIENT_REGISTRATIONS",
+            scope: "user",
+            scopeId: email,
+            last4: "",
+            description:
+              "Sigma OAuth client registration for Analytics connections.",
+            urlAllowlist: null,
+            createdAt: 1,
+            updatedAt: 1,
+          }
+        : null,
+    );
+    sigmaSecretMocks.writeAppSecret.mockImplementation(async ({ value }) => {
+      savedValue = value;
+      return "sigma-client-secret-row";
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      const apiBaseUrl = url.origin;
+      if (url.pathname === "/.well-known/oauth-authorization-server") {
+        return sigmaMetadataResponse(apiBaseUrl);
+      }
+      return new Response(
+        JSON.stringify({
+          client_id: `sigma-client-${url.hostname}`,
+          token_endpoint_auth_method: "none",
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const results = await Promise.all([
+      handleWorkspaceProviderOAuthStart(
+        sigmaStartEvent(apiBaseUrls[0]!),
+        "sigma",
+      ),
+      handleWorkspaceProviderOAuthStart(
+        sigmaStartEvent(apiBaseUrls[1]!),
+        "sigma",
+      ),
+      handleWorkspaceProviderOAuthStart(
+        sigmaStartEvent(apiBaseUrls[0]!),
+        "sigma",
+      ),
+    ]);
+
+    expect(results.every((result) => result instanceof Response)).toBe(true);
+    expect(
+      fetchMock.mock.calls.filter(([input]) =>
+        String(input).endsWith("/mcp/register"),
+      ),
+    ).toHaveLength(2);
+    expect(sigmaSecretMocks.writeAppSecret).toHaveBeenCalledTimes(2);
+    expect(Object.values(JSON.parse(savedValue!))).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          clientId: "sigma-client-aws-api.sigmacomputing.com",
+        }),
+        expect.objectContaining({
+          clientId: "sigma-client-api.eu.aws.sigmacomputing.com",
+        }),
+      ]),
+    );
+  });
+
+  it("keeps Sigma OAuth discovery limited to supported API regions", async () => {
+    defineAppConfig({ app: { id: "analytics", workspaceId: "analytics" } });
+    callbackMocks.getSession.mockResolvedValue({
+      email: "requester@example.com",
+    });
+    callbackMocks.getOrgContext.mockResolvedValue({
+      orgId: "org-1",
+      email: "requester@example.com",
+      role: "member",
+    });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const requestUrl = new URL(
+      "https://example.test/_agent-native/connections/oauth/sigma/start",
+    );
+    requestUrl.searchParams.set("appId", "analytics");
+    requestUrl.searchParams.set("scope", "user");
+    requestUrl.searchParams.set("baseUrl", "https://tenant.sigmacomputing.com");
+    const event = {
+      req: new Request(requestUrl),
+      res: { status: 200, headers: new Headers() },
+    } as never;
+
+    const result = await handleWorkspaceProviderOAuthStart(event, "sigma");
+
+    expect(result).toMatchObject({
+      error: "Choose a supported Sigma API region.",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sigmaSecretMocks.writeAppSecret).not.toHaveBeenCalled();
+  });
+
+  it("rejects a Sigma OAuth app id that differs from the current app", async () => {
+    const email = "requester@example.com";
+    defineAppConfig({ app: { id: "analytics", workspaceId: "analytics" } });
+    callbackMocks.getSession.mockResolvedValue({ email });
+    const requestUrl = new URL(
+      "https://example.test/_agent-native/connections/oauth/sigma/start",
+    );
+    requestUrl.searchParams.set("appId", "dispatch");
+    requestUrl.searchParams.set("scope", "user");
+    const event = {
+      req: new Request(requestUrl),
+      res: { status: 200, headers: new Headers() },
+    } as never;
+
+    const result = await handleWorkspaceProviderOAuthStart(event, "sigma");
+
+    expect(result).toMatchObject({
+      error: "This Sigma OAuth request does not match the current app.",
+    });
+    expect(callbackMocks.getOrgContext).not.toHaveBeenCalled();
+    expect(sigmaSecretMocks.writeAppSecret).not.toHaveBeenCalled();
+  });
+
+  it("limits a personal Sigma OAuth connection to its granting app", async () => {
+    const email = "requester@example.com";
+    const apiBaseUrl = "https://api.eu.aws.sigmacomputing.com";
+    defineAppConfig({ app: { id: "analytics", workspaceId: "analytics" } });
+    const redirectUri =
+      "https://example.test/_agent-native/connections/oauth/sigma/callback";
+    const flow: WorkspaceProviderOAuthFlow = {
+      provider: "sigma",
+      flowId: "sigma-callback-flow-1",
+      verifier: "sigma-verifier-1",
+      redirectUri,
+      owner: email,
+      orgId: "org-1",
+      appId: "analytics",
+      scope: "user",
+      returnUrl: "/dashboards?openSigma=1",
+      sigmaApiBaseUrl: apiBaseUrl,
+      sigmaAuthorizationUrl: `${apiBaseUrl}/mcp/authorize`,
+      sigmaTokenUrl: `${apiBaseUrl}/mcp/token`,
+      sigmaOAuthClientId: "sigma-dynamic-client",
+      sigmaTokenEndpointAuthMethod: "none",
+      expiresAt: Date.now() + 60_000,
+    };
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+    callbackMocks.getSession.mockResolvedValue({ email });
+    callbackMocks.getOrgContext.mockResolvedValue({
+      orgId: "org-1",
+      email,
+      role: "member",
+    });
+    callbackMocks.listWorkspaceConnections.mockResolvedValue([]);
+    callbackMocks.upsertWorkspaceConnection.mockResolvedValue({
+      id: "sigma-connection-1",
+    } as never);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: "sigma-access-token",
+            refresh_token: "sigma-refresh-token",
+            expires_in: 3600,
+            scope: "api:access",
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            userId: "sigma-user-1",
+            organizationId: "sigma-org-1",
+            email,
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const state = encodeOAuthState({
+      redirectUri,
+      owner: email,
+      orgId: "org-1",
+      app: "analytics",
+      scope: "user",
+      provider: "sigma",
+      flowId: flow.flowId,
+    });
+    const callbackUrl = new URL(redirectUri);
+    callbackUrl.searchParams.set("code", "sigma-code");
+    callbackUrl.searchParams.set("state", state);
+    const event = {
+      req: new Request(callbackUrl, {
+        headers: {
+          cookie: `an_workspace_oauth_sigma=${encodeURIComponent(
+            encryptSecretValue(JSON.stringify(flow)),
+          )}`,
+        },
+      }),
+      res: { status: 200, headers: new Headers() },
+    } as never;
+
+    const result = await handleWorkspaceProviderOAuthCallback(event, "sigma");
+
+    expect(result).toBeInstanceOf(Response);
+    const returnUrl = new URL((result as Response).headers.get("Location")!);
+    expect(returnUrl.pathname).toBe("/dashboards");
+    expect(returnUrl.searchParams.get("openSigma")).toBe("1");
+    expect(returnUrl.searchParams.get("sigmaConnectionId")).toBe(
+      "sigma-connection-1",
+    );
+    expect(callbackMocks.upsertWorkspaceConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "sigma",
+        accountId: scopedOAuthAccountId(
+          "sigma",
+          email,
+          "sigma-org-1:sigma-user-1",
+        ),
+        allowedApps: ["analytics"],
+        allowedUsers: [email],
+        config: expect.objectContaining({
+          workspaceConnectionScope: "user",
+        }),
+      }),
+    );
+    expect(callbackMocks.upsertWorkspaceConnectionGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "sigma-connection-1",
+        appId: "analytics",
+        provider: "sigma",
+        config: expect.objectContaining({
+          workspaceConnectionScope: "user",
+        }),
+      }),
+    );
+  });
+
+  it("records the scopes HubSpot granted on a personal connection", async () => {
+    const email = "requester@example.com";
+    defineAppConfig({ app: { id: "crm", workspaceId: "crm" } });
+    const redirectUri =
+      "https://example.test/_agent-native/connections/oauth/hubspot/callback";
+    const flow: WorkspaceProviderOAuthFlow = {
+      provider: "hubspot",
+      flowId: "hubspot-callback-flow-1",
+      verifier: "unused-verifier",
+      redirectUri,
+      owner: email,
+      orgId: "org-1",
+      appId: "crm",
+      scope: "user",
+      expiresAt: Date.now() + 60_000,
+    };
+    const grantedScopes = [
+      "oauth",
+      "crm.objects.contacts.read",
+      "crm.objects.deals.write",
+      "crm.objects.notes.write",
+    ];
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+    resolveSecretMock.mockImplementation(async (key: string) =>
+      key.endsWith("_CLIENT_ID")
+        ? "hubspot-client"
+        : key.endsWith("_CLIENT_SECRET")
+          ? "hubspot-secret"
+          : null,
+    );
+    callbackMocks.getSession.mockResolvedValue({ email });
+    callbackMocks.getOrgContext.mockResolvedValue({
+      orgId: "org-1",
+      email,
+      role: "member",
+    });
+    callbackMocks.listWorkspaceConnections.mockResolvedValue([]);
+    callbackMocks.upsertWorkspaceConnection.mockResolvedValue({
+      id: "hubspot-connection-1",
+    } as never);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            access_token: "hubspot-access-token",
+            refresh_token: "hubspot-refresh-token",
+            expires_in: 1800,
+            hub_id: 12345,
+            user_id: 678,
+            scopes: grantedScopes,
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            hub_id: 12345,
+            user_id: 678,
+            hub_domain: "example.hubspot.com",
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const state = encodeOAuthState({
+      redirectUri,
+      owner: email,
+      orgId: "org-1",
+      app: "crm",
+      scope: "user",
+      provider: "hubspot",
+      flowId: flow.flowId,
+    });
+    const callbackUrl = new URL(redirectUri);
+    callbackUrl.searchParams.set("code", "hubspot-code");
+    callbackUrl.searchParams.set("state", state);
+    const event = {
+      req: new Request(callbackUrl, {
+        headers: {
+          cookie: `an_workspace_oauth_hubspot=${encodeURIComponent(
+            encryptSecretValue(JSON.stringify(flow)),
+          )}`,
+        },
+      }),
+      res: { status: 200, headers: new Headers() },
+    } as never;
+
+    const result = await handleWorkspaceProviderOAuthCallback(event, "hubspot");
+
+    expect(result).toBeInstanceOf(Response);
+    expect(callbackMocks.upsertWorkspaceConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "hubspot",
+        allowedUsers: [email],
+        scopes: grantedScopes,
+      }),
+    );
+    expect(callbackMocks.upsertWorkspaceConnectionGrant).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "hubspot-connection-1",
+        provider: "hubspot",
+        scopes: grantedScopes,
+      }),
+    );
+  });
+
+  it.each([
+    {
+      existingAllowedApps: ["analytics"],
+      expectedAllowedApps: ["analytics", "analytics-secondary"],
+    },
+    { existingAllowedApps: [], expectedAllowedApps: [] },
+  ])(
+    "preserves existing app access when reconnecting the same Sigma identity",
+    async ({ existingAllowedApps, expectedAllowedApps }) => {
+      const email = "requester@example.com";
+      const apiBaseUrl = "https://api.eu.aws.sigmacomputing.com";
+      const accountId = scopedOAuthAccountId(
+        "sigma",
+        email,
+        "sigma-org-1:sigma-user-1",
+      );
+      defineAppConfig({
+        app: { id: "analytics-secondary", workspaceId: "analytics-secondary" },
+      });
+      const redirectUri =
+        "https://example.test/_agent-native/connections/oauth/sigma/callback";
+      const flow: WorkspaceProviderOAuthFlow = {
+        provider: "sigma",
+        flowId: "sigma-callback-flow-secondary-app",
+        verifier: "sigma-verifier-secondary-app",
+        redirectUri,
+        owner: email,
+        orgId: "org-1",
+        appId: "analytics-secondary",
+        scope: "user",
+        sigmaApiBaseUrl: apiBaseUrl,
+        sigmaAuthorizationUrl: `${apiBaseUrl}/mcp/authorize`,
+        sigmaTokenUrl: `${apiBaseUrl}/mcp/token`,
+        sigmaOAuthClientId: "sigma-dynamic-client",
+        sigmaTokenEndpointAuthMethod: "none",
+        expiresAt: Date.now() + 60_000,
+      };
+      vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+      callbackMocks.getSession.mockResolvedValue({ email });
+      callbackMocks.getOrgContext.mockResolvedValue({
+        orgId: "org-1",
+        email,
+        role: "member",
+      });
+      callbackMocks.listWorkspaceConnections.mockResolvedValue([
+        {
+          id: "sigma-connection-existing",
+          provider: "sigma",
+          accountId,
+          allowedUsers: [email],
+          allowedApps: existingAllowedApps,
+          scopes: ["api:access"],
+          config: { credentialMode: "oauth" },
+        },
+      ]);
+      callbackMocks.upsertWorkspaceConnection.mockResolvedValue({
+        id: "sigma-connection-existing",
+      } as never);
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValueOnce(
+            new Response(
+              JSON.stringify({
+                access_token: "sigma-access-token",
+                refresh_token: "sigma-refresh-token",
+                expires_in: 3600,
+                scope: "api:access",
+              }),
+              { status: 200 },
+            ),
+          )
+          .mockResolvedValueOnce(
+            new Response(
+              JSON.stringify({
+                userId: "sigma-user-1",
+                organizationId: "sigma-org-1",
+                email,
+              }),
+              { status: 200 },
+            ),
+          ),
+      );
+      const state = encodeOAuthState({
+        redirectUri,
+        owner: email,
+        orgId: "org-1",
+        app: "analytics-secondary",
+        scope: "user",
+        provider: "sigma",
+        flowId: flow.flowId,
+      });
+      const callbackUrl = new URL(redirectUri);
+      callbackUrl.searchParams.set("code", "sigma-code");
+      callbackUrl.searchParams.set("state", state);
+      const event = {
+        req: new Request(callbackUrl, {
+          headers: {
+            cookie: `an_workspace_oauth_sigma=${encodeURIComponent(
+              encryptSecretValue(JSON.stringify(flow)),
+            )}`,
+          },
+        }),
+        res: { status: 200, headers: new Headers() },
+      } as never;
+
+      await handleWorkspaceProviderOAuthCallback(event, "sigma");
+
+      expect(callbackMocks.upsertWorkspaceConnection).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "sigma-connection-existing",
+          accountId,
+          allowedApps: expectedAllowedApps,
+          allowedUsers: [email],
+        }),
+      );
+      expect(callbackMocks.upsertWorkspaceConnectionGrant).toHaveBeenCalledWith(
+        expect.objectContaining({
+          connectionId: "sigma-connection-existing",
+          appId: "analytics-secondary",
+          provider: "sigma",
+        }),
+      );
+    },
+  );
+
+  it("rejects a Sigma OAuth callback bound to another app", async () => {
+    const email = "requester@example.com";
+    const redirectUri =
+      "https://example.test/_agent-native/connections/oauth/sigma/callback";
+    defineAppConfig({ app: { id: "analytics", workspaceId: "analytics" } });
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+    callbackMocks.getSession.mockResolvedValue({ email });
+    const flow: WorkspaceProviderOAuthFlow = {
+      provider: "sigma",
+      flowId: "sigma-callback-flow-2",
+      verifier: "sigma-verifier-2",
+      redirectUri,
+      owner: email,
+      orgId: "org-1",
+      appId: "dispatch",
+      scope: "user",
+      sigmaApiBaseUrl: "https://api.eu.aws.sigmacomputing.com",
+      sigmaAuthorizationUrl:
+        "https://api.eu.aws.sigmacomputing.com/mcp/authorize",
+      sigmaTokenUrl: "https://api.eu.aws.sigmacomputing.com/mcp/token",
+      sigmaOAuthClientId: "sigma-dynamic-client",
+      sigmaTokenEndpointAuthMethod: "none",
+      expiresAt: Date.now() + 60_000,
+    };
+    const state = encodeOAuthState({
+      redirectUri,
+      owner: email,
+      orgId: "org-1",
+      app: "dispatch",
+      scope: "user",
+      provider: "sigma",
+      flowId: flow.flowId,
+    });
+    const callbackUrl = new URL(redirectUri);
+    callbackUrl.searchParams.set("code", "sigma-code");
+    callbackUrl.searchParams.set("state", state);
+    const event = {
+      req: new Request(callbackUrl, {
+        headers: {
+          cookie: `an_workspace_oauth_sigma=${encodeURIComponent(
+            encryptSecretValue(JSON.stringify(flow)),
+          )}`,
+        },
+      }),
+      res: { status: 200, headers: new Headers() },
+    } as never;
+
+    const result = await handleWorkspaceProviderOAuthCallback(event, "sigma");
+
+    expect(result).toMatchObject({
+      error: "This Sigma OAuth request does not match the current app.",
+    });
+    expect(callbackMocks.getOrgContext).not.toHaveBeenCalled();
+    expect(callbackMocks.upsertWorkspaceConnection).not.toHaveBeenCalled();
   });
 
   it("keeps portal and site OAuth token keys owner-scoped", () => {
@@ -385,6 +1375,37 @@ describe("workspace provider OAuth", () => {
     expect(url.searchParams.has("code_challenge")).toBe(false);
   });
 
+  it("lets the HubSpot app's own configuration decide the granted scopes", () => {
+    const provider = getWorkspaceConnectionProvider("hubspot")!;
+    const url = new URL(
+      buildWorkspaceProviderAuthorizationUrl({
+        provider,
+        clientId: "hubspot-client",
+        redirectUri:
+          "https://app.example.com/_agent-native/connections/oauth/hubspot/callback",
+        state: "signed-state",
+        challenge: "unused-challenge",
+      }),
+    );
+
+    expect(url.origin + url.pathname).toBe(
+      "https://app.hubspot.com/oauth/authorize",
+    );
+    expect(url.searchParams.has("scope")).toBe(false);
+  });
+
+  it("reads granted scopes from a scope string or a scopes array", () => {
+    expect(tokenScopes({ scope: "api refresh_token" }, ["fallback"])).toEqual([
+      "api",
+      "refresh_token",
+    ]);
+    expect(
+      tokenScopes({ scopes: ["oauth", "crm.objects.deals.write", 7] }, []),
+    ).toEqual(["oauth", "crm.objects.deals.write"]);
+    expect(tokenScopes({ scopes: [] }, ["fallback"])).toEqual(["fallback"]);
+    expect(tokenScopes({}, [])).toEqual([]);
+  });
+
   it("builds a GitHub authorization request from shared catalog metadata", () => {
     const provider = getWorkspaceConnectionProvider("github")!;
     const url = new URL(
@@ -549,6 +1570,257 @@ describe("workspace provider OAuth", () => {
       "https://www.googleapis.com/auth/drive.file",
     ]);
   });
+
+  it.each([
+    ["https://www.googleapis.com/auth/gmail.modify"],
+    ["openid", "email", "https://www.googleapis.com/auth/gmail.modify"],
+  ])(
+    "requests the Gmail API and required identity scopes, preserving earlier grants (%j)",
+    async (...requestedScopes) => {
+      const email = "requester@example.com";
+      const optionalScopes = [
+        "https://www.googleapis.com/auth/contacts.readonly",
+      ];
+      vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+      resolveSecretMock.mockResolvedValue("test-only-oauth-client-value");
+      callbackMocks.getSession.mockResolvedValue({ email });
+      callbackMocks.getOrgContext.mockResolvedValue({
+        orgId: "org-1",
+        email,
+        role: "owner",
+      });
+      const requestUrl = new URL(
+        "https://example.test/_agent-native/connections/oauth/gmail/start",
+      );
+      requestUrl.searchParams.set("appId", "mail-test-app");
+      requestUrl.searchParams.set("scope", "app");
+      requestUrl.searchParams.set("requestedScopes", requestedScopes.join(" "));
+      requestUrl.searchParams.set("optionalScopes", optionalScopes.join(" "));
+      const event = {
+        req: new Request(requestUrl),
+        res: { status: 200, headers: new Headers() },
+      } as never;
+
+      const result = await handleWorkspaceProviderOAuthStart(event, "gmail");
+
+      expect(result).toBeInstanceOf(Response);
+      const response = result as Response;
+      const authorizationUrl = new URL(response.headers.get("Location")!);
+      expect(authorizationUrl.searchParams.get("include_granted_scopes")).toBe(
+        "true",
+      );
+      expect(authorizationUrl.searchParams.get("scope")?.split(" ")).toEqual([
+        ...new Set(["openid", "email", ...requestedScopes, ...optionalScopes]),
+      ]);
+      const flowCookie = response.headers
+        .getSetCookie()
+        .find((cookie) => cookie.startsWith("an_workspace_oauth_gmail_"));
+      expect(flowCookie).toBeDefined();
+      const secondEvent = {
+        req: new Request(requestUrl),
+        res: { status: 200, headers: new Headers() },
+      } as never;
+      const secondResult = await handleWorkspaceProviderOAuthStart(
+        secondEvent,
+        "gmail",
+      );
+      const secondCookie = (secondResult as Response).headers
+        .getSetCookie()
+        .find((cookie) => cookie.startsWith("an_workspace_oauth_gmail_"));
+      expect(secondCookie?.split("=", 1)[0]).not.toBe(
+        flowCookie!.split("=", 1)[0],
+      );
+      const encryptedFlow = decodeURIComponent(
+        flowCookie!.split(";", 1)[0]!.split("=", 2)[1]!,
+      );
+      expect(JSON.parse(decryptSecretValue(encryptedFlow))).toMatchObject({
+        requestedScopes,
+        optionalScopes,
+      });
+    },
+  );
+
+  it.each([
+    "openid https://www.googleapis.com/auth/calendar.readonly",
+    "openid openid",
+  ])(
+    "rejects an unsupported or repeated requested scope: %s",
+    async (scopes) => {
+      const email = "requester@example.com";
+      callbackMocks.getSession.mockResolvedValue({ email });
+      callbackMocks.getOrgContext.mockResolvedValue({
+        orgId: "org-1",
+        email,
+        role: "owner",
+      });
+      const requestUrl = new URL(
+        "https://example.test/_agent-native/connections/oauth/gmail/start",
+      );
+      requestUrl.searchParams.set("appId", "mail-test-app");
+      requestUrl.searchParams.set("scope", "app");
+      requestUrl.searchParams.set("requestedScopes", scopes);
+      const event = {
+        req: new Request(requestUrl),
+        res: { status: 200, headers: new Headers() },
+      } as never;
+
+      const result = await handleWorkspaceProviderOAuthStart(event, "gmail");
+
+      expect(result).toMatchObject({
+        error: "Requested OAuth scopes are invalid or unsupported.",
+      });
+      expect(resolveSecretMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a stored flow whose requested scopes no longer match the catalog", async () => {
+    const email = "requester@example.com";
+    const flow = {
+      provider: "gmail",
+      flowId: "gmail-flow-invalid-scopes",
+      verifier: "gmail-verifier",
+      redirectUri: "https://example.test/_agent-native/google/callback",
+      owner: email,
+      orgId: "org-1",
+      appId: "mail-test-app",
+      scope: "app",
+      requestedScopes: ["https://www.googleapis.com/auth/calendar.readonly"],
+      expiresAt: Date.now() + 60_000,
+    } satisfies WorkspaceProviderOAuthFlow;
+    vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+    callbackMocks.getSession.mockResolvedValue({ email });
+    const callbackUrl = new URL(flow.redirectUri);
+    callbackUrl.searchParams.set("code", "test-code");
+    callbackUrl.searchParams.set(
+      "state",
+      encodeOAuthState({
+        redirectUri: flow.redirectUri,
+        owner: email,
+        orgId: flow.orgId,
+        app: flow.appId,
+        scope: flow.scope,
+        provider: "gmail",
+        flowId: flow.flowId,
+      }),
+    );
+    const event = {
+      req: new Request(callbackUrl, {
+        headers: {
+          cookie: `an_workspace_oauth_gmail_${flow.flowId}=${encodeURIComponent(
+            encryptSecretValue(JSON.stringify(flow)),
+          )}`,
+        },
+      }),
+      res: { status: 200, headers: new Headers() },
+    } as never;
+
+    const result = await handleWorkspaceProviderOAuthCallback(event, "gmail");
+
+    expect(result).toMatchObject({
+      error: "OAuth flow cookie has invalid requested scopes.",
+    });
+    expect(callbackMocks.getOrgContext).not.toHaveBeenCalled();
+  });
+
+  // oracle-change: RFC 6749 omission confirms the requested grant and does not establish revocation of earlier account access.
+  it.each([[], ["https://www.googleapis.com/auth/calendar.readonly"]])(
+    "retains requested and earlier grants when Google omits token scope (%j)",
+    async (...previousScopes) => {
+      const email = "requester@example.com";
+      const redirectUri = "https://example.test/_agent-native/google/callback";
+      const requestedScopes = [
+        "openid",
+        "email",
+        "https://www.googleapis.com/auth/gmail.modify",
+      ];
+      const flow: WorkspaceProviderOAuthFlow = {
+        provider: "gmail",
+        flowId: "gmail-flow-scope-fallback",
+        verifier: "gmail-verifier",
+        redirectUri,
+        owner: email,
+        orgId: "org-1",
+        appId: "mail-test-app",
+        scope: "user",
+        requestedScopes,
+        expiresAt: Date.now() + 60_000,
+      };
+      vi.stubEnv("BETTER_AUTH_SECRET", "test-only-oauth-secret");
+      resolveSecretMock.mockResolvedValue("test-only-oauth-client-value");
+      callbackMocks.getSession.mockResolvedValue({ email });
+      callbackMocks.getOrgContext.mockResolvedValue({
+        orgId: "org-1",
+        email,
+        role: "owner",
+      });
+      callbackMocks.listWorkspaceConnections.mockResolvedValue([]);
+      callbackMocks.getOAuthTokens.mockResolvedValue({
+        scope: previousScopes.join(" "),
+      });
+      callbackMocks.upsertWorkspaceConnection.mockResolvedValue({
+        id: "gmail-connection-1",
+      } as never);
+      const fetchMock = vi
+        .fn()
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              access_token: "gmail-access-token",
+              refresh_token: "gmail-refresh-token",
+              expires_in: 3600,
+            }),
+            { status: 200 },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ email }), { status: 200 }),
+        );
+      vi.stubGlobal("fetch", fetchMock);
+      const state = encodeOAuthState({
+        redirectUri,
+        owner: email,
+        orgId: "org-1",
+        app: "mail-test-app",
+        scope: "user",
+        provider: "gmail",
+        flowId: flow.flowId,
+      });
+      const callbackUrl = new URL(redirectUri);
+      callbackUrl.searchParams.set("code", "gmail-code");
+      callbackUrl.searchParams.set("state", state);
+      const event = {
+        req: new Request(callbackUrl, {
+          headers: {
+            cookie: `an_workspace_oauth_gmail=${encodeURIComponent(
+              encryptSecretValue(JSON.stringify(flow)),
+            )}`,
+          },
+        }),
+        res: { status: 200, headers: new Headers() },
+      } as never;
+
+      await handleWorkspaceProviderOAuthCallback(event, "gmail");
+
+      const [connection] =
+        callbackMocks.upsertWorkspaceConnection.mock.calls[0]!;
+      expect(connection.scopes).toEqual(requestedScopes);
+      expect(connection.status).toBe("connected");
+      expect(callbackMocks.getOAuthTokens).toHaveBeenCalledWith(
+        "google",
+        email,
+        email,
+      );
+      expect(callbackMocks.listWorkspaceConnections).toHaveBeenCalledTimes(1);
+      expect(callbackMocks.saveOAuthTokens).toHaveBeenCalledWith(
+        "google",
+        email,
+        expect.objectContaining({
+          scope: [...requestedScopes, ...previousScopes].join(" "),
+        }),
+        email,
+      );
+    },
+  );
 
   it("keeps the Google account chooser and preselects the signed-in identity", () => {
     const provider = getWorkspaceConnectionProvider("google_calendar")!;

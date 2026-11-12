@@ -1,4 +1,4 @@
-import { appBasePath } from "@agent-native/core/client/api-path";
+import { appApiPath } from "@agent-native/core/client/api-path";
 import { callAction } from "@agent-native/core/client/hooks";
 import { waitForAcceptedRecordingAfterFinalizeError } from "@shared/finalize-recovery";
 import {
@@ -36,6 +36,7 @@ export type LocalUploadFailureCode =
   | "copy_kept"
   | "still_processing"
   | "storage_setup_required"
+  | "hosted_storage_unavailable"
   | "session_expired"
   | "recording_too_large"
   | "network"
@@ -58,6 +59,7 @@ const SERVER_FAILURE_CODE: Record<LocalUploadFailureCode, string> = {
   copy_kept: "upload_failed",
   still_processing: "upload_failed",
   storage_setup_required: "storage_setup_required",
+  hosted_storage_unavailable: "hosted_storage_unavailable",
   session_expired: "upload_interrupted",
   recording_too_large: "recording_too_large",
   network: "upload_interrupted",
@@ -93,6 +95,9 @@ export function classifyLocalUploadFailure(input: {
   const message = input.message ?? "";
   if (input.networkError) return "network";
   if (input.errorCode === RECORDING_OWNER_MISMATCH) return "owner_mismatch";
+  if (input.errorCode === "hosted_storage_unavailable") {
+    return "hosted_storage_unavailable";
+  }
   if (
     input.errorCode === "builder_oauth_reauthorization_required" ||
     input.errorCode === "builder_credentials_rejected" ||
@@ -590,7 +595,9 @@ async function createAndUpload(
       "Clips did not return an upload target.",
     );
   }
-  const abortUrl = `${appBasePath()}${target.abortUrl ?? `/api/uploads/${serverId}/abort`}`;
+  const abortUrl = appApiPath(
+    target.abortUrl ?? `/api/uploads/${serverId}/abort`,
+  );
   const withAbortUrl = (error: unknown) =>
     Object.assign(error as object, { abortUrl });
 
@@ -611,7 +618,7 @@ async function createAndUpload(
     // coercion-ok: the thumbnail sweeper fills in a missing poster later.
   });
 
-  const base = `${appBasePath()}${target.uploadChunkUrl}`;
+  const base = appApiPath(target.uploadChunkUrl);
   const total = Math.max(1, Math.ceil(blob.size / UPLOAD_SLICE_BYTES));
   let finalBody: Record<string, unknown> | null = null;
   try {
@@ -744,6 +751,7 @@ async function postChunkWithRetry(
         status: response.status,
         message,
         isHtml: classified.isHtml,
+        errorCode: classified.errorCode,
       });
       failure = new LocalRecordingUploadError(
         // A finalize that already marked the row failed is terminal; resending

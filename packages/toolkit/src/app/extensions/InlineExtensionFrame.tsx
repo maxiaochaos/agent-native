@@ -1,4 +1,3 @@
-import { sendToAgentChat } from "@agent-native/core/client/agent-chat";
 import { agentNativePath } from "@agent-native/core/client/api-path";
 import { getBrowserTabId } from "@agent-native/core/client/hooks";
 import { SESSION_REPLAY_IFRAME_ATTRIBUTE } from "@agent-native/core/client/host";
@@ -7,6 +6,10 @@ import { getThemeVars } from "@agent-native/core/extensions/theme";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  extensionFrameNameWithLinkNonce,
+  useExternalExtensionLinks,
+} from "./extension-links.js";
+import {
   isAllowedExtensionPath,
   sanitizeExtensionRequestOptions,
   checkBridgePolicy,
@@ -14,7 +17,13 @@ import {
   type ExtensionBridgeRole,
 } from "./iframe-bridge.js";
 import { useExtensionIframeMetaCsp } from "./iframe-display-sources.js";
+import {
+  EXTENSION_OPEN_URL_MESSAGE,
+  useExtensionFrameKey,
+  useOpenUrlLatch,
+} from "./open-extension-link.js";
 import { normalizeAgentNativeExtensionSandbox } from "./portable-extension.js";
+import { useExtensionChatSubmission } from "./use-extension-chat-submission.js";
 
 const THEME_CSS_VARS = [
   "--background",
@@ -47,8 +56,10 @@ const THEME_CSS_VARS = [
   "--sidebar-ring",
 ];
 
-const EXTENSION_IFRAME_SANDBOX =
-  normalizeAgentNativeExtensionSandbox(undefined);
+const EXTENSION_IFRAME_SANDBOX = normalizeAgentNativeExtensionSandbox(
+  undefined,
+  { mode: "nonce" },
+);
 
 interface InlineExtensionSource {
   mode?: "database" | "local-files";
@@ -302,6 +313,7 @@ function buildTransientSrcDoc(
   extension: InlineExtensionDefinition,
   isDark: boolean,
   metaCsp: string,
+  linkNonce: string,
 ): string {
   return buildExtensionHtml(
     extension.content ?? "",
@@ -315,6 +327,7 @@ function buildTransientSrcDoc(
       role: "owner",
     },
     metaCsp,
+    linkNonce,
   );
 }
 
@@ -328,6 +341,7 @@ export function InlineExtensionFrame({
 }: InlineExtensionFrameProps) {
   const providedId = providedExtension?.id ?? extensionId ?? "";
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const extensionChat = useExtensionChatSubmission();
   const [height, setHeight] = useState<number>(initialHeight);
   const [isDark, setIsDark] = useState(() =>
     typeof document === "undefined"
@@ -339,6 +353,7 @@ export function InlineExtensionFrame({
     isAuthor: !!providedExtension?.content,
   });
   const bindingLatchedRef = useRef(false);
+  const openUrl = useOpenUrlLatch();
   const [fetchedExtension, setFetchedExtension] =
     useState<InlineExtensionDefinition | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -390,6 +405,11 @@ export function InlineExtensionFrame({
   const isTransient =
     extension?.mode === "transient" ||
     (!!extension?.content && !extensionId && extension?.mode !== "persisted");
+  const iframeKey = `${resolvedId}-${extension?.updatedAt ?? "inline"}-${isTransient ? "transient" : "persisted"}`;
+  const linkNonce = useExternalExtensionLinks(
+    iframeRef,
+    `${iframeKey}:${Boolean(extension)}`,
+  );
 
   const initialDarkRef = useRef(isDark);
   const iframeSrc = useMemo(() => {
@@ -404,13 +424,20 @@ export function InlineExtensionFrame({
   // img-src / media-src from the server and wait for it before rendering.
   const iframeMetaCsp = useExtensionIframeMetaCsp(!!extension && isTransient);
   const srcDoc = useMemo(() => {
-    if (!extension || !isTransient || !iframeMetaCsp) return undefined;
+    if (!extension || !isTransient || !iframeMetaCsp || !linkNonce) {
+      return undefined;
+    }
     return buildTransientSrcDoc(
       extension,
       initialDarkRef.current,
       iframeMetaCsp,
+      linkNonce,
     );
-  }, [extension, iframeMetaCsp, isTransient]);
+  }, [extension, iframeMetaCsp, isTransient, linkNonce]);
+
+  const frameKey = useExtensionFrameKey(
+    `${resolvedId}|${extension?.updatedAt ?? "inline"}|${isTransient}|${iframeSrc ?? ""}|${srcDoc ?? ""}`,
+  );
 
   useEffect(() => {
     bridgeContextRef.current = isTransient
@@ -466,6 +493,7 @@ export function InlineExtensionFrame({
       if (!message || typeof message !== "object") return;
 
       if (message.type === "agent-native-extension-binding") {
+        openUrl.latch(message, event.source);
         if (bindingLatchedRef.current) return;
         bindingLatchedRef.current = true;
         const binding = (message as any).binding ?? {};
@@ -506,21 +534,31 @@ export function InlineExtensionFrame({
         return;
       }
 
+      if (message.type === EXTENSION_OPEN_URL_MESSAGE) {
+        openUrl.open(message);
+        return;
+      }
+
       if (message.type === "agent-native-send-to-chat") {
-        const text = serializeChatValue((message as any).message);
+        const chatMessage = message as Record<string, unknown>;
+        const text = serializeChatValue(chatMessage.message);
         if (!text?.trim()) return;
-        const submit = (message as any).submit === true;
-        if (isTransient && submit) {
-          if (hasSubmittedRef.current) return;
-          hasSubmittedRef.current = true;
-          setHasSubmitted(true);
-        }
-        sendToAgentChat({
-          message: text,
-          context: serializeChatValue((message as any).context),
-          submit: (message as any).submit === true,
-          openSidebar: (message as any).openSidebar !== false,
-        });
+        const submit = chatMessage.submit === true;
+        if (isTransient && submit && hasSubmittedRef.current) return;
+        extensionChat.send(
+          {
+            message: text,
+            context: serializeChatValue(chatMessage.context),
+            submit,
+            openSidebar: chatMessage.openSidebar !== false,
+          },
+          () => {
+            if (isTransient) {
+              hasSubmittedRef.current = true;
+              setHasSubmitted(true);
+            }
+          },
+        );
         return;
       }
 
@@ -545,7 +583,7 @@ export function InlineExtensionFrame({
         const errors: string[] = Array.isArray((message as any).errors)
           ? (message as any).errors
           : [];
-        sendToAgentChat({
+        extensionChat.send({
           message: `Fix runtime errors in the inline extension "${extension?.name ?? resolvedId}".\n\nErrors:\n${errors.join("\n")}`,
           context: [
             `The user is viewing an inline generated extension named "${extension?.name ?? resolvedId}".`,
@@ -655,7 +693,7 @@ export function InlineExtensionFrame({
 
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);
-  }, [extension, isTransient, resolvedId]);
+  }, [extension, isTransient, openUrl, resolvedId]);
 
   if (!extension) {
     if (!isLoading) return null;
@@ -673,9 +711,14 @@ export function InlineExtensionFrame({
       <iframe
         {...{ [SESSION_REPLAY_IFRAME_ATTRIBUTE]: "" }}
         ref={iframeRef}
-        key={`${resolvedId}-${extension.updatedAt ?? "inline"}-${isTransient ? "transient" : "persisted"}`}
-        src={iframeSrc}
-        srcDoc={srcDoc}
+        key={`${resolvedId}-${extension.updatedAt ?? "inline"}-${isTransient ? "transient" : "persisted"}-${frameKey}-${linkNonce ?? "no-link-nonce"}`}
+        name={
+          !isTransient && iframeSrc && linkNonce
+            ? extensionFrameNameWithLinkNonce(linkNonce)
+            : undefined
+        }
+        src={!isTransient && iframeSrc && linkNonce ? iframeSrc : undefined}
+        srcDoc={linkNonce ? srcDoc : undefined}
         title={extension.name}
         sandbox={EXTENSION_IFRAME_SANDBOX}
         aria-disabled={isTransient && hasSubmitted ? true : undefined}
@@ -688,10 +731,12 @@ export function InlineExtensionFrame({
           pointerEvents: isTransient && hasSubmitted ? "none" : undefined,
         }}
         onLoad={() => {
+          extensionChat.cancel();
           sendThemeToIframe();
           sendContextToIframe();
         }}
       />
+      {extensionChat.confirmation}
     </div>
   );
 }

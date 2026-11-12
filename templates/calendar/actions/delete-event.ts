@@ -11,13 +11,13 @@ import {
   cliBoolean,
   googleEventResultId,
   normalizeWritableGoogleEventId,
-  rawCliBoolean,
   requireActionUserEmail,
   resolveGoogleEventAccountEmail,
   resolveOwnedAccountEmail,
 } from "./event-action-helpers.js";
 
 export default defineAction({
+  searchHints: ["cancel a meeting", "remove a meeting"],
   description:
     "Delete or remove ONE Google Calendar event. For recurring events, choose just this instance, all events in the series, or this and following events. For more than one event — any 'remove all …' / 'clear …' request — use delete-events instead; never call this in a loop.",
   schema: z.object({
@@ -53,8 +53,7 @@ export default defineAction({
   }),
   toolCallable: false,
   needsApproval: ({ sendUpdates, notificationMessage, removeOnly }) =>
-    !rawCliBoolean(removeOnly) &&
-    (sendUpdates === "all" || !!notificationMessage?.trim()),
+    !removeOnly && (sendUpdates === "all" || !!notificationMessage?.trim()),
   run: async (args) => {
     const ownerEmail = requireActionUserEmail();
     if (!(await googleCalendar.isConnected(ownerEmail))) {

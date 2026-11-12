@@ -1,52 +1,8 @@
-import { CONTEXT_XRAY_MIGRATIONS } from "../agent/context-xray/migrations.js";
-import {
-  AGENT_HARNESS_SESSION_MIGRATIONS,
-  AGENT_HARNESS_SESSION_MIGRATIONS_TABLE,
-} from "../agent/harness/migrations.js";
-import { OBSERVATIONAL_MEMORY_MIGRATIONS } from "../agent/observational-memory/migrations.js";
-import {
-  AGENT_RUN_MIGRATIONS,
-  AGENT_RUN_MIGRATIONS_TABLE,
-} from "../agent/run-migrations.js";
-import {
-  AGENT_TOOL_APPROVAL_MIGRATIONS,
-  AGENT_TOOL_APPROVAL_MIGRATIONS_TABLE,
-} from "../agent/tool-approval-migrations.js";
 import { getAppConfig } from "../app-config/index.js";
-import {
-  CHAT_THREAD_SCHEMA_MIGRATIONS,
-  CHAT_THREAD_SCHEMA_MIGRATIONS_TABLE,
-} from "../chat-threads/schema-migrations.js";
 import { getDatabaseUrl } from "../db/client.js";
-import { runMigrations } from "../db/migrations.js";
-import {
-  REMOTE_DEVICE_MIGRATIONS,
-  REMOTE_DEVICE_MIGRATIONS_TABLE,
-} from "../integrations/remote-device-migrations.js";
-import { runAutomationRunMigrations } from "../jobs/run-history.js";
-import { runAutomationSchedulerHealthMigrations } from "../jobs/scheduler-health.js";
-import {
-  OAUTH_TOKEN_MIGRATIONS,
-  OAUTH_TOKEN_MIGRATIONS_TABLE,
-} from "../oauth-tokens/migrations.js";
-import {
-  OBSERVABILITY_MIGRATIONS,
-  OBSERVABILITY_MIGRATIONS_TABLE,
-} from "../observability/migrations.js";
-import { ORG_MIGRATIONS } from "../org/migrations.js";
+import { withStoreMigrationLock } from "../db/store-registry.js";
 import { ensureSharingAccessIndexes } from "../sharing/indexes.js";
-import { runAutomationTriggerEventMigrations } from "../triggers/event-queue.js";
-import {
-  USAGE_ALERT_MIGRATIONS,
-  USAGE_ALERT_MIGRATIONS_TABLE,
-} from "../usage/migrations.js";
-import {
-  WORKSPACE_CONNECTIONS_MIGRATIONS,
-  WORKSPACE_CONNECTIONS_MIGRATIONS_TABLE,
-} from "../workspace-connections/migrations.js";
-import { runBetterAuthMigrations } from "./better-auth-migrations.js";
 import { recordDatabaseIdentity } from "./database-identity.js";
-import { IDENTITY_SSO_MIGRATIONS } from "./identity-sso-migrations.js";
 import { runFrameworkSchemaEnsures } from "./release-schema.js";
 
 /**
@@ -56,20 +12,27 @@ import { runFrameworkSchemaEnsures } from "./release-schema.js";
  * still reports success — `Applied migration ...` lines, a zero exit, a
  * published deploy — so this has to fail here or it fails silently forever.
  *
- * Scoped to `CONTEXT=production` on purpose. The beta lane deliberately builds
+ * Explicit production commands always require a PostgreSQL target. Other callers
+ * are scoped to `CONTEXT=production`: the beta lane deliberately builds
  * with `AGENT_NATIVE_RUN_RELEASE_MIGRATIONS=1` under a branch-deploy context
  * against masked site secrets, and its database is migrated by the beta
  * publish step — so keying off that flag would fail every beta deploy while
  * never guarding the production one this exists for.
  */
-function assertReleaseMigrationTargetsRemoteDatabase(): void {
-  if (getAppConfig().migration.deployContext !== "production") return;
+function assertReleaseMigrationTargetsRemoteDatabase(
+  requirePostgres: boolean,
+): void {
+  if (
+    !requirePostgres &&
+    getAppConfig().migration.deployContext !== "production"
+  )
+    return;
   const url = getDatabaseUrl();
   // `isLocalDatabase()` alone is not enough. Netlify hands the CLI a MASKED
   // secret ("****************uire") outside its own build infra, and that is
   // neither empty nor a local URL — so it reads as "not local" while being
   // unconnectable. Require a real remote scheme too.
-  if (url.includes("://")) return;
+  if (/^postgres(?:ql)?:\/\//i.test(url)) return;
   throw new Error(
     `Release migrations resolved to an unusable database (${describeReleaseMigrationUrl(url)}). ` +
       "In a production deploy the schema must be applied to the same remote " +
@@ -89,57 +52,56 @@ function describeReleaseMigrationUrl(url: string): string {
   return scheme ? `${scheme} url` : "no scheme — likely a masked secret";
 }
 
+function shouldLogReleaseTiming(): boolean {
+  return (
+    typeof process !== "undefined" &&
+    typeof process.uptime === "function" &&
+    process.env.VITEST !== "true" &&
+    process.env.VITEST !== "1"
+  );
+}
+
 export async function runFrameworkReleaseMigrations(
-  nitroApp: unknown,
+  _nitroApp?: unknown,
+  options: { requirePostgres?: boolean } = {},
 ): Promise<void> {
-  assertReleaseMigrationTargetsRemoteDatabase();
-  // First: the versioned migration lists below only cover the tables that have
-  // one. Most framework tables are defined by their store's `ensureTable()`,
-  // which production serverless can never run — see `./release-schema.ts`.
-  await runFrameworkSchemaEnsures();
-  await recordDatabaseIdentity();
-  await runBetterAuthMigrations(nitroApp);
-  await runMigrations(AGENT_TOOL_APPROVAL_MIGRATIONS, {
-    table: AGENT_TOOL_APPROVAL_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(OAUTH_TOKEN_MIGRATIONS, {
-    table: OAUTH_TOKEN_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(CHAT_THREAD_SCHEMA_MIGRATIONS, {
-    table: CHAT_THREAD_SCHEMA_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(OBSERVABILITY_MIGRATIONS, {
-    table: OBSERVABILITY_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(AGENT_RUN_MIGRATIONS, {
-    table: AGENT_RUN_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(AGENT_HARNESS_SESSION_MIGRATIONS, {
-    table: AGENT_HARNESS_SESSION_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(USAGE_ALERT_MIGRATIONS, {
-    table: USAGE_ALERT_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(ORG_MIGRATIONS, { table: "_org_migrations" })(nitroApp);
-  await runMigrations(REMOTE_DEVICE_MIGRATIONS, {
-    table: REMOTE_DEVICE_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runMigrations(IDENTITY_SSO_MIGRATIONS, {
-    table: "_identity_sso_migrations",
-  })(nitroApp);
-  await runMigrations(CONTEXT_XRAY_MIGRATIONS, {
-    table: "_context_xray_migrations",
-  })(nitroApp);
-  await runMigrations(OBSERVATIONAL_MEMORY_MIGRATIONS, {
-    table: "_observational_memory_migrations",
-  })(nitroApp);
-  await runMigrations(WORKSPACE_CONNECTIONS_MIGRATIONS, {
-    table: WORKSPACE_CONNECTIONS_MIGRATIONS_TABLE,
-  })(nitroApp);
-  await runAutomationRunMigrations(nitroApp);
-  await runAutomationTriggerEventMigrations(nitroApp);
-  await runAutomationSchedulerHealthMigrations(nitroApp);
-  // Last, so the framework's own share and owner tables exist. An app's tables
-  // are indexed by the release after the one that creates them.
-  await ensureSharingAccessIndexes();
+  const logTiming = shouldLogReleaseTiming();
+  const startedAt = Date.now();
+  if (logTiming) {
+    console.log(
+      `[db] Migration runtime ready ${Math.round(process.uptime() * 1_000)}ms after process start`,
+    );
+  }
+  let lockWaitMs: number | undefined;
+  try {
+    assertReleaseMigrationTargetsRemoteDatabase(
+      options.requirePostgres === true,
+    );
+    // One lease for the whole release, so two deploys against one database
+    // never interleave.
+    await withStoreMigrationLock(async () => {
+      lockWaitMs = Date.now() - startedAt;
+      await runFrameworkSchemaEnsures();
+      await recordDatabaseIdentity();
+      // Last, so the framework's own share and owner tables exist. An app's tables
+      // are indexed by the release after the one that creates them.
+      await ensureSharingAccessIndexes();
+    });
+  } catch (err) {
+    if (logTiming) {
+      const lockWait =
+        lockWaitMs === undefined
+          ? "lock not acquired"
+          : `lock wait ${lockWaitMs}ms`;
+      console.log(
+        `[db] Framework release migrations failed after ${Date.now() - startedAt}ms (${lockWait})`,
+      );
+    }
+    throw err;
+  }
+  if (logTiming) {
+    console.log(
+      `[db] Framework release migrations finished in ${Date.now() - startedAt}ms (lock wait ${lockWaitMs}ms)`,
+    );
+  }
 }

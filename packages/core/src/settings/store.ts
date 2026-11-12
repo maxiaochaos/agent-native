@@ -2,14 +2,12 @@ import type { EventEmitter } from "node:events";
 
 import { getDbExec, type DbExec } from "../db/client.js";
 import { ensureIndexExists, ensureTableExists } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
 import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import { captureError } from "../server/capture-error.js";
 import { getRequestContext } from "../server/request-context.js";
 import { assertNoInlineImageBytes } from "../shared/inline-bytes.js";
 import { createEventEmitter } from "../shared/optional-node-builtins.js";
-
-let _initPromise: Promise<void> | undefined;
 
 const _requestSettingsCache = new WeakMap<object, Map<string, string | null>>();
 
@@ -39,31 +37,42 @@ function settingsTable(): string {
   return "public.settings";
 }
 
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const table = settingsTable();
-      const createSql = `
-        CREATE TABLE IF NOT EXISTS ${table} (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at BIGINT NOT NULL
-        )
-      `;
+export const settingsStore = defineStore({
+  id: "settings",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createSql = `
+          CREATE TABLE IF NOT EXISTS ${settingsTable()} (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at BIGINT NOT NULL
+          )
+        `;
+        await ensureTableExists("settings", createSql);
+      },
+    },
+    {
+      name: "widen-bigint",
+      run: async () => {
+        await widenIntColumnsToBigInt("settings", ["updated_at"]);
+      },
+    },
+    {
+      name: "indexes",
+      run: async () => {
+        await ensureIndexExists(
+          "settings_updated_at_idx",
+          `CREATE INDEX IF NOT EXISTS settings_updated_at_idx ON ${settingsTable()} (updated_at)`,
+        );
+      },
+    },
+  ],
+});
 
-      await ensureTableExists("settings", createSql);
-      await widenIntColumnsToBigInt("settings", ["updated_at"]);
-      await ensureIndexExists(
-        "settings_updated_at_idx",
-        `CREATE INDEX IF NOT EXISTS settings_updated_at_idx ON ${table} (updated_at)`,
-      );
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+export function ensureTable(): Promise<void> {
+  return settingsStore.ready();
 }
 
 export interface StoreReadOptions {
@@ -72,15 +81,12 @@ export interface StoreReadOptions {
   transaction?: DbExec;
 }
 
-export async function getSetting(
+async function readSettingRaw(
   key: string,
   options?: StoreReadOptions,
-): Promise<Record<string, unknown> | null> {
+): Promise<string | null> {
   const cache = options?.transaction ? null : requestSettingsCache();
-  if (!options?.bypassCache && cache?.has(key)) {
-    const cached = cache.get(key);
-    return cached == null ? null : JSON.parse(cached);
-  }
+  if (!options?.bypassCache && cache?.has(key)) return cache.get(key) ?? null;
   if (!options?.transaction) await ensureTable();
   const client = options?.transaction ?? getDbExec();
   const table = settingsTable();
@@ -90,7 +96,28 @@ export async function getSetting(
   });
   const raw = rows.length === 0 ? null : (rows[0].value as string);
   if (!options?.bypassCache) cache?.set(key, raw);
+  return raw;
+}
+
+export async function getSetting(
+  key: string,
+  options?: StoreReadOptions,
+): Promise<Record<string, unknown> | null> {
+  const raw = await readSettingRaw(key, options);
   return raw == null ? null : JSON.parse(raw);
+}
+
+export type SettingEntry = { found: false } | { found: true; value: unknown };
+
+/** Like `getSetting`, but a stored JSON `null` is found, not missing. */
+export async function getSettingEntry(
+  key: string,
+  options?: StoreReadOptions,
+): Promise<SettingEntry> {
+  const raw = await readSettingRaw(key, options);
+  return raw == null
+    ? { found: false }
+    : { found: true, value: JSON.parse(raw) };
 }
 
 const SETTINGS_IN_LIST_CHUNK_SIZE = 500;
@@ -114,16 +141,30 @@ export async function getSettings(
   keys: readonly string[],
   options?: StoreReadOptions,
 ): Promise<Map<string, Record<string, unknown> | null>> {
-  const uniqueKeys = [...new Set(keys)];
+  const raw = await getSettingsRaw(keys, options);
   const result = new Map<string, Record<string, unknown> | null>();
+  for (const [key, value] of raw)
+    result.set(key, value == null ? null : parseSettingValue(key, value));
+  return result;
+}
+
+/**
+ * Like `getSettings`, but returns each stored value unparsed, so a caller can
+ * tell a row that isn't JSON from a missing one.
+ */
+export async function getSettingsRaw(
+  keys: readonly string[],
+  options?: StoreReadOptions,
+): Promise<Map<string, string | null>> {
+  const uniqueKeys = [...new Set(keys)];
+  const result = new Map<string, string | null>();
   if (uniqueKeys.length === 0) return result;
 
   const cache = options?.transaction ? null : requestSettingsCache();
   const misses: string[] = [];
   for (const key of uniqueKeys) {
     if (!options?.bypassCache && cache?.has(key)) {
-      const cached = cache.get(key);
-      result.set(key, cached == null ? null : parseSettingValue(key, cached));
+      result.set(key, cache.get(key) ?? null);
     } else {
       misses.push(key);
     }
@@ -148,13 +189,18 @@ export async function getSettings(
   for (const key of misses) {
     const raw = rawByKey.get(key) ?? null;
     if (!options?.bypassCache) cache?.set(key, raw);
-    result.set(key, raw == null ? null : parseSettingValue(key, raw));
+    result.set(key, raw);
   }
   return result;
 }
 
 export interface StoreWriteOptions {
   requestSource?: string;
+}
+
+export interface StoreMutationOptions extends StoreWriteOptions {
+  /** Initialize the settings store before the transaction and publish the change only after commit. */
+  transaction?: DbExec;
 }
 
 const SETTINGS_MUTATION_ATTEMPTS = 25;
@@ -164,10 +210,10 @@ export async function mutateSetting(
   updater: (
     current: Record<string, unknown> | null,
   ) => Record<string, unknown> | Promise<Record<string, unknown>>,
-  options?: StoreWriteOptions,
+  options?: StoreMutationOptions,
 ): Promise<Record<string, unknown>> {
-  await ensureTable();
-  const client = getDbExec();
+  if (!options?.transaction) await ensureTable();
+  const client = options?.transaction ?? getDbExec();
   const table = settingsTable();
   for (let attempt = 0; attempt < SETTINGS_MUTATION_ATTEMPTS; attempt += 1) {
     const snapshot = await client.execute({
@@ -195,16 +241,35 @@ export async function mutateSetting(
             args: [nextRaw, timestamp, key, raw],
           });
     if (result.rowsAffected === 0) continue;
-    requestSettingsCache()?.set(key, nextRaw);
-    settingsEmitter().emit("settings", {
-      source: "settings",
-      type: "change",
-      key,
-      ...(options?.requestSource && { requestSource: options.requestSource }),
-    });
+    if (!options?.transaction) {
+      requestSettingsCache()?.set(key, nextRaw);
+      settingsEmitter().emit("settings", {
+        source: "settings",
+        type: "change",
+        key,
+        ...(options?.requestSource && { requestSource: options.requestSource }),
+      });
+    }
     return JSON.parse(nextRaw);
   }
   throw new Error(`Setting ${key} changed too many times; retry the mutation.`);
+}
+
+export function publishSettingChange(
+  key: string,
+  options?: StoreWriteOptions,
+): void {
+  requestSettingsCache()?.delete(key);
+  settingsEmitter().emit("settings", {
+    source: "settings",
+    type: "change",
+    key,
+    ...(options?.requestSource && { requestSource: options.requestSource }),
+  });
+}
+
+export function invalidateSettingRequestCache(key: string): void {
+  requestSettingsCache()?.delete(key);
 }
 
 export async function putSetting(
@@ -257,10 +322,10 @@ export async function deleteSetting(
 export async function deleteSettingIfValue(
   key: string,
   expected: Record<string, unknown>,
-  options?: StoreWriteOptions,
+  options?: StoreMutationOptions,
 ): Promise<boolean> {
-  await ensureTable();
-  const client = getDbExec();
+  if (!options?.transaction) await ensureTable();
+  const client = options?.transaction ?? getDbExec();
   const table = settingsTable();
   const result = await client.execute({
     sql: `DELETE FROM ${table} WHERE key = ? AND value = ?`,
@@ -268,13 +333,15 @@ export async function deleteSettingIfValue(
   });
   if (result.rowsAffected === 0) return false;
 
-  requestSettingsCache()?.set(key, null);
-  settingsEmitter().emit("settings", {
-    source: "settings",
-    type: "delete",
-    key,
-    ...(options?.requestSource && { requestSource: options.requestSource }),
-  });
+  if (!options?.transaction) {
+    requestSettingsCache()?.set(key, null);
+    settingsEmitter().emit("settings", {
+      source: "settings",
+      type: "delete",
+      key,
+      ...(options?.requestSource && { requestSource: options.requestSource }),
+    });
+  }
   return true;
 }
 

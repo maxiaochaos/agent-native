@@ -11,6 +11,8 @@ export type SuggestionPresentationContext = {
 export type SuggestionPresentationNode =
   | { type: "text"; value: string }
   | { type: "indent"; value: string }
+  | { type: "block"; value: string }
+  | { type: "lineBreak" }
   | {
       type: "strong" | "emphasis" | "strike" | "code" | "underline";
       children: SuggestionPresentationNode[];
@@ -120,7 +122,12 @@ function stripInlineContext(
       const value = node.value.slice(context.length);
       return value ? { type: "text", value } : null;
     }
-    if (node.type === "indent") return node;
+    if (
+      node.type === "indent" ||
+      node.type === "block" ||
+      node.type === "lineBreak"
+    )
+      return node;
     const children = node.children.flatMap((child) => {
       const strippedChild = stripNode(child);
       return strippedChild ? [strippedChild] : [];
@@ -135,6 +142,19 @@ function stripInlineContext(
     throw new Error("Suggestion inline parsing lost its context marker");
   }
   return result;
+}
+
+/** Where each link in presented suggestion text points. */
+export function suggestionLinkDestinations(
+  nodes: readonly SuggestionPresentationNode[],
+): string[] {
+  return nodes.flatMap((node) =>
+    node.type === "link"
+      ? [node.url, ...suggestionLinkDestinations(node.children)]
+      : "children" in node
+        ? suggestionLinkDestinations(node.children)
+        : [],
+  );
 }
 
 export function suggestionTextPresentation(
@@ -172,7 +192,46 @@ export function suggestionTextPresentation(
   return nodes;
 }
 
+// Each suggestion is presented from its own copy of the Page, and the editor
+// asks again on every highlight rebuild, so recent Pages keep their results.
+// Each Page keeps its 256 most recent ranges: while a suggestion is being
+// drafted its Page stays the same and its range keeps changing.
+const presentationsBySource = new Map<
+  string,
+  Map<string, SuggestionPresentationNode[] | null>
+>();
+
 export function suggestionTextPresentationForSource(
+  content: string,
+  context: SuggestionPresentationContext,
+): SuggestionPresentationNode[] | null {
+  const key = `${context.from}:${context.to}:${content}`;
+  let known = presentationsBySource.get(context.source);
+  if (known) {
+    presentationsBySource.delete(context.source);
+    presentationsBySource.set(context.source, known);
+    if (known.has(key)) {
+      const presentation = known.get(key)!;
+      known.delete(key);
+      known.set(key, presentation);
+      return presentation;
+    }
+  } else {
+    if (presentationsBySource.size >= 128)
+      presentationsBySource.delete(presentationsBySource.keys().next().value!);
+    known = new Map();
+    presentationsBySource.set(context.source, known);
+  }
+  const presentation = computeSuggestionTextPresentationForSource(
+    content,
+    context,
+  );
+  if (known.size >= 256) known.delete(known.keys().next().value!);
+  known.set(key, presentation);
+  return presentation;
+}
+
+function computeSuggestionTextPresentationForSource(
   content: string,
   context: SuggestionPresentationContext,
 ): SuggestionPresentationNode[] | null {
@@ -207,11 +266,19 @@ export function suggestionTextPresentationForSource(
       ? text.replace(/ /g, "·").replace(/\t/g, "⇥")
       : text
     ).replace(/\n/g, "↵");
-  return parts.flatMap((part) =>
-    part.type === "indent"
-      ? [{ type: "indent" as const, value: part.text }]
+  // A line break beside text breaks the line; on its own it stays a visible ↵.
+  const breaksLines = parts.some(
+    (part) => part.type === "text" && /\S/.test(part.text),
+  );
+  return parts.flatMap((part): SuggestionPresentationNode[] =>
+    part.type === "indent" || part.type === "block"
+      ? [{ type: part.type, value: part.text }]
       : part.type === "break"
-        ? [{ type: "text" as const, value: part.text }]
+        ? [
+            breaksLines
+              ? { type: "lineBreak" }
+              : { type: "text", value: part.text },
+          ]
         : presentationNode(
             { type: "text", text: visibleText(part.text), marks: part.marks },
             (text) => text,

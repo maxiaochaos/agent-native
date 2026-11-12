@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
+  projectedLegacy: vi.fn(),
   projection: null as Record<string, unknown> | null,
   where: null as unknown,
   rows: [] as Record<string, unknown>[],
@@ -16,6 +17,9 @@ const state = vi.hoisted(() => ({
   accessFilter: vi.fn(),
 }));
 
+vi.mock("./legacy-dashboard-summaries.js", () => ({
+  listLegacyDashboardSummaries: state.projectedLegacy,
+}));
 function column(name: string) {
   return { name };
 }
@@ -148,6 +152,8 @@ const {
 const ctx = { email: "alice@example.com", orgId: "org-1" };
 
 beforeEach(() => {
+  state.projectedLegacy.mockReset();
+  state.projectedLegacy.mockResolvedValue([]);
   state.projection = null;
   state.where = null;
   state.rows = [];
@@ -162,6 +168,31 @@ beforeEach(() => {
 });
 
 describe("listDashboardSummaries", () => {
+  it("omits legacy settings at built-in ids while preserving saved rows", async () => {
+    state.settings = {
+      "u:alice@example.com:sql-dashboard-google-analytics": {
+        name: "Legacy Google Analytics",
+      },
+      "o:org-1:sql-dashboard-builtin-customer-roi-v2": { name: "Legacy ROI" },
+      "u:alice@example.com:sql-dashboard-custom": { name: "Custom" },
+    };
+    state.rows = [
+      {
+        id: "google-analytics",
+        kind: "sql",
+        name: "Saved edited Google Analytics",
+      },
+    ];
+
+    const summaries = await listDashboardSummaries(ctx);
+
+    expect(summaries.map((row) => [row.id, row.name])).toEqual([
+      ["google-analytics", "Saved edited Google Analytics"],
+      ["custom", "Custom"],
+    ]);
+    expect(state.insert).not.toHaveBeenCalled();
+  });
+
   it("projects metadata without the full config and maps name and parentId", async () => {
     state.rows = [
       {
@@ -304,15 +335,17 @@ describe("listDashboardSummaries", () => {
   });
 
   it("bounds catalog summaries and scopes legacy SQL dashboard reads", async () => {
-    state.settings = {
-      "u:alice@example.com:sql-dashboard-legacy-user": {
+    state.projectedLegacy.mockResolvedValue([
+      {
+        id: "legacy-user",
+        kind: "sql",
         name: "Legacy user dashboard",
+        description: null,
+        createdAt: "",
+        updatedAt: "",
+        orgId: null,
       },
-      "o:org-1:sql-dashboard-legacy-org": {
-        name: "Legacy org dashboard",
-      },
-      "u:alice@example.com:favorites": { ids: ["other"] },
-    };
+    ]);
 
     const result = await listDashboardSummaries(ctx, {
       kind: "sql",
@@ -325,13 +358,12 @@ describe("listDashboardSummaries", () => {
       { kind: "asc", value: { name: "id" } },
     ]);
     expect(result.map((row) => row.id)).toEqual(["legacy-user"]);
-    expect(state.settingsPrefixCalls).toEqual([
-      {
-        prefix: "u:alice@example.com:sql-dashboard-",
-        options: { limit: 1 },
-      },
-      { prefix: "o:org-1:sql-dashboard-", options: { limit: 1 } },
-    ]);
+    // oracle-change: bounded legacy reads now use metadata SQL rather than full settings bodies.
+    expect(state.projectedLegacy).toHaveBeenCalledWith(ctx, {
+      kind: "sql",
+      limit: 1,
+    });
+    expect(state.settingsPrefixCalls).toEqual([]);
   });
 
   it("normalizes dashboard names consistently for matching", () => {

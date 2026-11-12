@@ -21,6 +21,7 @@ import type { ExportSnapshotSource } from "@/pages/design-editor/export-snapshot
 import {
   PngCaptureError,
   renderExportDocumentCanvas,
+  screenFrameCropRect,
 } from "@/pages/design-editor/png-export-render";
 
 export interface DownloadAllScreensPdfArgs {
@@ -31,11 +32,12 @@ export interface DownloadAllScreensPdfArgs {
   exportTracking?: BrowserDesignExportContext;
   fallbackExportName: (extension: string, suffix?: string) => string;
   overviewScreens: OverviewScreen[];
-  prepareScreenForExport: (screenId: string) => void;
+  leaseHydratedSource: (screenId: string) => Promise<() => void>;
+  prepareScreenForExport: (screenId: string) => symbol | undefined;
   resolveSnapshotExportSource?: (
     screenId: string,
   ) => ExportSnapshotSource | null | Promise<ExportSnapshotSource | null>;
-  releaseScreenFromExport: () => void;
+  releaseScreenFromExport: (lease: symbol) => void;
   pngExportingRef: RefObject<boolean>;
   setPngExporting: Dispatch<SetStateAction<boolean>>;
   showRasterCaptureError: (error: unknown, format?: "png" | "pdf") => void;
@@ -76,10 +78,18 @@ async function waitForScreenPreview(
       const bridgeWindow = doc?.defaultView as
         | (Window & { __agentNativeContentSizeReport?: boolean })
         | null;
+      const expectedRevision = iframe.srcdoc.match(
+        /<meta data-agent-native-preview-revision="([0-9a-z:]+)">/,
+      )?.[1];
+      const loadedRevision = doc
+        ?.querySelector("meta[data-agent-native-preview-revision]")
+        ?.getAttribute("data-agent-native-preview-revision");
       if (
         doc?.readyState === "complete" &&
         (sourceType !== "inline" ||
-          bridgeWindow?.__agentNativeContentSizeReport === true)
+          (bridgeWindow?.__agentNativeContentSizeReport === true &&
+            expectedRevision &&
+            loadedRevision === expectedRevision))
       ) {
         return { iframe, doc };
       }
@@ -203,6 +213,7 @@ export async function runDownloadAllScreensPdf({
   exportTracking,
   fallbackExportName,
   overviewScreens,
+  leaseHydratedSource,
   prepareScreenForExport,
   resolveSnapshotExportSource,
   releaseScreenFromExport,
@@ -216,16 +227,16 @@ export async function runDownloadAllScreensPdf({
   if (overviewScreens.length < 2) return;
   pngExportingRef.current = true;
   setPngExporting(true);
-  let requestedScreenId: string | null = null;
+  let requestedScreenLease: symbol | undefined;
   try {
     const pages: RasterPdfPage[] = [];
     for (const screen of overviewScreens) {
-      requestedScreenId = screen.id;
-      prepareScreenForExport(screen.id);
+      const releaseSource = await leaseHydratedSource(screen.id);
       let iframe: HTMLIFrameElement | null = null;
       let snapshotFrameCleanup: (() => void) | null = null;
       let priorInlineHeight: string | null = null;
       try {
+        requestedScreenLease = prepareScreenForExport(screen.id);
         const preview = await waitForScreenPreview(
           screen,
           activeCanvasSourceType,
@@ -303,22 +314,23 @@ export async function runDownloadAllScreensPdf({
           doc,
           iframe,
           exportScale: PDF_MIN_PRINT_RASTER_SCALE,
-          cropRect: {
-            x: doc.defaultView?.scrollX ?? 0,
-            y: doc.defaultView?.scrollY ?? 0,
-            width: Math.max(1, iframe.clientWidth),
-            height: Math.max(1, iframe.clientHeight),
-          },
+          cropRect: screenFrameCropRect(doc, iframe, {
+            width: pageWidth,
+            height: pageHeight,
+          }),
         });
         const dataUrl = rendered.canvas.toDataURL("image/png");
         pages.push({ dataUrl, width: pageWidth, height: pageHeight });
       } finally {
+        releaseSource();
         if (iframe && priorInlineHeight !== null) {
           iframe.style.height = priorInlineHeight;
         }
         snapshotFrameCleanup?.();
-        releaseScreenFromExport();
-        requestedScreenId = null;
+        if (requestedScreenLease) {
+          releaseScreenFromExport(requestedScreenLease);
+          requestedScreenLease = undefined;
+        }
       }
     }
     const pdf = await createMultiPageRasterPdf(pages);
@@ -339,7 +351,7 @@ export async function runDownloadAllScreensPdf({
     console.error("All-screens PDF export failed:", error);
     showRasterCaptureError(error, "pdf");
   } finally {
-    if (requestedScreenId !== null) releaseScreenFromExport();
+    if (requestedScreenLease) releaseScreenFromExport(requestedScreenLease);
     pngExportingRef.current = false;
     setPngExporting(false);
   }

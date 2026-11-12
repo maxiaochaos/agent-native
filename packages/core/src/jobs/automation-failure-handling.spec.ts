@@ -125,7 +125,7 @@ vi.mock("../chat-threads/store.js", () => ({
     threadData: "{}",
     messageCount: 0,
   })),
-  updateThreadData: vi.fn(async () => {}),
+  updateThreadData: vi.fn(async () => true),
   withThreadDataLock: async (_threadId: string, fn: () => Promise<unknown>) =>
     fn(),
 }));
@@ -214,6 +214,7 @@ vi.mock("./scheduler-health.js", async (importOriginal) => ({
 }));
 
 const { processRecurringJobs, runJobNow } = await import("./scheduler.js");
+const { ensureRunTables } = await import("../agent/run-store.js");
 const { registerErrorCaptureProvider } =
   await import("../server/capture-error.js");
 const { automationHash } = await import("./automation-events.js");
@@ -335,6 +336,7 @@ async function historyOf(name: string) {
 beforeEach(async () => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(START);
+  await ensureRunTables();
   resourceStore.rows.clear();
   createThreadMock.mockClear();
   insertRunSpy.mockClear();
@@ -346,15 +348,18 @@ beforeEach(async () => {
   deployEnvironmentMock.mockReset().mockReturnValue("local");
   resetStaleWorkReapThrottle();
   await pglite.exec(`
-    CREATE TABLE IF NOT EXISTS "user" (id TEXT PRIMARY KEY, email TEXT UNIQUE);
-    INSERT INTO "user" (id, email) VALUES ('u1', 'alice@agent-native.test'), ('u2', 'qa-bot@local.test')
+    CREATE TABLE IF NOT EXISTS "user" (
+      id TEXT PRIMARY KEY, name TEXT, email TEXT UNIQUE,
+      created_at TIMESTAMPTZ, updated_at TIMESTAMPTZ
+    );
+    INSERT INTO "user" (id, name, email, created_at, updated_at) VALUES ('u1', 'u1', 'alice@agent-native.test', now(), now()), ('u2', 'u2', 'qa-bot@local.test', now(), now())
       ON CONFLICT DO NOTHING;
     CREATE TABLE IF NOT EXISTS org_members (
-      org_id TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL,
+      id TEXT, joined_at BIGINT, org_id TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL,
       federation_removal_pending_at BIGINT
     );
     DELETE FROM org_members;
-    INSERT INTO org_members (org_id, email, role) VALUES ('acme', 'alice@agent-native.test', 'member');
+    INSERT INTO org_members (id, org_id, email, role, joined_at) VALUES ('acme:alice@agent-native.test', 'acme', 'alice@agent-native.test', 'member', 0);
   `);
   await rawClient.execute(`DELETE FROM automation_runs`).catch(() => undefined);
 });
@@ -752,7 +757,7 @@ describe("scheduled automations that cannot run", () => {
     engineUsableMock.mockResolvedValue(false);
     await pglite.exec(`
       DELETE FROM org_members;
-      INSERT INTO org_members (org_id, email, role) VALUES ('acme', 'bob@agent-native.test', 'owner');
+      INSERT INTO org_members (id, org_id, email, role, joined_at) VALUES ('acme:bob@agent-native.test', 'acme', 'bob@agent-native.test', 'owner', 0);
     `);
     putOrgReminderJob();
 
@@ -799,6 +804,116 @@ describe("owners that cannot run automations", () => {
     ).toBe(written);
   });
 
+  it.each(["account", "membership"] as const)(
+    "does not retry permanent %s lookup failures",
+    async (stage) => {
+      for (const code of ["42501", "42P01", undefined]) {
+        const name = `permanent-${stage}-${code ?? "unexpected"}`;
+        putJob("alice@agent-native.test", name, [
+          'schedule: "0 * * * *"',
+          "enabled: true",
+          "createdBy: alice@agent-native.test",
+          'orgId: "acme"',
+          'appId: "calendar"',
+          `nextRun: "${new Date(START - MINUTE).toISOString()}"`,
+        ]);
+        const original = rawClient.execute.getMockImplementation();
+        if (!original) throw new Error("Missing fixture executor");
+        let reads = 0;
+        rawClient.execute.mockImplementation(async (input: ExecuteInput) => {
+          if (
+            typeof input !== "string" &&
+            input.sql.includes(
+              stage === "account" ? 'FROM "user"' : "FROM org_members",
+            )
+          ) {
+            reads++;
+            throw Object.assign(new Error("Fake private lookup diagnostics"), {
+              code,
+            });
+          }
+          return original(input);
+        });
+        try {
+          await tickAt(START);
+          expect(readJob("alice@agent-native.test", name)).toMatchObject({
+            enabled: false,
+            lastErrorCode: "config_invalid",
+            pausedReason: "config_invalid",
+          });
+          expect(createThreadMock).not.toHaveBeenCalled();
+          const firstReads = reads;
+          expect(firstReads).toBeGreaterThan(0);
+          await tickAt(START + 24 * 60 * MINUTE);
+          expect(reads).toBe(firstReads);
+        } finally {
+          rawClient.execute.mockImplementation(original);
+        }
+      }
+    },
+  );
+
+  it.each(["account", "membership"] as const)(
+    "retries network outages from known %s database lookups without pausing",
+    async (stage) => {
+      for (const code of [
+        "ECONNREFUSED",
+        "EAI_AGAIN",
+        "CONNECT_TIMEOUT",
+        "ETIMEDOUT",
+      ]) {
+        const name = `network-${stage}-${code}`;
+        putJob("alice@agent-native.test", name, [
+          'schedule: "0 * * * *"',
+          "enabled: true",
+          "createdBy: alice@agent-native.test",
+          'orgId: "acme"',
+          'appId: "calendar"',
+          `nextRun: "${new Date(START - MINUTE).toISOString()}"`,
+        ]);
+        const original = rawClient.execute.getMockImplementation();
+        if (!original) throw new Error("Missing fixture executor");
+        let reads = 0;
+        rawClient.execute.mockImplementation(async (input: ExecuteInput) => {
+          if (
+            typeof input !== "string" &&
+            input.sql.includes(
+              stage === "account" ? 'FROM "user"' : "FROM org_members",
+            )
+          ) {
+            reads++;
+            throw Object.assign(new Error("Fake connection failure"), { code });
+          }
+          return original(input);
+        });
+        try {
+          await tickAt(START);
+          expect(readJob("alice@agent-native.test", name)).toMatchObject({
+            enabled: true,
+            lastErrorCode: "owner_unverifiable",
+            lastCheck: new Date(START).toISOString(),
+          });
+          expect(
+            readJob("alice@agent-native.test", name).pausedReason,
+          ).toBeUndefined();
+          expect(createThreadMock).not.toHaveBeenCalled();
+          const firstReads = reads;
+          expect(firstReads).toBeGreaterThan(0);
+          const secondTick = START + 24 * 60 * MINUTE;
+          await tickAt(secondTick);
+          expect(readJob("alice@agent-native.test", name)).toMatchObject({
+            enabled: true,
+            lastErrorCode: "owner_unverifiable",
+            lastCheck: new Date(secondTick).toISOString(),
+          });
+          expect(reads).toBeGreaterThan(firstReads);
+        } finally {
+          rawClient.execute.mockImplementation(original);
+        }
+      }
+    },
+  );
+
   it("does not disable a job just because the owner lookup failed", async () => {
     putJob("alice@agent-native.test", "digest", [
       'schedule: "0 * * * *"',
@@ -810,7 +925,9 @@ describe("owners that cannot run automations", () => {
     const original = rawClient.execute.getMockImplementation()!;
     rawClient.execute.mockImplementation(async (input: ExecuteInput) => {
       if (typeof input !== "string" && input.sql.includes('FROM "user"')) {
-        throw new Error("connection terminated");
+        throw Object.assign(new Error("connection terminated"), {
+          code: "08006",
+        });
       }
       return original(input);
     });
@@ -831,7 +948,7 @@ describe("owners that cannot run automations", () => {
 
   it("runs a personal automation whose stored account email differs only in case", async () => {
     await pglite.exec(
-      `INSERT INTO "user" (id, email) VALUES ('u-carol', 'Carol@Agent-Native.test') ON CONFLICT DO NOTHING`,
+      `INSERT INTO "user" (id, name, email, created_at, updated_at) VALUES ('u-carol', 'u-carol', 'Carol@Agent-Native.test', now(), now()) ON CONFLICT DO NOTHING`,
     );
     try {
       putJob("carol@agent-native.test", "carol-digest", [

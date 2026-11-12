@@ -10,7 +10,10 @@ import {
 } from "../../server/request-context.js";
 import { parseArgs, fail } from "../utils.js";
 import { tryForwardDbQueryToDevServer } from "./dev-query-proxy.js";
-import { createPostgresScriptClient } from "./postgres-client.js";
+import {
+  createPostgresScriptClient,
+  withPostgresStatementDeadline,
+} from "./postgres-client.js";
 import {
   finalRawDbSql,
   readRawDbReadStatement,
@@ -113,13 +116,14 @@ export async function runDbQuery(
     let rows: Record<string, unknown>[] = [];
     try {
       await client.begin(async (tx) => {
-        const scoping = await buildScopingPostgres(tx);
-        for (const setup of scoping.setup) await tx.unsafe(setup);
+        const timedTx = withPostgresStatementDeadline(tx);
+        const scoping = await buildScopingPostgres(timedTx);
+        for (const setup of scoping.setup) await timedTx.unsafe(setup);
         // From here on the transaction cannot write, so a data-modifying CTE,
         // SELECT INTO, or EXPLAIN ANALYZE of a write fails instead of running.
-        await tx.unsafe("SET TRANSACTION READ ONLY");
-        await verifyRawDbStatement(tx, executed.statement);
-        const result = await tx.unsafe(executed.sql, sqlArgs, {
+        await timedTx.unsafe("SET TRANSACTION READ ONLY");
+        await verifyRawDbStatement(timedTx, executed.statement);
+        const result = await timedTx.unsafe(executed.sql, sqlArgs, {
           singleStatement: true,
         });
         rows = Array.from(result);
@@ -169,6 +173,9 @@ Options:
       format: parsed.format,
       userEmail: getRequestUserEmail(),
       orgId: getRequestOrgId() ?? undefined,
+      // The CLI already resolved this call's org; with none, it is personal,
+      // so the dev server must not look one up again.
+      ...(getRequestOrgId() ? {} : { orgScope: "personal" as const }),
       print: printTable,
     });
     if (forwarded) return;

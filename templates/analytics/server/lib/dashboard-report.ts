@@ -4,10 +4,17 @@ import { getAppProductionUrl, sendEmail } from "@agent-native/core/server";
 import { normalizeMultiSelectValue } from "../../app/pages/adhoc/sql-dashboard/filter-vars";
 import { listReportablePanelIds } from "../../app/pages/adhoc/sql-dashboard/report-panel-window";
 import type {
+  DashboardAnnotations,
   DashboardFilter,
   FilterType,
   SqlDashboardConfig,
 } from "../../app/pages/adhoc/sql-dashboard/types";
+import { dataNotesForPanel } from "../../shared/data-notes";
+import { keyDateEvents } from "../../shared/key-dates";
+import {
+  ALL_TRAFFIC,
+  TRAFFIC_FILTER_PARAM,
+} from "../../shared/traffic-environment";
 import {
   fetchReportPanelData,
   renderReportEmail,
@@ -20,7 +27,9 @@ import {
   type DashboardReportCaptureOutcome,
   type DashboardReportSubscription,
 } from "./dashboard-report-subscriptions";
+import { listDataNotes } from "./data-notes-store";
 import { ANALYTICS_DASHBOARD_REPORT_EMAIL_ID } from "./emails";
+import { listKeyDateSets } from "./key-dates-store";
 
 const DATE_FILTER_TYPES: ReadonlySet<FilterType> = new Set([
   "date",
@@ -61,9 +70,9 @@ function resolveDefault(raw: string | undefined, type: FilterType): string {
   return raw;
 }
 
-function defaultFilterValues(
-  config: SqlDashboardConfig,
-): Record<string, string> {
+function defaultFilterValues(config: {
+  filters?: DashboardFilter[] | undefined;
+}): Record<string, string> {
   const values: Record<string, string> = {};
   const filters = Array.isArray(config.filters) ? config.filters : [];
   for (const f of filters as DashboardFilter[]) {
@@ -112,6 +121,7 @@ function dashboardConfigFromRecord(raw: Record<string, unknown>) {
         : undefined,
     columns: typeof raw.columns === "number" ? raw.columns : undefined,
     panels: Array.isArray(raw.panels) ? (raw.panels as any[]) : [],
+    annotations: raw.annotations as DashboardAnnotations | undefined,
   } satisfies SqlDashboardConfig;
 }
 
@@ -156,12 +166,21 @@ export async function collectReportSnapshot(
   }
 
   const config = dashboardConfigFromRecord(dashboard.config);
+  // A report reads only the traffic it was saved with, so a dashboard default
+  // set later can't move it, and its link opens on the traffic it read.
+  const { [TRAFFIC_FILTER_PARAM]: dashboardTraffic, ...defaults } =
+    defaultFilterValues(config);
   const linkFilters = {
-    ...defaultFilterValues(config),
+    ...defaults,
+    ...(dashboardTraffic && dashboardTraffic !== ALL_TRAFFIC
+      ? { [TRAFFIC_FILTER_PARAM]: ALL_TRAFFIC }
+      : {}),
     ...sub.filters,
   };
   // Links keep a cleared multi-select's marker, because a link without it reopens with the default selected. The query and filter line read the normalized map.
   const filters = normalizeReportFilters(config.filters, linkFilters);
+  const scope = dashboard.annotationScope;
+  const dataNotes = await listDataNotes(scope);
 
   return {
     dashboardId: sub.dashboardId,
@@ -175,6 +194,18 @@ export async function collectReportSnapshot(
     generatedAt: new Date().toISOString(),
     panelIds: listReportablePanelIds(config.panels),
     panels: config.panels,
+    keyDates: keyDateEvents(await listKeyDateSets(scope), config.annotations),
+    dataNotesByPanel: Object.fromEntries(
+      config.panels.flatMap((panel) => {
+        const notes = dataNotesForPanel(
+          dataNotes,
+          sub.dashboardId,
+          panel,
+          config.annotations,
+        );
+        return notes.length > 0 ? [[panel.id, notes]] : [];
+      }),
+    ),
     variables: config.variables,
   };
 }

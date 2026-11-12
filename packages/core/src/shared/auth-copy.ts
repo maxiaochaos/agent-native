@@ -20,6 +20,7 @@ export interface NativeAuthCopy {
   emailLinkContinueAction: string;
   email: string;
   emailPlaceholder: string;
+  builderSignupDisclosure: string;
   legalPrefix: string;
   legalTerms: string;
   legalConnector: string;
@@ -78,11 +79,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "Welcome",
     welcomeToApp: "Welcome to {appName}",
     welcomeSubtitle: "Sign in or create your account",
-    emailLinkContinueTitle: "Continue with your email link",
-    emailLinkContinueMessage: "Select Continue to complete this email step.",
+    emailLinkContinueTitle: "Confirm this email link",
+    emailLinkContinueMessage:
+      "Some email security checks open links automatically. Select Continue to use your one-time link and finish signing in or confirming your email.",
     emailLinkContinueAction: "Continue",
     email: "Email",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "You also create a Builder.io account and agree to Builder’s",
     legalPrefix: "By signing up, you accept our",
     legalTerms: "Terms",
     legalConnector: "and",
@@ -123,11 +127,13 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "欢迎",
     welcomeToApp: "欢迎使用 {appName}",
     welcomeSubtitle: "继续以登录或创建账户",
-    emailLinkContinueTitle: "继续使用此电子邮件链接",
-    emailLinkContinueMessage: "选择“继续”以完成此电子邮件步骤。",
+    emailLinkContinueTitle: "确认此电子邮件链接",
+    emailLinkContinueMessage:
+      "某些电子邮件安全检查会自动打开链接。选择“继续”以使用这一次性链接，完成登录或确认电子邮件。",
     emailLinkContinueAction: "继续",
     email: "电子邮箱",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure: "你还将创建 Builder.io 帐户，并同意 Builder 的",
     legalPrefix: "注册即表示你接受我们的",
     legalTerms: "条款",
     legalConnector: "和",
@@ -166,11 +172,13 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "歡迎",
     welcomeToApp: "歡迎使用 {appName}",
     welcomeSubtitle: "繼續以登入或建立帳戶",
-    emailLinkContinueTitle: "繼續使用此電子郵件連結",
-    emailLinkContinueMessage: "選擇「繼續」以完成此電子郵件步驟。",
+    emailLinkContinueTitle: "確認此電子郵件連結",
+    emailLinkContinueMessage:
+      "部分電子郵件安全檢查會自動開啟連結。選擇「繼續」以使用這個一次性連結，完成登入或確認電子郵件。",
     emailLinkContinueAction: "繼續",
     email: "電子郵件",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure: "你也將建立 Builder.io 帳戶，並同意 Builder 的",
     legalPrefix: "註冊即表示你接受我們的",
     legalTerms: "條款",
     legalConnector: "和",
@@ -209,11 +217,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "Bienvenido",
     welcomeToApp: "Bienvenido a {appName}",
     welcomeSubtitle: "Continúa para iniciar sesión o crear tu cuenta",
-    emailLinkContinueTitle: "Continúa con el enlace de tu correo",
-    emailLinkContinueMessage: "Selecciona Continuar para completar este paso.",
+    emailLinkContinueTitle: "Confirma este enlace de correo",
+    emailLinkContinueMessage:
+      "Algunos controles de seguridad del correo abren enlaces automáticamente. Selecciona Continuar para usar este enlace de un solo uso y terminar de iniciar sesión o confirmar tu correo.",
     emailLinkContinueAction: "Continuar",
     email: "Email",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "También creas una cuenta de Builder.io y aceptas sus",
     legalPrefix: "Al registrarte, aceptas nuestros",
     legalTerms: "Términos",
     legalConnector: "y",
@@ -253,12 +264,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "Bienvenue",
     welcomeToApp: "Bienvenue sur {appName}",
     welcomeSubtitle: "Continuez pour vous connecter ou créer votre compte",
-    emailLinkContinueTitle: "Continuer avec le lien reçu par e-mail",
+    emailLinkContinueTitle: "Confirmez ce lien d’e-mail",
     emailLinkContinueMessage:
-      "Sélectionnez Continuer pour terminer cette étape.",
+      "Certains contrôles de sécurité des e-mails ouvrent les liens automatiquement. Sélectionnez Continuer pour utiliser ce lien à usage unique et terminer la connexion ou confirmer votre adresse e-mail.",
     emailLinkContinueAction: "Continuer",
     email: "E-mail",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "Vous créez aussi un compte Builder.io et acceptez ses",
     legalPrefix: "En vous inscrivant, vous acceptez nos",
     legalTerms: "Conditions",
     legalConnector: "et",
@@ -299,11 +312,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeToApp: "Willkommen bei {appName}",
     welcomeSubtitle:
       "Fahre fort, um dich anzumelden oder ein Konto zu erstellen",
-    emailLinkContinueTitle: "Mit deinem E-Mail-Link fortfahren",
-    emailLinkContinueMessage: "Wähle Weiter, um diesen Schritt abzuschließen.",
+    emailLinkContinueTitle: "Bestätige diesen E-Mail-Link",
+    emailLinkContinueMessage:
+      "Manche Sicherheitsprüfungen für E-Mails öffnen Links automatisch. Wähle „Weiter“, um diesen einmaligen Link zu verwenden und die Anmeldung oder E-Mail-Bestätigung abzuschließen.",
     emailLinkContinueAction: "Weiter",
     email: "E-Mail",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "Du erstellst auch ein Builder.io-Konto und akzeptierst Builders",
     legalPrefix: "Mit der Registrierung akzeptierst du unsere",
     legalTerms: "Bedingungen",
     legalConnector: "und",
@@ -344,11 +360,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "ようこそ",
     welcomeToApp: "{appName}へようこそ",
     welcomeSubtitle: "続けてサインインするか、アカウントを作成します",
-    emailLinkContinueTitle: "メールリンクで続行",
-    emailLinkContinueMessage: "「続行」を選択してこの手順を完了してください。",
+    emailLinkContinueTitle: "このメールリンクを確認",
+    emailLinkContinueMessage:
+      "メールのセキュリティチェックによってリンクが自動的に開かれることがあります。「続行」を選択して、この一度だけ使えるリンクでサインインまたはメールアドレスの確認を完了してください。",
     emailLinkContinueAction: "続行",
     email: "メール",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "Builder.io アカウントも作成し、Builder の以下に同意します:",
     legalPrefix: "登録すると、以下に同意したものとみなされます:",
     legalTerms: "利用規約",
     legalConnector: "および",
@@ -389,11 +408,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "환영합니다",
     welcomeToApp: "{appName}에 오신 것을 환영합니다",
     welcomeSubtitle: "계속해서 로그인하거나 계정을 만드세요",
-    emailLinkContinueTitle: "이메일 링크로 계속하기",
-    emailLinkContinueMessage: "계속을 선택해 이 단계를 완료하세요.",
+    emailLinkContinueTitle: "이 이메일 링크 확인",
+    emailLinkContinueMessage:
+      "일부 이메일 보안 검사는 링크를 자동으로 엽니다. 계속을 선택해 이 일회용 링크를 사용하고 로그인 또는 이메일 확인을 완료하세요.",
     emailLinkContinueAction: "계속",
     email: "이메일",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "Builder.io 계정도 생성하고 Builder의 다음 사항에 동의합니다:",
     legalPrefix: "가입하면 다음에 동의하게 됩니다:",
     legalTerms: "약관",
     legalConnector: "및",
@@ -433,11 +455,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "Bem-vindo",
     welcomeToApp: "Bem-vindo ao {appName}",
     welcomeSubtitle: "Continue para entrar ou criar sua conta",
-    emailLinkContinueTitle: "Continuar com o link do e-mail",
-    emailLinkContinueMessage: "Selecione Continuar para concluir esta etapa.",
+    emailLinkContinueTitle: "Confirme este link de e-mail",
+    emailLinkContinueMessage:
+      "Algumas verificações de segurança de e-mail abrem links automaticamente. Selecione Continuar para usar este link de uso único e concluir o login ou confirmar seu e-mail.",
     emailLinkContinueAction: "Continuar",
     email: "Email",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "Você também cria uma conta Builder.io e aceita seus",
     legalPrefix: "Ao se cadastrar, você aceita nossos",
     legalTerms: "Termos",
     legalConnector: "e",
@@ -477,11 +502,14 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "स्वागत है",
     welcomeToApp: "{appName} में आपका स्वागत है",
     welcomeSubtitle: "साइन इन करने या अपना खाता बनाने के लिए जारी रखें",
-    emailLinkContinueTitle: "ईमेल लिंक के साथ जारी रखें",
-    emailLinkContinueMessage: "यह चरण पूरा करने के लिए जारी रखें चुनें।",
+    emailLinkContinueTitle: "इस ईमेल लिंक की पुष्टि करें",
+    emailLinkContinueMessage:
+      "ईमेल की कुछ सुरक्षा जाँचें लिंक अपने आप खोलती हैं। इस एक बार इस्तेमाल होने वाले लिंक से साइन इन या ईमेल की पुष्टि पूरी करने के लिए जारी रखें चुनें।",
     emailLinkContinueAction: "जारी रखें",
     email: "ईमेल",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure:
+      "आप Builder.io खाता भी बनाते हैं और Builder की निम्न नीतियों से सहमत हैं:",
     legalPrefix: "साइन अप करके, आप हमारी",
     legalTerms: "शर्तें",
     legalConnector: "और",
@@ -521,11 +549,13 @@ export const NATIVE_AUTH_COPY: Record<LocaleCode, NativeAuthCopy> = {
     welcomeTitle: "مرحبًا",
     welcomeToApp: "مرحبًا بك في {appName}",
     welcomeSubtitle: "تابع لتسجيل الدخول أو إنشاء حسابك",
-    emailLinkContinueTitle: "المتابعة باستخدام رابط البريد الإلكتروني",
-    emailLinkContinueMessage: "اختر متابعة لإكمال هذه الخطوة.",
+    emailLinkContinueTitle: "أكّد رابط البريد الإلكتروني هذا",
+    emailLinkContinueMessage:
+      "قد تفتح بعض فحوصات أمان البريد الإلكتروني الروابط تلقائيًا. اختر متابعة لاستخدام هذا الرابط لمرة واحدة وإكمال تسجيل الدخول أو تأكيد بريدك الإلكتروني.",
     emailLinkContinueAction: "متابعة",
     email: "البريد الإلكتروني",
     emailPlaceholder: "you@example.com",
+    builderSignupDisclosure: "تنشئ أيضًا حساب Builder.io وتوافق على",
     legalPrefix: "بالتسجيل، فإنك توافق على",
     legalTerms: "الشروط",
     legalConnector: "و",

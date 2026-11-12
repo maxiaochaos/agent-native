@@ -9,7 +9,7 @@ import {
   ensureIndexExists,
   ensureColumnExists,
 } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
 import { accessFilter, type AccessContext } from "../sharing/access.js";
 import { registerShareableResource } from "../sharing/registry.js";
 import {
@@ -35,53 +35,54 @@ const DEFAULT_RUN_KEEP = 5;
 
 const getDb = createGetDb({ dataPrograms, dataProgramShares });
 
-let _initPromise: Promise<void> | undefined;
+export const dataProgramsStore = defineStore({
+  id: "data_programs",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const integerType = "BIGINT";
+        const runsCreateSql = dataProgramRunsCreateSql(integerType);
 
-export async function ensureDataProgramTables(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const integerType = "BIGINT";
-      const runsCreateSql = dataProgramRunsCreateSql(integerType);
+        await ensureTableExists("data_programs", DATA_PROGRAMS_CREATE_SQL);
+        await ensureTableExists(
+          "data_program_shares",
+          DATA_PROGRAM_SHARES_CREATE_SQL,
+        );
+        await ensureColumnExists(
+          "data_program_shares",
+          "notified_at",
+          DATA_PROGRAM_SHARES_NOTIFIED_AT_COLUMN_SQL,
+        );
+        await ensureTableExists("data_program_runs", runsCreateSql);
+        await ensureColumnExists(
+          "data_program_runs",
+          "truncated",
+          DATA_PROGRAM_RUNS_TRUNCATED_COLUMN_SQL,
+        );
+        await ensureIndexExists(
+          "data_programs_app_owner_idx",
+          DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
+        );
+        await ensureIndexExists(
+          "data_programs_app_name_idx",
+          DATA_PROGRAMS_APP_NAME_INDEX_SQL,
+        );
+        await ensureIndexExists(
+          "data_program_shares_resource_idx",
+          DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
+        );
+        await ensureIndexExists(
+          "data_program_runs_lookup_idx",
+          DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
+        );
+      },
+    },
+  ],
+});
 
-      await ensureTableExists("data_programs", DATA_PROGRAMS_CREATE_SQL);
-      await ensureTableExists(
-        "data_program_shares",
-        DATA_PROGRAM_SHARES_CREATE_SQL,
-      );
-      await ensureColumnExists(
-        "data_program_shares",
-        "notified_at",
-        DATA_PROGRAM_SHARES_NOTIFIED_AT_COLUMN_SQL,
-      );
-      await ensureTableExists("data_program_runs", runsCreateSql);
-      await ensureColumnExists(
-        "data_program_runs",
-        "truncated",
-        DATA_PROGRAM_RUNS_TRUNCATED_COLUMN_SQL,
-      );
-      await ensureIndexExists(
-        "data_programs_app_owner_idx",
-        DATA_PROGRAMS_APP_OWNER_INDEX_SQL,
-      );
-      await ensureIndexExists(
-        "data_programs_app_name_idx",
-        DATA_PROGRAMS_APP_NAME_INDEX_SQL,
-      );
-      await ensureIndexExists(
-        "data_program_shares_resource_idx",
-        DATA_PROGRAM_SHARES_RESOURCE_INDEX_SQL,
-      );
-      await ensureIndexExists(
-        "data_program_runs_lookup_idx",
-        DATA_PROGRAM_RUNS_LOOKUP_INDEX_SQL,
-      );
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+export function ensureDataProgramTables(): Promise<void> {
+  return dataProgramsStore.ready();
 }
 
 export function registerDataProgramsShareable(): void {
@@ -98,7 +99,7 @@ export function registerDataProgramsShareable(): void {
 }
 
 export function _resetDataProgramInitPromiseForTests(): void {
-  _initPromise = undefined;
+  dataProgramsStore.reset();
 }
 
 export type DataProgramRefreshMode = "manual" | "ttl";
@@ -218,19 +219,30 @@ export async function upsertDataProgram(
   const refreshMode = input.refreshMode ?? existing?.refreshMode ?? "ttl";
 
   if (existing) {
+    const next = {
+      title: input.title,
+      description: input.description ?? existing.description,
+      code: input.code,
+      paramsSchema: input.paramsSchema ?? null,
+      defaultParams: input.defaultParams ?? null,
+      outputColumns: input.outputColumns ?? existing.outputColumns,
+      refreshMode,
+      refreshTtlMs,
+      background: Boolean(input.background),
+    };
+    // Reads treat runs from before updatedAt as stale, and seeded programs
+    // are saved again on every ensure, so a save that changes nothing keeps it.
+    const unchanged =
+      existing.archivedAt === null &&
+      (Object.keys(next) as (keyof typeof next)[]).every(
+        (key) => next[key] === existing[key],
+      );
     const updated = await db
       .update(dataPrograms)
       .set({
-        title: input.title,
-        description: input.description ?? existing.description,
-        code: input.code,
-        paramsSchema: input.paramsSchema ?? null,
-        defaultParams: input.defaultParams ?? null,
-        outputColumns: input.outputColumns ?? existing.outputColumns,
-        refreshMode,
-        refreshTtlMs,
-        background: input.background ? 1 : 0,
-        updatedAt: now,
+        ...next,
+        background: next.background ? 1 : 0,
+        updatedAt: unchanged ? existing.updatedAt : now,
         archivedAt: null,
       })
       .where(
@@ -648,6 +660,55 @@ export async function getLatestRun(
   });
   const row = rows[0] as Record<string, unknown> | undefined;
   return row ? runRowFromDb(row) : null;
+}
+
+/**
+ * The newest run that has finished, successfully or not. Background programs
+ * record a queued run as soon as they enqueue one, so `getLatestRun` returns
+ * that empty row while it runs; readers that want a result use this.
+ */
+export async function getLatestFinishedRun(
+  programId: string,
+  paramsHash: string,
+): Promise<DataProgramRunRow | null> {
+  await ensureDataProgramTables();
+  const client = getDbExec();
+  const { rows } = await client.execute({
+    sql: `SELECT * FROM data_program_runs
+      WHERE program_id = ? AND params_hash = ? AND status NOT IN ('queued', 'running')
+      ORDER BY COALESCE(finished_at, started_at) DESC
+      LIMIT 1`,
+    args: [programId, paramsHash],
+  });
+  const row = rows[0] as Record<string, unknown> | undefined;
+  return row ? runRowFromDb(row) : null;
+}
+
+export type DataProgramRunOutcome = Pick<
+  DataProgramRunRow,
+  "status" | "errorCode" | "errorMessage" | "startedAt" | "finishedAt"
+>;
+
+/** `getLatestFinishedRun` without the cached rows, for checks made on every read. */
+export async function getLatestFinishedRunOutcome(
+  programId: string,
+  paramsHash: string,
+): Promise<DataProgramRunOutcome | null> {
+  await ensureDataProgramTables();
+  const client = getDbExec();
+  const { rows } = await client.execute({
+    sql: `SELECT status, error_code, error_message, started_at, finished_at
+      FROM data_program_runs
+      WHERE program_id = ? AND params_hash = ? AND status NOT IN ('queued', 'running')
+      ORDER BY COALESCE(finished_at, started_at) DESC
+      LIMIT 1`,
+    args: [programId, paramsHash],
+  });
+  const row = rows[0] as Record<string, unknown> | undefined;
+  if (!row) return null;
+  const { status, errorCode, errorMessage, startedAt, finishedAt } =
+    runRowFromDb(row);
+  return { status, errorCode, errorMessage, startedAt, finishedAt };
 }
 
 export async function getActiveRun(

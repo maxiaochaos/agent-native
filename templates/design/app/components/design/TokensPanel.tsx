@@ -5,6 +5,7 @@ import {
   useActionQuery,
 } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
+import { reportWriteFailure } from "@agent-native/core/client/write-failure";
 import { parseCssColorExtended } from "@shared/color-utils";
 import {
   DESIGN_TOKEN_GROUPS,
@@ -416,10 +417,6 @@ function TokenGroupSection({
   );
 }
 
-const TOKEN_MENU_CONTENT_CLASS = "rounded-[10px] p-0";
-const TOKEN_MENU_ITEM_CLASS = "rounded-md px-2 py-1 text-sm leading-5";
-const TOKEN_MENU_SEPARATOR_CLASS = "mx-0 my-0 bg-border";
-
 function HeaderMenuTrigger({
   label,
   icon,
@@ -510,7 +507,7 @@ function AddTokenMenu({
       />
       <DropdownMenuContent
         align="end"
-        className={cn("w-[220px]", TOKEN_MENU_CONTENT_CLASS)}
+        className="w-[220px]"
         // The menu keeps focus trapped until its close animation ends, so the
         // draft row is started only here; starting it from onSelect mounts the
         // row while focus is still trapped and its value input never focuses.
@@ -524,13 +521,10 @@ function AddTokenMenu({
       >
         {TOKEN_TYPE_MENU.map((section, index) => (
           <div key={section[0]}>
-            {index > 0 && (
-              <DropdownMenuSeparator className={TOKEN_MENU_SEPARATOR_CLASS} />
-            )}
+            {index > 0 && <DropdownMenuSeparator />}
             {section.map((type) => (
               <DropdownMenuItem
                 key={type}
-                className={TOKEN_MENU_ITEM_CLASS}
                 onSelect={() => {
                   pickedTypeRef.current = type;
                 }}
@@ -698,34 +692,27 @@ function ImportTokensMenu({ onImport, isPending }: ImportTokensMenuProps) {
           label={t("designEditor.tokens.import")}
           icon={<IconDownload className="size-4" />}
         />
-        <DropdownMenuContent
-          align="end"
-          className={cn("w-[240px]", TOKEN_MENU_CONTENT_CLASS)}
-        >
+        <DropdownMenuContent align="end" className="w-[240px]">
           <DropdownMenuItem
-            className={TOKEN_MENU_ITEM_CLASS}
             disabled={isPending}
             onSelect={() => pickFiles(DTCG_ACCEPT)}
           >
             {t("designEditor.tokens.importDtcg")}
           </DropdownMenuItem>
           <DropdownMenuItem
-            className={TOKEN_MENU_ITEM_CLASS}
             disabled={isPending}
             onSelect={() => pickFiles(CSS_OR_TAILWIND_ACCEPT)}
           >
             {t("designEditor.tokens.importCssOrTailwind")}
           </DropdownMenuItem>
           <DropdownMenuItem
-            className={TOKEN_MENU_ITEM_CLASS}
             disabled={isPending}
             onSelect={() => void pasteFromClipboard()}
           >
             {t("designEditor.tokens.importClipboard")}
           </DropdownMenuItem>
-          <DropdownMenuSeparator className={TOKEN_MENU_SEPARATOR_CLASS} />
+          <DropdownMenuSeparator />
           <DropdownMenuItem
-            className={TOKEN_MENU_ITEM_CLASS}
             disabled={isPending}
             onSelect={() => void runImport({ source: "current-design" })}
           >
@@ -892,10 +879,17 @@ export function TokensPanel({ designId, onTokensApplied }: TokensPanelProps) {
 
   const commitTokenColor = async (cssVar: string, value: string) => {
     const requestDesignId = designId;
-    const result = (await applyMutation.mutateAsync({
-      designId,
-      edits: [{ cssVar, value }],
-    })) as { resolvedCssVars?: Record<string, string> };
+    let result: { resolvedCssVars?: Record<string, string> };
+    try {
+      result = (await applyMutation.mutateAsync({
+        designId,
+        edits: [{ cssVar, value }],
+      })) as { resolvedCssVars?: Record<string, string> };
+    } catch (error) {
+      reportWriteFailure(error);
+      // Rethrow so TokenColorPicker still resets its preview and logs.
+      throw error;
+    }
     if (designIdRef.current !== requestDesignId) return;
     await refetch();
     if (result?.resolvedCssVars && onTokensApplied) {
@@ -911,7 +905,9 @@ export function TokensPanel({ designId, onTokensApplied }: TokensPanelProps) {
     const cssVar = editingKey;
     const value = editDraft.trim();
     cancelEdit();
-    applyTokenEdit(cssVar, value);
+    applyTokenEdit(cssVar, value, {
+      onError: (error) => reportWriteFailure(error),
+    });
   };
 
   const startTokenDraft = (type: MenuTokenType) => {

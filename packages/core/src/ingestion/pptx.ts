@@ -174,9 +174,63 @@ export interface ParsedPptxPresentation {
   hiddenSlideCount?: number;
 }
 
+export interface PptxImageByteLimits {
+  maxImageBytes: number;
+  maxTotalImageBytes: number;
+}
+
+export const DEFAULT_PPTX_IMAGE_BYTE_LIMITS: Readonly<PptxImageByteLimits> =
+  Object.freeze({
+    maxImageBytes: 10 * 1024 * 1024,
+    maxTotalImageBytes: 50 * 1024 * 1024,
+  });
+
+export class PptxImageByteLimitError extends Error {
+  readonly limit: "per-image" | "aggregate";
+  readonly maxBytes: number;
+
+  constructor(limit: "per-image" | "aggregate", maxBytes: number) {
+    super(`PPTX image data exceeded its ${limit} byte limit.`);
+    this.name = "PptxImageByteLimitError";
+    this.limit = limit;
+    this.maxBytes = maxBytes;
+  }
+}
+
+interface PptxImageByteBudget {
+  totalBytes: number;
+  limits: PptxImageByteLimits;
+}
+
+function resolvePptxImageByteLimits(
+  limits?: Readonly<PptxImageByteLimits>,
+): PptxImageByteLimits {
+  const configured = limits ?? DEFAULT_PPTX_IMAGE_BYTE_LIMITS;
+  if (
+    !Number.isSafeInteger(configured.maxImageBytes) ||
+    configured.maxImageBytes < 0 ||
+    !Number.isSafeInteger(configured.maxTotalImageBytes) ||
+    configured.maxTotalImageBytes < 0
+  ) {
+    throw new RangeError(
+      "PPTX image byte limits must be non-negative integers.",
+    );
+  }
+  return {
+    maxImageBytes: configured.maxImageBytes,
+    maxTotalImageBytes: configured.maxTotalImageBytes,
+  };
+}
+
 interface ZipFile {
   async(type: "string"): Promise<string>;
   async(type: "nodebuffer"): Promise<Buffer>;
+  nodeStream(type: "nodebuffer"): {
+    on(event: "data", listener: (chunk: Uint8Array) => void): unknown;
+    on(event: "end", listener: () => void): unknown;
+    on(event: "error", listener: (error: unknown) => void): unknown;
+    destroy(error?: Error): unknown;
+  };
 }
 
 interface ZipArchive {
@@ -186,8 +240,13 @@ interface ZipArchive {
 
 export async function parsePptxPresentation(
   fileBuffer: Uint8Array,
-  options: { includeHiddenSlides?: boolean } = {},
+  options: {
+    includeHiddenSlides?: boolean;
+    imageByteLimits?: Readonly<PptxImageByteLimits>;
+  } = {},
 ): Promise<ParsedPptxPresentation> {
+  const imageByteLimits = resolvePptxImageByteLimits(options.imageByteLimits);
+  const imageBudget = { totalBytes: 0, limits: imageByteLimits };
   const dependencies = await loadPptxDependencies();
   const loadZip = dependencies.loadZip.bind(dependencies);
   const parseXml = dependencies.parseXml.bind(dependencies);
@@ -244,22 +303,24 @@ export async function parsePptxPresentation(
     );
   }
   const unresolvedSlideIdCount = droppedSlides.length;
-  const theme = await parseTheme(zip, parseXml, slideMasterRelationship);
-  const tableStyles = await parseTableStyles(zip, parseXml);
-  const masterColorInfo = slideMasterRelationship
-    ? await parseMasterColorInfo({
-        zip,
-        target: slideMasterRelationship.target,
-        parseXml,
-      })
-    : {
-        clrMap: {},
-        titleDefaultsByLevel: {},
-        bodyDefaultsByLevel: {},
-        otherDefaultsByLevel: {},
-        placeholderDefaults: [],
-        background: null,
-      };
+  const [theme, tableStyles, masterColorInfo] = await Promise.all([
+    parseTheme(zip, parseXml, slideMasterRelationship),
+    parseTableStyles(zip, parseXml),
+    slideMasterRelationship
+      ? parseMasterColorInfo({
+          zip,
+          target: slideMasterRelationship.target,
+          parseXml,
+        })
+      : {
+          clrMap: {},
+          titleDefaultsByLevel: {},
+          bodyDefaultsByLevel: {},
+          otherDefaultsByLevel: {},
+          placeholderDefaults: [],
+          background: null,
+        },
+  ]);
   const colorContext: ColorContext = {
     themeColorsByName: theme.colorsByName,
     clrMap: masterColorInfo.clrMap,
@@ -305,6 +366,34 @@ export async function parsePptxPresentation(
   >();
   const slides: ParsedPptxSlide[] = [];
   let hiddenSlideCount = 0;
+  // A slide's notesSlide relationship names its notes. Notes parts are
+  // numbered in the order the notes were written, not by slide (with notes
+  // only on slide 2, they are notesSlide1.xml), so a slide without that
+  // relationship falls back to the part with its own number only when no
+  // other slide's relationship names that part. A relationships part that
+  // cannot be read may name any notes part, so it turns the fallback off.
+  const notesPartsNamedBySlides = new Set<string>();
+  let everyNotesClaimKnown = true;
+  for (const slidePath of slidePaths) {
+    const relationshipsXml = await zip
+      .file(relsPathForPptxPart(slidePath))
+      ?.async("string");
+    if (!relationshipsXml) continue;
+    let relationships: Map<string, { target: string; type: string }>;
+    try {
+      relationships = parseRelationships(parseXml(relationshipsXml));
+    } catch {
+      everyNotesClaimKnown = false;
+      continue;
+    }
+    for (const relationship of relationships.values()) {
+      if (relationship.type.endsWith("/notesSlide")) {
+        notesPartsNamedBySlides.add(
+          resolvePptxRelationshipPath("ppt/slides", relationship.target),
+        );
+      }
+    }
+  }
   for (const slidePath of slidePaths) {
     const xml = await zip.file(slidePath)?.async("string");
     if (!xml) {
@@ -351,6 +440,7 @@ export async function parsePptxPresentation(
         themeCache,
         masterInfoCache,
         templateContextCache,
+        imageBudget,
       })) ?? fallbackContext;
     const number = slideNumber(slidePath);
     elements = await parseSlideElements({
@@ -367,6 +457,7 @@ export async function parsePptxPresentation(
       placeholderDefaults: slideMasterContext.placeholderDefaults,
       slideNumber: slides.length + 1,
       tableStyles,
+      imageBudget,
     });
     images.unshift(...slideMasterContext.layerImages);
     elements.unshift(
@@ -376,9 +467,18 @@ export async function parsePptxPresentation(
       ),
     );
     const texts = flattenElementText(elements);
-    const notesXml = await zip
-      .file(`ppt/notesSlides/notesSlide${number}.xml`)
-      ?.async("string");
+    const notesRelationship = [...slideRelationships.values()].find(
+      (relationship) => relationship.type.endsWith("/notesSlide"),
+    );
+    const numberedNotesPath = `ppt/notesSlides/notesSlide${number}.xml`;
+    const notesPath = notesRelationship
+      ? resolvePptxRelationshipPath("ppt/slides", notesRelationship.target)
+      : !everyNotesClaimKnown || notesPartsNamedBySlides.has(numberedNotesPath)
+        ? undefined
+        : numberedNotesPath;
+    const notesXml = notesPath
+      ? await zip.file(notesPath)?.async("string")
+      : undefined;
     let notes: string | undefined;
     if (notesXml) {
       const runs: ParsedPptxTextRun[] = [];
@@ -554,6 +654,7 @@ async function resolveSlideMasterContext(args: {
   themeCache: Map<string, Promise<ThemeInfo>>;
   masterInfoCache: Map<string, ReturnType<typeof parseMasterColorInfo>>;
   templateContextCache: Map<string, Promise<SlideTemplateContext | undefined>>;
+  imageBudget: PptxImageByteBudget;
 }): Promise<SlideTemplateContext | undefined> {
   const layoutRelationship = [...args.slideRelationships.values()].find(
     (relationship) => relationship.type.endsWith("/slideLayout"),
@@ -579,12 +680,13 @@ async function buildSlideTemplateContext(args: {
   slideHeightEmu?: number;
   themeCache: Map<string, Promise<ThemeInfo>>;
   masterInfoCache: Map<string, ReturnType<typeof parseMasterColorInfo>>;
+  imageBudget: PptxImageByteBudget;
 }): Promise<SlideTemplateContext | undefined> {
   const layoutPath = args.layoutPath;
-  const layoutXml = await args.zip.file(layoutPath)?.async("string");
-  const layoutRelsXml = await args.zip
-    .file(relsPathForPptxPart(layoutPath))
-    ?.async("string");
+  const [layoutXml, layoutRelsXml] = await Promise.all([
+    args.zip.file(layoutPath)?.async("string"),
+    args.zip.file(relsPathForPptxPart(layoutPath))?.async("string"),
+  ]);
   if (!layoutRelsXml) return undefined;
   const layoutRelationships = parseRelationships(args.parseXml(layoutRelsXml));
   const masterRelationship = [...layoutRelationships.values()].find(
@@ -670,6 +772,7 @@ async function buildSlideTemplateContext(args: {
         slideHeightEmu: args.slideHeightEmu,
         images: layerImages,
         colorContext,
+        imageBudget: args.imageBudget,
       })),
     );
   }
@@ -714,6 +817,7 @@ async function parseTemplateLayerElements(args: {
   slideHeightEmu?: number;
   images: ParsedPptxImage[];
   colorContext?: ColorContext;
+  imageBudget: PptxImageByteBudget;
 }): Promise<ParsedPptxElement[]> {
   const relsXml = await args.zip
     .file(relsPathForPptxPart(args.path))
@@ -736,6 +840,7 @@ async function parseTemplateLayerElements(args: {
         images,
         tablesDegraded,
         colorContext: args.colorContext,
+        imageBudget: args.imageBudget,
         context: { matrix: IDENTITY_MAT, rotation: 0 },
       })),
     );
@@ -966,6 +1071,7 @@ async function parseSlideElements(args: {
   placeholderDefaults?: PlaceholderDefaults;
   slideNumber?: number;
   tableStyles?: PptxTableStyles;
+  imageBudget: PptxImageByteBudget;
 }): Promise<ParsedPptxElement[]> {
   const fragments = extractDirectShapeFragments(args.xml, "spTree");
   const elements: ParsedPptxElement[] = [];
@@ -996,6 +1102,7 @@ async function parseSlideElements(args: {
         y: 0,
         width: args.slideWidthEmu ?? 0,
         height: args.slideHeightEmu ?? 0,
+        imageBudget: args.imageBudget,
       });
       if (image) {
         args.images.unshift(image.image);
@@ -1021,6 +1128,7 @@ async function parseShapeFragment(
     placeholderDefaults?: PlaceholderDefaults;
     slideNumber?: number;
     tableStyles?: PptxTableStyles;
+    imageBudget: PptxImageByteBudget;
     context: ShapeTransformContext;
   },
 ): Promise<ParsedPptxElement[]> {
@@ -1159,6 +1267,7 @@ async function parseShapeFragment(
       width: transform.width,
       height: transform.height,
       crop: parseImageCrop(node),
+      imageBudget: args.imageBudget,
     });
     if (!image) return [];
     args.images.push(image.image);
@@ -2414,6 +2523,7 @@ async function loadPptxImage(args: {
   width: number;
   height: number;
   crop?: ParsedPptxImage["crop"];
+  imageBudget: PptxImageByteBudget;
 }): Promise<{ image: ParsedPptxImage; element: ParsedPptxElement } | null> {
   if (
     !args.relationship.type.includes("/image") &&
@@ -2431,8 +2541,12 @@ async function loadPptxImage(args: {
   const imageFile = args.zip.file(imagePath);
   if (!imageFile) return null;
   const name = imagePath.split("/").at(-1) ?? "image";
+  const imageData = await readPptxImageWithinBudget(
+    imageFile,
+    args.imageBudget,
+  );
   const image: ParsedPptxImage = {
-    data: new Uint8Array(await imageFile.async("nodebuffer")),
+    data: new Uint8Array(imageData),
     mimeType: imageMimeType(name),
     name,
     aspectRatio:
@@ -2460,6 +2574,61 @@ async function loadPptxImage(args: {
       image,
     },
   };
+}
+
+async function readPptxImageWithinBudget(
+  imageFile: ZipFile,
+  budget: PptxImageByteBudget,
+): Promise<Buffer> {
+  const stream = imageFile.nodeStream("nodebuffer");
+  return await new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let imageBytes = 0;
+    let settled = false;
+
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      stream.destroy();
+      reject(error);
+    };
+
+    stream.on("data", (chunk) => {
+      if (settled) return;
+      const nextImageBytes = imageBytes + chunk.byteLength;
+      if (nextImageBytes > budget.limits.maxImageBytes) {
+        fail(
+          new PptxImageByteLimitError("per-image", budget.limits.maxImageBytes),
+        );
+        return;
+      }
+      if (
+        budget.totalBytes + nextImageBytes >
+        budget.limits.maxTotalImageBytes
+      ) {
+        fail(
+          new PptxImageByteLimitError(
+            "aggregate",
+            budget.limits.maxTotalImageBytes,
+          ),
+        );
+        return;
+      }
+      imageBytes = nextImageBytes;
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    stream.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    stream.on("end", () => {
+      if (settled) return;
+      settled = true;
+      budget.totalBytes += imageBytes;
+      resolve(Buffer.concat(chunks, imageBytes));
+    });
+  });
 }
 
 function flattenElementText(

@@ -3,6 +3,7 @@ import {
   defineAction,
   embedApp,
 } from "@agent-native/core";
+import type { ActionRunContext } from "@agent-native/core/action";
 import { writeAppState } from "@agent-native/core/application-state";
 import { buildDeepLink } from "@agent-native/core/server";
 import {
@@ -31,12 +32,15 @@ import {
 } from "../server/lib/document-metadata-updated-at.js";
 import type {
   ContentDatabaseResponse,
+  ContentDatabaseResponsePayload,
   CreateDatabaseRequest,
 } from "../shared/api.js";
 import { ensureDocumentFilesMembership } from "./_content-files.js";
 import { resolveContentSpaceAccess } from "./_content-space-access.js";
+import { resolveProvisionedContentSpaceAccess } from "./_content-space-target.js";
 import {
   organizationContentSpaceId,
+  personalContentSpaceId,
   provisionContentSpaces,
 } from "./_content-spaces.js";
 import { loadContext } from "./_database-row-mutation.js";
@@ -48,7 +52,11 @@ import {
   setupError,
   setupAuditSummary,
 } from "./_database-setup-mutation.js";
-import { getContentDatabaseResponse } from "./_database-utils.js";
+import {
+  contentDatabaseResponseForCaller,
+  getContentDatabaseResponse,
+} from "./_database-utils.js";
+import { assertAgentsMayEditPageText } from "./_document-agent-lock.js";
 import {
   documentsPositionScope,
   nextAppendPosition,
@@ -60,6 +68,7 @@ import {
   seedDefaultBlocksField,
   serializeDatabaseViewConfig,
 } from "./_property-utils.js";
+import { lockParentOfNewPage } from "./_row-lock-order.js";
 
 const createContentDatabaseSchema = z
   .object({
@@ -139,7 +148,7 @@ export default defineAction({
     recordInputs: false,
     target: (_args, result) => ({
       type: "content-database",
-      id: (result as ContentDatabaseResponse).database.id,
+      id: (result as ContentDatabaseResponsePayload).database.id,
       visibility: "private",
     }),
     summary: (_args, result) =>
@@ -165,10 +174,13 @@ export default defineAction({
   run: async (args, context) => {
     if (context?.caller === "mcp") createDatabaseAgentSchema.parse(args);
     if (args.idempotencyKey !== undefined)
-      return createReliableDatabase(createDatabaseReliableSchema.parse(args));
-    const result = await createContentDatabaseCore(args);
+      return contentDatabaseResponseForCaller(
+        await createReliableDatabase(createDatabaseReliableSchema.parse(args)),
+        context,
+      );
+    const result = await createContentDatabaseCore(args, { ctx: context });
     await writeAppState("refresh-signal", { ts: Date.now() });
-    return result;
+    return contentDatabaseResponseForCaller(result, context);
   },
   link: ({ result }) => {
     const documentId = (result as { database?: { documentId?: string } } | null)
@@ -265,7 +277,10 @@ async function createReliableDatabase(
 
 export async function createContentDatabaseCore(
   args: CreateDatabaseRequest,
-  options: { db?: any } = {},
+  options: Pick<
+    NonNullable<Parameters<typeof createContentDatabaseRecord>[1]>,
+    "db" | "ctx"
+  > = {},
 ): Promise<ContentDatabaseResponse> {
   if (args.documentId && args.newDocumentId) {
     throw new Error("documentId and newDocumentId cannot both be provided");
@@ -280,12 +295,14 @@ export async function createContentDatabaseCore(
     databaseId = await createContentDatabaseRecord(args, {
       db,
       spaceId: resolvedSpaceId,
+      ctx: options.ctx,
     });
   } else {
     await db.transaction(async (tx: any) => {
       databaseId = await createContentDatabaseRecord(args, {
         db: tx,
         spaceId: resolvedSpaceId,
+        ctx: options.ctx,
       });
     });
   }
@@ -342,9 +359,13 @@ export async function resolveContentDatabaseSpace(
   }
   const userEmail = getRequestUserEmail();
   if (!userEmail) throw new Error("no authenticated user");
-  const provisioned = await provisionContentSpaces(db, userEmail);
-  const spaceId = args.spaceId ?? provisioned.personalSpaceId;
-  await resolveContentSpaceAccess(spaceId, "contributor");
+  const spaceId = args.spaceId ?? personalContentSpaceId(userEmail);
+  await resolveProvisionedContentSpaceAccess({
+    db,
+    userEmail,
+    spaceId,
+    requiredRole: "contributor",
+  });
   return spaceId;
 }
 
@@ -375,6 +396,7 @@ export async function createContentDatabaseRecord(
     db?: any;
     spaceId?: string;
     resolveSpaceAccess?: typeof resolveContentSpaceAccess;
+    ctx?: ActionRunContext;
   } = {},
 ): Promise<string> {
   const db = options.db ?? getDb();
@@ -458,7 +480,11 @@ export async function createContentDatabaseRecord(
       return existing.id;
     }
 
-    if (title && title !== document.title && !document.title.trim()) {
+    // Turning the page into a collection changes the page itself, title or not.
+    assertAgentsMayEditPageText(document, options.ctx);
+    const fillsTitle =
+      title && title !== document.title && !document.title.trim();
+    if (fillsTitle) {
       await db
         .update(schema.documents)
         .set({ title, updatedAt: now, ...documentEditAttribution(actor) })
@@ -479,6 +505,7 @@ export async function createContentDatabaseRecord(
     const parentId = args.parentId || null;
     let visibility: "private" | "org" | "public" = "private";
     let hideFromSearch = 0;
+    let parentScope: Parameters<typeof lockParentOfNewPage>[2] | null = null;
 
     if (parentId) {
       const parent = await assertDocumentEditorAccess(db, parentId);
@@ -493,6 +520,12 @@ export async function createContentDatabaseRecord(
       }
       visibility = parent.visibility ?? "private";
       hideFromSearch = parent.hideFromSearch ?? 0;
+      parentScope = {
+        ownerEmail: parent.ownerEmail,
+        spaceId: parent.spaceId ?? null,
+        orgId,
+        visibility: parent.visibility,
+      };
       inheritedShares = await db
         .select({
           principalType: schema.documentShares.principalType,
@@ -571,6 +604,9 @@ export async function createContentDatabaseRecord(
           createdAt: now,
         })),
       );
+    }
+    if (parentId && parentScope) {
+      await lockParentOfNewPage(db, parentId, parentScope);
     }
   }
 

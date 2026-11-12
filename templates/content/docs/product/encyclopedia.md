@@ -9,16 +9,16 @@ This index summarizes the atomic product contracts beneath the public roadmap. E
 - Chapters: 6
 - Features: 32
 - Named increments: 1
-- Capabilities: 125
+- Capabilities: 126
 
 | Capability state | Count |
 | ---------------- | ----: |
 | Verified         |     4 |
 | Failing          |     1 |
 | Stale            |     0 |
-| In Progress      |    20 |
-| Approved Shape   |    87 |
-| Exploring        |     8 |
+| In Progress      |    21 |
+| Approved Shape   |    86 |
+| Exploring        |     9 |
 | Deferred         |     0 |
 | Superseded       |     5 |
 
@@ -101,6 +101,7 @@ graph LR
   family_author --> family_reader
   family_author --> family_review
   family_command --> family_action
+  family_comment --> family_discussion
   family_diff --> family_review
   family_diff --> family_revision
   family_diff --> family_template
@@ -109,7 +110,6 @@ graph LR
   family_event --> family_agent
   family_event --> family_capture
   family_event --> family_diff
-  family_event --> family_discussion
   family_event --> family_expression
   family_event --> family_form
   family_event --> family_history
@@ -261,9 +261,9 @@ graph LR
 
 ## Comment
 
-| Capability                                             | State          | User promise                                                                       |
-| ------------------------------------------------------ | -------------- | ---------------------------------------------------------------------------------- |
-| [Comments](capabilities/content.comment.page-owned.md) | Approved Shape | Threaded Comments stay owned by a Page while targeting one or more precise Blocks. |
+| Capability                                             | State          | User promise                                                                                                    |
+| ------------------------------------------------------ | -------------- | --------------------------------------------------------------------------------------------------------------- |
+| [Comments](capabilities/content.comment.page-owned.md) | Approved Shape | Threaded Comments stay owned by a Page while pointing at precise Blocks, one Property value, or the whole Page. |
 
 ## Diff
 
@@ -275,9 +275,9 @@ graph LR
 
 ## Discussion
 
-| Capability                                                 | State          | User promise                                                                                       |
-| ---------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------- |
-| [Page Discussion](capabilities/content.discussion.page.md) | Approved Shape | Every Page has one continuing Discussion for humane, Page-wide collaboration and curated activity. |
+| Capability                                                 | State          | User promise                                                                                                         |
+| ---------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------- |
+| [Page Discussion](capabilities/content.discussion.page.md) | Approved Shape | Every Page has one Discussion that holds all of its comments: on the whole Page, on its text, and on its Properties. |
 
 ## Embed
 
@@ -333,11 +333,12 @@ graph LR
 
 ## Knowledge
 
-| Capability                                                     | State          | User promise                                                                                                                |
-| -------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| [Graph queries](capabilities/content.knowledge.graph.md)       | Exploring      | Graph navigation and query over typed links, mentions, relations, and authority edges                                       |
-| [Links and backlinks](capabilities/content.knowledge.links.md) | Approved Shape | Stable links, outline, backlinks, forward links, external-link health, and link-aware navigation through the Page Info rail |
-| [Search](capabilities/content.knowledge.search.md)             | In Progress    | Fast access-aware search across titles, bodies, rows, sources, and later comments/review                                    |
+| Capability                                                     | State          | User promise                                                                                                                                                    |
+| -------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Graph queries](capabilities/content.knowledge.graph.md)       | Exploring      | Graph navigation and query over typed links, mentions, relations, and authority edges                                                                           |
+| [Links and backlinks](capabilities/content.knowledge.links.md) | Approved Shape | Stable links, outline, backlinks, forward links, external-link health, and link-aware navigation through the Page Info rail                                     |
+| [Related work](capabilities/content.knowledge.related.md)      | Exploring      | A small, current set of related Pages and records beside the one you're reading, so people can move through a workspace without maintaining a hierarchy by hand |
+| [Search](capabilities/content.knowledge.search.md)             | In Progress    | Fast access-aware search across titles, bodies, rows, sources, and later comments/review                                                                        |
 
 ## Layout
 
@@ -499,7 +500,7 @@ graph LR
 | [Page-linked Sources](capabilities/content.source.page-link.md)                   | Exploring      | A Page can bind to one external item while keeping Content identity and the provider's ownership clear.                                                        |
 | [Materialized multi-source Collections](capabilities/content.source.row-union.md) | Superseded     | The former multi-source row-union model remains migration evidence, while active composition moves toward source Queries.                                      |
 | [Content spaces and Files](capabilities/content.source.spaces-files.md)           | Verified       | Personal and organization-backed Content spaces and Files views keep work navigable without becoming a second permission system.                               |
-| [Source sync policy](capabilities/content.source.sync-policy.md)                  | Approved Shape | Each connected Source declares one plain-language policy for refresh and write-back: View only, Keep in sync, or Review before write-back.                     |
+| [Source sync policy](capabilities/content.source.sync-policy.md)                  | In Progress    | Each connected Source declares one plain-language policy for refresh and write-back: View only, Keep in sync, or Review before write-back.                     |
 
 ## System
 

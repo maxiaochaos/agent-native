@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   bodyHoldsChanges,
+  mergeBlocksFieldEdits,
   mergeDocumentBodyIntents,
 } from "./document-intent-merge.js";
 
@@ -616,6 +617,51 @@ describe("document body intent merge", () => {
     ).toEqual({ status: "preservation-required", reason: "structure" });
   });
 
+  it("merges two writers' edits across every block of a page over 500,000 characters", () => {
+    const blocks = Array.from(
+      { length: 11_000 },
+      (_, index) => `Paragraph ${index} ${"x".repeat(50)}`,
+    );
+    const edited = (parity: number | null, mark: string) =>
+      blocks
+        .map((block, index) =>
+          parity !== null && index % 2 === parity ? `${mark} ${block}` : block,
+        )
+        .join("\n");
+    const expected = blocks
+      .map((block, index) =>
+        index % 2 === 0 ? `Browser ${block}` : `Agent ${block}`,
+      )
+      .join("\n");
+    expect(edited(null, "").length).toBeGreaterThan(500_000);
+
+    expect(
+      mergeDocumentBodyIntents({
+        authoredBaseContent: edited(null, ""),
+        authoredCandidateContent: edited(0, "Browser"),
+        currentContent: edited(1, "Agent"),
+        currentRevision: 2,
+        incoming: {
+          writerId: "browser:a",
+          operationId: "a:1",
+          authoredBaseRevision: 1,
+        },
+        priorIntents: [
+          {
+            writerId: "mcp:z",
+            operationId: "z:1",
+            authoredBaseRevision: 1,
+            committedRevision: 2,
+            affectedBlockIndexes: blocks.flatMap((_, index) =>
+              index % 2 === 1 ? [index] : [],
+            ),
+            canonicalChanged: true,
+          },
+        ],
+      }),
+    ).toMatchObject({ status: "resolved", content: expected });
+  }, 30_000);
+
   it("merges a save authored on the blank-line body an agent stored", () => {
     expect(
       mergeDocumentBodyIntents({
@@ -672,6 +718,30 @@ describe("document body intent merge", () => {
     ).toEqual({ status: "preservation-required", reason: "structure" });
   });
 
+  it("keeps a blank-line body that already holds the editor's save", () => {
+    // An accepted suggestion rewrote the agent's page on the server while the
+    // editor saved the same accepted text in its one-block-per-line form.
+    expect(
+      mergeDocumentBodyIntents({
+        authoredBaseContent: "Alpha.\n\nBravo.\n\nCharlie.",
+        authoredCandidateContent: "Alpha.\nBravo. accepted\nCharlie. accepted",
+        currentContent: "Alpha.\n\nBravo. accepted\n\nCharlie. accepted",
+        currentRevision: 3,
+        incoming: {
+          writerId: "browser:b",
+          operationId: "b:1",
+          authoredBaseRevision: 1,
+        },
+        priorIntents: [],
+      }),
+    ).toEqual({
+      status: "resolved",
+      content: "Alpha.\n\nBravo. accepted\n\nCharlie. accepted",
+      changedBlockIndexes: [],
+      displaced: false,
+    });
+  });
+
   it("compares a held body against the blank-line body an agent stored", () => {
     expect(
       bodyHoldsChanges(
@@ -690,5 +760,140 @@ describe("document body intent merge", () => {
       true,
     );
     expect(bodyHoldsChanges(base, "Alpha.\nBravo.", accepted)).toBe(false);
+  });
+});
+
+describe("Blocks field edit merge", () => {
+  it.each([
+    [
+      "edits to different paragraphs",
+      "One\nTwo\nThree",
+      "One\nTwo\nThree and more",
+      "One edited\nTwo\nThree",
+      "One edited\nTwo\nThree and more",
+    ],
+    [
+      "edits to different words of one paragraph",
+      "The cat sat on the mat",
+      "The cat sat on the red mat",
+      "The black cat sat on the mat",
+      "The black cat sat on the red mat",
+    ],
+    [
+      "text both added at the same spot, theirs first",
+      "One\nTwo",
+      "One\nTwo\nMy line",
+      "One\nTwo\nAgent line",
+      "One\nTwo\nAgent line\nMy line",
+    ],
+    [
+      "typing at the end of a paragraph where theirs starts a new one",
+      "Intro",
+      "Intro more",
+      "Intro\nNew paragraph",
+      "Intro more\nNew paragraph",
+    ],
+    [
+      "typing at the start of a paragraph where theirs adds one before it",
+      "One\nTwo",
+      "One\nHey Two",
+      "One\nNew\nTwo",
+      "One\nNew\nHey Two",
+    ],
+    [
+      "typing that already holds the other save",
+      "Draft",
+      "Draft more and more",
+      "Draft more",
+      "Draft more and more",
+    ],
+    [
+      "a save that already holds the typing",
+      "Draft",
+      "Draft more",
+      "Draft more and more",
+      "Draft more and more",
+    ],
+    [
+      "a save stored as blank-line Markdown",
+      "One\n\nTwo",
+      "One edit\nTwo",
+      "One\n\nTwo\n\nThree",
+      "One edit\nTwo\nThree",
+    ],
+  ])("keeps both sides for %s", (_name, base, mine, theirs, expected) => {
+    expect(mergeBlocksFieldEdits(base, mine, theirs)).toEqual({
+      content: expected,
+      moved: false,
+    });
+  });
+
+  it("keeps their words in place and moves mine to the end when both change the same words", () => {
+    expect(
+      mergeBlocksFieldEdits(
+        "Intro\nHello world\nOutro",
+        "Intro\nHello friend\nOutro",
+        "Intro\nHello there\nOutro",
+      ),
+    ).toEqual({
+      content: "Intro\nHello there\nOutro\nHello friend",
+      moved: true,
+    });
+  });
+
+  it("still places my other changes when one of them overlaps", () => {
+    expect(
+      mergeBlocksFieldEdits(
+        "Hello world\nSecond line",
+        "Hello friend\nSecond line, longer",
+        "Hello there\nSecond line",
+      ),
+    ).toEqual({
+      content: "Hello there\nSecond line, longer\nHello friend",
+      moved: true,
+    });
+  });
+
+  it("moves my rewrite even when it copies another paragraph", () => {
+    expect(
+      mergeBlocksFieldEdits(
+        "Chorus\nVerse one\nChorus",
+        "Chorus\nChorus\nChorus",
+        "Chorus\nVerse two\nChorus",
+      ),
+    ).toEqual({
+      content: "Chorus\nVerse two\nChorus\nChorus",
+      moved: true,
+    });
+  });
+
+  it("keeps a repeated paragraph I added when theirs repeats one too", () => {
+    expect(
+      mergeBlocksFieldEdits(
+        "Chorus\nVerse",
+        "Chorus\nVerse\nChorus",
+        "Verse\nChorus\nVerse",
+      ),
+    ).toEqual({
+      content: "Verse\nChorus\nVerse\nChorus",
+      moved: false,
+    });
+  });
+
+  it("drops a deletion of words the other side rewrote, moving nothing", () => {
+    expect(
+      mergeBlocksFieldEdits("Keep this part", "Keep part", "Keep that part"),
+    ).toEqual({ content: "Keep that part", moved: false });
+  });
+
+  it("takes either side unchanged when the other made no edit", () => {
+    expect(mergeBlocksFieldEdits("Same", "Same", "Theirs")).toEqual({
+      content: "Theirs",
+      moved: false,
+    });
+    expect(mergeBlocksFieldEdits("Same", "Mine", "Same")).toEqual({
+      content: "Mine",
+      moved: false,
+    });
   });
 });

@@ -10,23 +10,18 @@ Read relevant guides before deeper work:
 - `.agents/skills/slide-editing/SKILL.md` — for targeted edits and fit.
 - `.agents/skills/deck-management/SKILL.md` — for organize/share/import/export.
 - `.agents/skills/slide-images/SKILL.md` — for image work.
-- `.agents/skills/image-generation-via-a2a/SKILL.md` — for A2A image generation.
+- `.agents/skills/image-generation-via-a2a/SKILL.md` — for requested Assets brand-library images.
 - `.agents/skills/design-systems/SKILL.md` — for deck design systems.
 - `.agents/skills/slide-design/SKILL.md` — for visual-craft requests.
 - `.agents/skills/apply-slide-comments/SKILL.md` — for applying/resolving comments.
 - `.agents/skills/creative-context/SKILL.md` — for source reuse and context.
 - `.agents/skills/analytics-data-for-decks/SKILL.md` — for delegated data requests.
 
-`.agents/skills/actions/SKILL.md`, `.agents/skills/adding-a-feature/SKILL.md`, `.agents/skills/storing-data/SKILL.md`, `.agents/skills/security/SKILL.md`,
-`.agents/skills/secrets/SKILL.md`, `.agents/skills/sharing/SKILL.md`, `.agents/skills/frontend-design/SKILL.md`, `.agents/skills/shadcn-ui/SKILL.md`,
-`.agents/skills/real-time-sync/SKILL.md`, `.agents/skills/context-awareness/SKILL.md`, `.agents/skills/delegate-to-agent/SKILL.md`, `.agents/skills/agent-native-docs/SKILL.md`,
-`.agents/skills/agent-native-toolkit/SKILL.md`, `.agents/skills/customizing-agent-native/SKILL.md`, `.agents/skills/client-side-routing/SKILL.md`, `.agents/skills/reliable-mutations/SKILL.md`,
-`.agents/skills/performance/SKILL.md`, `.agents/skills/external-agents/SKILL.md`, `.agents/skills/portability/SKILL.md`, `.agents/skills/self-modifying-code/SKILL.md`,
-`.agents/skills/turn-into-skill/SKILL.md`, `.agents/skills/workspace-conventions/SKILL.md`.
+Shared framework conventions live in the matching skill under `.agents/skills/`.
 
 ## Framework Docs
 
-Use local framework docs, not web research: `pnpm action docs-search --query "<topic>"` searches; `pnpm action docs-search --slug "<slug>"` reads a page.
+For framework questions, use local docs: `pnpm action docs-search --query "<topic>"` or `pnpm action docs-search --slug "<slug>"`.
 
 ## Actions
 
@@ -35,10 +30,12 @@ Use local framework docs, not web research: `pnpm action docs-search --query "<t
 | `view-screen` / `navigate` | Read deck/selection / move UI |
 | `create-deck` / `add-slide` / `update-slide` / `patch-deck` | Create and edit slides |
 | `delete-deck` / `duplicate-deck` / `get-deck` / `list-decks` | Manage and read decks |
+| `list-deck-versions` / `restore-deck-version` | Read history / roll back |
 | `list-deck-templates` / `get-deck-template` / `create-deck-from-template` | Browse/copy templates |
 | `add-slide-comment` / `list-slide-comments` / `update-slide-comment` / `delete-slide-comment` / `toggle-slide-comment-reaction` | Manage comments |
 | `read-composer-source` / `apply-design-system` | Read references / link design system |
-| `generate-home-suggestions` / `generate-image-api` | Suggest prompts / create image via Assets |
+| `read-google-slides-context` | Read Google Slides text and speaker notes as chat context; creates no deck |
+| `generate-image-api` | Generate images locally; Assets is opt-in |
 | `export-pptx` / `export-html` / `export-google-slides` | Export deck |
 
 ## Core Rules
@@ -46,27 +43,33 @@ Use local framework docs, not web research: `pnpm action docs-search --query "<t
 - UI feedback: target 100 ms, never exceed 400 ms; acknowledge before network work.
 - Use actions for deck/slide writes; keep large files in configured file storage, not SQL/settings/resources. Never hardcode secrets or private/customer data; use obvious placeholders.
 - For external integrations, inspect the workspace/provider connection catalog first; reuse its scoped resolver.
-- Use `view-screen` when the active deck/slide/layout is unclear, and on every turn that says "this"/"here"/"selected". Preserve requested structure; do not restyle imports marked partial or with `imagesSkipped` without reporting the warning.
+- Scale work to the request. A blank slide, rename, reorder, or delete is one action call. A same-or-shorter text replacement, a selected-object or `selectedText` edit, or one style tweak is one `update-slide` call: no read-back, fit check, or contrast audit unless layout changes or text grows. Skip skill reads, `manage-progress`, and retitling for these, even after earlier generation turns.
+- Author and edit decks with Slides actions; use Design by A2A only for a requested Design-owned input or a Design-only capability.
+- Call `view-screen` only when the deck, slide, or selection is not already in the context block. "This", "this slide", or "here" with nothing selected means the current slide; ask only when there is none. Preserve requested structure; do not restyle imports marked partial or with `imagesSkipped` without reporting the warning.
+- To undo your change, write back only the slides you changed from the newest `list-deck-versions` snapshot before it; `restore-deck-version` rolls back the whole deck.
 - Slide HTML layout, card, no-SVG, and freeform-id rules: `slide-editing`.
 - Import attachments only on request or via Import. `sourceImport` records provenance; structural edits clear it. Read preloaded new-deck attachments before deciding whether to import.
 - Provider API actions are shortcuts, not limits. For exact Drive API needs use `provider-api-catalog` / `-docs` / `-request` with the user's Google Docs OAuth. Preserve imported PPTX timing metadata.
 - For data requests, follow `analytics-data-for-decks` and delegate via Analytics/A2A; never query SQL or providers directly. Without a reference deck or design system, read `get-workspace-defaults` before generation; use `creative-context` for source order and context submission.
 
-## Persistence Model
-
-Deck data lives in SQL; all writes go through server-side actions. Read `deck-management` before changing persistence or save paths.
-
 ## Application State
 
 - `navigation` exposes deck, slide, selection, and editor view; `navigate` opens decks, slides, imports, and exports.
-- `slides-selection` describes selected elements, tool mode, transient selectors, text/image/video hints, and computed styles. Read `view-screen` before visual/style edits; use actions for full data.
+- `slides-selection` describes selected elements, tool mode, transient selectors, text/image/video hints, and computed styles. Use actions for full data.
+- `agent-selection` lists slides and elements picked with Select; a `Selected objects` context block names the target set, so edit only those.
+- `slides-open-panel` records the open side panel (`layers` / `animations`) and `notesOpen` for the speaker notes panel; `view-screen` prints them as `openPanel` and `notesOpen`.
+- Presenter speech navigation accepts exact localized next/previous slide phrases; keep transcripts transient and ignore narration.
 
 ## Export Behavior
 
-Google Slides export produces a PPTX for the user to import; a native Slides file requires a separate API `batchUpdate` path. Preserve editable vector/DOM content; do not substitute full-slide images unless requested. Read `deck-management` for export path selection and failure details.
+Google Slides export produces a PPTX to import; a native Slides file needs the API `batchUpdate` path. Keep editable vector/DOM content, not full-slide images, unless requested. Read `deck-management` for export paths and failures.
 
 ## Source Changes
 
-Before building common workspace or agent UI, read `agent-native-toolkit`; read `customizing-agent-native` before adapting shared UI.
+Before building common workspace or agent UI, read `agent-native-toolkit`; read `customizing-agent-native` before adapting shared UI. Search with `rg --hidden --follow`.
 
-Search with `rg --hidden --follow`; read the exact linked guide before deeper work.
+## Actions for outside agents
+
+| Action | Purpose |
+| --- | --- |
+| `clone-context-slide` | Copy a pinned native library slide into an editable deck, preserving provenance |

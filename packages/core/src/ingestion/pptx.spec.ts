@@ -1,7 +1,11 @@
 import JSZip from "jszip";
 import { describe, expect, it } from "vitest";
 
-import { parsePptxPresentation, parsePptxSlideMetadata } from "./pptx.js";
+import {
+  parsePptxPresentation,
+  parsePptxSlideMetadata,
+  PptxImageByteLimitError,
+} from "./pptx.js";
 
 describe("parsePptxSlideMetadata", () => {
   it.each([
@@ -875,6 +879,31 @@ describe("parsePptxPresentation", () => {
     });
   });
 
+  it.each([
+    ["per-image", 2, 100, [pictureSlideXml()], "per-image"],
+    ["aggregate", 3, 5, [pictureSlideXml(), pictureSlideXml()], "aggregate"],
+  ] as const)(
+    "streams and enforces the %s expanded image byte limit",
+    async (_label, maxImageBytes, maxTotalImageBytes, slides, limit) => {
+      const fileBuffer = await buildPptxBufferWithParts({
+        slides: [...slides],
+        slideRels: [
+          { id: "rId9", type: "image", target: "../media/image1.png" },
+        ],
+        files: { "ppt/media/image1.png": Buffer.from([1, 2, 3]) },
+      });
+
+      const error = await parsePptxPresentation(fileBuffer, {
+        imageByteLimits: { maxImageBytes, maxTotalImageBytes },
+      }).then(
+        () => null,
+        (failure: unknown) => failure,
+      );
+      expect(error).toBeInstanceOf(PptxImageByteLimitError);
+      expect(error).toMatchObject({ limit });
+    },
+  );
+
   it("inherits size, typeface and bold from the layout placeholder's lstStyle, not just its color", async () => {
     const presentation = await parsePptxPresentation(
       await buildPptxBufferWithParts({
@@ -1443,6 +1472,109 @@ describe("parsePptxPresentation", () => {
       shapeType: "ellipse",
     });
   });
+
+  it("reads each slide's speaker notes through its notesSlide relationship", async () => {
+    // PowerPoint numbers notes parts in the order the notes were written:
+    // with notes only on slide 2, they are notesSlide1.xml.
+    const notesXml = `<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+      <p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+        <p:txBody><a:bodyPr/><a:p><a:r><a:t>Note for slide 2</a:t></a:r></a:p></p:txBody>
+      </p:sp></p:spTree></p:cSld>
+    </p:notes>`;
+    const presentation = await parsePptxPresentation(
+      await buildPptxBufferWithParts({
+        slides: [
+          textSlideXml("Slide 1"),
+          textSlideXml("Slide 2"),
+          textSlideXml("Slide 3"),
+        ],
+        files: {
+          "ppt/slides/_rels/slide2.xml.rels": pptxRelsXml([
+            {
+              id: "rId1",
+              type: "slideLayout",
+              target: "../slideLayouts/slideLayout1.xml",
+            },
+            {
+              id: "rId2",
+              type: "notesSlide",
+              target: "../notesSlides/notesSlide1.xml",
+            },
+          ]),
+          "ppt/notesSlides/notesSlide1.xml": notesXml,
+        },
+      }),
+    );
+
+    expect(presentation.slides.map((slide) => slide.notes)).toEqual([
+      undefined,
+      "Note for slide 2",
+      undefined,
+    ]);
+  });
+
+  it("falls back to the notes part with the slide's number when no slide names it", async () => {
+    // A package written without slide-to-notes relationships still pairs
+    // notesSlide1.xml with slide 1, as long as no other slide claims it.
+    const notesXml = `<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+      <p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+        <p:txBody><a:bodyPr/><a:p><a:r><a:t>Note for slide 1</a:t></a:r></a:p></p:txBody>
+      </p:sp></p:spTree></p:cSld>
+    </p:notes>`;
+    const presentation = await parsePptxPresentation(
+      await buildPptxBufferWithParts({
+        slides: [textSlideXml("Slide 1"), textSlideXml("Slide 2")],
+        files: { "ppt/notesSlides/notesSlide1.xml": notesXml },
+      }),
+    );
+
+    expect(presentation.slides.map((slide) => slide.notes)).toEqual([
+      "Note for slide 1",
+      undefined,
+    ]);
+  });
+
+  it("does not fall back to numbered notes when a slide's relationships cannot be read", async () => {
+    // Slide 1 is hidden, so its own relationships are never read again, and
+    // that part is cut off: which notes part it names is unknown. Here it
+    // names notesSlide2.xml, which slide 2 must not take.
+    const notesXml = `<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+      <p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" name="Notes"/><p:cNvSpPr/><p:nvPr><p:ph type="body" idx="1"/></p:nvPr></p:nvSpPr>
+        <p:txBody><a:bodyPr/><a:p><a:r><a:t>Note for slide 1</a:t></a:r></a:p></p:txBody>
+      </p:sp></p:spTree></p:cSld>
+    </p:notes>`;
+    const relsXml = pptxRelsXml([
+      {
+        id: "rId1",
+        type: "slideLayout",
+        target: "../slideLayouts/slideLayout1.xml",
+      },
+      {
+        id: "rId2",
+        type: "notesSlide",
+        target: "../notesSlides/notesSlide2.xml",
+      },
+    ]);
+    const presentation = await parsePptxPresentation(
+      await buildPptxBufferWithParts({
+        slides: [
+          textSlideXml("Slide 1", { attributes: ` show="0"` }),
+          textSlideXml("Slide 2"),
+        ],
+        files: {
+          "ppt/slides/_rels/slide1.xml.rels": relsXml.slice(
+            0,
+            relsXml.indexOf('<Relationship Id="rId2"') + 30,
+          ),
+          "ppt/notesSlides/notesSlide2.xml": notesXml,
+        },
+      }),
+    );
+
+    expect(presentation.slides.map((slide) => slide.notes)).toEqual([
+      undefined,
+    ]);
+  });
 });
 
 const TINY_PNG = Buffer.from(
@@ -1467,6 +1599,18 @@ function textSlideXml(
           <a:r>${options.runProperties ?? ""}<a:t>${content}</a:t></a:r>
         </a:p></p:txBody>
       </p:sp>
+    </p:spTree></p:cSld>
+  </p:sld>`;
+}
+
+function pictureSlideXml(): string {
+  return `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+    <p:cSld><p:spTree>
+      <p:pic>
+        <p:nvPicPr><p:cNvPr id="3" name="Image"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+        <p:blipFill><a:blip r:embed="rId9"/></p:blipFill>
+        <p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="100" cy="100"/></a:xfrm></p:spPr>
+      </p:pic>
     </p:spTree></p:cSld>
   </p:sld>`;
 }

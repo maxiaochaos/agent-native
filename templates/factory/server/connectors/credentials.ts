@@ -3,6 +3,13 @@ import { resolveOrgIdForEmail } from "@agent-native/core/org";
 import { readAppSecret } from "@agent-native/core/secrets";
 import { resolveWorkspaceConnectionCredentialForApp } from "@agent-native/core/workspace-connections";
 
+import {
+  UnreadableSecretError,
+  isUnreadableSecret,
+} from "../lib/unreadable-secret.js";
+import { noteCredentialSource } from "../lib/workflow-run-observer.js";
+import type { CredentialSource } from "../tripwire/types.js";
+
 function getVaultOrgId(): string | undefined {
   return process.env.AGENT_VAULT_ORG_ID?.trim() || undefined;
 }
@@ -24,6 +31,33 @@ const GITHUB_APP_KEYS = [
   "GITHUB_APP_INSTALLATION_ID",
   "GITHUB_APP_PRIVATE_KEY",
 ] as const;
+/** Which provider a connector key belongs to, for the run's credential-source note; undefined for a key that is not a credential. */
+function providerForKey(key: string): string | undefined {
+  if (WORKSPACE_PROVIDER_BY_KEY[key]) return WORKSPACE_PROVIDER_BY_KEY[key];
+  return (GITHUB_APP_KEYS as readonly string[]).includes(key)
+    ? "github"
+    : undefined;
+}
+
+/** Where in the vault a connector credential was found, as a word and never an id: the organization it was requested for, the designated vault organization, or a personal, solo or legacy entry. */
+type VaultScopeKind = "user" | "own-org" | "vault-org" | "solo" | "legacy";
+
+/** Tells the run where a connector credential came from; readiness checks pass `recordUsage: false` and say nothing. */
+function noteConnectorSource(
+  key: string,
+  source: CredentialSource,
+  options: ResolveConnectorSecretOptions,
+  scopeKind?: VaultScopeKind,
+): void {
+  const provider = providerForKey(key);
+  if (options.recordUsage === false || !provider) return;
+  noteCredentialSource({
+    provider,
+    source,
+    details: { via: "connector", ...(scopeKind ? { scopeKind } : {}) },
+  });
+}
+
 const VAULT_ONLY_KEYS = new Set([
   ...Object.keys(WORKSPACE_PROVIDER_BY_KEY),
   ...GITHUB_APP_KEYS,
@@ -117,6 +151,10 @@ async function readVaultSecret(
       return secret?.value?.trim() || undefined;
     } catch (error) {
       if (isMissingTableError(error)) return undefined;
+      // Saved but undecryptable never heals; retrying it would end as a vault outage.
+      if (isUnreadableSecret(error)) {
+        throw new UnreadableSecretError(key, error);
+      }
       lastError = error;
       if (attempt < attempts - 1) {
         await new Promise((resolve) =>
@@ -129,6 +167,13 @@ async function readVaultSecret(
 }
 
 /**
+ * Where a connector credential came from. `local-env` is this machine's
+ * `.env`, which only local development reads: a workflow run can use it, but
+ * `provider-api-request` cannot, since that needs a workspace connection.
+ */
+type ConnectorSecretSource = "workspace" | "local-env";
+
+/**
  * Resolve a workspace connector key for the requested organization only.
  * The designated vault org is the only extra org searched — never every
  * membership — so an org-A Factory job cannot pick up org-B's token.
@@ -138,6 +183,42 @@ export async function resolveConnectorSecret(
   ownerEmail: string,
   options: ResolveConnectorSecretOptions = {},
 ): Promise<string | undefined> {
+  return (await resolveConnectorSecretWithSource(key, ownerEmail, options))
+    ?.value;
+}
+
+async function resolveConnectorSecretWithSource(
+  key: string,
+  ownerEmail: string,
+  options: ResolveConnectorSecretOptions,
+): Promise<{ value: string; source: ConnectorSecretSource } | undefined> {
+  try {
+    return await findConnectorSecret(key, ownerEmail, options);
+  } catch (error) {
+    // Core's own decrypt error names no key, and the connection and legacy reads raise it too.
+    if (
+      isUnreadableSecret(error) &&
+      !(error instanceof UnreadableSecretError)
+    ) {
+      throw new UnreadableSecretError(key, error);
+    }
+    throw error;
+  }
+}
+
+async function findConnectorSecret(
+  key: string,
+  ownerEmail: string,
+  options: ResolveConnectorSecretOptions,
+): Promise<{ value: string; source: ConnectorSecretSource } | undefined> {
+  const workspace = (
+    value: string,
+    via: "workspace-connection" | "vault",
+    scopeKind?: VaultScopeKind,
+  ) => {
+    noteConnectorSource(key, via, options, scopeKind);
+    return { value, source: "workspace" as const };
+  };
   const userEmail = ownerEmail.trim().toLowerCase();
   const requestedOrgId =
     options.orgId?.trim() || (await resolveOrgIdForEmail(userEmail));
@@ -153,14 +234,16 @@ export async function resolveConnectorSecret(
         orgId: requestedOrgId,
         recordUsage: options.recordUsage,
       });
-      if (connected.available && connected.value) return connected.value.trim();
+      if (connected.available && connected.value) {
+        return workspace(connected.value.trim(), "workspace-connection");
+      }
     } catch (error) {
       if (!isMissingTableError(error)) throw error;
     }
   }
 
   const userSecret = await readVaultSecret(key, "user", userEmail);
-  if (userSecret) return userSecret;
+  if (userSecret) return workspace(userSecret, "vault", "user");
 
   const vaultOrgId = getVaultOrgId();
   const orgIds = Array.from(
@@ -172,7 +255,13 @@ export async function resolveConnectorSecret(
   for (const orgId of orgIds) {
     for (const scope of ["org", "workspace"] as const) {
       const scopedSecret = await readVaultSecret(key, scope, orgId);
-      if (scopedSecret) return scopedSecret;
+      if (scopedSecret) {
+        return workspace(
+          scopedSecret,
+          "vault",
+          orgId === requestedOrgId ? "own-org" : "vault-org",
+        );
+      }
     }
   }
 
@@ -182,17 +271,22 @@ export async function resolveConnectorSecret(
       "workspace",
       `solo:${userEmail}`,
     );
-    if (soloSecret) return soloSecret;
+    if (soloSecret) return workspace(soloSecret, "vault", "solo");
   }
 
   for (const orgId of orgIds.length > 0 ? orgIds : [undefined]) {
     const legacySecret = await resolveCredential(key, { userEmail, orgId });
-    if (legacySecret?.trim()) return legacySecret.trim();
+    if (legacySecret?.trim()) {
+      return workspace(legacySecret.trim(), "vault", "legacy");
+    }
   }
 
   if (!VAULT_ONLY_KEYS.has(key) || canUseLocalProviderEnvFallback()) {
     const environmentSecret = process.env[key]?.trim(); // guard:allow-env-credential - explicit local development or generic deploy-level connector fallback
-    if (environmentSecret) return environmentSecret;
+    if (environmentSecret) {
+      noteConnectorSource(key, "env", options);
+      return { value: environmentSecret, source: "local-env" };
+    }
   }
 
   return undefined;
@@ -213,33 +307,107 @@ export function connectorKeysForSource(
   return ["SENTRY_SERVER_TOKEN", "SENTRY_AUTH_TOKEN"];
 }
 
+/** What looking for a connector's credential found. Never carries a secret value. */
+export type ConnectorReading =
+  | { state: "present"; source: ConnectorSecretSource }
+  | { state: "absent" }
+  /** Saved, but this deployment cannot decrypt it: not absent, and no wait heals it. */
+  | { state: "unreadable"; keys: readonly string[] };
+
+const ABSENT: ConnectorReading = { state: "absent" };
+
+/** What the first of `keys` that resolves is. A key that cannot be decrypted ends the search, as it ends a read. */
+async function connectorReading(
+  keys: string | readonly string[],
+  ownerEmail: string,
+  options: ResolveConnectorSecretOptions,
+): Promise<ConnectorReading> {
+  const list = typeof keys === "string" ? [keys] : keys;
+  for (const key of list) {
+    try {
+      const found = await resolveConnectorSecretWithSource(
+        key,
+        ownerEmail,
+        options,
+      );
+      if (found) return { state: "present", source: found.source };
+    } catch (error) {
+      if (error instanceof UnreadableSecretError) {
+        return { state: "unreadable", keys: error.keys };
+      }
+      throw error;
+    }
+  }
+  return ABSENT;
+}
+
+/** Whether the credential is there, for a caller that has no way to show a third answer: an unreadable one fails loudly. */
+function presentOrThrow(reading: ConnectorReading): boolean {
+  if (reading.state === "unreadable") {
+    throw new UnreadableSecretError(reading.keys);
+  }
+  return reading.state === "present";
+}
+
 /** Presence only — never return the secret value to callers. */
 export async function hasConnectorSecret(
   keys: string | readonly string[],
   ownerEmail: string,
   options: ResolveConnectorSecretOptions = {},
 ): Promise<boolean> {
-  const list = typeof keys === "string" ? [keys] : keys;
-  for (const key of list) {
-    const value = await resolveConnectorSecret(key, ownerEmail, options);
-    if (value) return true;
-  }
-  return false;
+  return presentOrThrow(await connectorReading(keys, ownerEmail, options));
 }
 
-async function hasGitHubConnectorSecret(
+async function gitHubConnectorReading(
   ownerEmail: string,
   options: ResolveConnectorSecretOptions,
-): Promise<boolean> {
-  if (await hasConnectorSecret("GITHUB_TOKEN", ownerEmail, options)) {
-    return true;
-  }
-  const appSecrets = await Promise.all(
-    GITHUB_APP_KEYS.map((key) => hasConnectorSecret(key, ownerEmail, options)),
+): Promise<ConnectorReading> {
+  const token = await connectorReading("GITHUB_TOKEN", ownerEmail, options);
+  if (token.state !== "absent") return token;
+  const appKeys = await Promise.all(
+    GITHUB_APP_KEYS.map((key) => connectorReading(key, ownerEmail, options)),
   );
-  return appSecrets.every(Boolean);
+  const unreadable = appKeys.flatMap((reading) =>
+    reading.state === "unreadable" ? reading.keys : [],
+  );
+  if (unreadable.length > 0) return { state: "unreadable", keys: unreadable };
+  if (appKeys.some((reading) => reading.state === "absent")) return ABSENT;
+  return {
+    state: "present",
+    source: appKeys.some(
+      (reading) =>
+        reading.state === "present" && reading.source === "local-env",
+    )
+      ? "local-env"
+      : "workspace",
+  };
 }
 
+/** What each Factory connector's credential is: where it comes from, absent, or saved and unreadable. */
+export async function resolveFactoryConnectorSources(
+  ownerEmail: string,
+  options: ResolveConnectorSecretOptions = {},
+): Promise<{
+  slack: ConnectorReading;
+  slackSecondary: ConnectorReading;
+  github: ConnectorReading;
+  sentry: ConnectorReading;
+}> {
+  const readinessOptions = { ...options, recordUsage: false };
+  const [slack, slackSecondary, github, sentry] = await Promise.all([
+    connectorReading("SLACK_BOT_TOKEN", ownerEmail, readinessOptions),
+    connectorReading("SLACK_BOT_TOKEN_2", ownerEmail, readinessOptions),
+    gitHubConnectorReading(ownerEmail, readinessOptions),
+    connectorReading(
+      ["SENTRY_SERVER_TOKEN", "SENTRY_AUTH_TOKEN"],
+      ownerEmail,
+      readinessOptions,
+    ),
+  ]);
+  return { slack, slackSecondary, github, sentry };
+}
+
+/** Yes or no for each connector; a connector that is saved but unreadable fails the whole read, since a boolean would call it absent. */
 export async function resolveFactoryConnectorReadiness(
   ownerEmail: string,
   options: ResolveConnectorSecretOptions = {},
@@ -249,18 +417,19 @@ export async function resolveFactoryConnectorReadiness(
   github: boolean;
   sentry: boolean;
 }> {
-  const readinessOptions = { ...options, recordUsage: false };
-  const [slack, slackSecondary, github, sentry] = await Promise.all([
-    hasConnectorSecret("SLACK_BOT_TOKEN", ownerEmail, readinessOptions),
-    hasConnectorSecret("SLACK_BOT_TOKEN_2", ownerEmail, readinessOptions),
-    hasGitHubConnectorSecret(ownerEmail, readinessOptions),
-    hasConnectorSecret(
-      ["SENTRY_SERVER_TOKEN", "SENTRY_AUTH_TOKEN"],
-      ownerEmail,
-      readinessOptions,
-    ),
-  ]);
-  return { slack, slackSecondary, github, sentry };
+  const readings = await resolveFactoryConnectorSources(ownerEmail, options);
+  const unreadable = Object.values(readings).flatMap((reading) =>
+    reading.state === "unreadable" ? reading.keys : [],
+  );
+  if (unreadable.length > 0) {
+    throw new UnreadableSecretError([...new Set(unreadable)]);
+  }
+  return {
+    slack: readings.slack.state === "present",
+    slackSecondary: readings.slackSecondary.state === "present",
+    github: readings.github.state === "present",
+    sentry: readings.sentry.state === "present",
+  };
 }
 
 export async function assertFactoryConnectorReady(
@@ -274,14 +443,15 @@ export async function assertFactoryConnectorReady(
   const verb = options.verb ?? "creating";
   const label =
     source === "slack" ? "Slack" : source === "github" ? "GitHub" : "Sentry";
-  const ready =
+  const ready = presentOrThrow(
     source === "github"
-      ? await hasGitHubConnectorSecret(ownerEmail, options)
-      : await hasConnectorSecret(
+      ? await gitHubConnectorReading(ownerEmail, options)
+      : await connectorReading(
           connectorKeysForSource(source, options.slackWorkspace),
           ownerEmail,
           options,
-        );
+        ),
+  );
   if (!ready) {
     throw new Error(
       `Connect ${label} in Dispatch or add a vault token before ${verb} this job.`,

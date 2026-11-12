@@ -1,6 +1,7 @@
 import type { AgentActionScope } from "../agent/types.js";
 import type { TrackingEventScope } from "../observability/tracing.js";
 import type { ContextStatus } from "../shared/context-status.js";
+import type { FirstRunBuilderCreditsV2RequestAssignment } from "../shared/first-run-builder-credits-experiment.js";
 import type { ReasoningEffort } from "../shared/reasoning-effort.js";
 import type { SignupAttributionContext } from "./attribution.js";
 
@@ -60,10 +61,34 @@ function processEnv(name: string): string | undefined {
   return process.env?.[name];
 }
 
+/**
+ * The tab a request from no browser tab acts on for tab-scoped app state:
+ * the tab of this app the user used last, or none used recently.
+ */
+export type BrowserTabTarget =
+  | { kind: "last-used"; tabId: string; usedAt: number }
+  | { kind: "unavailable" };
+
+export interface BrowserTabTargetSlot {
+  /** Looks the tab up once; later calls get the same answer. */
+  resolve(): Promise<BrowserTabTarget>;
+  /** Set once something in the request has asked for the tab. */
+  resolved?: BrowserTabTarget;
+}
+
 export interface RequestRunContext {
   waitUntil?: (promise: Promise<unknown>) => void;
   requestOrigin?: string;
+  /** The browser tab the request came from. */
   browserTabId?: string;
+  /**
+   * For an MCP tool call by a signed-in user, which came from no tab: the tab
+   * whose tab-scoped app state (navigation, navigate commands, selection) the
+   * call reads and writes. Unlike `browserTabId`, it doesn't make the call
+   * that tab's own, so the tab still sees the call's changes as someone
+   * else's.
+   */
+  browserTabTarget?: BrowserTabTargetSlot;
   chatScope?: {
     type: string;
     id: string;
@@ -93,6 +118,19 @@ export interface RequestRunContext {
   };
   /** Whether the pre-model reference prefetch and screen grounding reached the model. */
   contextStatus?: { prefetch?: ContextStatus; screen?: ContextStatus };
+  /** Current user text used to rank reachable workspace apps for this turn. */
+  appDiscoveryQuery?: string;
+  /** Privacy-safe app discovery result diagnostics for the current run. */
+  appDiscoverySelection?: {
+    status: "selected" | "no-match" | "unavailable" | "failed" | "timed_out";
+    directoryStatus:
+      | "available"
+      | "unavailable"
+      | "forbidden"
+      | "setup-required";
+    selectedIds: string[];
+    latencyMs: number;
+  };
   toolCalls?: Array<{ name: string; input: unknown }>;
   toolResults?: Array<{ name: string; content: string; isError: boolean }>;
   extensionContentReads?: Record<string, string>;
@@ -101,12 +139,27 @@ export interface RequestRunContext {
     string,
     { totalTools: number; resultNames: string[] }
   >;
+  /** Signup-time question-intake assignment loaded for this authenticated run. */
+  questionIntakeExperimentAssignment?: {
+    authUserId: string;
+    experimentId: string;
+    variantId: "control" | "no_questions";
+  };
+  /** Tools unavailable to the current agent run and its tool-search surface. */
+  excludedActionNames?: readonly string[];
 }
 
 export interface RequestContext {
+  /**
+   * The id the server stamps on this request's response, so a failure captured
+   * anywhere in the request names the id the person sees on screen.
+   */
+  requestId?: string;
   isSyntheticTraffic?: boolean;
   mcpRequestId?: string;
   userEmail?: string;
+  /** Provenance for a cross-app identity; org-member grants only member-level org role. */
+  a2aIdentityAssurance?: "user" | "organization" | "org-member";
   /** Keep data-source credentials within the selected org, not the user. */
   credentialScope?: "org";
   /** Storage-only org selection; null prevents an active-org fallback. */
@@ -122,6 +175,8 @@ export interface RequestContext {
   userName?: string;
   orgId?: string;
   orgScope?: "personal";
+  /** Explicitly selects deployment-wide agent defaults for shared no-org jobs. */
+  defaultAgentEngineScope?: "deployment";
   /**
    * Narrow authorization capability verified from an embed session. This is
    * deliberately separate from user identity: capability-only sessions must
@@ -143,9 +198,16 @@ export interface RequestContext {
   signupAttribution?: SignupAttributionContext;
   signupOrigin?: import("./attribution.js").SignupOrigin;
   clientPlatform?: import("../shared/analytics-platform.js").AnalyticsClientPlatform;
+  /**
+   * Set only after the authenticated first-run route confirms the v2 flag is
+   * enabled; tracking uses it to tag the four durable experiment events.
+   */
+  firstRunBuilderCreditsV2Assignment?: FirstRunBuilderCreditsV2RequestAssignment;
   authContextAccessed?: boolean;
   requestOrigin?: string;
   federationMembershipValidated?: boolean;
+  /** Resolves embed authority independently of the origin used for MCP links. */
+  resolveEmbedRequestOrigin?: () => string;
   /**
    * True when the request's real socket peer is loopback, captured by the
    * action-route handler while the h3 event is still in scope (nothing below
@@ -158,6 +220,8 @@ export interface RequestContext {
    * radius (a resource that is itself local-only, NODE_ENV, etc.).
    */
   isLoopbackRequest?: boolean;
+  /** True only when this server received the request directly on 127.0.0.1. */
+  isDirectLoopbackRequest?: boolean;
   isIntegrationCaller?: boolean;
   integration?: {
     taskId: string;
@@ -217,6 +281,37 @@ export function getVerifiedServiceIdentityFromEvent(
     return undefined;
   }
   return { userEmail: userEmail.trim(), orgId: orgId.trim() };
+}
+
+const VERIFIED_MCP_CREDENTIAL_EVENT_KEY = "__anVerifiedMcpCredential";
+
+/**
+ * The request authenticated with an MCP credential this app verified, so an
+ * action route records the call as MCP rather than as a person's HTTP call.
+ */
+export function markVerifiedMcpCredentialForEvent(
+  event: RequestContextEvent,
+  credential: { userEmail: string; oauthClientId?: string },
+): void {
+  const context = (event.context ??= {});
+  context[VERIFIED_MCP_CREDENTIAL_EVENT_KEY] = credential;
+}
+
+export function getVerifiedMcpCredentialFromEvent(
+  event: RequestContextEvent,
+): { userEmail: string; oauthClientId?: string } | undefined {
+  const credential = event.context?.[VERIFIED_MCP_CREDENTIAL_EVENT_KEY] as
+    | { userEmail?: unknown; oauthClientId?: unknown }
+    | undefined;
+  const userEmail = credential?.userEmail;
+  if (typeof userEmail !== "string" || !userEmail.trim()) return undefined;
+  const oauthClientId = credential?.oauthClientId;
+  return {
+    userEmail: userEmail.trim(),
+    ...(typeof oauthClientId === "string" && oauthClientId
+      ? { oauthClientId }
+      : {}),
+  };
 }
 
 export function markExplicitPersonalOrgScope(event: {
@@ -385,6 +480,15 @@ export function runWithRequestContext<T>(
   ) {
     context = { ...context, trackingScope: inheritedContext.trackingScope };
   }
+  if (
+    context.a2aIdentityAssurance === undefined &&
+    inheritedContext?.a2aIdentityAssurance !== undefined
+  ) {
+    context = {
+      ...context,
+      a2aIdentityAssurance: inheritedContext.a2aIdentityAssurance,
+    };
+  }
   const contextUserEmail = context.userEmail?.trim().toLowerCase();
   if (contextUserEmail) {
     const inheritedUserEmail = inheritedContext?.userEmail
@@ -481,6 +585,10 @@ export function getRequestContext(): RequestContext | undefined {
   return store;
 }
 
+/**
+ * Call only after the Clips v2 feature flag evaluates on for this request.
+ * The arm is derived from the verified auth id already in the request context.
+ */
 export function hasRequestContext(): boolean {
   return als.getStore() !== undefined;
 }

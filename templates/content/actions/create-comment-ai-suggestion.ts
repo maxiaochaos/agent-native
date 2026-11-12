@@ -1,10 +1,10 @@
 import { defineAction } from "@agent-native/core/action";
 import createSuggestion from "@agent-native/core/review/suggestions/actions/create-resource-suggestion";
+import createSuggestionProposal from "@agent-native/core/review/suggestions/actions/create-resource-suggestion-proposal";
 import listSuggestions from "@agent-native/core/review/suggestions/actions/list-resource-suggestions";
 import { and, eq, lt } from "drizzle-orm";
 import { z } from "zod";
 
-import { markdownSuggestionOperation } from "../app/components/editor/suggestions/markdown-operation.js";
 import { getDb, schema } from "../server/db/index.js";
 import {
   CommentAiOperationError,
@@ -18,9 +18,17 @@ import {
   verifyCommentAiAttempt,
 } from "../server/lib/comment-ai.js";
 import { CONTENT_DOCUMENT_SUGGESTION_ADAPTER } from "../server/lib/suggested-edits.js";
+import {
+  createWithSavedUnits,
+  modelUnits,
+} from "../server/lib/suggestion-model-units.js";
+import { CONTENT_BLOCKS_FIELD_SUGGESTION_ADAPTER } from "../shared/blocks-field-suggestions.js";
 import type { CommentAiRequest } from "../shared/comment-ai.js";
 import { resolveDocumentTextEdits } from "../shared/document-text-edits.js";
-import { documentRevisionToken } from "./_document-edit-mutation.js";
+import {
+  findReplaceEditPieces,
+  markdownSuggestionOperationSummary,
+} from "../shared/suggestion-diff.js";
 import { addCommentWithGuard, commentIdForIdempotency } from "./add-comment.js";
 
 const payloadSchema = z.object({
@@ -33,25 +41,38 @@ const payloadSchema = z.object({
     .describe(
       "One or two sentences to the commenter about this change, including anything they should check; shown on the suggestion in their comment thread",
     ),
-  find: z
-    .string()
+  edits: z
+    .array(
+      z.object({
+        find: z
+          .string()
+          .min(1)
+          .max(24000)
+          .describe("Exact unique text to propose replacing"),
+        replace: z
+          .string()
+          .max(24000)
+          .describe("Proposed replacement; canonical text remains unchanged"),
+      }),
+    )
     .min(1)
-    .max(24000)
-    .describe("Exact unique text to propose replacing"),
-  replace: z
-    .string()
-    .max(24000)
-    .describe("Proposed replacement; canonical text remains unchanged"),
+    .max(20)
+    .describe(
+      "One entry per separate change. Each find holds the words that change plus only enough surrounding text to occur once, so changes in different places become separate edits instead of one span of unchanged text between them.",
+    ),
 });
 
 /**
  * Earlier pending proposals the requester got in this thread are replaced by
- * a revision instead of stacking up. Only requests made before this one count,
- * so a retry builds the same list and its creation receipt still matches.
+ * a revision instead of stacking up: those from requests made before this one,
+ * and those an earlier attempt of this request created. Edits from this
+ * attempt never count, so replaying it builds the same list and its creation
+ * receipt still matches.
  */
 async function supersededSuggestionIds(
   request: Awaited<ReturnType<typeof requireCommentAiRequest>>,
   ctx: Parameters<typeof listSuggestions.run>[1],
+  attemptId: string,
 ) {
   const earlier = await getDb()
     .select({ id: schema.commentAiRequests.id })
@@ -64,8 +85,11 @@ async function supersededSuggestionIds(
         lt(schema.commentAiRequests.createdAt, request.createdAt),
       ),
     );
-  if (!earlier.length) return [];
   const earlierIds = new Set(earlier.map((row) => row.id));
+  // Only an earlier request, or an earlier attempt of this one, can have left
+  // edits to replace. Attempts are counted rather than results, because an
+  // attempt can create edits and then fail before recording them.
+  if (!earlierIds.size && request.attemptCount <= 1) return [];
   const { suggestions } = await listSuggestions.run(
     { resourceType: "document", resourceId: request.documentId },
     ctx,
@@ -73,13 +97,16 @@ async function supersededSuggestionIds(
   return suggestions
     .filter(
       (suggestion) =>
-        suggestion.adapterKind === CONTENT_DOCUMENT_SUGGESTION_ADAPTER &&
+        (suggestion.adapterKind === CONTENT_DOCUMENT_SUGGESTION_ADAPTER ||
+          suggestion.adapterKind === CONTENT_BLOCKS_FIELD_SUGGESTION_ADAPTER) &&
         suggestion.authorEmail === request.requesterEmail &&
         suggestion.metadata?.sourceThreadId === request.threadId &&
-        earlierIds.has(String(suggestion.metadata?.commentAiRequestId)),
+        (earlierIds.has(String(suggestion.metadata?.commentAiRequestId)) ||
+          (suggestion.metadata?.commentAiRequestId === request.id &&
+            suggestion.metadata?.commentAiAttemptId !== attemptId)),
     )
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
-    .slice(-20)
+    .slice(-100)
     .map((suggestion) => suggestion.id);
 }
 
@@ -112,7 +139,7 @@ function targetError(kind: "missing" | "ambiguous" | "overlapping") {
 
 export default defineAction({
   description:
-    "Create one anchored suggestion against the latest Page text and link it to the original feedback. Pass the latest attemptId from get-comment-ai-context. Unrelated edits are tolerated when the exact target remains unique; missing or repeated targets become typed review conflicts. A new suggestion on the same comment replaces the requester's earlier pending one, so never ask them to reject it.",
+    "Propose anchored edits against the latest text the comment is on (the Page body, or its Blocks field tab), reviewed in the comment thread that asked for them. Pass the latest attemptId from get-comment-ai-context. Unrelated edits are tolerated when each exact target remains unique; missing, repeated, or overlapping targets become typed review conflicts. New edits on the same comment replace the requester's earlier pending ones, so never ask them to reject those.",
   schema: payloadSchema,
   run: async (args, ctx) => {
     const request = await requireCommentAiRequest("suggest");
@@ -120,51 +147,95 @@ export default defineAction({
       return suggestionResult(serializeCommentAiRequest(request));
     }
     const verification = await verifyCommentAiAttempt(request, args.attemptId);
+    const { text } = verification.source;
     try {
       const payload = payloadSchema.parse(
         await retainCommentAiAttemptPayload(request, args.attemptId, args),
       );
-      const proposed = resolveDocumentTextEdits(
-        verification.source.document.content,
-        [{ find: payload.find, replace: payload.replace }],
-      );
+      const proposed = resolveDocumentTextEdits(text.content, payload.edits);
       if (!proposed.ok) throw targetError(proposed.error.kind);
-      const operation = markdownSuggestionOperation(
-        verification.source.document.content,
-        proposed.content,
-      );
-      if (!operation) {
+      const { operations, editOfPiece } = findReplaceEditPieces({
+        before: text.content,
+        edits: proposed.ranges,
+      });
+      // A tab's edits name its field, as the tab's own suggestions do.
+      const onText = <T extends { targetId: string }>(operation: T) =>
+        text.fieldId === "body"
+          ? operation
+          : { ...operation, targetId: text.fieldId };
+      if (!operations.length) {
         throw new CommentAiOperationError(
           "target_deleted",
           "The proposal does not change the latest Page text",
           false,
         );
       }
-      const supersedes = await supersededSuggestionIds(request, ctx);
-      const suggestion = await createSuggestion.run(
-        {
-          ...(supersedes.length ? { supersedes } : {}),
-          resourceType: "document",
-          resourceId: request.documentId,
-          adapterKind: CONTENT_DOCUMENT_SUGGESTION_ADAPTER,
-          baseRevision: verification.source.document.updatedAt,
-          summary: payload.summary,
-          idempotencyKey: `comment-ai:${request.id}:suggestion`,
-          operations: [operation],
-          metadata: {
-            sourceCommentId: request.rootCommentId,
-            sourceThreadId: request.threadId,
-            sourceUrl: `/page/${encodeURIComponent(request.documentId)}?comment=${encodeURIComponent(request.threadId)}`,
-            commentAiRequestId: request.id,
-            commentAiOperationId: request.id,
-            commentAiAttemptId: args.attemptId,
-            agentThreadId: request.agentThreadId,
-            runId: request.runId,
-            model: request.model,
-          },
-        },
+      const supersedes = await supersededSuggestionIds(
+        request,
         ctx,
+        args.attemptId,
       );
+      const proposal = {
+        ...(supersedes.length ? { supersedes } : {}),
+        resourceType: "document",
+        resourceId: request.documentId,
+        adapterKind:
+          text.fieldId === "body"
+            ? CONTENT_DOCUMENT_SUGGESTION_ADAPTER
+            : CONTENT_BLOCKS_FIELD_SUGGESTION_ADAPTER,
+        baseRevision: text.suggestionBase,
+        summary: payload.summary,
+      };
+      const metadata = {
+        sourceCommentId: request.rootCommentId,
+        sourceThreadId: request.threadId,
+        sourceUrl: `/page/${encodeURIComponent(request.documentId)}?comment=${encodeURIComponent(request.threadId)}`,
+        commentAiRequestId: request.id,
+        commentAiOperationId: request.id,
+        commentAiAttemptId: args.attemptId,
+        agentThreadId: request.agentThreadId,
+        runId: request.runId,
+        model: request.model,
+      };
+      const units = await modelUnits({
+        ownerEmail: request.requesterEmail,
+        operations,
+        editOfPiece,
+      });
+      // A Content suggestion holds exactly one edit, so separate changes become
+      // one proposal. The receipt links its first edit. Each attempt creates
+      // under its own key, because a retry may propose different edits.
+      const suggestion =
+        operations.length === 1
+          ? await createSuggestion.run(
+              {
+                ...proposal,
+                idempotencyKey: `comment-ai:${args.attemptId}:suggestion`,
+                operations: operations.map(onText),
+                metadata,
+              },
+              ctx,
+            )
+          : (
+              await createWithSavedUnits({
+                labels: units.map((unit) => `${args.attemptId}:${unit}`),
+                idempotencyKey: `comment-ai:${args.attemptId}:proposal`,
+                ctx,
+                create: (labels) =>
+                  createSuggestionProposal.run(
+                    {
+                      ...proposal,
+                      idempotencyKey: `comment-ai:${args.attemptId}:proposal`,
+                      suggestions: operations.map((operation, index) => ({
+                        summary: markdownSuggestionOperationSummary(operation),
+                        operations: [onText({ ...operation, ordinal: 0 })],
+                        metadata: { ...metadata, reviewUnit: labels[index] },
+                      })),
+                    },
+                    ctx,
+                  ),
+              })
+            ).suggestions[0]!;
       await updateCommentAiRequest(request, {
         status: "running",
         result: { suggestionId: suggestion.id },
@@ -218,14 +289,7 @@ export default defineAction({
     } catch (error) {
       const latest = await verifyCommentAiAttempt(request, args.attemptId);
       if (
-        documentRevisionToken(
-          latest.source.document.bodyRevision,
-          latest.source.document.content,
-        ) !==
-          documentRevisionToken(
-            verification.source.document.bodyRevision,
-            verification.source.document.content,
-          ) &&
+        latest.currentRevision !== verification.currentRevision &&
         !(error instanceof CommentAiOperationError)
       ) {
         return markCommentAiRefreshRequired(request, verification.attempt);

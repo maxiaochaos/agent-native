@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # No `branches` filter: a stacked PR targets its parent PR's branch, and the
+  # required checks must report on it too.
   pull_request:
-    branches: [main]
+    types: [opened, edited, synchronize, reopened]
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -15,24 +17,31 @@ jobs:
   change-scope:
     name: Determine change scope
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     outputs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
       full: ${{ steps.scope.outputs.full }}
       lint: ${{ steps.scope.outputs.lint }}
+      has_reports: ${{ steps.feedback.outputs.has_reports }}
       typecheck: ${{ steps.scope.outputs.typecheck }}
       workspace_filters: ${{ steps.scope.outputs.workspace_filters }}
       test_workspace_filters: ${{ steps.scope.outputs.test_workspace_filters }}
       fast_tests: ${{ steps.scope.outputs.fast_tests }}
       content: ${{ steps.scope.outputs.content }}
+      content_db: ${{ steps.scope.outputs.content_db }}
       content_convergence: ${{ steps.scope.outputs.content_convergence }}
       core_integration: ${{ steps.scope.outputs.core_integration }}
       plan_e2e: ${{ steps.scope.outputs.plan_e2e }}
       brain_evals: ${{ steps.scope.outputs.brain_evals }}
       build: ${{ steps.scope.outputs.build }}
       trusted_acceptance: ${{ steps.scope.outputs.trusted_acceptance }}
+      trusted_acceptance_apps: ${{ steps.scope.outputs.trusted_acceptance_apps }}
       scaffold: ${{ steps.scope.outputs.scaffold }}
+      scaffold_cli: ${{ steps.scope.outputs.scaffold_cli }}
+      scaffold_workspace: ${{ steps.scope.outputs.scaffold_workspace }}
+      scaffold_workspace_apps: ${{ steps.scope.outputs.scaffold_workspace_apps }}
       builder_code_starter_scaffold: ${{ steps.scope.outputs.builder_code_starter_scaffold }}
+      deploy_paths: ${{ steps.scope.outputs.deploy_paths }}
       ssr_boot: ${{ steps.scope.outputs.ssr_boot }}
       ssr_boot_apps: ${{ steps.scope.outputs.ssr_boot_apps }}
       guards: ${{ steps.scope.outputs.guards }}
@@ -44,11 +53,20 @@ jobs:
       design_canvas_broad_workflows: ${{ steps.scope.outputs.design_canvas_broad_workflows }}
       pre_auth_session_replay_e2e: ${{ steps.scope.outputs.pre_auth_session_replay_e2e }}
       design_canvas_e2e_specs: ${{ steps.scope.outputs.design_canvas_e2e_specs }}
+      design_canvas_e2e_diagnostic_specs: ${{ steps.scope.outputs.design_canvas_e2e_diagnostic_specs }}
+      design_canvas_e2e_diagnostic_shards: ${{ steps.scope.outputs.design_canvas_e2e_diagnostic_shards }}
+      design_canvas_broad_workflow_shards: ${{ steps.scope.outputs.design_canvas_broad_workflow_shards }}
       agentkit_acceptance: ${{ steps.scope.outputs.agentkit_acceptance }}
-      slides_chat_e2e: ${{ steps.scope.outputs.slides_chat_e2e }}
+      slides_caret_e2e: ${{ steps.scope.outputs.slides_caret_e2e }}
+      slides_typing_chat_e2e: ${{ steps.scope.outputs.slides_typing_chat_e2e }}
+      slides_mobile_import_e2e: ${{ steps.scope.outputs.slides_mobile_import_e2e }}
+      slides_text_surface_e2e: ${{ steps.scope.outputs.slides_text_surface_e2e }}
       slides_authoring_e2e: ${{ steps.scope.outputs.slides_authoring_e2e }}
+      slides_authoring_matrix: ${{ steps.scope.outputs.slides_authoring_matrix }}
       slides_oracle: ${{ steps.scope.outputs.slides_oracle }}
       changeset: ${{ steps.scope.outputs.changeset }}
+      verify_execution_lease: ${{ steps.scope.outputs.verify_execution_lease }}
+      core_mutation: ${{ steps.scope.outputs.core_mutation }}
       script_tests: ${{ steps.scope.outputs.script_tests }}
       lanes_matrix: ${{ steps.lanes.outputs.matrix }}
       has_tests: ${{ steps.lanes.outputs.has_tests }}
@@ -56,15 +74,20 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           fetch-depth: 0
           filter: blob:none
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
       - name: Test change scope classifier
-        run: node --experimental-strip-types --test scripts/ci-change-scope.test.ts scripts/ci-build-workspaces.test.ts
+        run: >-
+          node --experimental-strip-types --test
+          scripts/ci-change-scope.test.ts
+          scripts/ci-change-scope-renames.test.ts
+          scripts/ci-build-workspaces.test.ts
 
       - name: Test fast-test lane planner
         run: node --experimental-strip-types --test scripts/ci-test-lanes.test.ts
@@ -76,6 +99,21 @@ jobs:
           CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CI_PR_TITLE: ${{ github.event.pull_request.title }}
         run: node --experimental-strip-types scripts/ci-change-scope.ts
+
+      - name: Look for feedback reports
+        id: feedback
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/feedback-proof-gate"
+          if git cat-file -e "$BASE_SHA:scripts/feedback-fix-proof.ts" 2>/dev/null; then
+            git show "$BASE_SHA:scripts/feedback-fix-proof.ts" > "$RUNNER_TEMP/feedback-proof-gate/feedback-fix-proof.ts"
+          else
+            cp scripts/feedback-fix-proof.ts "$RUNNER_TEMP/feedback-proof-gate/feedback-fix-proof.ts"
+          fi
+          node --experimental-strip-types --no-warnings "$RUNNER_TEMP/feedback-proof-gate/feedback-fix-proof.ts" --has-reports >> "$GITHUB_OUTPUT"
 
       # Full planning only reads manifests and counts files. Targeted planning
       # runs `pnpm list` and `vitest list --changed`, so it needs an install.
@@ -105,18 +143,32 @@ jobs:
   lint:
     name: Lint & format
     needs: change-scope
-    if: needs.change-scope.outputs.lint == 'true'
+    # Required check: run when selected, and also when change-scope did not
+    # succeed so the feedback proof gate fails closed instead of being skipped.
+    if: ${{ !cancelled() && (needs.change-scope.result != 'success' || needs.change-scope.outputs.lint == 'true' || needs.change-scope.outputs.has_reports == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - name: Require a successful change scope
+        env:
+          CHANGE_SCOPE_RESULT: ${{ needs.change-scope.result }}
+        run: |
+          if [ "$CHANGE_SCOPE_RESULT" != "success" ]; then
+            echo "::error::change-scope did not succeed ($CHANGE_SCOPE_RESULT)"
+            exit 1
+          fi
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           fetch-depth: 0
           filter: blob:none
 
-      - uses: ./.github/actions/setup-pnpm
+      - id: setup
+        uses: ./.github/actions/setup-pnpm
         with:
-          install: no-scripts
+          install: ${{ needs.change-scope.outputs.has_reports == 'true' && 'full' || 'no-scripts' }}
+          restore-dist-cache: ${{ needs.change-scope.outputs.has_reports == 'true' && 'true' || 'false' }}
 
       - name: Check the full tree
         if: needs.change-scope.outputs.full == 'true'
@@ -159,14 +211,31 @@ jobs:
           fi
 
       - name: Require changeset for publishable package changes
-        if: ${{ !cancelled() && needs.change-scope.outputs.changeset == 'true' && github.event.pull_request.head.ref != 'changeset-release/main' }}
+        if: ${{ !cancelled() && needs.change-scope.result == 'success' && steps.setup.outcome == 'success' && needs.change-scope.outputs.changeset == 'true' && github.event.pull_request.head.ref != 'changeset-release/main' }}
         env:
           GITHUB_BASE_REF: ${{ github.base_ref }}
         run: node scripts/check-changeset.mjs
 
       - name: Enforce package bump policy
-        if: ${{ !cancelled() && needs.change-scope.outputs.changeset == 'true' && github.event.pull_request.head.ref != 'changeset-release/main' }}
+        if: ${{ !cancelled() && needs.change-scope.result == 'success' && steps.setup.outcome == 'success' && needs.change-scope.outputs.changeset == 'true' && github.event.pull_request.head.ref != 'changeset-release/main' }}
         run: node scripts/guard-no-major-changeset.mjs
+
+      - name: Re-run feedback fix proofs
+        if: needs.change-scope.outputs.has_reports == 'true'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/feedback-proof-gate"
+          for f in feedback-fix-proof.ts fix-proof.ts; do
+            if git cat-file -e "$BASE_SHA:scripts/$f" 2>/dev/null; then
+              git show "$BASE_SHA:scripts/$f" > "$RUNNER_TEMP/feedback-proof-gate/$f"
+            else
+              cp "scripts/$f" "$RUNNER_TEMP/feedback-proof-gate/$f"
+            fi
+          done
+          node --experimental-strip-types --no-warnings "$RUNNER_TEMP/feedback-proof-gate/feedback-fix-proof.ts"
 
   typecheck:
     name: Typecheck
@@ -176,6 +245,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -214,6 +285,8 @@ jobs:
       matrix: ${{ fromJSON(needs.change-scope.outputs.lanes_matrix) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -320,6 +393,8 @@ jobs:
       matrix: ${{ fromJSON(needs.change-scope.outputs.lanes_matrix) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -437,7 +512,7 @@ jobs:
     needs: change-scope
     if: needs.change-scope.outputs.design_canvas_core_regression == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -449,6 +524,7 @@ jobs:
             inspector-3a,
             inspector-3b,
             inspector-4a,
+            inspector-4c,
             inspector-4b,
             drag-1a,
             drag-1b,
@@ -465,6 +541,8 @@ jobs:
           ]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/free-disk
 
@@ -488,19 +566,19 @@ jobs:
       - name: Run focused Screen selection history regressions
         if: startsWith(matrix.shard, 'screen-history-')
         working-directory: templates/design
-        timeout-minutes: 5
+        timeout-minutes: 21
         env:
           E2E_RUN_ID: design-selection-history-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
         run: |
           case "${{ matrix.shard }}" in
             screen-history-1)
-              grep='undo of a screen deletion remaps stale selection-history entries instead of restoring a dead screen id|undo restores a child layer with its additive Screen selection|marquee-selecting child elements after a Screen pick deletes only the elements|undoing a canvas element click restores its explicit Screen target for Delete|failed Screen deletion keeps the explicit Screen target for retry'
+              grep='undo of a screen deletion selects the recreated screen under its new id|selection changes are not undo steps, and Delete removes an additive Screen selection|marquee-selecting child elements after a Screen pick deletes only the elements|Undo after a canvas element click keeps the element selected for Delete|failed Screen deletion keeps the explicit Screen target for retry'
               ;;
             screen-history-2)
               grep='a newer layer selection survives failed Screen deletion settlement|Shift-picking a Screen extends the Delete selection in All screens|Shift-marquee adds a hit Screen to the existing Delete selection|a newer Screen pick survives failed Screen deletion settlement|a newer sidebar Screen selection survives failed Screen deletion settlement|Select All Screens survives failed Screen deletion settlement'
               ;;
             screen-history-3)
-              grep='deleting a selected child layer keeps its owning Screen|marquee selection persists and deletes Screens after a prior layer selection|deep-select marquee over a Screen deletes only the child|Shift-marqueeing child layers preserves an explicit Screen elsewhere for Delete|Shift-marquee reselecting an owner Screen makes Delete target the Screen'
+              grep='deleting a selected child layer keeps its owning Screen|marquee selection persists and deletes Screens after a prior layer selection|deep-select marquee over a Screen deletes only the child|Shift-marqueeing child layers preserves an explicit Screen elsewhere for Delete|Shift-marquee reselecting an owner Screen makes Delete target the Screen|deleting two selected Screens is one undo step that restores both with their content, position and order'
               ;;
             *)
               echo "::error::Unknown Screen-history shard: ${{ matrix.shard }}"
@@ -515,9 +593,10 @@ jobs:
       - name: Run focused Design regression cases
         if: ${{ !startsWith(matrix.shard, 'screen-history-') }}
         working-directory: templates/design
-        timeout-minutes: 6
+        timeout-minutes: 23
         env:
           E2E_RUN_ID: design-dnd-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          E2E_LOG_TEST_PROGRESS: "1"
         run: |
           set -euo pipefail
           # Workers in a shard share PGlite-backed application state; each matrix shard has its own E2E_RUN_ID.
@@ -528,7 +607,8 @@ jobs:
             echo "::error::No Design regression pins resolved for shard ${{ matrix.shard }}"
             exit 2
           fi
-          pnpm exec playwright test "${focused_specs[@]}" --workers=1
+          required_pin_identities_json="$(node --experimental-strip-types ../../scripts/design-e2e-regression-pin-identities.ts "${{ matrix.shard }}")"
+          E2E_REQUIRED_PIN_IDENTITIES="$required_pin_identities_json" pnpm exec playwright test "${focused_specs[@]}" --workers=1
 
       - name: Detect retried Design test failures
         id: retry-artifacts
@@ -565,20 +645,15 @@ jobs:
     needs: change-scope
     if: needs.change-scope.outputs.design_canvas_broad_workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ (matrix.shard == 'music-app-workflow' || matrix.shard == 'landing-page-build') && 25 || matrix.shard == 'autolayout-vertical-center-trailing' && 9 || 20 }}
+    timeout-minutes: ${{ matrix.shard == 'home-system-selection' && 40 || (matrix.shard == 'music-app-workflow' || matrix.shard == 'landing-page-build') && 35 || 30 }}
     strategy:
       fail-fast: false
       matrix:
-        shard:
-          [
-            ai-sidebar-loopback,
-            music-app-workflow,
-            home-system-selection,
-            autolayout-vertical-center-trailing,
-            landing-page-build,
-          ]
+        shard: ${{ fromJSON(needs.change-scope.outputs.design_canvas_broad_workflow_shards) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/free-disk
 
@@ -602,7 +677,7 @@ jobs:
       - name: Run AI sidebar loopback image regressions
         if: matrix.shard == 'ai-sidebar-loopback'
         working-directory: templates/design
-        timeout-minutes: 18
+        timeout-minutes: 24
         env:
           E2E_RUN_ID: design-ai-sidebar-${{ github.run_id }}-${{ github.run_attempt }}
           E2E_AI_SIDEBAR_LOOPBACK: "1"
@@ -611,7 +686,7 @@ jobs:
       - name: Run long music-app workflow regression
         if: ${{ matrix.shard == 'music-app-workflow' && contains(fromJSON(needs.change-scope.outputs.design_canvas_e2e_specs), 'templates/design/e2e/interaction-responsive-music-app.spec.ts') }}
         working-directory: templates/design
-        timeout-minutes: 23
+        timeout-minutes: 29
         env:
           E2E_RUN_ID: design-music-app-${{ github.run_id }}-${{ github.run_attempt }}
           DESIGN_CANVAS_E2E_SPECS: ${{ needs.change-scope.outputs.design_canvas_e2e_specs }}
@@ -649,7 +724,7 @@ jobs:
       - name: Run landing-page build workflow regression
         if: ${{ matrix.shard == 'landing-page-build' && contains(fromJSON(needs.change-scope.outputs.design_canvas_e2e_specs), 'templates/design/e2e/interaction-landing-page-build.spec.ts') }}
         working-directory: templates/design
-        timeout-minutes: 23
+        timeout-minutes: 29
         env:
           E2E_RUN_ID: design-dnd-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
           DESIGN_CANVAS_E2E_SPECS: ${{ needs.change-scope.outputs.design_canvas_e2e_specs }}
@@ -677,7 +752,7 @@ jobs:
       - name: Run Home design-system selection regressions
         if: matrix.shard == 'home-system-selection'
         working-directory: templates/design
-        timeout-minutes: 6
+        timeout-minutes: 28
         env:
           E2E_RUN_ID: design-dnd-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
           E2E_AI_SIDEBAR_LOOPBACK: "1"
@@ -686,7 +761,7 @@ jobs:
       - name: Run vertical auto-layout held-guide regression
         if: ${{ matrix.shard == 'autolayout-vertical-center-trailing' && contains(fromJSON(needs.change-scope.outputs.design_canvas_e2e_specs), 'templates/design/e2e/autolayout-drag-drop-matrix.spec.ts') }}
         working-directory: templates/design
-        timeout-minutes: 7
+        timeout-minutes: 23
         env:
           E2E_RUN_ID: design-dnd-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
           DESIGN_CANVAS_E2E_SPECS: ${{ needs.change-scope.outputs.design_canvas_e2e_specs }}
@@ -752,65 +827,17 @@ jobs:
   design-canvas-changed-spec-diagnostics:
     name: Design changed-spec diagnostics (${{ matrix.shard }})
     needs: change-scope
-    if: needs.change-scope.outputs.design_canvas_e2e_specs != '[]'
+    if: needs.change-scope.outputs.design_canvas_e2e_specs != '[]' && needs.change-scope.outputs.design_canvas_e2e_diagnostic_specs != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 19
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard:
-          [
-            changed-1,
-            changed-2,
-            changed-3,
-            changed-4,
-            changed-5,
-            changed-6,
-            changed-7,
-            changed-8,
-            changed-9,
-            changed-10,
-            changed-11,
-            changed-12,
-            changed-13,
-            changed-14,
-            changed-15,
-            changed-16,
-            changed-17,
-            changed-18,
-            changed-19,
-            changed-20,
-            changed-21,
-            changed-22,
-            changed-23,
-            changed-24,
-            changed-25,
-            changed-26,
-            changed-27,
-            changed-28,
-            changed-29,
-            changed-30,
-            changed-31,
-            changed-32,
-            changed-33,
-            changed-34,
-            changed-35,
-            changed-36,
-            changed-37,
-            changed-38,
-            changed-39,
-            changed-40,
-            changed-41,
-            changed-42,
-            changed-43,
-            changed-44,
-            changed-45,
-            changed-46,
-            changed-47,
-            changed-48,
-          ]
+        shard: ${{ fromJSON(needs.change-scope.outputs.design_canvas_e2e_diagnostic_shards) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/free-disk
 
@@ -833,10 +860,10 @@ jobs:
 
       - name: Run changed Design E2E specs
         working-directory: templates/design
-        timeout-minutes: 15
+        timeout-minutes: 24
         env:
           E2E_RUN_ID: design-dnd-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
-          DESIGN_CANVAS_E2E_SPECS: ${{ needs.change-scope.outputs.design_canvas_e2e_specs }}
+          DESIGN_CANVAS_E2E_SPECS: ${{ needs.change-scope.outputs.design_canvas_e2e_diagnostic_specs }}
           E2E_LOG_TEST_PROGRESS: "1"
           PW_TEST_DEBUG_REPORTERS: "1"
         run: |
@@ -850,7 +877,7 @@ jobs:
           fi
           changed_shard="${{ matrix.shard }}"
           changed_shard="${changed_shard#changed-}"
-          pnpm exec playwright test "${existing_changed_specs[@]}" --workers=1 --fully-parallel --shard="${changed_shard}/48" --grep-invert '(a drawn empty Frame refreshes its inspector after auto layout|sizing mode actions survive the selected layer route update)$|vertical center and trailing insertion keep held guides and exact reload geometry$'
+          pnpm exec playwright test "${existing_changed_specs[@]}" --workers=1 --fully-parallel --shard="${changed_shard}/${{ strategy.job-total }}" --grep-invert '(a drawn empty Frame refreshes its inspector after auto layout|sizing mode actions survive the selected layer route update)$|vertical center and trailing insertion keep held guides and exact reload geometry$'
 
       - name: Detect retried Design test failures
         id: retry-artifacts
@@ -879,9 +906,11 @@ jobs:
     needs: change-scope
     if: needs.change-scope.outputs.pre_auth_session_replay_e2e == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/free-disk
 
@@ -901,7 +930,7 @@ jobs:
 
       - name: Run pre-auth session replay smoke
         working-directory: templates/design
-        timeout-minutes: 7
+        timeout-minutes: 20
         env:
           E2E_DISABLE_AUTO_DEV_ACCOUNT: "1"
           E2E_RUN_ID: pre-auth-replay-${{ github.run_id }}-${{ github.run_attempt }}
@@ -1082,6 +1111,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1101,6 +1132,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1112,7 +1145,7 @@ jobs:
   content-db-tests:
     name: Content DB tests
     needs: change-scope
-    if: needs.change-scope.outputs.content == 'true' || needs.change-scope.outputs.content_convergence == 'true'
+    if: needs.change-scope.outputs.content_db == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -1136,16 +1169,27 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
           restore-dist-cache: "true"
 
-      - name: Create isolated Content row-mutation database
-        run: psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d content_migration_test -c "CREATE DATABASE content_row_mutation_test"
+      - name: Create isolated Content row-mutation databases
+        run: |
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d content_migration_test -c "CREATE DATABASE content_row_mutation_test"
+          psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d content_migration_test -c "CREATE DATABASE content_block_action_test"
 
       - name: Run Content DB tests
         run: pnpm test:content-db
+
+      # Main still fails these. They report every run without failing the PR
+      # until the fix that drops their known-loss tag lands.
+      - name: Report Content DB and acceptance tests main still fails
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: pnpm test:content-db:known-loss
 
       - name: Install isolated PGlite test driver
         if: ${{ !cancelled() }}
@@ -1165,14 +1209,62 @@ jobs:
         run: |
           pnpm test:content-db-postgres
           pnpm --filter content exec vitest --run actions/upsert-database-item-by-key.db.test.ts --config vitest.config.ts
+          pnpm test:content-db-two-connections
         env:
           CONTENT_MIGRATION_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/content_migration_test
           CONTENT_ROW_MUTATION_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/content_row_mutation_test
+          CONTENT_BLOCK_ACTION_POSTGRES_URL: postgres://postgres@127.0.0.1:5432/content_block_action_test
+
+  # The convergence steps run as three isolated groups in parallel; each group
+  # has its own Postgres, build and server, so no group's pages or flags leak
+  # into another's. The Content convergence job below merges their reports.
+  content-convergence-groups:
+    name: Content convergence (${{ matrix.label }})
+    needs: change-scope
+    if: needs.change-scope.outputs.content_convergence == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: regular-off
+            label: regular, gate off
+          - group: regular-on
+            label: regular, gate on
+          - group: known-loss
+            label: known loss, not blocking
+    services:
+      postgres:
+        image: ghcr.io/builderio/agent-native-ci-postgres-fallback:17-alpine
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_DB: content_migration_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d content_migration_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          restore-dist-cache: "true"
 
       # Two tabs on one page against the production build, with the realtime
       # stream refused as a serverless function refuses it.
       - name: Restore Playwright browser cache
-        if: ${{ !cancelled() && needs.change-scope.outputs.content_convergence == 'true' }}
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
@@ -1180,12 +1272,10 @@ jobs:
           restore-keys: playwright-${{ runner.os }}-
 
       - name: Install Playwright Chromium
-        if: ${{ !cancelled() && needs.change-scope.outputs.content_convergence == 'true' }}
         run: pnpm exec playwright install --only-shell --with-deps chromium
 
       - name: Build Content for the two-tab convergence lane
         id: convergence-build
-        if: ${{ !cancelled() && needs.change-scope.outputs.content_convergence == 'true' }}
         run: |
           docker exec "${{ job.services.postgres.id }}" createdb -U postgres content_convergence
           pnpm --filter content build
@@ -1194,7 +1284,7 @@ jobs:
 
       - name: Run Content two-tab convergence lane
         id: convergence
-        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'regular-off' }}
         working-directory: templates/content
         run: |
           BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
@@ -1202,51 +1292,309 @@ jobs:
             e2e/two-tab-convergence.spec.ts \
             e2e/chatgpt-widget-body-paint.spec.ts \
             --workers=1 \
-            --grep-invert @known-loss --output test-results/required
+            --grep-invert @known-loss --output test-results/gate-off
         env:
           CONTENT_E2E_SERVE_BUILD: "1"
           CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "off"
           CONTENT_CONVERGENCE_BUILD: ${{ github.sha }}
-          CONTENT_CONVERGENCE_REPORT: ${{ runner.temp }}/content-convergence/convergence.jsonl
-          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/required.json
+          CONTENT_CONVERGENCE_REPORT: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/convergence.jsonl
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/gate-off.json
           DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
 
       # Main still loses text in these. They report every run without failing
       # the PR until the fix that drops their @known-loss tag lands.
       - name: Run Content two-tab scenarios main still loses text in
-        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'known-loss' }}
         continue-on-error: true
         working-directory: templates/content
         run: |
           BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
             -c e2e/playwright.config.ts e2e/two-tab-convergence.spec.ts --workers=1 \
-            --grep @known-loss --pass-with-no-tests --output test-results/known-loss
+            --grep @known-loss --pass-with-no-tests --output test-results/gate-off-known-loss
         env:
           CONTENT_E2E_SERVE_BUILD: "1"
           CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "off"
           CONTENT_CONVERGENCE_BUILD: ${{ github.sha }}
-          CONTENT_CONVERGENCE_REPORT: ${{ runner.temp }}/content-convergence/convergence.jsonl
-          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/known-loss.json
+          CONTENT_CONVERGENCE_REPORT: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/convergence.jsonl
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/gate-off-known-loss.json
           DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
 
-      - name: Summarize Content two-tab convergence
-        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' }}
+      # The same scenarios on pages switched to the live-body writer (decision
+      # D2). Each one skips, with its reason, until the build has the writer
+      # flag and the per-page switch; a skip is reported, never counted a pass.
+      - name: Run Content two-tab convergence lane with the live-body gate on
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'regular-on' }}
         working-directory: templates/content
+        run: |
+          BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
+            -c e2e/playwright.config.ts e2e/two-tab-convergence.spec.ts --workers=1 \
+            --grep-invert @known-loss --output test-results/gate-on
+        env:
+          CONTENT_E2E_SERVE_BUILD: "1"
+          CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "on"
+          CONTENT_E2E_EMAIL: e2e+autoz-live-body-gate@content.test
+          AGENT_NATIVE_FEATURE_FLAG_ADMIN_EMAILS: e2e+autoz-live-body-gate@content.test
+          CONTENT_CONVERGENCE_BUILD: ${{ github.sha }}
+          CONTENT_CONVERGENCE_REPORT: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/convergence.jsonl
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/gate-on.json
+          DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
+
+      - name: Run Content two-tab scenarios main still loses text in, with the live-body gate on
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'known-loss' }}
+        continue-on-error: true
+        working-directory: templates/content
+        run: |
+          BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
+            -c e2e/playwright.config.ts e2e/two-tab-convergence.spec.ts --workers=1 \
+            --grep @known-loss --pass-with-no-tests --output test-results/gate-on-known-loss
+        env:
+          CONTENT_E2E_SERVE_BUILD: "1"
+          CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "on"
+          CONTENT_E2E_EMAIL: e2e+autoz-live-body-gate@content.test
+          AGENT_NATIVE_FEATURE_FLAG_ADMIN_EMAILS: e2e+autoz-live-body-gate@content.test
+          CONTENT_CONVERGENCE_BUILD: ${{ github.sha }}
+          CONTENT_CONVERGENCE_REPORT: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/convergence.jsonl
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/gate-on-known-loss.json
+          DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
+
+      # The stored-form acceptance checks (SF-02 to SF-12), on both sides of
+      # the gate. Each creates its own pages, so two workers share the server.
+      - name: Run Content stored-form acceptance checks
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'regular-off' }}
+        working-directory: templates/content
+        run: |
+          BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
+            -c e2e/playwright.config.ts e2e/stored-form/ --workers=2 \
+            --grep-invert @known-loss --output test-results/stored-form-gate-off
+        env:
+          CONTENT_E2E_SERVE_BUILD: "1"
+          CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "off"
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/stored-form-gate-off.json
+          DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
+
+      - name: Run Content stored-form checks main still fails
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'known-loss' }}
+        continue-on-error: true
+        working-directory: templates/content
+        run: |
+          BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
+            -c e2e/playwright.config.ts e2e/stored-form/ --workers=2 \
+            --grep @known-loss --pass-with-no-tests --output test-results/stored-form-gate-off-known-loss
+        env:
+          CONTENT_E2E_SERVE_BUILD: "1"
+          CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "off"
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/stored-form-gate-off-known-loss.json
+          DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
+
+      - name: Run Content stored-form acceptance checks with the live-body gate on
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'regular-on' }}
+        working-directory: templates/content
+        run: |
+          BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
+            -c e2e/playwright.config.ts e2e/stored-form/ --workers=2 \
+            --grep-invert @known-loss --output test-results/stored-form-gate-on
+        env:
+          CONTENT_E2E_SERVE_BUILD: "1"
+          CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "on"
+          CONTENT_E2E_EMAIL: e2e+autoz-live-body-gate@content.test
+          AGENT_NATIVE_FEATURE_FLAG_ADMIN_EMAILS: e2e+autoz-live-body-gate@content.test,e2e+autoz-live-body-gate-landing@content.test
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/stored-form-gate-on.json
+          DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
+
+      - name: Run Content stored-form checks main still fails, with the live-body gate on
+        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' && matrix.group == 'known-loss' }}
+        continue-on-error: true
+        working-directory: templates/content
+        run: |
+          BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm exec playwright test \
+            -c e2e/playwright.config.ts e2e/stored-form/ --workers=2 \
+            --grep @known-loss --pass-with-no-tests --output test-results/stored-form-gate-on-known-loss
+        env:
+          CONTENT_E2E_SERVE_BUILD: "1"
+          CONTENT_BASE_URL: http://127.0.0.1:8090
+          CONTENT_LIVE_BODY_GATE: "on"
+          CONTENT_E2E_EMAIL: e2e+autoz-live-body-gate@content.test
+          AGENT_NATIVE_FEATURE_FLAG_ADMIN_EMAILS: e2e+autoz-live-body-gate@content.test,e2e+autoz-live-body-gate-landing@content.test
+          PLAYWRIGHT_JSON_OUTPUT_FILE: ${{ runner.temp }}/content-convergence/${{ matrix.group }}/stored-form-gate-on-known-loss.json
+          DATABASE_URL: postgres://postgres@127.0.0.1:5432/content_convergence
+
+      - name: Collect the group's Playwright output
+        if: ${{ always() }}
+        env:
+          GROUP_DIR: ${{ runner.temp }}/content-convergence/${{ matrix.group }}
+        run: |
+          mkdir -p "$GROUP_DIR"
+          if [ -d templates/content/test-results ]; then
+            cp -R templates/content/test-results "$GROUP_DIR/test-results"
+          fi
+
+      - name: Upload Content convergence group report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: content-convergence-${{ matrix.group }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/content-convergence/
+          if-no-files-found: error
+          retention-days: 14
+
+  content-convergence-tests:
+    name: Content convergence
+    needs: [change-scope, content-convergence-groups]
+    if: ${{ !cancelled() && needs.change-scope.outputs.content_convergence == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          sparse-checkout: templates/content/e2e
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Absent artifacts are reported by the merge step, group by group.
+      - name: Download Content convergence group reports
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: content-convergence-*-attempt-*
+          path: .tmp/content-convergence-groups
+          merge-multiple: false
+
+      # Earlier attempts' artifacts stay downloadable, so the run's job list,
+      # not the newest artifact, names the attempt whose report counts. A rerun
+      # of failed jobs copies each job it does not rerun into the new attempt,
+      # with the new run_attempt but the original started_at; that copy never
+      # uploaded anything. So the job with the latest start time ran the group,
+      # and among equal start times the lowest attempt is the one that ran it.
+      # A page that fails mid-pagination would leave a list that can miss the
+      # newest attempts, so only a complete list reaches the merge.
+      - name: Read the attempt that last ran each group
+        id: jobs
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOBS_FILE: .tmp/content-convergence-jobs.tsv
+        run: |
+          mkdir -p .tmp
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=all&per_page=100" \
+            --jq '.jobs[] | select(.name | startswith("Content convergence (")) | [.name, .run_attempt, (.started_at // ""), (.conclusion // "none")] | @tsv' \
+            > "$JOBS_FILE.partial"
+          mv "$JOBS_FILE.partial" "$JOBS_FILE"
+
+      - name: Merge Content convergence group reports
+        id: merge
+        env:
+          JOBS_FILE: .tmp/content-convergence-jobs.tsv
+          GROUPS_DIR: .tmp/content-convergence-groups
+          REPORT_DIR: .tmp/content-convergence
+        run: |
+          mkdir -p "$REPORT_DIR"
+          : > "$REPORT_DIR/convergence.jsonl"
+          failed=""
+          {
+            echo "## Content convergence groups"
+            echo ""
+            echo "| Group | Attempt | Result |"
+            echo "| --- | --: | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for entry in "regular-off:regular, gate off" "regular-on:regular, gate on" "known-loss:known loss, not blocking"; do
+            group="${entry%%:*}"
+            # A newest attempt that never started has no start time to compare,
+            # so it must not let an older attempt's start time win.
+            latest="$(awk -F '\t' -v name="Content convergence (${entry#*:})" '
+              $1 != name { next }
+              { a = $2 + 0 }
+              a > maxAttempt { maxAttempt = a; maxStart = $3 }
+              !seen || $3 > start || ($3 == start && a < attempt) { seen = 1; start = $3; attempt = a; result = $4 }
+              END {
+                if (!seen) exit
+                if (maxStart == "") print maxAttempt, "not started"
+                else print attempt, result
+              }' "$JOBS_FILE" 2>/dev/null || true)"
+            attempt="${latest%% *}"
+            result="${latest#* }"
+            src="$GROUPS_DIR/content-convergence-$group-attempt-$attempt/$group"
+            if [ -z "$latest" ]; then
+              attempt="none"
+              result="no job found"
+            elif [ ! -d "$src" ]; then
+              result="$result, report missing"
+            else
+              if [ -f "$src/convergence.jsonl" ]; then
+                cat "$src/convergence.jsonl" >> "$REPORT_DIR/convergence.jsonl"
+              fi
+              for report in "$src"/*.json; do
+                [ -f "$report" ] && cp "$report" "$REPORT_DIR/"
+              done
+            fi
+            echo "| $group | $attempt | $result |" >> "$GITHUB_STEP_SUMMARY"
+            case "$group:$result" in
+              known-loss:*|*:success) ;;
+              *) failed="$failed $group" ;;
+            esac
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          [ -s "$REPORT_DIR/convergence.jsonl" ] || rm "$REPORT_DIR/convergence.jsonl"
+          echo "failed=${failed# }" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize Content two-tab convergence
+        if: ${{ !cancelled() }}
+        working-directory: templates/content
+        env:
+          REPORT_DIR: ${{ github.workspace }}/.tmp/content-convergence
         run: >-
           node --experimental-strip-types e2e/convergence-summary.ts
-          "$RUNNER_TEMP/content-convergence/convergence.jsonl"
-          "$RUNNER_TEMP/content-convergence/required.json"
-          "$RUNNER_TEMP/content-convergence/known-loss.json"
+          "$REPORT_DIR/convergence.jsonl"
+          --required "$REPORT_DIR/gate-off.json"
+          "$REPORT_DIR/gate-off-known-loss.json"
+          --required "$REPORT_DIR/gate-on.json"
+          "$REPORT_DIR/gate-on-known-loss.json"
+          --required "$REPORT_DIR/stored-form-gate-off.json"
+          "$REPORT_DIR/stored-form-gate-off-known-loss.json"
+          --required "$REPORT_DIR/stored-form-gate-on.json"
+          "$REPORT_DIR/stored-form-gate-on-known-loss.json"
           >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Require the regular groups to pass
+        if: ${{ !cancelled() }}
+        env:
+          JOBS_OUTCOME: ${{ steps.jobs.outcome }}
+          MERGE_OUTCOME: ${{ steps.merge.outcome }}
+          FAILED_GROUPS: ${{ steps.merge.outputs.failed }}
+        run: |
+          if [ "$JOBS_OUTCOME" != "success" ]; then
+            echo "::error::The run's job list could not be read in full, so no group's latest attempt is known"
+            exit 1
+          fi
+          if [ "$MERGE_OUTCOME" != "success" ]; then
+            echo "::error::The group reports could not be merged"
+            exit 1
+          fi
+          if [ -n "$FAILED_GROUPS" ]; then
+            echo "::error::Content convergence groups did not pass: $FAILED_GROUPS"
+            exit 1
+          fi
+
       - name: Upload Content two-tab convergence report
-        if: ${{ !cancelled() && steps.convergence-build.outcome == 'success' }}
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: content-convergence-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/content-convergence/
-            templates/content/test-results/
+          path: .tmp/content-convergence/
           if-no-files-found: warn
           retention-days: 14
 
@@ -1256,8 +1604,31 @@ jobs:
     if: needs.change-scope.outputs.core_integration == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    env:
+      AGENT_RUN_POSTGRES_TEST_URL: postgres://postgres@127.0.0.1:5432/agent_harness_test
+    services:
+      postgres:
+        image: ghcr.io/builderio/agent-native-ci-postgres-fallback:17-alpine
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_DB: agent_harness_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agent_harness_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1286,6 +1657,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1297,11 +1670,13 @@ jobs:
   slides-chat-e2e:
     name: Slides chat caret in Chromium
     needs: change-scope
-    if: ${{ needs.change-scope.outputs.slides_chat_e2e == 'true' }}
+    if: ${{ needs.change-scope.outputs.slides_caret_e2e == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1325,11 +1700,13 @@ jobs:
   slides-chat-typing-e2e:
     name: Slides chat typing during slide editing
     needs: change-scope
-    if: ${{ needs.change-scope.outputs.slides_chat_e2e == 'true' }}
+    if: ${{ needs.change-scope.outputs.slides_typing_chat_e2e == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1350,42 +1727,16 @@ jobs:
         timeout-minutes: 20
         run: pnpm exec tsx scripts/edit-fidelity/run.ts --typing-chat
 
-  slides-macos-caret-qa:
-    name: Slides caret navigation in macOS
+  slides-mobile-import-e2e:
+    name: Slides mobile PowerPoint import status
     needs: change-scope
-    if: ${{ needs.change-scope.outputs.slides_chat_e2e == 'true' }}
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - uses: ./.github/actions/setup-pnpm
-        with:
-          restore-dist-cache: "true"
-
-      - name: Restore Playwright browser cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
-          restore-keys: playwright-${{ runner.os }}-
-
-      - name: Install Playwright Chromium
-        run: pnpm exec playwright install --only-shell chromium
-
-      - name: Check platform-aware line-edge caret navigation in slide text
-        working-directory: templates/slides
-        timeout-minutes: 10
-        run: pnpm exec tsx scripts/edit-fidelity/run.ts --caret-qa --line-key-platform darwin
-
-  slides-authoring-e2e:
-    name: Slides rich-text authoring
-    needs: change-scope
-    if: needs.change-scope.outputs.slides_authoring_e2e == 'true'
+    if: needs.change-scope.outputs.slides_mobile_import_e2e == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1398,67 +1749,60 @@ jobs:
           key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: playwright-${{ runner.os }}-
 
-      - name: Install Playwright browsers
-        run: |
-          pnpm exec playwright install --only-shell --with-deps chromium
-          pnpm exec playwright install --with-deps webkit
-          pnpm exec playwright install --with-deps firefox
-
-      - name: Check IME Escape preserves inline slide text editing
-        working-directory: templates/slides
-        run: pnpm exec tsx scripts/edit-fidelity/run.ts --ime-escape
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --only-shell --with-deps chromium
 
       - name: Check mobile PowerPoint import pending status
         working-directory: templates/slides
+        timeout-minutes: 15
         run: pnpm exec tsx scripts/edit-fidelity/run.ts --mobile-import-status
 
-      - name: Check typing fidelity across Slides text surfaces in Chromium
-        working-directory: templates/slides
-        run: pnpm exec tsx scripts/edit-fidelity/run.ts --text-surface-qa
+  slides-text-surface-e2e:
+    name: Slides text surfaces (${{ matrix.browser }})
+    needs: change-scope
+    if: needs.change-scope.outputs.slides_text_surface_e2e == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, webkit]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
-      - name: Check typing fidelity across Slides text surfaces in WebKit
-        working-directory: templates/slides
-        run: pnpm exec tsx scripts/edit-fidelity/run.ts --text-surface-qa --browser webkit
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          restore-dist-cache: "true"
 
-      - name: Check rich-text authoring parity in Slides
-        working-directory: templates/slides
-        run: pnpm exec tsx scripts/edit-fidelity/run.ts --authoring
+      - name: Restore Playwright browser cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: playwright-${{ runner.os }}-
 
-      - name: Check rich-text authoring parity in Slides WebKit
-        working-directory: templates/slides
-        run: pnpm exec tsx scripts/edit-fidelity/run.ts --authoring --browser webkit
+      - name: Install Playwright browser
+        run: |
+          if [ "${{ matrix.browser }}" = chromium ]; then
+            pnpm exec playwright install --only-shell --with-deps chromium
+          else
+            pnpm exec playwright install --with-deps "${{ matrix.browser }}"
+          fi
 
-      - name: Check rich-text authoring against the committed corpus
+      - name: Check IME Escape preserves slide text editing
+        if: matrix.browser == 'chromium'
         working-directory: templates/slides
-        run: pnpm exec tsx scripts/edit-fidelity/run.ts --authoring-corpus
+        timeout-minutes: 15
+        run: pnpm exec tsx scripts/edit-fidelity/run.ts --ime-escape
 
-      - name: Run deterministic authoring smoke in Chromium
+      - name: Check typing fidelity across Slides text surfaces
         working-directory: templates/slides
+        timeout-minutes: 20
         run: >-
-          pnpm exec tsx scripts/edit-fidelity/run.ts --authoring-fuzz
-          --seed 16 --steps 80 --browser chromium
-
-      - name: Run absolute-layout authoring smoke in Chromium
-        working-directory: templates/slides
-        run: >-
-          pnpm exec tsx scripts/edit-fidelity/run.ts --authoring-fuzz
-          --seed 2 --steps 80 --browser chromium
-
-      - name: Run deterministic authoring smoke in WebKit
-        working-directory: templates/slides
-        env:
-          SLIDES_AUTHORING_FUZZ_TRACE: "1"
-        run: >-
-          pnpm exec tsx scripts/edit-fidelity/run.ts --authoring-fuzz
-          --seed 16 --steps 80 --browser webkit
-
-      - name: Run deterministic authoring smoke in Firefox
-        working-directory: templates/slides
-        env:
-          SLIDES_AUTHORING_FUZZ_TRACE: "1"
-        run: >-
-          pnpm exec tsx scripts/edit-fidelity/run.ts --authoring-fuzz
-          --seed 16 --steps 80 --browser firefox
+          pnpm exec tsx scripts/edit-fidelity/run.ts --text-surface-qa
+          ${{ matrix.browser == 'webkit' && '--browser webkit' || '' }}
 
   brain-evals:
     name: Brain evals
@@ -1468,6 +1812,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1509,6 +1855,8 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1614,6 +1962,8 @@ jobs:
       RUN_BACKGROUND_JOBS: "0"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1671,7 +2021,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U postgres -d neon_budget"
+          --health-cmd "pg_isready -U postgres -d postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -1683,6 +2033,8 @@ jobs:
       NODE_ENV: production
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
         with:
@@ -1699,6 +2051,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-pnpm
 
@@ -1710,21 +2064,30 @@ jobs:
           AGENT_NATIVE_BUILD_SHA: ${{ github.sha }}
           NITRO_PRESET: netlify
         run: |
-          pnpm --filter calendar build
-          pnpm --filter content build
-          test -d templates/calendar/dist
-          test -f templates/calendar/.netlify/functions-internal/server/main.mjs
-          test -d templates/content/dist
-          test -f templates/content/.netlify/functions-internal/server/main.mjs
+          mapfile -t apps < <(jq -r '.[]' <<< '${{ needs.change-scope.outputs.trusted_acceptance_apps }}')
+          if [ "${#apps[@]}" -eq 0 ]; then
+            echo "::error::trusted acceptance was selected without an affected app."
+            exit 1
+          fi
+          for app in "${apps[@]}"; do
+            pnpm --filter "$app" build
+            test -d "templates/$app/dist"
+            test -f "templates/$app/.netlify/functions-internal/server/main.mjs"
+          done
 
   scaffold-e2e:
     name: Scaffold E2E — create + pnpm install
     needs: change-scope
-    if: needs.change-scope.outputs.scaffold == 'true'
+    if: >-
+      needs.change-scope.outputs.scaffold_cli == 'true' ||
+      needs.change-scope.outputs.scaffold_workspace == 'true' ||
+      needs.change-scope.outputs.builder_code_starter_scaffold == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/free-disk
 
@@ -1733,9 +2096,11 @@ jobs:
           restore-dist-cache: "true"
 
       - name: Headless scaffold — pnpm install + typecheck + action
+        if: needs.change-scope.outputs.scaffold_cli == 'true'
         run: pnpm --filter @agent-native/core exec vitest run src/cli/create-e2e.spec.ts
 
       - name: Headless onboarding — local core install + typecheck + action
+        if: needs.change-scope.outputs.scaffold_cli == 'true'
         env:
           AGENT_NATIVE_CREATE_USE_LOCAL_CORE: "1"
         run: >-
@@ -1754,11 +2119,14 @@ jobs:
           pnpm install
           pnpm typecheck
 
-      - name: Scaffold workspace (chat + calendar + dispatch) and verify pnpm install + build
+      - name: Scaffold workspace (chat + calendar + dispatch) and verify pnpm install
+        if: needs.change-scope.outputs.scaffold_workspace == 'true'
         env:
           AGENT_NATIVE_CREATE_USE_LOCAL_CORE: "1"
         run: |
-          cd "$(mktemp -d)"
+          workspace_root="$(mktemp -d)"
+          echo "SCAFFOLD_WORKSPACE=$workspace_root/test-workspace" >> "$GITHUB_ENV"
+          cd "$workspace_root"
           node "$GITHUB_WORKSPACE/packages/core/dist/cli/index.js" create test-workspace --template chat,calendar,dispatch
           cd test-workspace
           # Required package must be scaffolded
@@ -1815,10 +2183,13 @@ jobs:
             }
           '
           pnpm install
-          # Build generated apps to catch missing peer/runtime deps that
-          # `pnpm install` alone won't surface.
-          pnpm --filter ./apps/calendar build
-          pnpm --filter ./apps/dispatch build
+      - name: Build generated Calendar app
+        if: contains(fromJSON(needs.change-scope.outputs.scaffold_workspace_apps), 'calendar')
+        run: cd "$SCAFFOLD_WORKSPACE" && pnpm --filter ./apps/calendar build
+
+      - name: Build generated Dispatch app
+        if: contains(fromJSON(needs.change-scope.outputs.scaffold_workspace_apps), 'dispatch')
+        run: cd "$SCAFFOLD_WORKSPACE" && pnpm --filter ./apps/dispatch build
 
   ssr-boot-smoke:
     name: SSR cold-start smoke
@@ -1830,6 +2201,8 @@ jobs:
       SSR_BOOT_APPS: ${{ needs.change-scope.outputs.ssr_boot_apps }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       # Skip postinstall build chain here — core is built explicitly below so we
       # control the exact build order and avoid redundant parallel builds.
@@ -1870,15 +2243,153 @@ jobs:
           NITRO_PRESET=aws-lambda pnpm --filter plan build
           AWS_LAMBDA_FUNCTION_NAME=ssr-smoke timeout 120 node scripts/ssr-boot-smoke.mjs --preset aws-lambda plan
 
+  verify-execution-lease:
+    name: Execution lease model check
+    needs: change-scope
+    # Required check: run when selected, and also when change-scope did not
+    # succeed so the check fails closed instead of reporting "skipped".
+    if: ${{ !cancelled() && (needs.change-scope.result != 'success' || needs.change-scope.outputs.verify_execution_lease == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require a successful change scope
+        env:
+          CHANGE_SCOPE_RESULT: ${{ needs.change-scope.result }}
+        run: |
+          if [ "$CHANGE_SCOPE_RESULT" != "success" ]; then
+            echo "::error::change-scope did not succeed ($CHANGE_SCOPE_RESULT)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          install: no-scripts
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Restore TLA+ tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .tmp/tla
+          key: tla2tools-${{ hashFiles('verification/execution-lease/manifest.json') }}
+
+      - name: Model-check the execution lease
+        run: pnpm verify:execution-lease
+
+  mutation-plan:
+    name: Plan Core mutation workers
+    needs: change-scope
+    if: ${{ !cancelled() && needs.change-scope.result == 'success' && needs.change-scope.outputs.core_mutation == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_ranges: ${{ steps.plan.outputs.has_ranges }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Plan complete mutation scope
+        id: plan
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: node scripts/mutation-changed.ts --plan
+
+  mutation-shards:
+    name: Core mutation report ${{ matrix.index }}
+    needs: [change-scope, mutation-plan]
+    if: ${{ !cancelled() && needs.mutation-plan.result == 'success' && needs.mutation-plan.outputs.has_ranges == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.mutation-plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-pnpm
+        with:
+          restore-dist-cache: "true"
+      - name: Run owned mutants with the complete original test scope
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: pnpm mutation:changed --shard '${{ matrix.index }}' '${{ matrix.count }}'
+      - name: Upload owner-only mutation receipt
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutation-owner-${{ matrix.index }}-${{ github.run_attempt }}
+          path: .tmp/mutation-shards/shard-${{ matrix.index }}.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+  mutation-changed:
+    name: Mutation test changed Core lines
+    needs: [change-scope, mutation-plan, mutation-shards]
+    # Required check also reports failed scope, planning, missing reports and cancelled workers.
+    if: ${{ always() && (needs.change-scope.result != 'success' || needs.change-scope.outputs.core_mutation == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require complete scope and workers
+        env:
+          SCOPE_RESULT: ${{ needs.change-scope.result }}
+          PLAN_RESULT: ${{ needs.mutation-plan.result }}
+          HAS_RANGES: ${{ needs.mutation-plan.outputs.has_ranges }}
+          SHARD_RESULT: ${{ needs.mutation-shards.result }}
+        run: |
+          if [ "$SCOPE_RESULT" != "success" ] || [ "$PLAN_RESULT" != "success" ]; then
+            echo "::error::Mutation scope or planning did not succeed"
+            exit 1
+          fi
+          case "$HAS_RANGES:$SHARD_RESULT" in
+            true:success|false:skipped) ;;
+            *) echo "::error::Mutation workers were incomplete ($HAS_RANGES:$SHARD_RESULT)"; exit 1 ;;
+          esac
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Download complete owner receipts
+        if: needs.mutation-plan.outputs.has_ranges == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutation-owner-*
+          path: .tmp/mutation-shards
+          merge-multiple: false
+      - name: Verify complete inventories and the original global threshold
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: node scripts/mutation-changed.ts --aggregate .tmp/mutation-shards
+
   guards:
     name: Security guards
     needs: change-scope
     if: needs.change-scope.outputs.guards == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: ./.github/actions/setup-pnpm
@@ -1897,11 +2408,29 @@ jobs:
       - name: Test untracked-imports guard
         run: pnpm test:no-untracked-imports
 
+      - name: Test deferred server counts guard
+        run: pnpm test:no-deferred-server-counts
+
       - name: Test mobile build path guard
         run: pnpm test:mobile-build-paths
 
+      - name: Test bare pnpm spawn guard
+        run: pnpm test:no-bare-pnpm-spawn
+
+      - name: Test single S3 signer guard
+        run: pnpm test:single-s3-signer
+
       - name: Test source-reading tests guard
         run: pnpm test:no-source-reading-tests
+
+      - name: Test legacy MCP hint baseline guard
+        run: pnpm test:no-new-legacy-mcp-hints
+
+      - name: Test blocker-safe module names guard
+        run: pnpm test:blocker-safe-module-names
+
+      - name: Test strictness ratchet guards
+        run: pnpm test:strictness-guards
 
       - name: Test Neon transfer alert and offline backtest
         run: pnpm test:neon-transfer-alert
@@ -1923,7 +2452,9 @@ jobs:
           scripts/guard-no-heavy-dashboard-list-reads.test.ts
 
       - name: Run security guards
-        run: pnpm guards
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: node --import tsx scripts/run-guards.ts
 
       - name: Check the Slides interaction oracle against one full test run
         if: ${{ !cancelled() && needs.change-scope.outputs.slides_oracle == 'true' }}
@@ -1986,5 +2517,20 @@ jobs:
           fi
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - uses: ./.github/actions/standalone-chat-acceptance
+
+  deploy-paths:
+    name: Deploy paths
+    needs: change-scope
+    # Run when selected, and also when change-scope did not succeed so the
+    # check fails closed instead of reporting "skipped".
+    if: ${{ !cancelled() && (needs.change-scope.result != 'success' || needs.change-scope.outputs.deploy_paths == 'true') }}
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/deploy-paths.yml
+    with:
+      source: local

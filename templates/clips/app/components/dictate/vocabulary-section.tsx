@@ -3,6 +3,7 @@ import {
   useActionQuery,
 } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
+import { reportWriteFailure } from "@agent-native/core/client/write-failure";
 import {
   IconBook2,
   IconDownload,
@@ -13,7 +14,7 @@ import {
   IconUpload,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
 import {
@@ -191,7 +192,11 @@ export async function addVocabularyEntries(
   return failedCount;
 }
 
-export function VocabularyManager() {
+export function VocabularyManager({
+  disabled = false,
+}: {
+  disabled?: boolean;
+}) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -205,9 +210,15 @@ export function VocabularyManager() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
 
+  useEffect(() => {
+    if (!disabled) return;
+    setOpen(false);
+    setRemoveCandidate(null);
+  }, [disabled]);
+
   const { data, isLoading } = useActionQuery<{
     vocabulary: VocabularyEntry[];
-  }>("list-vocabulary", {}, { enabled: open });
+  }>("list-vocabulary", {}, { enabled: open && !disabled });
   const entries = data?.vocabulary ?? [];
 
   const visibleEntries = useMemo(() => {
@@ -241,11 +252,18 @@ export function VocabularyManager() {
         );
         return { previous };
       },
-      onError: (_error, _variables, context: any) => {
-        if (context?.previous) {
+      onError: (error, _variables, context) => {
+        if (
+          typeof context === "object" &&
+          context !== null &&
+          "previous" in context &&
+          context.previous
+        ) {
           queryClient.setQueryData(QUERY_KEY, context.previous);
         }
-        toast.error(t("dictateRoute.vocabularyRemoveFailed"));
+        reportWriteFailure(error, {
+          label: t("dictateRoute.vocabularyRemoveFailed"),
+        });
       },
       onSettled: () => {
         void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
@@ -318,7 +336,7 @@ export function VocabularyManager() {
   return (
     <>
       <Sheet
-        open={open}
+        open={open && !disabled}
         onOpenChange={(nextOpen) => {
           setOpen(nextOpen);
           if (!nextOpen) {
@@ -332,6 +350,7 @@ export function VocabularyManager() {
           <Button
             variant="outline"
             size="sm"
+            disabled={disabled}
             className="ms-auto shrink-0"
             aria-label={t("dictateRoute.dictionaryTitle")}
           >
@@ -506,7 +525,7 @@ export function VocabularyManager() {
                 </EmptyHeader>
               </Empty>
             ) : (
-              <ItemGroup className="overflow-hidden rounded-lg border border-border">
+              <ItemGroup className="shrink-0 overflow-hidden rounded-lg border border-border">
                 {visibleEntries.map((entry, index) => (
                   <div key={entry.id}>
                     {index > 0 ? <ItemSeparator /> : null}
@@ -560,7 +579,7 @@ export function VocabularyManager() {
       </Sheet>
 
       <AlertDialog
-        open={removeCandidate !== null}
+        open={removeCandidate !== null && !disabled}
         onOpenChange={(nextOpen) => {
           if (!nextOpen) setRemoveCandidate(null);
         }}

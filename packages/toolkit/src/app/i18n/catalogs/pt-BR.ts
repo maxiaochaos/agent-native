@@ -1,6 +1,22 @@
 import type { ToolkitAgentChatTranslation } from "../types.js";
 
 const messages: ToolkitAgentChatTranslation = {
+  "settingsApiKeys.approvedOrigins": "Origens aprovadas",
+  "settingsApiKeys.originsHint":
+    "Uma origem HTTPS exata por linha. Vazio bloqueia o encaminhamento. HTTP local é permitido.",
+  "settingsApiKeys.invalidOrigins":
+    "Informe origens HTTPS exatas, uma por linha.",
+  "settingsApiKeys.editOrigins": "Editar origens",
+  "settingsApiKeys.originsSaved": "Origens salvas",
+  "settingsApiKeys.originsCount_one": "{{count}} origem aprovada",
+  "settingsApiKeys.originsCount_many": "{{count}} origens aprovadas",
+  "settingsApiKeys.originsCount_other": "{{count}} origens aprovadas",
+  "settingsApiKeys.noApprovedOrigins": "Nenhuma origem aprovada",
+  "extensions.cancel": "Cancelar",
+  "extensions.context": "Contexto",
+  "extensions.confirmAgentMessage": "Enviar a mensagem da extensão ao agente?",
+  "extensions.sendToAgent": "Enviar ao agente",
+  "auth.logOutFailed": "Não foi possível sair",
   "block.renderUnavailable": "Este bloco está temporariamente indisponível.",
   "block.loading": "Carregando bloco.",
   "composer.contextUrlLabel": "Endereço URL",
@@ -78,7 +94,6 @@ const messages: ToolkitAgentChatTranslation = {
   "auth.refreshTitle": "A sessão do chat precisa ser atualizada",
   "auth.requiredDescription": "Você precisa entrar para usar o agente.",
   "auth.requiredTitle": "Autenticação obrigatória",
-  "commands.act": "Voltar ao modo de ação",
   "commands.available": "Comandos disponíveis",
   "commands.clear": "Iniciar um novo chat (mantém o chat atual no histórico)",
   "commands.closeHelp": "Fechar ajuda",
@@ -86,7 +101,6 @@ const messages: ToolkitAgentChatTranslation = {
   "commands.history": "Ver todos os chats",
   "commands.mention": "Mencionar arquivos, agentes ou recursos",
   "commands.new": "O mesmo que /clear",
-  "commands.plan": "Mudar para o planejamento somente leitura",
   "observability.promoteMustContain": "A resposta deve conter…",
   "observability.promoteMustContainOptional":
     "Texto opcional a verificar na resposta…",
@@ -129,10 +143,15 @@ const messages: ToolkitAgentChatTranslation = {
   "onboarding.roleMarketing": "Marketing",
   "onboarding.roleSales": "Vendas",
   "onboarding.roleOps": "Operações",
+  "onboarding.roleCreator": "Criador de conteúdo",
+  "onboarding.roleStudent": "Estudante",
+  "onboarding.roleEducator": "Educador",
   "onboarding.roleIndividual": "Individual",
   "onboarding.roleOther": "Outro",
   "onboarding.roleOtherInputLabel": "Descreva sua função",
   "onboarding.skipForNow": "Pular por enquanto",
+  "onboarding.builderProvisionFailedDetail":
+    "Não foi possível criar sua conta do Builder.io. Tente novamente ou entre com uma conta existente.",
   "onboarding.saveRoleError": "Não foi possível salvar sua função.",
   "onboarding.builderCreateAccount": "Usar o Builder.io",
   "onboarding.builderSignInWithAccount": "Entrar com uma conta do Builder.io",
@@ -143,7 +162,8 @@ const messages: ToolkitAgentChatTranslation = {
   "onboarding.builderCredits": "Incluído nos créditos gratuitos do Builder.io",
   "onboarding.builderIncludedFreeWithAccount":
     "Incluído gratuitamente em uma conta do Builder.io",
-  "onboarding.builderMonthlyCredits": "60 Agent Credits por mês",
+  "onboarding.builderMonthlyCredits":
+    "15 créditos gratuitos por dia, até 60 por mês",
   "onboarding.builderIncludedFree": "Incluído grátis",
   "onboarding.builderMoreServices": "+ {{count}} serviços adicionais",
   "onboarding.builderLlmCredits": "Créditos para LLM",
@@ -175,6 +195,29 @@ const messages: ToolkitAgentChatTranslation = {
   "onboarding.builderPrivacy": "Política de Privacidade",
   "onboarding.builderConsentAnd": "e",
   "onboarding.builderExistingAccount": "Tenho uma conta Builder.io",
+  "onboarding.creditsTitle":
+    "Experimente com 15 créditos gratuitos por dia, até 60 por mês",
+  "onboarding.creditsTitleClips":
+    "Experimente com armazenamento de vídeo grátis e 15 créditos por dia, até 60 por mês",
+  "onboarding.creditsActivate": "Ativar créditos gratuitos",
+  "onboarding.creditsFinePrint":
+    "Isto criará uma conta Builder.io gratuita. Ao continuar, você concorda com nossos",
+  "onboarding.creditsMoreInfo": "Mais informações",
+  "onboarding.creditsSubtitle":
+    "Ganhe créditos gratuitos para LLMs, Jev, armazenamento e muito mais para este app em um clique com a Builder.io.",
+  "onboarding.creditsLearnMore": "Saiba mais",
+  "onboarding.creditsSkip": "Pular",
+  "onboarding.creditsSkipConfirmTitle": "Tem certeza?",
+  "onboarding.creditsSkipConfirmBody":
+    "Apps Agent-Native precisam de um LLM conectado para usar a maioria dos recursos. A maioria das funcionalidades não funciona sem um.",
+  "onboarding.creditsSkipGoBack": "Voltar",
+  "onboarding.creditsSkipAnyway": "Pular mesmo assim",
+  "onboarding.creditsUseCustomKeys": "Usar chaves personalizadas",
+  "onboarding.creditsUseOwnApiKeys": "Usar minhas próprias chaves de API",
+  "onboarding.creditsAboutLabel": "Sobre os créditos gratuitos",
+  "onboarding.creditsActivating": "Ativando créditos gratuitos",
+  "onboarding.creditsActivatingTooltip":
+    "A Builder oferece créditos gratuitos para LLMs, Jev, armazenamento e muito mais, para você usar os recursos de IA deste app sem suas próprias chaves.",
   "onboarding.builderConnect": "Conectar Builder.io",
   "onboarding.builderActivating":
     "Ativando os créditos gratuitos do Builder.io",
@@ -216,6 +259,10 @@ const messages: ToolkitAgentChatTranslation = {
   "onboarding.capability.embeddings.keySummary": "Vetores semânticos",
   "onboarding.capability.embeddings.why":
     "Vetores semânticos melhoram a busca semântica. A busca por palavras-chave continua funcionando sem eles.",
+  "onboarding.capability.webSearch.label": "Pesquisa na Web",
+  "onboarding.capability.webSearch.keySummary": "Pesquisa na Web",
+  "onboarding.capability.webSearch.why":
+    "Pesquise em fontes públicas atuais na Web. A pesquisa gerenciada pelo Builder usa os créditos de IA incluídos, sem exigir uma chave de pesquisa separada.",
   "onboarding.capability.systemOne.why":
     "Jev é um modelo de decisão opcional que ajuda a escolher ferramentas e habilidades relevantes antes da primeira solicitação de modelo do agente.",
   "onboarding.capability.assetsImageGeneration.label": "Geração de imagens",
@@ -407,6 +454,9 @@ const messages: ToolkitAgentChatTranslation = {
     "Não foi possível adicionar o arquivo solto. Tente outro formato.",
   "composer.openDesktop": "Abra o aplicativo para desktop para usar este chat.",
   "composer.removeAttachment": "Remover {{name}}",
+  "composer.attachmentReadFailed": "Não foi possível ler este arquivo",
+  "composer.attachmentTooLarge": "O arquivo tem mais de 8 MB",
+  "composer.attachmentNotUtf8": "O arquivo não é texto UTF-8",
   "composer.scrollToBottom": "Rolar até o final",
   "composer.suggestedPrompts": "Prompts sugeridos",
   "composer.stopResponse": "Parar resposta",
@@ -433,6 +483,29 @@ const messages: ToolkitAgentChatTranslation = {
   "history.searching": "Pesquisando...",
   "history.untitledChat": "Chat",
   "history.yesterday": "Ontem",
+  "history.mine": "Meus chats",
+  "history.sharedWithYou": "Compartilhados com você",
+  "history.showAll": "Mostrar tudo",
+  "history.showLess": "Mostrar menos",
+  "history.loadMore": "Ver mais",
+  "history.loadingMore": "Carregando...",
+  "history.retry": "Tentar novamente",
+  "history.loadFailed": "Não foi possível carregar os chats",
+  "history.loadMoreFailed": "Não foi possível carregar mais chats",
+  "history.emptyMine": "Nenhum chat ainda",
+  "history.emptyShared": "Nenhum chat foi compartilhado com você",
+  "history.ownedBy": "Proprietário: {{name}}",
+  "history.accessDirect": "Compartilhados com você",
+  "history.accessOrganization": "Compartilhado com sua organização",
+  "history.copyLink": "Copiar link",
+  "history.linkCopied": "Link copiado",
+  "history.copyLinkFailed": "Não foi possível copiar o link",
+  "history.onlyYou": "Só você",
+  "history.hide": "Ocultar da minha lista",
+  "history.hidden": "Oculto da sua lista",
+  "history.undo": "Desfazer",
+  "history.hideFailed": "Não foi possível ocultar o chat",
+  "history.unhideFailed": "Não foi possível restaurar o chat",
   "integrations.availableSection": "Integrações disponíveis",
   "integrations.connectedSection": "Conectado",
   "integrations.goToApiKeys": "Ir para chaves de API",
@@ -682,7 +755,28 @@ const messages: ToolkitAgentChatTranslation = {
   "mcpIntegrations.catalog.hubspot.useCase":
     "CRM, contatos, empresas, negócios, tickets, análise de clientes",
   "mcpIntegrations.catalog.hubspot.setupNote":
-    "Quando um HubSpot MCP Auth App gerenciado pelo espaço de trabalho estiver configurado, qualquer membro pode conectar uma conta pessoal do HubSpot com OAuth e PKCE. Caso contrário, crie o app no HubSpot Developer Platform antes de conectar. O conector OAuth existente do HubSpot continua disponível para as ações do app.",
+    "Cada pessoa conecta sua própria conta do HubSpot depois que um proprietário configura o HubSpot MCP Auth App.",
+  "mcpIntegrations.hubspot.setupTitle": "Configurar o HubSpot MCP",
+  "mcpIntegrations.hubspot.dialogDescription":
+    "Um proprietário configura o HubSpot MCP uma vez. Depois, cada membro conecta a própria conta.",
+  "mcpIntegrations.hubspot.workspaceSetupStatus":
+    "É necessário configurar o espaço de trabalho",
+  "mcpIntegrations.hubspot.setupChecking":
+    "Verificando a configuração do espaço de trabalho…",
+  "mcpIntegrations.hubspot.setupUnavailable":
+    "Status da configuração indisponível",
+  "mcpIntegrations.hubspot.setupUnavailableDescription":
+    "Não foi possível verificar as configurações OAuth do espaço de trabalho. Tente novamente.",
+  "mcpIntegrations.hubspot.ownerSetupDescription":
+    "Crie um HubSpot MCP Auth App e adicione o ID e o segredo do cliente em Agent-Native settings → API keys.",
+  "mcpIntegrations.hubspot.memberSetupDescription":
+    "Peça a um proprietário para criar um HubSpot MCP Auth App e adicionar o ID e o segredo do cliente em Agent-Native settings → API keys. Depois da configuração, você poderá conectar sua própria conta do HubSpot.",
+  "mcpIntegrations.hubspot.noWorkspaceDescription":
+    "Entre em um espaço de trabalho antes de conectar o HubSpot MCP.",
+  "mcpIntegrations.hubspot.configureWorkspaceCredentials":
+    "Adicionar credenciais do espaço de trabalho",
+  "mcpIntegrations.hubspot.refreshSetupStatus": "Verificar novamente",
+  "mcpIntegrations.hubspot.retrySetupStatus": "Tentar novamente",
   "mcpIntegrations.catalog.pylon.description":
     "Pesquise e atualize dados de suporte do Pylon.",
   "mcpIntegrations.catalog.pylon.useCase":
@@ -813,7 +907,6 @@ const messages: ToolkitAgentChatTranslation = {
   "message.sentAt": "Enviado às {{time}}",
   "plan.act": "Agir",
   "plan.implement": "Implementar",
-  "plan.mode": "Modo de planejamento",
   "plan.ready": "Plano pronto",
   "plan.switchToAct": "Mudar para o modo de ação",
   "queue.count": "{{count}} na fila",
@@ -823,8 +916,7 @@ const messages: ToolkitAgentChatTranslation = {
     "{{count}} na fila — enviar uma mensagem de acompanhamento...",
   "queue.remove": "Remover da fila",
   "queue.sendNow": "Enviar agora",
-  "queue.sendNowHint":
-    "Interrompe a resposta atual e depois envia esta mensagem",
+  "queue.sendNowHint": "Envia esta mensagem na próxima etapa do agente",
   "queue.sendNext": "Enviar em seguida",
   "queue.sendNextHint": "Enviar após o término da resposta atual",
   "queue.moreActions": "Mais ações",
@@ -924,6 +1016,7 @@ const messages: ToolkitAgentChatTranslation = {
     "O Builder.io inclui créditos gratuitos, ou você pode usar sua própria chave de API.",
   "setup.builderOrOwnKeys":
     "Use o Builder.io (créditos gratuitos) ou adicione as chaves do seu próprio provedor.",
+  "setup.reconnectBuilder": "Reconectar Builder.io",
   "setup.connectAi": "Conectar IA",
   "setup.connectBuilder": "Usar Builder.io",
   "setup.connectionsDescription":
@@ -994,6 +1087,11 @@ const messages: ToolkitAgentChatTranslation = {
   "tool.worked": "Trabalhou",
   "tool.workedFor": "Trabalhou por {{duration}}",
   "widget.chart": "Gráfico",
+  "widget.chartActions": "Ações do gráfico",
+  "widget.chartRowsOmitted":
+    "Este gráfico mostra apenas algumas das linhas disponíveis.",
+  "widget.dataSources": "Fontes de dados",
+  "widget.tableActions": "Ações da tabela",
   "widget.dataChart": "Gráfico de dados",
   "widget.dataInsights": "Insights de dados",
   "widget.dataTable": "Tabela de dados",
@@ -1041,7 +1139,6 @@ const messages: ToolkitAgentChatTranslation = {
   "widget.sampled": "amostrado",
   "commands.clearShort": "Iniciar um novo bate-papo",
   "commands.newShort": "Iniciar um novo bate-papo",
-  "composer.actDescription": "Use ferramentas e faça alterações aprovadas",
   "composer.activeAppContext": "Contexto de aplicativo ativo",
   "composer.actMode": "Modo de ação",
   "composer.add": "Adicionar...",
@@ -1122,7 +1219,12 @@ const messages: ToolkitAgentChatTranslation = {
   "composer.menu.scheduleTask": "Agendar tarefa",
   "composer.menu.scheduleTaskDescription":
     "Executar algo conforme uma programação",
-  "composer.menu.uploadFile": "Carregar arquivo",
+  "composer.menu.uploadFile": "Arquivos e imagens",
+  "composer.menu.searchWorkspace": "Pesquisar no espaço de trabalho…",
+  "composer.menu.references": "Referências",
+  "composer.menu.referenceFile": "Referenciar um arquivo",
+  "composer.menu.attachToMessage": "Adicionar contexto",
+  "composer.menu.commands": "Comandos",
   "composer.menu.uploadFileDescription":
     "Imagens, PDFs, texto/código, JSON, CSV",
   "composer.messageAgent": "Enviar mensagem ao agente...",
@@ -1133,9 +1235,6 @@ const messages: ToolkitAgentChatTranslation = {
     "Não foi possível anexar a imagem colada. Experimente um formato diferente.",
   "composer.pastedTextError": "Não foi possível anexar o texto colado.",
   "composer.plan": "Plano",
-  "composer.planDescription": "Pesquisa somente leitura e aprovação primeiro",
-  "composer.planDesktopRequired":
-    "Abra Agent-Native Desktop para usar o modo Plano.",
   "composer.previewAttachment": "Visualização {{name}}",
   "composer.reasoning": "Raciocínio",
   "composer.reasoningEffort.auto": "Auto",
@@ -1146,9 +1245,6 @@ const messages: ToolkitAgentChatTranslation = {
   "composer.reasoningEffort.minimal": "Mínimo",
   "composer.reasoningEffort.none": "Nenhum",
   "composer.reasoningEffort.xhigh": "Extra alto",
-  "composer.reasoningExtraHighShort": "Muito alto",
-  "composer.reasoningMediumShort": "Méd.",
-  "composer.reasoningMinimalShort": "Mín.",
   "composer.removeContext": "Remover contexto {{name}}",
   "composer.removeReference": "Remover referência {{name}}",
   "composer.route": "Rota",
@@ -1156,6 +1252,11 @@ const messages: ToolkitAgentChatTranslation = {
   "composer.scheduleTaskPrefix": "Crie um trabalho recorrente: ",
   "composer.selectedReferences": "Referências selecionadas",
   "composer.sendMessage": "Enviar mensagem",
+  "composer.select": "Selecionar",
+  "composer.selectContextFull":
+    "O contexto está cheio. Remova um item antes de selecionar outro.",
+  "composer.selectContextTooLarge":
+    "Esse objeto é grande demais para ser adicionado como contexto.",
   "composer.skill.added": 'Habilidade "{{name}}" adicionada',
   "composer.skill.back": "Voltar",
   "composer.skill.content": "Conteúdo",
@@ -1173,6 +1274,10 @@ const messages: ToolkitAgentChatTranslation = {
   "composer.upload": "Carregar",
   "composer.uploadFailed":
     "Não foi possível fazer upload do arquivo selecionado.",
+  "composer.imageTooLargeToAttach":
+    '"{{name}}" tem {{size}} MB; imagens acima de {{limit}} MB não podem ser anexadas. Use uma imagem menor.',
+  "composer.imageTooManyPixelsToAttach":
+    '"{{name}}" tem {{megapixels}} megapixels; imagens acima de {{limit}} megapixels não podem ser anexadas. Use uma imagem menor.',
   "composer.fileTooLarge":
     "Este arquivo é maior que o limite de upload de {{size}} MB.",
   "composer.sessionExpired":
@@ -1211,14 +1316,9 @@ const messages: ToolkitAgentChatTranslation = {
   "pastedText.preview": "Visualizar texto colado",
   "pastedText.remove": "Remover texto colado",
   "pastedText.title": "Texto colado",
-  "voice.dictation.cancel": "Cancelar (Esc)",
-  "voice.dictation.cancelRecording": "Cancelar gravação",
   "voice.dictation.start": "Ditar ({{shortcut}})",
   "voice.dictation.stopRecording": "Parar gravação",
   "voice.dictation.transcribing": "Transcrevendo…",
-  "voiceMode.connectBuilder": "Usar Builder.io",
-  "voiceMode.end": "Encerrar modo de voz",
-  "voiceMode.entryButtonLabel": "Usar microfone",
   "voiceMode.errors.channelDisconnected":
     "O canal de controle de voz em tempo real foi desconectado.",
   "voiceMode.errors.connectionFailed": "A conexão de voz em tempo real falhou.",
@@ -1231,12 +1331,6 @@ const messages: ToolkitAgentChatTranslation = {
     "A sessão de voz em tempo real encontrou um erro.",
   "voiceMode.errors.unsupported":
     "Este navegador não oferece suporte a conversas de voz em tempo real.",
-  "voiceMode.hideChat": "Ocultar bate-papo",
-  "voiceMode.keepDictating": "Ditar uma mensagem",
-  "voiceMode.promptDescription":
-    "O modo de voz continua ouvindo enquanto o agente navega e executa ações.",
-  "voiceMode.promptTitle": "Use sua voz",
-  "voiceMode.rememberPreference": "Lembrar minha preferência",
   "voiceMode.settings.autoLanguage": "Auto",
   "voiceMode.settings.defaultMicrophone": "Padrão do sistema",
   "voiceMode.settings.intelligence": "Inteligência",
@@ -1270,8 +1364,6 @@ const messages: ToolkitAgentChatTranslation = {
   "voiceMode.settings.voiceDescriptions.shimmer": "Leve e otimista",
   "voiceMode.settings.voiceDescriptions.verse": "Expressivo e versátil",
   "voiceMode.settings.voiceStyle": "Estilo de voz",
-  "voiceMode.setupDescription":
-    "Use o Builder.io para voz gerenciada com créditos gratuitos ou adicione suas próprias chaves.",
   "transcription.builderCtaDescription":
     "Use o Builder.io para transcrição de maior qualidade, com créditos gratuitos e sem chave de API.",
   "voiceMode.googleRealtimeDescription":
@@ -1280,17 +1372,13 @@ const messages: ToolkitAgentChatTranslation = {
     "O JSON da conta de serviço está configurado. Use o Builder.io (plano gratuito disponível) para criar a sessão WebSocket gerenciada em tempo real.",
   "voiceMode.builderGeminiDescription":
     "Use o Builder.io para transcrição com Gemini Flash-Lite e limpeza de texto com Luna. Não é necessária uma chave do Google.",
-  "voiceMode.setupTitle": "Configurar o modo de voz",
-  "voiceMode.showChat": "Mostrar bate-papo",
   "voiceMode.start": "Iniciar conversa por voz",
-  "voiceMode.startWithOpenAiKey": "Iniciar com uma chave da OpenAI",
   "voiceMode.status.connecting": "Conectando",
   "voiceMode.status.ending": "Encerrando o modo de voz",
   "voiceMode.status.error": "O modo de voz precisa de atenção",
   "voiceMode.status.listening": "Ouvindo",
   "voiceMode.status.speaking": "Falando",
   "voiceMode.status.working": "Trabalhando",
-  "voiceMode.useOpenAiKey": "Adicione suas próprias chaves",
   "voiceMode.voiceSettings": "Configurações de voz",
   "duration.hourShort": "h",
   "duration.minuteShort": "min",
@@ -1338,6 +1426,10 @@ const messages: ToolkitAgentChatTranslation = {
     "O provedor do modelo rejeitou esta solicitação por estar malformada, então ela não foi repetida. Tente novamente ou inicie um novo chat se continuar acontecendo.",
   "errorMessages.requestTooLarge":
     "Esta solicitação excedeu o limite de tamanho do servidor (HTTP 413). Inicie um novo chat ou remova anexos ou referências grandes e tente novamente.",
+  "errorMessages.capabilityUnavailable":
+    "Não foi possível enviar sua mensagem agora. Tente novamente em instantes.",
+  "errorMessages.capabilityUnsupported":
+    "Este app ainda não pode tentar novamente com segurança o seu prompt salvo. Atualize o app e tente de novo.",
   "errorMessages.runInterrupted": "O agente parou antes de terminar.",
   "errorMessages.runFailed": "A execução do agente falhou.",
   "errorMessages.runUnverified":
@@ -1531,8 +1623,38 @@ const messages: ToolkitAgentChatTranslation = {
     "Qualquer pessoa na sua organização pode visualizar",
   "share.owner": "Proprietário",
   "share.peopleWithAccess": "Pessoas com acesso",
-  "share.people": "Pessoas",
-  "share.agents": "Agentes",
+  "share.canView": "Pode ver",
+  "share.canComment": "Pode comentar",
+  "share.canEdit": "Pode editar",
+  "share.canManageAccess": "Pode gerenciar o acesso",
+  "share.onlyPeopleInvited": "Somente pessoas convidadas",
+  "share.anyoneInOrganization": "Qualquer pessoa da sua organização",
+  "share.anyoneAtOrganization": "Qualquer pessoa da {{organization}}",
+  "share.anyoneWithLink": "Qualquer pessoa com o link",
+  "share.invite": "Convidar",
+  "share.addPeopleOrAgents": "Adicionar pessoas ou agentes",
+  "share.you": "você",
+  "share.agentBadge": "Agente",
+  "share.removeAccess": "Remover acesso",
+  "share.loadAgentsFailed": "Não foi possível carregar os agentes.",
+  "share.namesUnavailable":
+    "Não foi possível carregar os nomes, por isso os e-mails são exibidos.",
+  "share.copyLink": "Copiar link",
+  "share.copyLinkFailed": "Não foi possível copiar o link.",
+  "share.sendTo": "Enviar para",
+  "share.openInClaude": "Abrir no Claude",
+  "share.openInClaudeCode": "Abrir no Claude Code",
+  "share.openInCodex": "Abrir no Codex",
+  "share.copyAgentPrompt": "Copiar prompt do agente",
+  "share.copyAgentLink": "Copiar link para agentes",
+  "share.copyAgentLinkFailed": "Não foi possível copiar o link para agentes.",
+  "share.copiedAgentLink": "Link para agentes copiado",
+  "share.retryAgentLinkItem": "Tentar link para agentes novamente",
+  "share.mcpServerSettings": "Configurações do servidor MCP",
+  "share.copiedAgentPrompt": "Prompt do agente copiado",
+  "share.copyAgentPromptFailed": "Não foi possível copiar o prompt do agente.",
+  "share.agentReadPrompt":
+    'Leia este item ({{label}}): {{url}}\n\nUse uma conexão MCP disponível para {{mcpUrl}} e chame {{actions}} com {{idParam}} "{{id}}". Use as permissões atuais da minha conta.\n\nSe essa conexão não existir ou estiver desconectada, peça que eu a conecte e entre na conta: {{connectUrl}}. Depois que eu confirmar, tente a leitura de novo. Se a leitura for negada, me avise.',
   "share.private": "Privado",
   "share.privateDescription": "Somente pessoas com acesso podem visualizar",
   "share.public": "Público",
@@ -1550,6 +1672,17 @@ const messages: ToolkitAgentChatTranslation = {
   "share.viewer": "Visualizador",
   "share.viewerDescription": "Pode visualizar",
   "share.userGroup": "Grupo de usuários",
+  "share.ownedByAnyone": "De qualquer pessoa",
+  "share.ownedByMe": "Meus",
+  "share.sharedWithMe": "Compartilhado comigo",
+  "share.confirmOrganizationTitle": "Compartilhar com sua organização?",
+  "share.confirmOrganizationTitleNamed": "Compartilhar com {{organization}}?",
+  "share.confirmOrganizationDescription":
+    "Todas as pessoas da sua organização, incluindo novos membros, poderão abrir isto e ver tudo o que há nele, incluindo mensagens, arquivos e outros conteúdos. Você pode alterar isso depois.",
+  "share.confirmOrganizationDescriptionNamed":
+    "Todas as pessoas de {{organization}}, incluindo novos membros, poderão abrir isto e ver tudo o que há nele, incluindo mensagens, arquivos e outros conteúdos. Você pode alterar isso depois.",
+  "share.confirmOrganizationAction": "Compartilhar com a organização",
+  "share.confirmOrganizationSharing": "Compartilhando...",
   "settings.emailTitle": "E-mail",
   "settings.emailChange": "Alterar e-mail",
   "settings.emailChanging": "Enviando...",
@@ -1562,6 +1695,34 @@ const messages: ToolkitAgentChatTranslation = {
   "featureFlags.builderCreditReferrals.name": "Indicações de créditos Builder",
   "featureFlags.builderCreditReferrals.description":
     "Mostrar os detalhes de indicação do espaço de trabalho Builder conectado em Uso.",
+  "featureFlags.scope.appliesTo": "Aplica-se a",
+  "featureFlags.scope.org": "Esta organização",
+  "featureFlags.scope.global": "Todas as organizações",
+  "featureFlags.scope.setForOrg": "Definido para esta organização",
+  "featureFlags.scope.setForGlobal": "Definido para todas as organizações",
+  "featureFlags.scope.overridesGlobal":
+    "Substitui a regra de todas as organizações",
+  "featureFlags.scope.overridesGlobalTooltip":
+    "A regra própria desta organização substitui a regra de todas as organizações, que é: {{audience}}.",
+  "featureFlags.scope.unreadable": "Não foi possível ler",
+  "featureFlags.scope.enableForMeOrg":
+    "Adiciona você à regra desta organização",
+  "featureFlags.scope.enableForMeGlobal":
+    "Adiciona você à regra de todas as organizações",
+  "featureFlags.scope.turnOffOrg": "Desativar para esta organização",
+  "featureFlags.scope.turnOffGlobal": "Desativar para todas as organizações",
+  "featureFlags.scope.turnOffOrgTitle":
+    "Desativar {{name}} para esta organização?",
+  "featureFlags.scope.turnOffGlobalTitle":
+    "Desativar {{name}} para todas as organizações?",
+  "featureFlags.scope.turnOffOrgDescription":
+    "Isso remove imediatamente o acesso de todas as pessoas desta organização. Você pode configurar um novo lançamento depois.",
+  "featureFlags.scope.turnOffGlobalDescription":
+    "Isso remove imediatamente o acesso em todas as organizações que não têm uma regra própria. Você pode configurar um novo lançamento depois.",
+  "featureFlags.scope.summaryOrg": "Nesta organização: {{audience}}.",
+  "featureFlags.scope.summaryGlobal": "Em todas as organizações: {{audience}}.",
+  "featureFlags.scope.orgKeepsOwnRule":
+    "Esta organização mantém a própria regra.",
   "usage.inviteFriends": "Convide amigos",
   "usage.inviteCredits":
     "Ganhe {{amount}} créditos do Builder quando um amigo assinar.",
@@ -1948,12 +2109,31 @@ const messages: ToolkitAgentChatTranslation = {
   "settings.storage.loadFailed":
     "Não foi possível carregar as configurações de armazenamento de arquivos.",
   "settings.storage.retry": "Tentar novamente",
+  "settings.storage.unreadable":
+    "Não foi possível verificar algumas configurações de armazenamento salvas. Tente novamente ou substitua os valores obrigatórios ilegíveis antes de salvar.",
+  "settings.storage.unreadableField":
+    "Não foi possível ler este valor salvo. Insira-o novamente.",
+  "settings.storage.clearUnreadableField": "Limpar campo ilegível {{field}}",
+  "settings.storage.unreadableFieldCleared":
+    "Este valor salvo será removido ao salvar.",
   "settings.storage.adminOnly":
     "Somente proprietários e administradores da organização podem alterar o armazenamento de arquivos.",
   "settings.audit.action": "Ação",
   "settings.audit.agentVia": "Agente via {{protocol}}",
   "settings.audit.allApps": "Todos os apps",
   "settings.audit.app": "App",
+  "settings.audit.approval": "Aprovação",
+  "settings.audit.approvalAgentChat": "Aprovado no chat do agente",
+  "settings.audit.approvalA2AReview":
+    "Aprovado na página de revisão de ações do agente",
+  "settings.audit.approvalMcpClient":
+    "Aceito pelo cliente MCP (não verificado)",
+  "settings.audit.approvalMcpReview":
+    "Aprovado na página de revisão de ações do MCP",
+  "settings.audit.approvalCliPrompt":
+    "Aprovado no prompt da CLI (não verificado)",
+  "settings.audit.approvalCliFlag":
+    "Executado de novo com --approved (não verificado)",
   "settings.audit.changedBy": "Alterado por",
   "settings.audit.close": "Fechar",
   "settings.audit.empty": "Nenhuma alteração neste período.",
@@ -1967,9 +2147,11 @@ const messages: ToolkitAgentChatTranslation = {
   "settings.audit.last90Days": "Últimos 90 dias",
   "settings.audit.loadFailed": "Não foi possível carregar o log de auditoria.",
   "settings.audit.loading": "Carregando log de auditoria",
+  "settings.audit.oauthClient": "Cliente OAuth",
   "settings.audit.onBehalfOf": "Em nome de",
   "settings.audit.range": "Período",
   "settings.audit.refused": "Recusado",
+  "settings.audit.reportedClient": "Cliente autodeclarado",
   "settings.audit.result": "Resultado",
   "settings.audit.showMore": "Mostrar mais {{count}}",
   "settings.audit.succeeded": "Concluído",
@@ -2042,9 +2224,9 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsOrg.moreInformation": "Mais informações",
   "settingsOrg.general.workspaceUrl": "URL do espaço de trabalho",
   "settingsOrg.general.workspaceUrlDescription":
-    "Envie os membros para este espaço de trabalho a partir de outra implantação.",
+    "Conecte o diretório de apps desta organização entre implantações.",
   "settingsOrg.general.workspaceUrlHelp":
-    "Os membros que chegarem a outra implantação vão para este espaço de trabalho em vez de um app vazio.",
+    "Outras implantações usam esta URL para descobrir apps do espaço de trabalho. Os membros não são redirecionados automaticamente.",
   "settingsOrg.general.editWorkspaceUrl": "Editar URL do espaço de trabalho",
   "settingsOrg.general.removeWorkspaceUrl": "Remover URL do espaço de trabalho",
   "settingsOrg.general.setWorkspaceUrl": "Definir URL",
@@ -2061,6 +2243,10 @@ const messages: ToolkitAgentChatTranslation = {
     "Definido. Permite que os apps deste espaço de trabalho verifiquem uns aos outros.",
   "settingsOrg.auth.sharedSecretNotSet":
     "Não definido. Permite que os apps deste espaço de trabalho verifiquem uns aos outros.",
+  "settingsOrg.auth.memberDelegation":
+    "Delegação de identidade de membros da organização",
+  "settingsOrg.auth.memberDelegationHelp":
+    "Apps conectados que tenham este segredo compartilhado da organização podem declarar a identidade de qualquer membro atual ao chamar este app. Este app verifica a lista de membros em tempo real e limita o acesso delegado à organização às permissões do nível de membro.",
   "settingsOrg.auth.secretNotSetValue": "Não definido",
   "settingsOrg.auth.manage": "Gerenciar",
   "settingsOrg.auth.reveal": "Mostrar",
@@ -2132,6 +2318,12 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsShell.account.languageAndRegion": "Idioma e região",
   "settingsShell.account.languageDescription":
     "Vale para todos os seus dispositivos.",
+  "settingsShell.account.appearance": "Aparência",
+  "settingsShell.account.themeFamily": "Família do tema",
+  "settingsShell.account.themeFamilyAgentNative": "Agent-Native",
+  "settingsShell.account.themeFamilyOriginal": "Cores originais do app",
+  "settingsShell.account.themeFamilySaveError":
+    "Não foi possível atualizar o tema. Tente novamente.",
   "settingsShell.account.manage": "Gerenciar",
   "settingsShell.account.name": "Nome",
   "settingsShell.account.nameDescription":
@@ -2237,6 +2429,9 @@ const messages: ToolkitAgentChatTranslation = {
     "Não foi possível alterar {{lab}}. Tente novamente.",
   "settingsShell.appGroup.mcpAbout":
     "Conecte {{app}} ao Claude, ao ChatGPT, ao Cursor ou a qualquer app de IA compatível com MCP. Esse app poderá trabalhar em {{app}} por você. Ele só vê o que você pode ver.",
+  "settingsShell.appGroup.mcpAppCards": "Cartões do app em apps de chat",
+  "settingsShell.appGroup.mcpAppCardsDescription":
+    "As ferramentas mostram cartões interativos, como um rascunho de e-mail que você pode editar e enviar, em apps de chat compatíveis com MCP Apps, como Claude e ChatGPT. Depois de mudar isso, reconecte este app no seu app de chat.",
   "settingsShell.appGroup.mcpFootnote":
     "Para as ferramentas que o próprio agente usa, consulte {{integrations}}.",
   "settingsShell.appGroup.newAutomation": "Nova automação",
@@ -2373,7 +2568,11 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsShell.channels.removeCredentials.aria":
     "Remover as credenciais do {{platform}}",
   "settingsShell.channels.removeCredentials.body":
-    "O agente para de responder no {{platform}} para todos, a menos que o ambiente de implantação também defina essas chaves.",
+    "A remoção dessas credenciais do espaço de trabalho pode impedir que o agente responda a todos no {{platform}}, a menos que o ambiente de implantação também defina essas chaves.",
+  "settingsShell.channels.removeCredentials.personalBody":
+    "Isso remove apenas suas credenciais pessoais do {{platform}}. As credenciais de outras pessoas e do espaço de trabalho permanecem inalteradas.",
+  "settingsShell.channels.removeCredentials.mixedBody":
+    "Isso remove as credenciais salvas selecionadas do {{platform}}. As demais credenciais salvas permanecem inalteradas.",
   "settingsShell.channels.removeCredentials.confirm": "Remover",
   "settingsShell.channels.removeCredentials.failed":
     "Não foi possível remover as credenciais.",
@@ -2381,6 +2580,14 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsShell.channels.removeCredentials.title":
     "Remover as credenciais do {{platform}}?",
   "settingsShell.channels.retry": "Tentar novamente",
+  "settingsShell.channels.setup.unreadable":
+    "Não foi possível ler uma credencial salva. Insira um valor substituto.",
+  "settingsShell.channels.setup.personalCredentialOnly":
+    "Isso substitui apenas sua credencial pessoal; as credenciais de outras pessoas permanecem iguais.",
+  "settingsShell.channels.setup.repairUnavailable":
+    "Esta credencial é gerenciada em outra área de configurações. Atualize-a lá antes de configurar este canal.",
+  "settingsShell.channels.setup.configurationUnavailable":
+    "Não foi possível ler algumas credenciais salvas do canal. Substitua-as antes de ativar este canal.",
   "settingsShell.channels.setup.addToEnvironment":
     "Adicione ao ambiente de implantação",
   "settingsShell.channels.setup.body":
@@ -2391,6 +2598,8 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsShell.channels.setup.optional": "Opcional",
   "settingsShell.channels.setup.replace": "Substituir",
   "settingsShell.channels.setup.replaceAria": "Substituir {{key}}",
+  "settingsShell.channels.setup.repairInOwnerSettings":
+    "Substitua esta credencial salva nas configurações da integração correspondente.",
   "settingsShell.channels.setup.save": "Salvar",
   "settingsShell.channels.setup.saveAndTurnOn": "Salvar e ativar",
   "settingsShell.channels.setup.saving": "Salvando…",
@@ -2405,6 +2614,7 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsShell.channels.state.notSetUp": "Não configurado",
   "settingsShell.channels.state.off": "Desativado",
   "settingsShell.channels.state.on": "Ativado",
+  "settingsShell.channels.state.unavailable": "Indisponível",
   "settingsShell.channels.status": "Status",
   "settingsShell.channels.toggleFailed":
     "Não foi possível atualizar o {{platform}}.",
@@ -2432,6 +2642,9 @@ const messages: ToolkitAgentChatTranslation = {
     "O agente usa o token de acesso que você adicionar, então vê o que esse token pode ver.",
   "settingsShell.integrationDetail.accessToken": "Token de acesso",
   "settingsShell.integrationDetail.addAccessToken": "Adicionar token de acesso",
+  "settingsShell.integrationDetail.tokenCheckFailed":
+    "Não foi possível verificar um token de acesso salvo.",
+  "settingsShell.integrationDetail.tokenCheckRetry": "Tentar de novo",
   "settingsShell.integrationDetail.callout.adminNeeded":
     "Um admin precisa configurar isso",
   "settingsShell.integrationDetail.callout.adminNeededBody":
@@ -2712,6 +2925,8 @@ const messages: ToolkitAgentChatTranslation = {
     "Acesso a modelos, automação de navegador, armazenamento de arquivos e identidade do workspace. Plano gratuito disponível.",
   "settingsShell.integrations.builderStatusFailed":
     "O status da conexão está indisponível. Tente novamente para verificar.",
+  "settingsShell.integrations.builderDetailsUnavailable":
+    "Não foi possível ler alguns dados salvos da conta Builder.",
   "settingsShell.integrations.category.analytics": "Análise",
   "settingsShell.integrations.category.design": "Design",
   "settingsShell.integrations.category.engineering": "Engenharia",
@@ -2780,6 +2995,7 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsShell.search.appDefaultModel": "Modelo padrão do app",
   "settingsShell.search.backgroundAgents": "Agentes em segundo plano",
   "settingsShell.search.browserAutomation": "Automação de navegador",
+  "settingsShell.search.webSearch": "Pesquisa na Web",
   "settingsShell.search.connectedAgents": "Agentes conectados",
   "settingsShell.search.database": "Banco de dados",
   "settingsShell.search.defaultModel": "Modelo padrão",
@@ -2850,6 +3066,95 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsResources.skills.upload": "Enviar um arquivo de habilidade",
   "settingsResources.skills.describePlaceholder":
     "Uma habilidade que revisa pull requests em busca de problemas de segurança",
+  "settingsResources.skills.personalHint": "Só você tem estas.",
+  "settingsResources.skills.orgHint":
+    "Compartilhadas com todas as pessoas em {{org}}. Seus botões valem só para você.",
+  "settingsResources.skills.orgAdminHint":
+    "Compartilhadas com todas as pessoas em {{org}}. Como você é admin, escolhe como cada uma começa para as pessoas.",
+  "settingsResources.skills.dispatchHint":
+    "O Dispatch é onde seu espaço de trabalho guarda as habilidades que todos os apps compartilham. Desativar uma aqui muda apenas {{app}}.",
+  "settingsResources.skills.thisApp": "este app",
+  "settingsResources.skills.forEveryone": "Para todos",
+  "settingsResources.skills.forYou": "Para você",
+  "settingsResources.skills.markRecommended": "Recomendada",
+  "settingsResources.skills.markRecommendedHint":
+    "Ativada a menos que alguém a desative.",
+  "settingsResources.skills.markOptional": "Opcional",
+  "settingsResources.skills.markOptionalHint":
+    "Desativada a menos que alguém a ative.",
+  "settingsResources.skills.markRequired": "Obrigatória",
+  "settingsResources.skills.markRequiredHint":
+    "Ativada para todos. Ninguém pode desativá-la nem usar a própria versão.",
+  "settingsResources.skills.recommendedBy": "Recomendada por {{org}}",
+  "settingsResources.skills.requiredBy": "Exigida por {{org}}",
+  "settingsResources.skills.requiredHidesOwn":
+    "Não usada: {{org}} exige que todos usem a versão compartilhada",
+  "settingsResources.skills.optionalOff":
+    "Opcional: desativada até você ativá-la",
+  "settingsResources.skills.optionalOn": "Opcional: você a ativou",
+  "settingsResources.skills.switchedOffOn": "Você a desativou em {{date}}",
+  "settingsResources.skills.alwaysOn": "Sempre ativada",
+  "settingsResources.skills.requiredLockHint":
+    "Exigida por {{org}}, por isso está sempre ativada",
+  "settingsResources.skills.dispatchClash":
+    "O Dispatch também tem uma {{name}}. O agente usa esta e ignora a do Dispatch. Renomeie uma para usar as duas.",
+  "settingsResources.skills.dispatchClashRequired":
+    "A {{name}} do Dispatch é obrigatória, então o agente usa ela e ignora esta. Renomeie uma para usar as duas.",
+  "settingsResources.skills.choicesLoadFailed":
+    "Não foi possível carregar quais habilidades estão ativadas para você, então os interruptores estão ocultos. Recarregue a página para tentar de novo.",
+  "settingsResources.skills.requireChecking": "Verificando quem isso afeta…",
+  "settingsResources.skills.requireCountsFailed":
+    "Não foi possível verificar quem isso afeta.",
+  "settingsResources.skills.requireTitle": "Tornar {{name}} obrigatória?",
+  "settingsResources.skills.makeRequired": "Tornar obrigatória",
+  "settingsResources.skills.switchFailed":
+    "Não foi possível salvar sua escolha para {{name}}.",
+  "settingsResources.skills.markFailed":
+    "Não foi possível mudar como {{name}} começa para as pessoas.",
+  "settingsResources.skills.addForMe": "Adicionar para mim",
+  "settingsResources.skills.addForEveryone": "Adicionar para todos",
+  "settingsResources.skills.offFor_one":
+    "Desativada para {{off}} de {{count}} pessoa",
+  "settingsResources.skills.offFor_many":
+    "Desativada para {{off}} de {{count}} pessoas",
+  "settingsResources.skills.offFor_other":
+    "Desativada para {{off}} de {{count}} pessoas",
+  "settingsResources.skills.onFor_one":
+    "Ativada para {{on}} de {{count}} pessoa",
+  "settingsResources.skills.onFor_many":
+    "Ativada para {{on}} de {{count}} pessoas",
+  "settingsResources.skills.onFor_other":
+    "Ativada para {{on}} de {{count}} pessoas",
+  "settingsResources.skills.ownVersions_one":
+    "{{count}} pessoa tem a própria versão",
+  "settingsResources.skills.ownVersions_many":
+    "{{count}} pessoas têm a própria versão",
+  "settingsResources.skills.ownVersions_other":
+    "{{count}} pessoas têm a própria versão",
+  "settingsResources.skills.requireTurnsBackOn_one":
+    "Ela volta a ser ativada para a {{count}} pessoa que a desativou.",
+  "settingsResources.skills.requireTurnsBackOn_many":
+    "Ela volta a ser ativada para as {{count}} pessoas que a desativaram.",
+  "settingsResources.skills.requireTurnsBackOn_other":
+    "Ela volta a ser ativada para as {{count}} pessoas que a desativaram.",
+  "settingsResources.skills.requireTurnsOn_one":
+    "Ela é ativada para a {{count}} pessoa que não a tinha ativado.",
+  "settingsResources.skills.requireTurnsOn_many":
+    "Ela é ativada para as {{count}} pessoas que não a tinham ativado.",
+  "settingsResources.skills.requireTurnsOn_other":
+    "Ela é ativada para as {{count}} pessoas que não a tinham ativado.",
+  "settingsResources.skills.requireOwnVersions_one":
+    "A {{count}} pessoa com a própria versão recebe o texto de {{org}} no lugar. A versão dela é mantida e volta se você mudar isso depois.",
+  "settingsResources.skills.requireOwnVersions_many":
+    "As {{count}} pessoas com a própria versão recebem o texto de {{org}} no lugar. As versões delas são mantidas e voltam se você mudar isso depois.",
+  "settingsResources.skills.requireOwnVersions_other":
+    "As {{count}} pessoas com a própria versão recebem o texto de {{org}} no lugar. As versões delas são mantidas e voltam se você mudar isso depois.",
+  "settingsResources.skills.requireOwnVersionsDispatch_one":
+    "A {{count}} pessoa com a própria versão recebe o texto de Dispatch no lugar. A versão dela é mantida e volta se você mudar isso depois.",
+  "settingsResources.skills.requireOwnVersionsDispatch_many":
+    "As {{count}} pessoas com a própria versão recebem o texto de Dispatch no lugar. As versões delas são mantidas e voltam se você mudar isso depois.",
+  "settingsResources.skills.requireOwnVersionsDispatch_other":
+    "As {{count}} pessoas com a própria versão recebem o texto de Dispatch no lugar. As versões delas são mantidas e voltam se você mudar isso depois.",
   "settingsResources.files.empty":
     "Adicione um arquivo para dar mais contexto ao seu agente.",
   "settingsResources.files.emptyTitle": "Nenhum arquivo ainda",
@@ -2920,6 +3225,8 @@ const messages: ToolkitAgentChatTranslation = {
     "Faz alterações no código a partir da produção.",
   "settingsInfra.whyBrowser":
     "Permite que o agente use um navegador em produção.",
+  "settingsInfra.whyWebSearch":
+    "Encontra informações públicas atuais e documentação oficial.",
   "settingsInfra.provider": "Provedor",
   "settingsInfra.keyOrg": "Usa a chave do {{provider}} da organização.",
   "settingsInfra.manageKey": "Gerenciar chave",
@@ -3084,6 +3391,10 @@ const messages: ToolkitAgentChatTranslation = {
     "Desconectado aqui. O acesso pode continuar ativo no ChatGPT.",
   "settingsModel.chatgptLocalOnly":
     "Apps de código aberto podem ser usados sem solicitação quando executados localmente com um callback de loopback; não é necessário solicitar acesso de parceiro. Apps hospedados em *.agent-native.com precisam da aprovação do operador e de um callback hospedado.",
+  "settingsModel.chatgptPersonalScopeOnly":
+    "Use o acesso ao plano do ChatGPT com uma conta pessoal. No desenvolvimento local, defina access.autoCreateDefaultOrg como false antes de entrar.",
+  "settingsModel.chatgptScopeUnresolved":
+    "O app não conseguiu confirmar o escopo da sua conta. Conclua a configuração local e recarregue as configurações.",
   "settingsModel.chatgptNoDirectUse":
     "Reconecte e permita o acesso direto aos modelos para usar esta conta do ChatGPT.",
   "settingsModel.chatgptReconnect": "Reconectar",
@@ -3184,11 +3495,16 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsModel.rejectedAskAdmin":
     "O {{provider}} recusou esta chave em {{date}}. Peça a um proprietário ou administrador para substituí-la.",
   "settingsModel.rejectedHeadline": "O {{provider}} recusou esta chave",
+  "settingsModel.unreadable":
+    "Não foi possível ler a configuração salva do provedor. Substitua-a para restaurar o acesso.",
+  "settingsModel.unreadableAskAdmin":
+    "Não foi possível ler a configuração salva do provedor. Peça a um proprietário ou administrador para substituí-la.",
   "settingsModel.remove": "Remover",
   "settingsModel.removeProvider": "Remover provedor",
   "settingsModel.removeTitle": "Remover {{provider}}?",
   "settingsModel.removing": "Removendo",
   "settingsModel.replace": "Substituir",
+  "settingsModel.replaceEndpoint": "Substituir endpoint",
   "settingsModel.replaceKey": "Substituir chave",
   "settingsModel.restrictBody":
     "Os membros só podem usar provedores da organização.",
@@ -3271,6 +3587,384 @@ const messages: ToolkitAgentChatTranslation = {
   "settingsSubAgents.close": "Fechar",
   "observability.insights.rawTrace":
     "Trace bruto (todos os spans, com entradas e saídas)",
+  "reportProblem.menuItem": "Relatar um problema",
+  "reportProblem.title_one":
+    "Anexar o que o app fez no último {{count}} segundo?",
+  "reportProblem.title_many":
+    "Anexar o que o app fez nos últimos {{count}} segundos?",
+  "reportProblem.title_other":
+    "Anexar o que o app fez nos últimos {{count}} segundos?",
+  "reportProblem.noEvents": "Nada registrado ainda.",
+  "reportProblem.send": "Enviar ao agente",
+  "reportProblem.copy": "Copiar relatório do problema",
+  "reportProblem.attaching": "Anexando…",
+  "reportProblem.notAttached": "O relatório não foi anexado.",
+  "reportProblem.agentMessage":
+    "Algo deu errado no app. Use o relatório do problema anexado para explicar o que aconteceu.",
+  "unsupportedDevice.title": "Abra em uma tela maior",
+  "unsupportedDevice.titleDeck": "Abra esta apresentação em uma tela maior",
+  "unsupportedDevice.titleDesign": "Abra este design em uma tela maior",
+  "unsupportedDevice.body":
+    "O {{app}} funciona em iPad, tablets e computadores. Envie o link para você mesmo para continuar por lá.",
+  "unsupportedDevice.email": "Enviar o link por e-mail",
+  "unsupportedDevice.share": "Compartilhar link",
+  "unsupportedDevice.copy": "Copiar link",
+  "unsupportedDevice.copyFailed": "Não foi possível copiar o link",
+  "unsupportedDevice.copied": "Link copiado",
+  "unsupportedDevice.emailSubject": "Abra o {{app}} no seu computador",
+  "composer.stop": "Parar",
+  "message.copyCode": "Copiar código",
+  "message.codeCopied": "Copiado",
+  "message.codeBlock": "Bloco de código",
+  "message.codeBlockLanguage": "Código {{language}}",
+  "message.table": "Tabela",
+  "message.runStopped": "Interrompido",
+  "message.responseReady": "Resposta pronta",
+  "message.responseFailed": "Falha na resposta",
+  "message.waitingForApproval": "Aguardando aprovação",
+  "message.waitingForInput": "Aguardando resposta",
+  "message.workSummaryFailedCount": "{{summary}}, {{count}} com falha",
+  "message.taskStatusPending": "Pendente",
+  "message.taskStatusRunning": "Em execução",
+  "message.taskStatusCompleted": "Concluído",
+  "message.taskStatusFailed": "Falhou",
+  "message.taskStatusAwaitingInput": "Precisa de resposta",
+  "message.untitledTask": "Tarefa sem título",
+  "message.connectProvider": "Conectar {{provider}}",
+  "message.connectionDeclined": "{{provider}} não conectado",
+  "message.connectionAdminRequiredTitle":
+    "{{provider}} precisa de um administrador",
+  "message.branchPositionLabel": "Resposta {{index}} de {{count}}",
+  "message.taskListChecked": "Concluída",
+  "message.taskListUnchecked": "Não concluída",
+  "message.threadLoadFailed": "Não foi possível carregar este chat.",
+  "common.reconnect": "Reconectar",
+  "message.closeTabFailed":
+    "Não foi possível fechar esta aba. Tente novamente.",
+  "message.restoreInProgress":
+    "Uma restauração do histórico do chat já está em andamento.",
+  "message.restoreUnavailable": "Uma execução do chat já está em andamento.",
+  "message.restoreSubmissionInProgress":
+    "Um envio do chat já está em andamento.",
+  "composer.agentSection": "Agente",
+  "composer.modelSection": "Modelo",
+  "composer.effortSection": "Esforço",
+  "composer.modelButtonWithAgent": "{{model}}. Agente: {{agent}}",
+  "guided.title": "Antes de gerar",
+  "guided.description":
+    "Use Outro para detalhes personalizados ou deixe o agente decidir.",
+  "guided.skip": "Pular",
+  "guided.continue": "Continuar",
+  "guided.exploreLabel": "Explorar algumas opções",
+  "guided.exploreDescription":
+    "Mostre algumas direções diferentes antes de decidir.",
+  "guided.decideLabel": "Deixar o agente decidir",
+  "guided.decideDescription": "Use seu julgamento e siga em frente.",
+  "guided.other": "Outro…",
+  "guided.otherDescription": "Diga ao agente exatamente o que você quer dizer.",
+  "guided.recommended": "Recomendado",
+  "guided.typeAnswer": "Digite sua resposta…",
+  "guided.typeCustomAnswer": "Digite uma resposta personalizada…",
+  "guided.dropFiles": "Arraste arquivos para cá ou",
+  "guided.browseFiles": "procure",
+  "guided.removeFile": "Remover {{name}}",
+  "guided.submitMessage": "Aqui estão minhas respostas. Pode seguir.",
+  "guided.skipMessage": "Pule as perguntas e deixe o agente decidir.",
+  "agentPanel.terminalTab": "Terminal {{index}}",
+  "agentPanel.mainThread": "Principal",
+  "agentPanel.chatTabs": "Conversas",
+  "agentPanel.clisLoadFailed": "Não foi possível carregar as CLIs.",
+  "agentPanel.terminalTabs": "Terminais",
+  "agentPanel.subAgentTabs": "Subagentes",
+  "agentPanel.resizePanel": "Redimensionar painel do agente",
+  "keepTabOpen.title": "Mantenha esta aba aberta.",
+  "keepTabOpen.body":
+    "Esta tarefa continua pelo seu navegador. Se você fechar ou sair desta aba, ela será pausada até você voltar.",
+  "conversation.empty": "Nenhuma mensagem ainda",
+  "conversation.loading": "Carregando sessão",
+  "conversation.open": "Abrir",
+  "conversation.toolInput": "Entrada",
+  "conversation.toolResult": "Resultado",
+  "mcpApps.loading": "Carregando app",
+  "mcpApps.resourceUnavailable": "O recurso do app MCP não estava disponível.",
+  "mcpApps.openInNewTab": "Abrir em uma nova aba",
+  "mcpApps.initFailed": "Não foi possível inicializar o app MCP.",
+  "mcpApps.readOnly": "Este app MCP salvo é somente leitura.",
+  "iframeEmbed.blocked": "Incorporação bloqueada",
+  "iframeEmbed.missingSrc": "Fonte ausente",
+  "iframeEmbed.crossOrigin": "URL de outra origem não permitida",
+  "iframeEmbed.embeddedContent": "Conteúdo incorporado",
+  "codeAgent.working":
+    "O agente de código está trabalhando na sua solicitação…",
+  "codeAgent.applied": "Alterações de código aplicadas",
+  "toolCells.showEarlierLines": "Mostrar {{count}} linhas anteriores",
+  "toolCells.showMoreLines": "Mostrar mais {{count}} linhas",
+  "toolCells.partial": "Parcial",
+  "toolCells.timedOut": "Tempo esgotado",
+  "codeRequired.requestFailed": "Falha na solicitação ({{status}})",
+  "chatFirst.chats": "Conversas",
+  "chatFirst.noChats": "Nenhuma conversa ainda.",
+  "chatFirst.newTab": "Nova aba",
+  "chatFirst.agentNavigation": "Navegação do agente",
+  "chatFirst.primaryNavigation": "Navegação principal",
+  "chatFirst.newChat": "Novo chat",
+  "chatFirst.search": "Pesquisar",
+  "chatFirst.workspaceApps": "Apps",
+  "chatFirst.allApps": "Todos os apps",
+  "chatFirst.integrations": "Integrações",
+  "chatFirst.scheduled": "Agendados",
+  "chatFirst.createWorkspaceApp": "Criar app",
+  "chatFirst.openApp": "Abrir {{name}}",
+  "chatFirst.appLabel": "App {{name}}",
+  "chatFirst.appsLoadError": "Não foi possível carregar os apps",
+  "chatFirst.noWorkspaceApps": "Nenhum app ainda",
+  "chatFirst.createApp": "Criar app",
+  "chatFirst.retry": "Tentar novamente",
+  "chatFirst.dismiss": "Dispensar",
+  "chatFirst.unpinApp": "Desafixar este app",
+  "chatFirst.pinApp": "Fixar este app",
+  "chatFirst.reloadApp": "Recarregar app",
+  "chatFirst.removePinned": "Remover dos apps fixados",
+  "chatFirst.pinTop": "Fixar app no topo",
+  "chatFirst.moveUp": "Mover para cima",
+  "chatFirst.moveDown": "Mover para baixo",
+  "chatFirst.removeApp": "Remover app do workspace",
+  "chatFirst.showMore": "Mostrar mais",
+  "chatFirst.showLess": "Mostrar menos",
+  "chatFirst.showMoreCount": "Mostrar mais {{count}}",
+  "chatFirst.appOrderUnavailable":
+    "Não foi possível salvar a ordem dos apps neste dispositivo.",
+  "chatFirst.openSideSurfaces": "Abrir painéis laterais",
+  "chatFirst.sideSurfaces": "Painéis laterais",
+  "chatFirst.resizeSideSurface": "Redimensionar painel lateral",
+  "chatFirst.closeTab": "Fechar {{name}}",
+  "chatFirst.close": "Fechar",
+  "chatFirst.closeOthers": "Fechar as outras",
+  "chatFirst.closeToRight": "Fechar as da direita",
+  "chatFirst.closeAll": "Fechar todas",
+  "chatFirst.deferred": "Adiado",
+  "chatFirst.openActivity": "Abrir atividade",
+  "chatFirst.unavailable": "Este painel não está disponível aqui.",
+  "chatFirst.browserBack": "Voltar",
+  "chatFirst.browserForward": "Avançar",
+  "chatFirst.browserReload": "Recarregar página",
+  "chatFirst.browserAddress": "Endereço do navegador",
+  "chatFirst.browserOpenExternal": "Abrir em navegador externo",
+  "chatFirst.browserClose": "Fechar navegador",
+  "chatFirst.browserPage": "Página do navegador",
+  "chatFirst.browserInvalidUrl":
+    "Digite uma URL http(s) completa para navegar.",
+  "chatFirst.browserPreviewStarting": "Iniciando visualização…",
+  "chatFirst.browserPreviewError": "Visualização indisponível",
+  "chatFirst.appUnavailable": "Este app do workspace não está mais disponível.",
+  "chatFirst.appLoadError": "Não foi possível carregar este app",
+  "chatFirst.appLoading": "Carregando app",
+  "chatFirst.agentActivityEyebrow": "Espaço de trabalho",
+  "chatFirst.agentActivityTitle": "Atividade do agente",
+  "chatFirst.agentActivityDescription":
+    "Acompanhe execuções e abra uma segunda sessão ao lado deste chat.",
+  "chatFirst.refreshAgentActivity": "Atualizar atividade do agente",
+  "chatFirst.noAgentSessions": "Nenhuma sessão do agente ainda",
+  "chatFirst.startAgentSession":
+    "Inicie uma execução do agente e ela aparecerá aqui.",
+  "chatFirst.watchSession": "Acompanhar",
+  "chatFirst.copySessionId": "Copiar ID da sessão",
+  "chatFirst.copySessionIdFor": "Copiar ID da sessão de {{name}}",
+  "chatFirst.sessionIdCopied": "ID da sessão copiado",
+  "chatFirst.sessionIdShort": "ID",
+  "chatFirst.copied": "Copiado",
+  "chatFirst.agentActivityStatusQueued": "Na fila",
+  "chatFirst.agentActivityStatusRunning": "Em execução",
+  "chatFirst.agentActivityStatusPaused": "Pausado",
+  "chatFirst.agentActivityStatusNeedsApproval": "Precisa de aprovação",
+  "chatFirst.agentActivityStatusCompleted": "Concluído",
+  "chatFirst.agentActivityStatusErrored": "Precisa de atenção",
+  "chatFirst.agentActivityStatusRecent": "Recente",
+  "chatFirst.agentActivityStatusUnknown": "Desconhecido",
+  "chatFirst.watchingSession": "Acompanhando {{name}}",
+  "chatFirst.session": "sessão",
+  "chatFirst.stopWatchingSession": "Parar de acompanhar a sessão",
+  "chatFirst.stopWatching": "Parar de acompanhar",
+  "chatFirst.watchedSession": "Sessão acompanhada",
+  "chatFirst.agentsTitle": "Subagentes",
+  "guided.submitProgress": "{{label}} ({{answered}} de {{total}})",
+  "approval.answerPending": "Requer resposta",
+  "feedback.label": "Feedback",
+  "feedback.goodResponse": "Boa resposta",
+  "feedback.badResponse": "Resposta ruim",
+  "feedback.note": "Adicione uma nota (opcional)",
+  "message.moreActions": "Mais ações",
+  "message.fewerActions": "Menos ações",
+  "activity.showMore": "Mostrar mais {{count}}",
+  "message.editing": "Editando mensagem",
+  "message.editingHint":
+    "Ao enviar, o chat é bifurcado a partir desta mensagem.",
+  "history.refreshFailed": "Não foi possível atualizar os chats",
+  "message.forkFromHere": "Ramificar a partir daqui",
+  "feedback.rate": "Avaliar resposta",
+  "composer.suggestedActions": "Ações sugeridas",
+  "message.runDetails": "Detalhes da execução",
+  "message.creditsUsed": "Créditos usados",
+  "message.cost": "Custo",
+  "message.toolCalls": "Chamadas de ferramentas",
+  "message.modelUsed": "Modelo usado",
+  "message.detailUnavailable": "Indisponível",
+  "message.notRecorded": "Não registrado",
+  "message.incomplete": "Incompleto",
+  "message.estimatedAmount": "{{amount}} estimado",
+  "message.mixedAmount": "{{amount}} informado e estimado",
+  "composer.newChatPlaceholder": "Pergunte qualquer coisa",
+  "composer.replyPlaceholder": "Responder…",
+  "mentions.noCommands": "Nenhum comando",
+  "mentions.noMatches": "Nenhuma correspondência",
+  "queue.dragToReorder": "Arraste para reordenar",
+  "queue.moveUp": "Mover para cima",
+  "queue.moveDown": "Mover para baixo",
+  "queue.movedToPosition": "Movido para a posição {{position}} de {{count}}",
+  "queue.reorderFailed": "Não foi possível reordenar a fila. Tente novamente.",
+  "composer.effort": "Esforço",
+  "composer.moreModels": "Mais modelos",
+  "composer.modelCost": "Custo",
+  "composer.modelReasoning": "Raciocínio",
+  "composer.modelSpeed": "Velocidade",
+  "composer.modelRatingAria": "{{label}} {{value}} de 5",
+  "composer.contextWindow": "Janela de contexto",
+  "composer.tokenCount": "{{count}} tokens",
+  "composer.billingBuilderCredits": "Usa créditos do Builder",
+  "composer.billingProviderKey": "Cobrado na sua chave da {{provider}}",
+  "composer.billingSubscription": "Usa seu plano do {{plan}}",
+  "composer.modelDescription.auto": "Usa o modelo padrão",
+  "composer.modelDescription.claude-opus-5-5":
+    "O modelo Claude mais capaz para trabalhos complexos",
+  "composer.modelDescription.gpt-6-1-sol":
+    "O modelo GPT mais capaz para raciocínio complexo",
+  "composer.modelDescription.gemini-3-1-pro":
+    "O modelo Gemini mais capaz para trabalhos complexos",
+  "composer.modelDescription.claude-sonnet-5-5":
+    "Velocidade e capacidade equilibradas para o dia a dia",
+  "composer.modelDescription.gpt-5-6-terra":
+    "Modelo GPT intermediário que equilibra custo e capacidade",
+  "composer.modelDescription.claude-haiku-5-5":
+    "O modelo Claude mais rápido para tarefas rápidas",
+  "composer.modelDescription.gpt-6-luna":
+    "Modelo GPT rápido e de menor custo para tarefas do dia a dia",
+  "composer.modelDescription.gemini-3-8-flash":
+    "Modelo Gemini rápido para tarefas do dia a dia",
+  "composer.modelDescription.gpt-5-4-mini":
+    "Modelo GPT pequeno e de baixo custo",
+  "composer.modelDescription.gpt-5-1-codex-mini":
+    "Modelo GPT pequeno ajustado para código",
+  "composer.modelDescription.gemini-3-5-flash-lite":
+    "O modelo Gemini de menor custo para tarefas simples e de alto volume",
+  "composer.modelDescription.grok-code-fast": "Modelo rápido de código da xAI",
+  "composer.modelDescription.qwen3-coder":
+    "Modelo de código com pesos abertos da Qwen",
+  "contextRing.usedLabel": "Contexto {{percent}}% usado",
+  "contextRing.untilAutoCompact": "{{tokens}} até a compactação automática",
+  "contextRing.compactNow": "Compactar agora",
+  "contextRing.system": "Sistema",
+  "contextRing.nothingToCompact": "Tudo nesta conversa já foi compactado.",
+  "contextRing.compacted": "Compactado. Vale a partir da próxima mensagem.",
+  "contextRing.compactFailed": "Não foi possível compactar esta conversa.",
+  "workSteps.showMoreOne": "Mostrar mais 1 etapa",
+  "workSteps.showMoreOther": "Mostrar mais {{count}} etapas",
+  "workSteps.moreGroups": "+{{count}} mais",
+  "workSteps.moreObjects": "+{{count}}",
+  "workSteps.searchedOne": "1 consulta pesquisada",
+  "workSteps.searchedOther": "{{count}} consultas pesquisadas",
+  "workSteps.readPagesOne": "1 página lida",
+  "workSteps.readPagesOther": "{{count}} páginas lidas",
+  "workSteps.fetchedOne": "1 URL obtida",
+  "workSteps.fetchedOther": "{{count}} URLs obtidas",
+  "workSteps.readFilesOne": "1 arquivo lido",
+  "workSteps.readFilesOther": "{{count}} arquivos lidos",
+  "workSteps.editedOne": "1 arquivo editado",
+  "workSteps.editedOther": "{{count}} arquivos editados",
+  "workSteps.ranCommandsOne": "1 comando executado",
+  "workSteps.ranCommandsOther": "{{count}} comandos executados",
+  "workSteps.ranActionsOne": "1 ação executada",
+  "workSteps.ranActionsOther": "{{count}} ações executadas",
+  "workSteps.usedTool": "{{tool}} usado",
+  "workSteps.failedCount": "{{count}} com falha",
+  "workSteps.searching": "Pesquisando",
+  "workSteps.readingPages": "Lendo páginas",
+  "workSteps.fetching": "Obtendo URLs",
+  "workSteps.readingFiles": "Lendo arquivos",
+  "workSteps.editing": "Editando arquivos",
+  "workSteps.runningCommands": "Executando comandos",
+  "workSteps.runningActions": "Executando ações",
+  "composer.effortDefaultBadge": "Recomendado",
+  "queue.itemBusy": "Esta mensagem será enviada depois desta resposta.",
+  "queue.itemBlocked":
+    "Não foi possível enviar esta mensagem. Remova-a e envie novamente.",
+  "queue.orderStale": "A fila mudou. Tente novamente.",
+  "tabs.moreTabs": "Mais {{count}}",
+  "tabs.openChats": "Chats abertos",
+  "queue.stopAndSend": "Parar e enviar",
+  "queue.stopAndSendHint":
+    "Interrompe a resposta atual e depois envia esta mensagem",
+  "queue.sending": "Enviando…",
+  "queue.sendsAfterReply": "Enviada após esta resposta",
+  "commands.planNext": "Planejar a próxima mensagem",
+  "composer.removePlan": "Remover plano",
+  "contextRing.title": "Janela de contexto",
+  "contextRing.usage": "{{used}} / {{window}} ({{percent}}%)",
+  "contextRing.breakdown": "Detalhamento",
+  "contextRing.freeSpace": "Espaço livre",
+  "history.unread": "Não lido",
+  "documentTitle.running": "Trabalhando · {{title}}",
+  "documentTitle.replyReady": "Resposta pronta · {{title}}",
+  "voice.dictation.recording": "Ditando",
+  "voice.dictation.errors.permissionsPolicy":
+    "Este app está bloqueando o acesso ao microfone pela política de permissões do navegador. Recarregue o app ou abra-o diretamente em uma aba do navegador.",
+  "voice.dictation.errors.microphoneBlocked":
+    "O acesso ao microfone está bloqueado. Clique no ícone de controles do site na barra de endereço, permita o microfone para este app e tente novamente.",
+  "voice.dictation.errors.microphoneBlockedBySystem":
+    "Seu computador está bloqueando o acesso ao microfone para este navegador. Permita nas configurações de privacidade do sistema e tente novamente.",
+  "voice.dictation.errors.noMicrophone":
+    "Nenhum microfone foi encontrado. Conecte um ou escolha outra entrada e tente novamente.",
+  "voice.dictation.errors.microphoneBusy":
+    "Seu microfone está em uso por outro app. Feche o outro app ou escolha outra entrada e tente novamente.",
+  "voice.dictation.errors.startFailed":
+    "Não foi possível iniciar o ditado. Tente novamente.",
+  "voice.dictation.errors.speechServiceUnreachable":
+    "O reconhecimento de voz não conseguiu acessar o serviço. Verifique sua conexão ou escolha outra fonte em Transcrição de voz, nas Configurações.",
+  "voice.dictation.errors.noAudioCaptured":
+    "O ditado parou antes de captar qualquer áudio. Outro app ou aba pode estar usando o microfone. Feche-o ou escolha outra fonte em Transcrição de voz, nas Configurações.",
+  "voice.dictation.errors.speechRecognitionFailed":
+    "Falha no reconhecimento de voz: {{error}}",
+  "voice.dictation.errors.recordingUnsupported":
+    "Seu navegador não oferece suporte à gravação de áudio. Escolha a opção do navegador em Transcrição de voz, nas Configurações.",
+  "voice.dictation.errors.transcriptionFailedStatus":
+    "A transcrição falhou ({{status}}). Tente novamente.",
+  "voice.dictation.errors.transcriptionFailed":
+    "A transcrição falhou. Verifique seu provedor em Transcrição de voz, nas Configurações.",
+  "voice.dictation.errors.speechRecognitionUnsupported":
+    "Seu navegador não oferece suporte ao reconhecimento de voz. Adicione uma chave de API da OpenAI nas Configurações para usar a transcrição do Whisper.",
+  "voice.dictation.errors.googleRealtimeStartFailed":
+    "Não foi possível iniciar a transcrição em tempo real do Google ({{status}}).",
+  "voice.dictation.errors.googleRealtimeUploadFailed":
+    "O envio de áudio em tempo real falhou.",
+  "voice.dictation.errors.googleRealtimeFailed":
+    "A transcrição em tempo real do Google falhou.",
+  "voice.dictation.errors.googleRealtimeConnectionFailed":
+    "A transcrição em tempo real do Google perdeu a conexão.",
+  "voice.dictation.errors.googleRealtimeStreamFailed":
+    "Não foi possível iniciar a transmissão em tempo real.",
+  "voice.dictation.errors.googleRealtimeRecordingUnsupported":
+    "Seu navegador não oferece suporte à gravação de áudio, por isso a transcrição em tempo real do Google não pode começar.",
+  "voiceMode.endVoiceChat": "Encerrar conversa por voz",
+  "voiceMode.placeholder": "Ouvindo…",
+  "voiceMode.muteMicrophone": "Silenciar microfone",
+  "voiceMode.unmuteMicrophone": "Ativar microfone",
+  "voiceMode.muteSpeaker": "Silenciar alto-falante",
+  "voiceMode.unmuteSpeaker": "Ativar alto-falante",
+  "settingsShell.account.voiceChat": "Conversa por voz",
+  "settingsShell.account.voiceChatLoadError":
+    "Não foi possível carregar as configurações da conversa por voz.",
+  "settingsShell.account.voiceChatSaveError":
+    "Não foi possível salvar as configurações da conversa por voz.",
+  "voice.dictation.cancelTranscription": "Cancelar transcrição",
 };
 
 export default messages;

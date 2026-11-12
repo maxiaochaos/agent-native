@@ -4,10 +4,12 @@ import { InvalidCanvasDimensionsError } from "@shared/canvas-dimensions";
 import type { Dispatch, RefObject, SetStateAction } from "react";
 
 import type { UploadedFile } from "@/components/editor/PromptDialog";
+import { isAgentRunSettled, readAgentRunStatus } from "@/lib/agent-run-status";
 import {
   formatComposerContext,
   hasComposerSystemContext,
 } from "@/lib/composer-context";
+import { figmaReferenceDirectives } from "@/lib/figma-attachment";
 import {
   failPendingGenerationForMissingImagePayload,
   patchPendingGeneration,
@@ -37,10 +39,18 @@ export interface StartRetryGenerationArgs {
     model?: string;
     engine?: string;
     effort?: PromptComposerSubmitOptions["effort"];
+    references?: PromptComposerSubmitOptions["references"];
   } | null>;
   imageAttachmentUnavailableMessage: string;
   invalidCanvasDimensionsMessage: string;
   id: string | undefined;
+  outputBaselineFiles?: Array<{ id: string; contentHash: string }>;
+  previousRunTabId: string | null;
+  retryInFlightRef: { current: boolean };
+  trackActiveRun: (
+    tabId: string,
+    options: { currentRunId?: string; currentTurnId?: string },
+  ) => void;
   setGenerationChatTabId: Dispatch<SetStateAction<string | null>>;
   setGenerationIssue: Dispatch<SetStateAction<string | null>>;
   setHasPendingGeneration: Dispatch<SetStateAction<boolean>>;
@@ -51,17 +61,36 @@ export interface StartRetryGenerationArgs {
       model?: PromptComposerSubmitOptions["model"];
       engine?: PromptComposerSubmitOptions["engine"];
       effort?: PromptComposerSubmitOptions["effort"];
+      references?: PromptComposerSubmitOptions["references"];
       contextItems?: PromptComposerSubmitOptions["contextItems"];
       designSystemId?: string | null;
       attempt?: number;
       source?: string;
       templateId?: string;
+      outputBaselineFiles?: Array<{ id: string; contentHash: string }>;
       templateBaselineFiles?: Array<{ id: string; contentHash: string }>;
     } | null>
   >;
 }
 
 export async function runStartRetryGeneration(
+  args: StartRetryGenerationArgs,
+  promptState: RetryablePrompt,
+  attempt: number,
+  mode: "manual" | "auto",
+) {
+  // A rerender or a Retry click while a status or context read is pending
+  // must not start a second submission of the same generation.
+  if (args.retryInFlightRef.current) return;
+  args.retryInFlightRef.current = true;
+  try {
+    await startRetryGeneration(args, promptState, attempt, mode);
+  } finally {
+    args.retryInFlightRef.current = false;
+  }
+}
+
+async function startRetryGeneration(
   {
     agentSubmit,
     canEditDesign,
@@ -72,6 +101,9 @@ export async function runStartRetryGeneration(
     imageAttachmentUnavailableMessage,
     invalidCanvasDimensionsMessage,
     id,
+    outputBaselineFiles,
+    previousRunTabId,
+    trackActiveRun,
     setGenerationChatTabId,
     setGenerationIssue,
     setHasPendingGeneration,
@@ -83,6 +115,39 @@ export async function runStartRetryGeneration(
 ) {
   if (!id || !design || !canEditDesign) return;
   clearAutoRetryTimer();
+  if (mode === "auto" && previousRunTabId) {
+    // A stale mark is only a missed signal; resubmitting while the first run
+    // still writes puts two agents on the same design. Only a settled thread
+    // is safe to submit to; an unsettled run the server names is followed,
+    // since a continuation it has not started yet still writes this design.
+    const run = await readAgentRunStatus(previousRunTabId);
+    if (!run.ok) return;
+    const settled = isAgentRunSettled(run);
+    if (!settled && (run.active || run.awaitingRedispatch || run.runId)) {
+      clearGenerationCompleteTimer();
+      setGenerationIssue(null);
+      const { autoRetry: _autoRetry, ...retained } = promptState;
+      const runIds = {
+        ...(run.runId ? { currentRunId: run.runId } : {}),
+        ...(run.turnId ? { currentTurnId: run.turnId } : {}),
+      };
+      patchPendingGeneration(id, {
+        ...retained,
+        title: design.title,
+        ...(outputBaselineFiles !== undefined ? { outputBaselineFiles } : {}),
+        attempt: promptState.attempt ?? 1,
+        runTabId: previousRunTabId,
+        ...runIds,
+        startedAt: Date.now(),
+      });
+      setHasPendingGeneration(true);
+      setRetryablePrompt(null);
+      setGenerationChatTabId(previousRunTabId);
+      trackActiveRun(previousRunTabId, runIds);
+      return;
+    }
+    if (!settled) return;
+  }
   const fileContext = formatUploadedFileContext(promptState.files);
   let images: string[];
   try {
@@ -144,6 +209,7 @@ export async function runStartRetryGeneration(
     "",
     retryLine,
     ...generationDirectives,
+    ...figmaReferenceDirectives(promptState.contextItems),
   ].join("\n");
   clearGenerationCompleteTimer();
   setGenerationIssue(null);
@@ -156,9 +222,11 @@ export async function runStartRetryGeneration(
     model: promptState.model,
     engine: promptState.engine,
     effort: promptState.effort,
+    references: promptState.references,
     contextItems: promptState.contextItems,
     source: promptState.source,
     templateId: promptState.templateId,
+    ...(outputBaselineFiles !== undefined ? { outputBaselineFiles } : {}),
     templateBaselineFiles: promptState.templateBaselineFiles,
     attempt,
     startedAt,
@@ -169,11 +237,13 @@ export async function runStartRetryGeneration(
     model: promptState.model,
     engine: promptState.engine,
     effort: promptState.effort,
+    references: promptState.references,
   };
   const runTabId = agentSubmit(promptState.prompt, context, {
     model: promptState.model,
     engine: promptState.engine,
     effort: promptState.effort,
+    references: promptState.references,
     images,
   });
   setGenerationChatTabId(runTabId);
@@ -185,8 +255,10 @@ export async function runStartRetryGeneration(
     model: promptState.model,
     engine: promptState.engine,
     effort: promptState.effort,
+    references: promptState.references,
     source: promptState.source,
     templateId: promptState.templateId,
+    ...(outputBaselineFiles !== undefined ? { outputBaselineFiles } : {}),
     templateBaselineFiles: promptState.templateBaselineFiles,
     attempt,
     runTabId,

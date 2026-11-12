@@ -29,6 +29,7 @@ vi.mock("../db/client.js", () => ({
 
 vi.mock("../db/migration-policy.js", () => ({
   appMigratesAtRelease: mockAppMigratesAtRelease,
+  schemaEnsureSkipRequested: () => false,
 }));
 
 vi.mock("../db/ddl-guard.js", () => ({
@@ -46,16 +47,13 @@ vi.mock("./http-response-telemetry.js", () => ({
 }));
 
 describe("poll handler", () => {
-  it("fails closed when session resolution throws", async () => {
-    mockGetSession.mockImplementation(() => {
-      throw new Error("auth unavailable");
-    });
+  it("propagates session unavailability instead of reporting a missing session", async () => {
+    const error = new Error("auth unavailable");
+    mockGetSession.mockRejectedValue(error);
     const { createPollHandler } = await import("./poll.js");
     const handler = createPollHandler() as any;
 
-    await expect(handler({ query: { since: "0" } })).resolves.toEqual({
-      error: "Unauthenticated",
-    });
+    await expect(handler({ query: { since: "0" } })).rejects.toBe(error);
   });
 
   beforeEach(() => {
@@ -349,7 +347,11 @@ describe("poll handler", () => {
     const queries = mockExecute.mock.calls.map(([query]) =>
       typeof query === "string" ? query : query.sql,
     );
-    expect(queries.filter((sql) => sql.includes("FROM sync_events"))).toEqual([
+    expect(
+      queries.filter(
+        (sql) => /^\s*SELECT\b/.test(sql) && sql.includes("FROM sync_events"),
+      ),
+    ).toEqual([
       "SELECT MAX(version) as max_version FROM sync_events",
       "SELECT MAX(version) as max_version FROM sync_events",
     ]);

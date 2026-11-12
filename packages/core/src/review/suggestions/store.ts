@@ -1,6 +1,6 @@
 import { getDbExec, type DbExec } from "../../db/client.js";
 import { ensureColumnExists, ensureTableExists } from "../../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../../db/request-pool-context.js";
+import { defineStore } from "../../db/store-registry.js";
 import type { Visibility } from "../../sharing/schema.js";
 import type {
   ResourceSuggestion,
@@ -10,9 +10,8 @@ import type {
   ResourceSuggestionProposal,
 } from "./types.js";
 
-let initialized: Promise<void> | undefined;
 export function __resetSuggestionTablesForTests(): void {
-  initialized = undefined;
+  reviewSuggestionsStore.reset();
 }
 const newId = () => globalThis.crypto.randomUUID();
 const encode = (value: unknown) =>
@@ -27,13 +26,12 @@ function decodeSuggestionIds(value: unknown): string[] {
   return ids;
 }
 
-export async function ensureSuggestionTables(
-  client = getDbExec(),
-): Promise<void> {
-  if (client !== getDbExec()) return;
-  if (!initialized)
-    initialized = retainRequestDbPoolScope(
-      (async () => {
+export const reviewSuggestionsStore = defineStore({
+  id: "review_suggestions",
+  migrations: [
+    {
+      name: "baseline",
+      run: async (exec) => {
         const ddl = [
           `CREATE TABLE IF NOT EXISTS agent_review_suggestions (id TEXT PRIMARY KEY, resource_type TEXT NOT NULL, resource_id TEXT NOT NULL, adapter_kind TEXT NOT NULL, adapter_version INTEGER NOT NULL, thread_id TEXT NOT NULL, author_email TEXT, actor_kind TEXT NOT NULL, base_revision TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', summary TEXT NOT NULL, owner_email TEXT, org_id TEXT, visibility TEXT NOT NULL DEFAULT 'private', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, metadata_json TEXT)`,
           `CREATE TABLE IF NOT EXISTS agent_review_suggestion_operations (id TEXT PRIMARY KEY, suggestion_id TEXT NOT NULL, ordinal INTEGER NOT NULL, operation_kind TEXT NOT NULL, target_id TEXT, before_json TEXT, after_json TEXT, anchor_json TEXT, dependencies_json TEXT, schema_version INTEGER NOT NULL)`,
@@ -82,18 +80,35 @@ export async function ensureSuggestionTables(
             );
           }
         }
-        await client.execute(
+        await exec.execute(
           "CREATE INDEX IF NOT EXISTS idx_review_suggestions_resource ON agent_review_suggestions (resource_type, resource_id, created_at)",
         );
-        await client.execute(
+        await exec.execute(
           "CREATE INDEX IF NOT EXISTS idx_review_suggestion_operations ON agent_review_suggestion_operations (suggestion_id, ordinal)",
         );
-        await client.execute(
+        await exec.execute(
           "CREATE INDEX IF NOT EXISTS idx_review_suggestion_proposal_members ON agent_review_suggestions (proposal_id, created_at)",
         );
-      })(),
-    );
-  await initialized;
+      },
+    },
+    {
+      name: "author-source-and-client",
+      run: async () => {
+        for (const column of ["author_source", "author_client"]) {
+          await ensureColumnExists(
+            "agent_review_suggestions",
+            column,
+            `ALTER TABLE agent_review_suggestions ADD COLUMN IF NOT EXISTS ${column} TEXT`,
+          );
+        }
+      },
+    },
+  ],
+});
+
+export function ensureSuggestionTables(client = getDbExec()): Promise<void> {
+  if (client !== getDbExec()) return Promise.resolve();
+  return reviewSuggestionsStore.ready();
 }
 
 export interface SuggestionCreationReceipt {
@@ -199,7 +214,7 @@ export async function insertSuggestion(
   const suggestionId = `suggestion-${newId()}`;
   const now = new Date().toISOString();
   await client.execute({
-    sql: "INSERT INTO agent_review_suggestions (id,resource_type,resource_id,adapter_kind,adapter_version,thread_id,author_email,actor_kind,base_revision,status,summary,owner_email,org_id,visibility,created_at,updated_at,metadata_json,proposal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    sql: "INSERT INTO agent_review_suggestions (id,resource_type,resource_id,adapter_kind,adapter_version,thread_id,author_email,actor_kind,author_source,author_client,base_revision,status,summary,owner_email,org_id,visibility,created_at,updated_at,metadata_json,proposal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     args: [
       suggestionId,
       input.resourceType,
@@ -209,6 +224,8 @@ export async function insertSuggestion(
       input.threadId,
       input.authorEmail,
       input.actorKind,
+      input.authorSource ?? null,
+      input.authorClient ?? null,
       input.baseRevision,
       input.status,
       input.summary,
@@ -277,11 +294,12 @@ export async function amendSuggestion(
   summary: string,
   idempotencyKey: string,
   request: string,
+  baseRevision: string = before.baseRevision,
 ): Promise<ResourceSuggestion | null> {
   const now = new Date().toISOString();
   const claimed = await client.execute({
-    sql: "UPDATE agent_review_suggestions SET revision = revision + 1, summary = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND revision = ?",
-    args: [summary, now, before.id, before.revision],
+    sql: "UPDATE agent_review_suggestions SET revision = revision + 1, summary = ?, base_revision = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND revision = ?",
+    args: [summary, baseRevision, now, before.id, before.revision],
   });
   if (claimed.rowsAffected !== 1) return null;
   await client.execute({
@@ -310,6 +328,37 @@ export async function amendSuggestion(
   return after;
 }
 
+/**
+ * Moves a pending suggestion onto `baseRevision` with `operations` that make
+ * the same change there, as when its resource was rewritten into an
+ * equivalent form. It is recorded as an amendment, so the suggestion's
+ * revision moves and anyone holding the old one refreshes before deciding.
+ * Null when the suggestion was decided or changed since `before` was read.
+ */
+export function rebaseSuggestion(
+  client: DbExec,
+  before: ResourceSuggestion,
+  input: {
+    operations: SuggestionOperation[];
+    baseRevision: string;
+    idempotencyKey: string;
+    reason: string;
+  },
+): Promise<ResourceSuggestion | null> {
+  return amendSuggestion(
+    client,
+    before,
+    input.operations,
+    before.summary,
+    input.idempotencyKey,
+    JSON.stringify({
+      rebase: input.reason,
+      baseRevision: input.baseRevision,
+    }),
+    input.baseRevision,
+  );
+}
+
 export async function getSuggestion(
   suggestionId: string,
   client = getDbExec(),
@@ -331,6 +380,41 @@ export async function getSuggestion(
   return suggestionFromRows(row, rows);
 }
 
+/** Loads several suggestions in two queries; missing ids come back as null. */
+export async function getSuggestions(
+  suggestionIds: readonly string[],
+  client = getDbExec(),
+): Promise<(ResourceSuggestion | null)[]> {
+  await ensureSuggestionTables(client);
+  if (suggestionIds.length === 0) return [];
+  const placeholders = suggestionIds.map(() => "?").join(",");
+  const rows = (
+    await client.execute({
+      sql: `SELECT s.*,p.summary AS proposal_summary FROM agent_review_suggestions s LEFT JOIN agent_review_suggestion_proposals p ON p.id = s.proposal_id WHERE s.id IN (${placeholders})`,
+      args: [...suggestionIds],
+    })
+  ).rows;
+  const operations = new Map<string, Record<string, unknown>[]>();
+  for (const operation of (
+    await client.execute({
+      sql: `SELECT * FROM agent_review_suggestion_operations WHERE suggestion_id IN (${placeholders}) ORDER BY suggestion_id,ordinal`,
+      args: [...suggestionIds],
+    })
+  ).rows) {
+    const id = String(operation.suggestion_id);
+    const list = operations.get(id);
+    if (list) list.push(operation);
+    else operations.set(id, [operation]);
+  }
+  const byId = new Map(
+    rows.map((row) => [
+      String(row.id),
+      suggestionFromRows(row, operations.get(String(row.id)) ?? []),
+    ]),
+  );
+  return suggestionIds.map((id) => byId.get(id) ?? null);
+}
+
 function suggestionFromRows(
   row: Record<string, unknown>,
   operationRows: Record<string, unknown>[],
@@ -348,6 +432,9 @@ function suggestionFromRows(
     threadId: String(row.thread_id),
     authorEmail: row.author_email as string | null,
     actorKind: row.actor_kind as ResourceSuggestion["actorKind"],
+    authorSource: (row.author_source ??
+      null) as ResourceSuggestion["authorSource"],
+    authorClient: (row.author_client ?? null) as string | null,
     baseRevision: String(row.base_revision),
     status: row.status as SuggestionStatus,
     summary: String(row.summary),
@@ -383,9 +470,10 @@ export async function listSuggestions(
     ? ` AND s.status IN (${statuses.map(() => "?").join(",")})`
     : "";
   args.push(...(statuses ?? []));
+  // raw-sql-ok: the filter adds only ? placeholders, one per bound status.
   const rows = (
     await client.execute({
-      sql: `SELECT s.id AS suggestion_id,s.proposal_id,p.summary AS proposal_summary,s.revision,s.resource_type,s.resource_id,s.adapter_kind,s.adapter_version,s.thread_id,s.author_email,s.actor_kind,s.base_revision,s.status,s.summary,s.owner_email,s.org_id,s.visibility,s.created_at,s.updated_at,s.metadata_json,o.id AS operation_id,o.ordinal AS operation_ordinal,o.operation_kind,o.target_id,o.before_json,o.after_json,o.anchor_json,o.dependencies_json,o.schema_version FROM agent_review_suggestions s LEFT JOIN agent_review_suggestion_proposals p ON p.id = s.proposal_id LEFT JOIN agent_review_suggestion_operations o ON o.suggestion_id = s.id WHERE s.resource_type = ? AND s.resource_id = ?${filter} ORDER BY s.created_at,o.ordinal`,
+      sql: `SELECT s.id AS suggestion_id,s.proposal_id,p.summary AS proposal_summary,s.revision,s.resource_type,s.resource_id,s.adapter_kind,s.adapter_version,s.thread_id,s.author_email,s.actor_kind,s.author_source,s.author_client,s.base_revision,s.status,s.summary,s.owner_email,s.org_id,s.visibility,s.created_at,s.updated_at,s.metadata_json,o.id AS operation_id,o.ordinal AS operation_ordinal,o.operation_kind,o.target_id,o.before_json,o.after_json,o.anchor_json,o.dependencies_json,o.schema_version FROM agent_review_suggestions s LEFT JOIN agent_review_suggestion_proposals p ON p.id = s.proposal_id LEFT JOIN agent_review_suggestion_operations o ON o.suggestion_id = s.id WHERE s.resource_type = ? AND s.resource_id = ?${filter} ORDER BY s.created_at,o.ordinal`,
       args,
     })
   ).rows;

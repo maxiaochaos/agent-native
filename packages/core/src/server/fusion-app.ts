@@ -48,10 +48,29 @@ export interface EnsureFusionContainerResult {
   status: "ready" | "provisioning" | "error";
   url?: string;
   message?: string;
+  /**
+   * For an error: whether the container reported it failed (`container`), or
+   * the request to Builder failed (`request`, e.g. this caller's credentials
+   * were rejected), which says nothing about the container.
+   */
+  errorSource?: "container" | "request";
 }
 
 export interface SendFusionMessageResult {
   sent: boolean;
+  /**
+   * True only when the app agent's run finished without an error. A message
+   * can be sent (dispatched) and still not complete: it timed out, failed
+   * afterwards, or was fire-and-forget.
+   */
+  completed?: boolean;
+  /**
+   * True when the message was dispatched but this call stopped hearing from
+   * the run before it ended (timed out or the stream was cut off): Builder
+   * may still be applying it, so it must not be treated as failed-and-safe
+   * to resend, nor as done.
+   */
+  unconfirmed?: boolean;
   response?: string;
   error?: string;
 }
@@ -270,6 +289,7 @@ export async function ensureFusionContainer(
       const text = await response.text().catch(() => "");
       return {
         status: "error",
+        errorSource: "request",
         message:
           text.slice(0, 500) || `ensure-container failed (${response.status})`,
       };
@@ -297,15 +317,41 @@ export async function ensureFusionContainer(
     }
     return {
       status: "error",
+      errorSource: "request",
       message: error instanceof Error ? error.message : String(error),
     };
   } finally {
     clearTimeout(timer);
   }
 
-  if (errorMessage) return { status: "error", message: errorMessage };
+  if (errorMessage) {
+    return { status: "error", errorSource: "container", message: errorMessage };
+  }
   if (readyUrl) return { status: "ready", url: readyUrl, message: lastMessage };
   return { status: "provisioning", message: lastMessage };
+}
+
+/**
+ * Whether the branch's dev server is serving pages. ensureFusionContainer
+ * reports `ready` once the container is up, which is earlier: a page loaded
+ * before the dev server serves never gets the editor bridge.
+ */
+export async function isFusionDevServerServing(
+  previewUrl: string,
+  timeoutMs = 5_000,
+): Promise<boolean> {
+  try {
+    const response = await fetch(
+      new URL("/_builder.io/api/status-v2", previewUrl),
+      { cache: "no-store", signal: AbortSignal.timeout(timeoutMs) },
+    );
+    if (!response.ok) return false;
+    const status = (await response.json()) as { httpServerState?: unknown };
+    return status.httpServerState === "ok-2xx";
+  } catch {
+    // coercion-ok: an unreachable or unparsable status is "not serving yet".
+    return false;
+  }
 }
 
 const DEFAULT_SEND_MESSAGE_TIMEOUT_MS = 30_000;
@@ -316,6 +362,13 @@ export async function sendFusionBranchMessage(
     fireAndForget?: boolean;
     timeoutMs?: number;
     userEmail?: string;
+    /**
+     * Every coding-agent step as it streams (`GenerateCompletionStep`:
+     * text, thinking, tool, tool_result, file, diff, done, error, ...), so a
+     * delegating agent can show the Builder agent's work live instead of only
+     * its final message. Pair with `fireAndForget: false`.
+     */
+    onEvent?: (step: Record<string, unknown>) => void;
   },
 ): Promise<SendFusionMessageResult> {
   const prompt = args.prompt?.trim();
@@ -327,6 +380,7 @@ export async function sendFusionBranchMessage(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let dispatched = false;
+  let finished = false;
   let finalText: string | undefined;
   let errorMessage: string | undefined;
 
@@ -378,6 +432,13 @@ export async function sendFusionBranchMessage(
         const event = chunk.event;
         if (event && typeof event === "object") {
           const ev = event as Record<string, unknown>;
+          args.onEvent?.(ev);
+          // A `done` ends one model turn, not the run: `autoContinue` says
+          // the agent runs another (after tool calls, a pause, compaction,
+          // or a max_tokens cut-off).
+          if (asString(ev.type) === "done") {
+            finished = ev.autoContinue !== true;
+          }
           if (asString(ev.type) === "done" && Array.isArray(ev.actions)) {
             for (const action of ev.actions) {
               if (
@@ -398,7 +459,16 @@ export async function sendFusionBranchMessage(
     });
   } catch (error) {
     if (controller.signal.aborted) {
-      if (dispatched) return { sent: true };
+      if (dispatched) {
+        // Fire-and-forget never waits for the run, so dispatch is the outcome.
+        if (fireAndForget) return { sent: true };
+        return {
+          sent: true,
+          unconfirmed: true,
+          error:
+            "Timed out waiting for the app agent to finish; it may still be working",
+        };
+      }
       return {
         sent: false,
         error: "Timed out sending message to the app agent",
@@ -413,7 +483,18 @@ export async function sendFusionBranchMessage(
   }
 
   if (errorMessage) return { sent: dispatched, error: errorMessage };
-  return { sent: true, response: finalText };
+  // Only the agent's own `done` event means the run finished. A stream that
+  // ends without it (cut off, or no body) was at most dispatched.
+  if (!finished) {
+    // Fire-and-forget never waits for the run, so dispatch is the outcome.
+    if (fireAndForget) return { sent: dispatched };
+    return {
+      sent: dispatched,
+      ...(dispatched ? { unconfirmed: true } : {}),
+      error: "The app agent's run ended before it finished",
+    };
+  }
+  return { sent: true, completed: true, response: finalText };
 }
 
 async function fusionJsonRequest(

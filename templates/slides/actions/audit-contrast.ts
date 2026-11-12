@@ -14,6 +14,11 @@ import {
   finalizeContrastAudit,
 } from "../shared/contrast-audit.js";
 import { resolveDeckDesignSystemId } from "../shared/deck-content.js";
+import { withUniqueSlideIds } from "../shared/slide-ids.js";
+import {
+  projectRenderingDesignSystemData,
+  readDeckLinkedDesignSystem,
+} from "./_linked-design-system.js";
 import { getCurrentRequestBrowserTabId } from "./_tab-state.js";
 
 const AUDIT_TIMEOUT_MS = 60_000;
@@ -47,7 +52,10 @@ export default defineAction({
     const ownerEmail = getRequestUserEmail();
     if (!ownerEmail) throw new Error("no authenticated user");
 
-    const data = JSON.parse(access.resource.data) as {
+    const data = withUniqueSlideIds(
+      deckId,
+      JSON.parse(access.resource.data),
+    ) as {
       tweaks?: unknown;
       aspectRatio?: string | null;
       slides?: Array<{
@@ -61,7 +69,7 @@ export default defineAction({
     };
     const designSystemId = resolveDeckDesignSystemId(access.resource, data);
     const designSystemAccess = designSystemId
-      ? await resolveAccess("design-system", designSystemId)
+      ? await readDeckLinkedDesignSystem(access.resource, designSystemId)
       : null;
     const slides = Array.isArray(data.slides) ? data.slides : [];
     const requestedSlideIds = slideIds ? new Set(slideIds) : undefined;
@@ -81,7 +89,13 @@ export default defineAction({
       deckId,
       {
         designSystemId,
-        designSystemData: designSystemAccess?.resource.data ?? null,
+        // The client renders what get-design-system returned, so the render
+        // key must hash the same projection a deck-only reader receives.
+        designSystemData: designSystemAccess
+          ? designSystemAccess.viaDeck
+            ? projectRenderingDesignSystemData(designSystemAccess.resource.data)
+            : (designSystemAccess.resource.data ?? null)
+          : null,
         tweaks: data.tweaks,
         aspectRatio: data.aspectRatio,
         slides,
@@ -122,6 +136,19 @@ export default defineAction({
       },
       { timeoutMs: AUDIT_TIMEOUT_MS },
     );
-    return finalizeContrastAudit(request, raw);
+    const report = finalizeContrastAudit(request, raw);
+    // An all-stale result is a failed audit, not a clean one: returning it as a
+    // success lets the agent treat it as a finished check and replay it as a duplicate.
+    if (
+      report.auditedSlideCount === 0 &&
+      report.skipped.length > 0 &&
+      report.skipped.every((entry) => entry.reason === "stale-render")
+    ) {
+      fail(
+        "The open editor has not caught up to the deck's latest slide content, so nothing was audited. Wait a moment, then run audit-contrast again.",
+        { errorCode: "contrast_audit_stale_render", statusCode: 409 },
+      );
+    }
+    return report;
   },
 });

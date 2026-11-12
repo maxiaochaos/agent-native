@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const canQueueAutomationRunNowMock = vi.hoisted(() => vi.fn());
+const resolveAutomationAccessMock = vi.hoisted(() => vi.fn());
 const resourceGetByPathMock = vi.hoisted(() => vi.fn());
 const startAutomationRunMock = vi.hoisted(() => vi.fn());
 const listUnclaimedAutomationRunsMock = vi.hoisted(() => vi.fn());
@@ -8,6 +9,10 @@ const fireInternalDispatchMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../automations/service.js", () => ({
   canQueueAutomationRunNow: canQueueAutomationRunNowMock,
+}));
+
+vi.mock("../automations/access.js", () => ({
+  resolveAutomationAccess: resolveAutomationAccessMock,
 }));
 
 vi.mock("../resources/store.js", async (importOriginal) => ({
@@ -33,7 +38,7 @@ vi.mock("../agent/durable-background.js", () => ({
   resolveAgentChatProcessRunDispatchPath: () => "/_agent-native/process-run",
 }));
 
-import { queueAutomationRunNow } from "./run-now.js";
+import { authorizeAutomationRunNow, queueAutomationRunNow } from "./run-now.js";
 
 function resourceAt(path: string) {
   return {
@@ -60,6 +65,60 @@ beforeEach(() => {
 });
 
 describe("queueAutomationRunNow", () => {
+  it("resolves a stable resource id and binds the run to its creator", async () => {
+    const resource = {
+      ...resourceAt("jobs/report.md"),
+      content:
+        '---\nschedule: ""\nenabled: true\ntriggerType: manual\ncreatedBy: creator@example.com\norgId: "org-1"\nrunAs: creator\n---\nRun the report.\n',
+    };
+    resolveAutomationAccessMock.mockResolvedValue({
+      resource,
+      name: "report",
+      owningOrganizationId: "org-1",
+    });
+
+    await queueAutomationRunNow({
+      userEmail: "collaborator@example.com",
+      orgId: "org-1",
+      appId: "factory",
+      resourceId: "resource-1",
+    });
+
+    expect(resolveAutomationAccessMock).toHaveBeenCalledWith(
+      { userEmail: "collaborator@example.com" },
+      "resource-1",
+    );
+    expect(canQueueAutomationRunNowMock).toHaveBeenCalledWith(
+      expect.objectContaining({ userEmail: "collaborator@example.com" }),
+      resource,
+      "organization",
+      undefined,
+    );
+    expect(startAutomationRunMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        owner: "__organization__:org-1",
+        automation: "report",
+        path: "jobs/report.md",
+        scope: "organization",
+        orgId: "org-1",
+        appId: "factory",
+        notificationEmail: "collaborator@example.com",
+      }),
+    );
+  });
+
+  it("does not disclose a missing stable resource id", async () => {
+    resolveAutomationAccessMock.mockResolvedValue(null);
+
+    await expect(
+      queueAutomationRunNow({
+        userEmail: "collaborator@example.com",
+        resourceId: "missing-resource",
+      }),
+    ).rejects.toMatchObject({ statusCode: 404 });
+    expect(startAutomationRunMock).not.toHaveBeenCalled();
+  });
+
   it("keeps a personal job's manual history personal with an active organization", async () => {
     resourceGetByPathMock.mockResolvedValue({
       ...resourceAt("jobs/digest.md"),
@@ -184,6 +243,23 @@ describe("queueAutomationRunNow", () => {
     expect(resourceGetByPathMock).not.toHaveBeenCalled();
   });
 
+  it("hands the caller's additional job app ids to the run check", async () => {
+    resourceGetByPathMock.mockResolvedValue(resourceAt("jobs/digest.md"));
+
+    await queueAutomationRunNow({
+      ...organizationRun,
+      name: "digest",
+      additionalJobAppIds: ["factory-workflows"],
+    });
+
+    expect(canQueueAutomationRunNowMock).toHaveBeenCalledWith(
+      expect.objectContaining({ appId: "factory" }),
+      expect.objectContaining({ path: "jobs/digest.md" }),
+      "organization",
+      ["factory-workflows"],
+    );
+  });
+
   it("rejects when the caller cannot queue the run", async () => {
     canQueueAutomationRunNowMock.mockResolvedValue(false);
     resourceGetByPathMock.mockResolvedValue(resourceAt("jobs/digest.md"));
@@ -192,5 +268,110 @@ describe("queueAutomationRunNow", () => {
       queueAutomationRunNow({ ...organizationRun, name: "digest" }),
     ).rejects.toMatchObject({ statusCode: 403 });
     expect(startAutomationRunMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing app owner without queueing an organization job", async () => {
+    canQueueAutomationRunNowMock.mockResolvedValue(false);
+    resourceGetByPathMock.mockResolvedValue({
+      ...resourceAt("jobs/digest.md"),
+      content: '---\norgId: "org-1"\n---\nSend the digest.\n',
+    });
+
+    await expect(
+      queueAutomationRunNow({ ...organizationRun, name: "digest" }),
+    ).rejects.toMatchObject({
+      statusCode: 403,
+      message: "This automation has no app owner and cannot be run.",
+    });
+    expect(startAutomationRunMock).not.toHaveBeenCalled();
+    expect(fireInternalDispatchMock).not.toHaveBeenCalled();
+  });
+
+  it("reports an access denial for a recovered Factory job", async () => {
+    canQueueAutomationRunNowMock.mockResolvedValue(false);
+    resourceGetByPathMock.mockResolvedValue({
+      ...resourceAt("jobs/factory-digest.md"),
+      content: '---\norgId: "org-1"\n---\nSend the digest.\n',
+    });
+
+    await expect(
+      queueAutomationRunNow({ ...organizationRun, name: "factory-digest" }),
+    ).rejects.toMatchObject({
+      statusCode: 403,
+      message: "Collaborate access is required to run this automation.",
+    });
+    expect(startAutomationRunMock).not.toHaveBeenCalled();
+  });
+
+  it("names the owning app when the job belongs to another app", async () => {
+    canQueueAutomationRunNowMock.mockResolvedValue(false);
+    resourceGetByPathMock.mockResolvedValue({
+      ...resourceAt("jobs/digest.md"),
+      content: `---\nappId: pr-review-reminders\n---\nSend the digest.\n`,
+    });
+
+    await expect(
+      queueAutomationRunNow({
+        ...organizationRun,
+        appId: "dispatch",
+        name: "digest",
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 403,
+      message: expect.stringContaining("pr-review-reminders"),
+    });
+  });
+});
+
+describe("authorizeAutomationRunNow", () => {
+  it("answers the automation a run would be for, and queues nothing", async () => {
+    resourceGetByPathMock.mockResolvedValue(resourceAt("jobs/digest.md"));
+
+    const access = await authorizeAutomationRunNow({
+      ...organizationRun,
+      name: "digest",
+    });
+
+    expect(access).toMatchObject({
+      name: "digest",
+      scope: "organization",
+      resource: expect.objectContaining({ path: "jobs/digest.md" }),
+    });
+    expect(startAutomationRunMock).not.toHaveBeenCalled();
+    expect(fireInternalDispatchMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a caller without collaborate access exactly as a run does", async () => {
+    canQueueAutomationRunNowMock.mockResolvedValue(false);
+    resourceGetByPathMock.mockResolvedValue(resourceAt("jobs/digest.md"));
+    const input = { ...organizationRun, name: "digest" };
+
+    const refusal = await authorizeAutomationRunNow(input).catch(
+      (error: unknown) => error,
+    );
+    const queued = await queueAutomationRunNow(input).catch(
+      (error: unknown) => error,
+    );
+
+    expect(refusal).toMatchObject({
+      statusCode: 403,
+      message: "Collaborate access is required to run this automation.",
+    });
+    expect(queued).toMatchObject({
+      statusCode: (refusal as { statusCode: number }).statusCode,
+      message: (refusal as Error).message,
+    });
+  });
+
+  it("does not disclose an automation that is not there", async () => {
+    resourceGetByPathMock.mockResolvedValue(null);
+
+    await expect(
+      authorizeAutomationRunNow({ ...organizationRun, name: "missing" }),
+    ).rejects.toMatchObject({
+      statusCode: 404,
+      message: "Automation not found.",
+    });
+    expect(canQueueAutomationRunNowMock).not.toHaveBeenCalled();
   });
 });

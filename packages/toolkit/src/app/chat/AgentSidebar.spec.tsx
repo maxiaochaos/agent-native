@@ -21,7 +21,9 @@ const mockPanelOwnership = vi.hoisted(() => ({ hosted: false }));
 const mockHostedHarness = vi.hoisted(() => ({
   configured: false,
   enabled: false,
+  queryEnabled: undefined as boolean | undefined,
 }));
+const mockAgentNativeDesktop = vi.hoisted(() => ({ enabled: false }));
 
 const mockPanel = vi.hoisted(() => {
   let resolveImport!: () => void;
@@ -36,6 +38,12 @@ const mockPanel = vi.hoisted(() => {
       | undefined,
     onNavigationChange:
       undefined as MultiTabAssistantChatProps["onNavigationChange"],
+    mcpSuggestionExcludedIntegrationIds: undefined as
+      | readonly string[]
+      | undefined,
+    hostedHarness: undefined as boolean | undefined,
+    emptyStateText: null as string | null | undefined,
+    composerAutoFocus: undefined as boolean | undefined,
     composer: undefined as React.ReactNode,
     importGate: new Promise<void>((resolve) => {
       resolveImport = resolve;
@@ -52,11 +60,24 @@ vi.mock("./AgentSidebarPanel.js", async () => {
       onReadyChange,
       onReferenceTargetChange,
       onNavigationChange,
+      mcpSuggestionExcludedIntegrationIds,
+      hostedHarness,
+      emptyStateText,
+      composerAutoFocus,
     }: {
       onReadyChange?: (ready: boolean) => void;
       onReferenceTargetChange?: MultiTabAssistantChatProps["onReferenceTargetChange"];
       onNavigationChange?: MultiTabAssistantChatProps["onNavigationChange"];
+      mcpSuggestionExcludedIntegrationIds?: readonly string[];
+      hostedHarness?: boolean;
+      emptyStateText?: string;
+      composerAutoFocus?: boolean;
     }) => {
+      mockPanel.mcpSuggestionExcludedIntegrationIds =
+        mcpSuggestionExcludedIntegrationIds;
+      mockPanel.hostedHarness = hostedHarness;
+      mockPanel.emptyStateText = emptyStateText;
+      mockPanel.composerAutoFocus = composerAutoFocus;
       React.useEffect(() => {
         mockPanel.onNavigationChange = onNavigationChange;
         const record = (event: Event) => {
@@ -116,6 +137,19 @@ vi.mock("@agent-native/core/client/app-config", () => ({
     harness: mockHostedHarness.configured ? {} : undefined,
   }),
 }));
+vi.mock(
+  "@agent-native/core/client/auth/auth-page-helpers",
+  async (importOriginal) => {
+    const actual =
+      await importOriginal<
+        typeof import("@agent-native/core/client/auth/auth-page-helpers")
+      >();
+    return {
+      ...actual,
+      isAgentNativeDesktop: () => mockAgentNativeDesktop.enabled,
+    };
+  },
+);
 vi.mock("@agent-native/core/client/host", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("@agent-native/core/client/host")>();
@@ -162,12 +196,21 @@ vi.mock("@agent-native/core/client/hooks", async (importOriginal) => {
     }),
     isPerAppChatStorageKey: () => false,
     requestPerAppChatCommand: vi.fn(),
-    useActionQuery: (action: string) => ({
-      data:
-        action === "get-hosted-harness-config" && mockHostedHarness.enabled
-          ? { enabled: true, runtimes: [] }
-          : undefined,
-    }),
+    useActionQuery: (
+      action: string,
+      _input: unknown,
+      options?: { enabled?: boolean },
+    ) => {
+      if (action === "get-hosted-harness-config") {
+        mockHostedHarness.queryEnabled = options?.enabled;
+      }
+      return {
+        data:
+          action === "get-hosted-harness-config" && mockHostedHarness.enabled
+            ? { enabled: true, runtimes: [] }
+            : undefined,
+      };
+    },
     usePerAppChatState: () => ({
       hosted: mockPanelOwnership.hosted,
       open: false,
@@ -176,7 +219,11 @@ vi.mock("@agent-native/core/client/hooks", async (importOriginal) => {
   };
 });
 
-import { AgentSidebar, preloadAgentChatSurface } from "./AgentSidebar.js";
+import {
+  AgentSidebar,
+  AgentToggleButton,
+  preloadAgentChatSurface,
+} from "./AgentSidebar.js";
 import type { MultiTabAssistantChatProps } from "./MultiTabAssistantChat.js";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -194,6 +241,8 @@ function renderSidebar(
   openOnChatRunning = false,
   storageKey?: string,
   strictMode = false,
+  mcpSuggestionExcludedIntegrationIds?: readonly string[],
+  panelHost?: HTMLElement,
 ) {
   const render = (nextEnabled: boolean) => {
     flushSync(() => {
@@ -204,7 +253,11 @@ function renderSidebar(
             disableChatShortcut={disableChatShortcut}
             enabled={nextEnabled}
             forceOverlay={forceOverlay}
+            mcpSuggestionExcludedIntegrationIds={
+              mcpSuggestionExcludedIntegrationIds
+            }
             openOnChatRunning={openOnChatRunning}
+            panelHost={panelHost}
             position={position}
             screenRefreshEnabled={screenRefreshEnabled}
             storageKey={storageKey}
@@ -248,12 +301,16 @@ beforeEach(() => {
   mockPanel.onEvent = undefined;
   mockPanel.onReady = undefined;
   mockPanel.composer = undefined;
+  mockPanel.mcpSuggestionExcludedIntegrationIds = undefined;
   mockTrust.frame = true;
   mockTrust.builder = false;
   mockPanelOwnership.hosted = false;
   window.history.replaceState({}, "", "/");
   mockHostedHarness.configured = false;
   mockHostedHarness.enabled = false;
+  mockHostedHarness.queryEnabled = undefined;
+  mockPanel.hostedHarness = undefined;
+  mockAgentNativeDesktop.enabled = false;
   window.sessionStorage.clear();
   const values = new Map<string, string>();
   vi.stubGlobal("localStorage", {
@@ -442,6 +499,37 @@ describe("AgentSidebar panel", () => {
     });
   });
 
+  it("forwards MCP suggestion exclusions to the panel", async () => {
+    mockPanel.resolveImport();
+    renderSidebar(
+      true,
+      undefined,
+      false,
+      true,
+      true,
+      false,
+      false,
+      undefined,
+      false,
+      ["gong"],
+    );
+    await act(async () => {
+      await mockPanel.importGate;
+    });
+
+    expect(mockPanel.mcpSuggestionExcludedIntegrationIds).toEqual(["gong"]);
+  });
+
+  it("leaves the empty state text unset when the host passes none", async () => {
+    mockPanel.resolveImport();
+    renderSidebar(true);
+    await act(async () => {
+      await mockPanel.importGate;
+    });
+
+    expect(mockPanel.emptyStateText).toBeUndefined();
+  });
+
   it("binds a cold reference before a second selection commits in the same turn", async () => {
     mockPanel.resolveImport();
     mockPanel.composer = (
@@ -499,6 +587,65 @@ describe("AgentSidebar panel", () => {
           submitMessageId: "cold-recipient-before-drain",
           delivered: false,
           reason: "reference-target-changed",
+        },
+      ]);
+    } finally {
+      window.removeEventListener(chat.AGENT_CHAT_SUBMIT_RESULT_EVENT, record);
+    }
+  });
+
+  it("delivers a cold new-tab send after the panel switches to its new tab", async () => {
+    mockPanel.resolveImport();
+    mockPanel.composer = (
+      <div data-agent-chat-reference-target="restored">
+        <textarea />
+      </div>
+    );
+    // The panel mounts on the chat it last showed, then opens the send's own
+    // tab before the retained send is replayed.
+    mockPanel.onReady = (notify) => {
+      notify?.("restored", []);
+      container!
+        .querySelector("textarea")!
+        .parentElement!.setAttribute(
+          "data-agent-chat-reference-target",
+          "automation-tab",
+        );
+      notify?.("automation-tab", []);
+    };
+    const chat = await import("@agent-native/core/client/agent-chat");
+    const results: unknown[] = [];
+    const record = (event: Event) =>
+      results.push((event as CustomEvent).detail);
+    window.addEventListener(chat.AGENT_CHAT_SUBMIT_RESULT_EVENT, record);
+    try {
+      renderSidebar(false);
+      await act(async () => {
+        window.dispatchEvent(
+          new MessageEvent("message", {
+            origin: window.location.origin,
+            data: {
+              type: "agentNative.submitChat",
+              data: {
+                message: "Create an automation that does this: say ok",
+                submit: true,
+                newTab: true,
+                tabId: "automation-tab",
+                submitMessageId: "cold-new-tab-send",
+              },
+            },
+          }),
+        );
+      });
+      expect(results).toEqual([]);
+      expect(mockPanel.events).toEqual([
+        {
+          type: "message",
+          detail: expect.objectContaining({
+            data: expect.objectContaining({
+              submitMessageId: "cold-new-tab-send",
+            }),
+          }),
         },
       ]);
     } finally {
@@ -2214,6 +2361,108 @@ describe("AgentSidebar panel", () => {
     expect(container?.querySelector("textarea")).toBeTruthy();
   });
 
+  describe("in a host's element", () => {
+    function renderHosted(attached = true) {
+      const host = document.createElement("div");
+      if (attached) document.body.appendChild(host);
+      renderSidebar(
+        true,
+        undefined,
+        false,
+        true,
+        true,
+        false,
+        false,
+        undefined,
+        false,
+        undefined,
+        host,
+      );
+      return host;
+    }
+
+    const press = (init: KeyboardEventInit) =>
+      act(async () => {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            bubbles: true,
+            cancelable: true,
+            ...init,
+          }),
+        );
+      });
+
+    it("draws the chat there and keeps it mounted after it closes", async () => {
+      mockPanel.resolveImport();
+      const host = renderHosted();
+      await act(async () => {});
+
+      expect(
+        host.querySelector("[data-agent-sidebar-layout='hosted']"),
+      ).toBeTruthy();
+      expect(container?.querySelector(".agent-sidebar-panel")).toBeNull();
+      expect(host.querySelector("textarea")).toBeTruthy();
+
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent("agent-panel:close"));
+      });
+      expect(
+        host.querySelector("[data-agent-sidebar-state='closed']"),
+      ).toBeTruthy();
+      expect(host.querySelector("textarea")).toBeTruthy();
+      host.remove();
+    });
+
+    it("does not take focus from the tab that opened it", async () => {
+      mockPanel.resolveImport();
+      const host = renderHosted();
+      await act(async () => {});
+
+      expect(mockPanel.composerAutoFocus).toBe(false);
+      host.remove();
+    });
+
+    it("leaves its panel keys to the host", async () => {
+      mockPanel.resolveImport();
+      const host = renderHosted();
+      await act(async () => {});
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent("agent-panel:close"));
+      });
+
+      await press({ code: "Backslash", key: "\\", ctrlKey: true });
+      await press({ key: "i", metaKey: true, shiftKey: true });
+      expect(
+        host.querySelector("[data-agent-sidebar-state='open']"),
+      ).toBeNull();
+
+      await press({ key: "i", metaKey: true });
+      expect(
+        host.querySelector("[data-agent-sidebar-state='open']"),
+      ).toBeTruthy();
+      host.remove();
+    });
+
+    it("answers ⌘\\ itself while the host's element isn't on the page", async () => {
+      mockPanel.resolveImport();
+      const host = renderHosted(false);
+      await act(async () => {});
+      await act(async () => {
+        window.dispatchEvent(new CustomEvent("agent-panel:close"));
+      });
+
+      await press({ key: "i", metaKey: true, shiftKey: true });
+      expect(
+        host.querySelector("[data-agent-sidebar-state='open']"),
+      ).toBeNull();
+
+      await press({ code: "Backslash", key: "\\", ctrlKey: true });
+      expect(
+        host.querySelector("[data-agent-sidebar-state='open']"),
+      ).toBeTruthy();
+    });
+  });
+
   it("pauses screen refresh until the panel is active", () => {
     renderSidebar(false);
 
@@ -2238,6 +2487,7 @@ describe("AgentSidebar panel", () => {
   });
 
   it("defaults hosted-harness chat to the right and respects a closed preference", async () => {
+    mockAgentNativeDesktop.enabled = true;
     mockHostedHarness.configured = true;
     mockHostedHarness.enabled = true;
     renderSidebar(false);
@@ -2261,6 +2511,7 @@ describe("AgentSidebar panel", () => {
   });
 
   it("respects an explicit position in hosted-harness UI", async () => {
+    mockAgentNativeDesktop.enabled = true;
     mockHostedHarness.configured = true;
     mockHostedHarness.enabled = true;
     renderSidebar(false, "left");
@@ -2276,6 +2527,7 @@ describe("AgentSidebar panel", () => {
   });
 
   it("respects a saved closed state when hosted harness would otherwise open", async () => {
+    mockAgentNativeDesktop.enabled = true;
     mockHostedHarness.configured = true;
     mockHostedHarness.enabled = true;
     localStorage.setItem("agent-native-sidebar-open", "false");
@@ -2286,6 +2538,22 @@ describe("AgentSidebar panel", () => {
     expect(
       container?.querySelector("[data-agent-sidebar-main-state='closed']"),
     ).toBeTruthy();
+  });
+
+  it("does not render hosted-harness UI in a browser", async () => {
+    mockHostedHarness.configured = true;
+    mockHostedHarness.enabled = true;
+    renderSidebar(true);
+
+    await act(async () => {});
+
+    const sidebar = container?.querySelector(".agent-sidebar-shell");
+    expect(sidebar).toBeTruthy();
+    expect(mockHostedHarness.queryEnabled).toBe(false);
+    expect(mockPanel.hostedHarness).toBe(false);
+    expect(
+      sidebar?.getAttribute("data-agent-native-hosted-harness-ui"),
+    ).toBeNull();
   });
 
   it("keeps URL synchronization mounted while the panel is closed", () => {
@@ -2537,5 +2805,204 @@ describe("AgentSidebar panel", () => {
       vi.doUnmock("./AgentSidebarPanel.js");
       errors.mockRestore();
     }
+  });
+});
+
+describe("AgentSidebar layout", () => {
+  function stubPhoneViewport() {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("max-width: 767px"),
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    return () => {
+      window.matchMedia = original;
+    };
+  }
+
+  it("shows a panel that is open on load in place, then animates requested toggles", async () => {
+    renderSidebar(true);
+    const panel = () =>
+      container?.querySelector<HTMLElement>(".agent-sidebar-panel");
+
+    expect(panel()?.dataset.agentSidebarState).toBe("open");
+    expect(panel()?.dataset.agentSidebarEntry).toBe("instant");
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent("agent-panel:close"));
+    });
+    expect(panel()?.dataset.agentSidebarEntry).toBeUndefined();
+  });
+
+  it("resizes from the keyboard in 8px steps and saves the width", async () => {
+    renderSidebar(true, "right");
+    const handle = container?.querySelector<HTMLElement>('[role="separator"]');
+
+    expect(handle?.getAttribute("aria-orientation")).toBe("vertical");
+    expect(handle?.getAttribute("aria-valuenow")).toBe("384");
+    expect(handle?.tabIndex).toBe(0);
+
+    await act(async () => {
+      handle?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }),
+      );
+    });
+    expect(handle?.getAttribute("aria-valuenow")).toBe("392");
+    expect(localStorage.getItem("agent-native-sidebar-width")).toBe("392");
+
+    await act(async () => {
+      handle?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+      );
+    });
+    expect(handle?.getAttribute("aria-valuenow")).toBe("384");
+  });
+
+  it("jumps to the narrowest and widest panel with Home and End", async () => {
+    renderSidebar(true, "right");
+    const handle = container?.querySelector<HTMLElement>('[role="separator"]');
+    const max = handle?.getAttribute("aria-valuemax");
+    expect(Number(max)).toBeGreaterThan(384);
+
+    await act(async () => {
+      handle?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "End", bubbles: true }),
+      );
+    });
+    expect(handle?.getAttribute("aria-valuenow")).toBe(max);
+    expect(localStorage.getItem("agent-native-sidebar-width")).toBe(max);
+
+    await act(async () => {
+      handle?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Home", bubbles: true }),
+      );
+    });
+    expect(handle?.getAttribute("aria-valuenow")).toBe("320");
+    expect(localStorage.getItem("agent-native-sidebar-width")).toBe("320");
+  });
+
+  it("shows the header toggle pressed when it mounts after the panel opened", async () => {
+    renderSidebar(true);
+    const toggleHost = document.createElement("div");
+    document.body.appendChild(toggleHost);
+    const toggleRoot = createRoot(toggleHost);
+    try {
+      await act(async () => {
+        toggleRoot.render(<AgentToggleButton showWhenOpen />);
+      });
+      const toggle = toggleHost.querySelector("button");
+      expect(toggle?.getAttribute("aria-pressed")).toBe("true");
+      expect(toggle?.dataset.state).toBe("open");
+    } finally {
+      act(() => toggleRoot.unmount());
+      toggleHost.remove();
+    }
+  });
+
+  it("opens on a phone when a chat handoff run starts", async () => {
+    const restore = stubPhoneViewport();
+    try {
+      renderSidebar(false, undefined, false, true, true, false, true);
+      await act(async () => {
+        window.dispatchEvent(
+          new CustomEvent("agentNative.chatRunning", {
+            detail: { isRunning: true, tabId: "running-chat" },
+          }),
+        );
+      });
+      expect(
+        container?.querySelector("[data-agent-sidebar-state='open']"),
+      ).toBeTruthy();
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("AgentSidebar width floor", () => {
+  function renderAt(defaultSidebarWidth?: number) {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    flushSync(() => {
+      root?.render(
+        <MemoryRouter>
+          <AgentSidebar defaultOpen defaultSidebarWidth={defaultSidebarWidth}>
+            <div data-testid="app-content">App content</div>
+          </AgentSidebar>
+        </MemoryRouter>,
+      );
+    });
+  }
+
+  const handle = () =>
+    container?.querySelector<HTMLElement>('[role="separator"]') ?? null;
+  const panel = () =>
+    container?.querySelector<HTMLElement>(".agent-sidebar-panel") ?? null;
+
+  async function drag(target: HTMLElement, fromX: number, toX: number) {
+    Object.assign(target, {
+      setPointerCapture: () => {},
+      releasePointerCapture: () => {},
+      hasPointerCapture: () => true,
+    });
+    await act(async () => {
+      target.dispatchEvent(
+        new PointerEvent("pointerdown", {
+          bubbles: true,
+          button: 0,
+          clientX: fromX,
+          pointerId: 1,
+        }),
+      );
+      target.dispatchEvent(
+        new PointerEvent("pointermove", {
+          bubbles: true,
+          clientX: toX,
+          pointerId: 1,
+        }),
+      );
+      target.dispatchEvent(
+        new PointerEvent("pointerup", {
+          bubbles: true,
+          clientX: toX,
+          pointerId: 1,
+        }),
+      );
+    });
+  }
+
+  it("holds a narrow host default to the 320px floor", () => {
+    renderAt(200);
+    expect(handle()?.getAttribute("aria-valuemin")).toBe("320");
+    expect(handle()?.getAttribute("aria-valuenow")).toBe("320");
+    expect(panel()?.style.getPropertyValue("--agent-sidebar-min-width")).toBe(
+      "320px",
+    );
+  });
+
+  it("holds a drag just below the floor at 320px", async () => {
+    renderAt();
+    // Right-docked: dragging right by 104px narrows 384 to 280.
+    await drag(handle()!, 1000, 1104);
+    expect(handle()?.getAttribute("aria-valuenow")).toBe("320");
+    expect(panel()?.dataset.agentSidebarState).toBe("open");
+    expect(localStorage.getItem("agent-native-sidebar-width")).toBe("320");
+  });
+
+  it("holds a drag far below the floor at 320px without closing", async () => {
+    renderAt();
+    // Dragging right by 284px would narrow 384 to 100.
+    await drag(handle()!, 1000, 1284);
+    expect(handle()?.getAttribute("aria-valuenow")).toBe("320");
+    expect(panel()?.dataset.agentSidebarState).toBe("open");
+    expect(localStorage.getItem("agent-native-sidebar-open")).not.toBe("false");
+    expect(localStorage.getItem("agent-native-sidebar-width")).toBe("320");
   });
 });

@@ -1,8 +1,8 @@
 /**
- * Contract: every attachment kind the composer can produce is minted once into
- * a core attachment ref and opened by the one shared reader, whichever path
- * minted it (chat composer hook, upload route, chunked commit) and whichever
- * Slides action accepts the file. No action opens storage on its own.
+ * Binary chat attachments and reference uploads open through one shared
+ * private-blob reader, whichever path minted them and whichever Slides action
+ * accepts the file. Text chat attachments stay with core's hosted text reader
+ * so their source remains pageable. No action opens storage on its own.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -104,6 +104,16 @@ const KINDS = [
     bytes: Buffer.concat([Buffer.from("%PDF-1.7\n"), Buffer.alloc(4096, 7)]),
   },
   {
+    kind: "docx",
+    attachmentType: "file",
+    name: "Quarterly report.docx",
+    mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    bytes: Buffer.concat([
+      Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+      Buffer.alloc(4096, 7),
+    ]),
+  },
+  {
     kind: "image",
     attachmentType: "image",
     name: "logo.png",
@@ -148,6 +158,13 @@ describe.each(KINDS)("$kind attachment", (entry) => {
         attachments: [attachment],
       }),
     );
+    // oracle-change: text chat files stay with core's hosted reader so their full source remains pageable.
+    if (entry.mime.startsWith("text/")) {
+      expect(prepared).toBeUndefined();
+      expect(attachment).not.toHaveProperty("referenceOnly");
+      expect(blobs.size).toBe(0);
+      return;
+    }
     const stamped = prepared?.attachments?.[0] as
       | { slidesUploadPath?: string }
       | undefined;
@@ -217,7 +234,7 @@ describe("one reader for every Slides action that accepts a file", () => {
     ]);
     for (const file of readers) {
       const source = readFileSync(path.join(actionsDir, file), "utf8");
-      expect(source).toMatch(/readUserUploadedFile\(filePath, ctx\)/);
+      expect(source).toMatch(/readUserUploadedFile\(filePath, ctx(?:,|\))/);
     }
   });
 

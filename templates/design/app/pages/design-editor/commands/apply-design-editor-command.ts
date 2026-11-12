@@ -140,7 +140,7 @@ export function runApplyDesignEditorCommand(
         : typeof commandRecord.layerId === "string"
           ? commandRecord.layerId
           : null;
-  const targetFile = findDesignFileByScreenTarget(files, target);
+  const targetFile = findDesignFileByScreenTarget(overviewScreens, target);
   if (target && !targetFile) return false;
   // A restored URL or agent request for Annotate/Draw waits for the Labs answer
   // rather than being downgraded while the lab is still unknown.
@@ -149,9 +149,13 @@ export function runApplyDesignEditorCommand(
   }
 
   const editorView =
-    requestedEditorView === "single" || targetFile
-      ? "overview"
-      : requestedEditorView;
+    requestedEditorView === "single"
+      ? targetFile && !commandRequestsAnnotate(command)
+        ? "single"
+        : "overview"
+      : targetFile
+        ? "overview"
+        : requestedEditorView;
 
   const targetView = editorView ?? viewModeRef.current;
 
@@ -212,9 +216,8 @@ export function runApplyDesignEditorCommand(
       hasZoomCommand: commandZoom !== null,
       targetView,
       filesLoaded:
-        files.length > 0 &&
-        (targetView !== "overview" ||
-          (overviewDataReady && overviewScreens.length > 0)),
+        overviewScreens.length > 0 &&
+        (targetView !== "overview" || overviewDataReady),
     })
   ) {
     return false;
@@ -297,6 +300,14 @@ export function runApplyDesignEditorCommand(
           : undefined,
       );
     }
+  } else if (editorView === "single") {
+    viewModeRef.current = "single";
+    setMode("edit");
+    setDrawMode(false);
+    setPinMode(false);
+    setSelectedElement(null);
+    applyCommandTool("move");
+    setViewMode("single");
   } else if (effectiveCommandTool) {
     applyCommandTool("move");
   }

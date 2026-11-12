@@ -1,4 +1,4 @@
-import { fail } from "@agent-native/core/action";
+import { fail, isActionContractError } from "@agent-native/core/action";
 
 import {
   buildDashboardPanelGroups,
@@ -38,6 +38,12 @@ type DashboardPatch = {
   variables?: Record<string, string>;
   /** Id of another dashboard to nest this one under in the sidebar. */
   parentId?: string;
+  /** What this dashboard hides. Each list given replaces that list; one left out is kept. */
+  annotations?: {
+    /** Key-date set ids from list-key-dates. */
+    hiddenKeyDateSets?: string[];
+    hiddenDataNotes?: { noteId: string; panelId: string }[];
+  };
 };
 
 type PanelTimeScope =
@@ -58,6 +64,8 @@ type PanelPatch = {
   source?: "bigquery" | "ga4" | "amplitude" | "first-party" | "demo" | "prometheus" | "program";
   chartType?: ${PANEL_CHART_TYPES.map((type) => `"${type}"`).join(" | ")};
   width?: number;
+  /** Fixed height in 180px units (1-6); omit for content height. */
+  height?: number;
   columns?: number;
   tab?: string;
   config?: PanelConfig;
@@ -103,12 +111,14 @@ type PanelSelection = {
   setTitle(title: string): void;
   setSql(sql: string): void;
   setWidth(width: number): void;
+  setHeight(height: number): void;
+  clearHeight(): void;
   setConfig(patch: Record<string, unknown>): void;
   setConfigPath(path: string, value: unknown): void; // path under config, e.g. "yFormatter" or "config.yFormatter"
   duplicate(newPanelId: string, patch?: PanelPatch): PanelPlacement;
 };
 
-type SectionSelection = PanelSelection & {
+type SectionSelection = Omit<PanelSelection, "setHeight" | "clearHeight"> & {
   append(panelIds: string[]): void;
 };
 
@@ -134,9 +144,11 @@ export const DASHBOARD_MUTATION_EXAMPLES = [
   'dashboard.panel("recurring-users-by-template").duplicate("recurring-users-by-template-bar", {"title":"Recurring Signed-In Users by Template (Bar)","chartType":"bar"}).nextTo("recurring-users-by-template");',
   'dashboard.setFilterDefault("emailFilter","exclude_builder");',
   'dashboard.panel("top-referrers").setTitle("Top Referrers by Domain");',
-  'dashboard.panel("retention").set({"width":2,"config":{"description":"Updated definition."}});',
+  'dashboard.panel("retention").set({"width":2,"height":2,"config":{"description":"Updated definition."}});',
   'dashboard.panelsMatching({"titleIncludes":"Signed-In"}).moveToTop();',
   'dashboard.panelsMatching({"source":"first-party"}).setWidth(2);',
+  'dashboard.panel("retention").setHeight(2);',
+  'dashboard.panel("retention").clearHeight();',
   'dashboard.panel("retention").setConfigPath("yFormatter","percent");',
   'dashboard.section("retention-activity-section").append(["repeat-users","retention-over-time"]);',
   `dashboard.insertPanel({"id":"new-kpi","title":"New KPI","source":"first-party","chartType":"metric","width":1,"config":{"timeScope":"dashboard"},"sql":"SELECT COUNT(*) AS value FROM analytics_events WHERE ${firstPartyDashboardTimeFilter}"}).atTop();`,
@@ -169,6 +181,10 @@ export type DashboardMutationOperation =
       op: "updatePanel";
       panelId: string;
       patch: Record<string, unknown>;
+    }
+  | {
+      op: "clearPanelHeight";
+      panelId: string;
     }
   | {
       op: "updatePanelPath";
@@ -270,6 +286,8 @@ const PANEL_METHODS = [
   "setTitle",
   "setSql",
   "setWidth",
+  "setHeight",
+  "clearHeight",
   "setConfig",
   "setConfigPath",
   "duplicate",
@@ -710,7 +728,12 @@ function insertPanel(
   const placeholderId = `__agent_native_insert_${id}`;
   if (isVisualPlacementTarget(target)) {
     const slot = resolveVisualDropSlot(config, target);
-    config.panels = [...panels, { ...panel, id: placeholderId }];
+    // Full width, so the placeholder gets a row of its own and leaving it
+    // resizes no panel; the placement rebalances its width anyway.
+    config.panels = [
+      ...panels,
+      { ...panel, id: placeholderId, width: MAX_DASHBOARD_COLUMNS },
+    ];
     const expansion = ensureVisualDropSlotCapacity(config, placeholderId, slot);
     const currentPanels = panelsForLayout(config);
     const nextPanels = movePanelToDropSlot(
@@ -736,6 +759,62 @@ function insertPanel(
   const inserted = requirePanel(nextPanels, placeholderId);
   inserted.id = id;
   return result.insertIndex;
+}
+
+type PanelLayout = { width: unknown; columns: unknown };
+
+type LayoutSnapshot = {
+  columns: unknown;
+  panels: Map<string, PanelLayout>;
+};
+
+function panelLayout(panel: Record<string, unknown>): PanelLayout {
+  return { width: panel.width, columns: panel.columns };
+}
+
+function layoutSnapshot(config: Record<string, unknown>): LayoutSnapshot {
+  return {
+    columns: config.columns,
+    panels: new Map(
+      panelsFromConfig(config).map((panel): [string, PanelLayout] => [
+        panelId(panel),
+        panelLayout(panel),
+      ]),
+    ),
+  };
+}
+
+/**
+ * A row-aware placement rebalances the row the panel joins or leaves, and a
+ * group it widens; the command log names those resizes so the caller sees
+ * every panel the op changed, the placed one included. An inserted panel is
+ * compared with the layout it asked for.
+ */
+function reflowNote(
+  before: LayoutSnapshot,
+  config: Record<string, unknown>,
+): string {
+  const describe = (value: unknown) =>
+    value === undefined ? "unset" : JSON.stringify(value);
+  const changes: string[] = [];
+  if (!sameJsonValue(before.columns, config.columns)) {
+    changes.push(
+      `dashboard columns ${describe(before.columns)} to ${describe(config.columns)}`,
+    );
+  }
+  for (const panel of panelsFromConfig(config)) {
+    const id = panelId(panel);
+    const previous = before.panels.get(id);
+    if (!previous) continue;
+    for (const key of ["columns", "width"] as const) {
+      if (!sameJsonValue(previous[key], panel[key])) {
+        changes.push(
+          `${id} ${key} ${describe(previous[key])} to ${describe(panel[key])}`,
+        );
+      }
+    }
+  }
+  return changes.length > 0 ? `; also changed ${changes.join(", ")}` : "";
 }
 
 export function sameJsonValue(left: unknown, right: unknown): boolean {
@@ -769,6 +848,20 @@ export function sameJsonValue(left: unknown, right: unknown): boolean {
         sameJsonValue(leftRecord[key], rightRecord[key]),
     )
   );
+}
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+/**
+ * A dashboard's `annotations` keeps one list per kind of thing it hides, and
+ * a patch names only the lists it changes, so hiding a key-date set can't show
+ * the hidden notes again.
+ */
+function patchedAnnotations(current: unknown, patch: unknown): unknown {
+  return isPlainObject(current) && isPlainObject(patch)
+    ? { ...current, ...patch }
+    : patch;
 }
 
 function hasSameJsonProperty(
@@ -897,13 +990,12 @@ function setConfigPath(
   return { field: `config.${segments.join(".")}`, changed: true };
 }
 
-function duplicatePanel(
+function duplicateOfPanel(
   config: Record<string, unknown>,
   panelIdToCopy: string,
   newPanelId: string,
   patch: Record<string, unknown>,
-  target: DashboardPlacementTarget,
-): number {
+): Record<string, unknown> {
   const panels = panelsFromConfig(config);
   const source = requirePanel(panels, panelIdToCopy);
   const duplicate = JSON.parse(JSON.stringify(source)) as Record<
@@ -912,7 +1004,7 @@ function duplicatePanel(
   >;
   duplicate.id = newPanelId;
   patchPanel(duplicate, patch);
-  return insertPanel(config, duplicate, target);
+  return duplicate;
 }
 
 export function applyDashboardMutationOperations(
@@ -930,8 +1022,7 @@ export function applyDashboardMutationOperations(
   const insertedPanelIds = new Set<string>();
   const dashboardFieldsChanged = new Set<string>();
 
-  for (let opIndex = 0; opIndex < operations.length; opIndex++) {
-    const op = operations[opIndex];
+  for (const [opIndex, op] of operations.entries()) {
     try {
       switch (op.op) {
         case "movePanels": {
@@ -942,6 +1033,7 @@ export function applyDashboardMutationOperations(
                 "row-aware visual placement supports one moving panel at a time",
               );
             }
+            const before = layoutSnapshot(config);
             const index = moveSinglePanelToVisualTarget(
               config,
               op.panelIds[0],
@@ -949,7 +1041,9 @@ export function applyDashboardMutationOperations(
             );
             changedPanelIds.add(op.panelIds[0]);
             movedPanelIds.add(op.panelIds[0]);
-            commandLog.push(`movePanels(${op.panelIds[0]}) -> index ${index}`);
+            commandLog.push(
+              `movePanels(${op.panelIds[0]}) -> index ${index}${reflowNote(before, config)}`,
+            );
             break;
           }
           const panelOrderBefore = panelsFromConfig(config).map(panelId);
@@ -1006,6 +1100,27 @@ export function applyDashboardMutationOperations(
           );
           break;
         }
+        case "clearPanelHeight": {
+          const panel = requirePanel(panelsFromConfig(config), op.panelId);
+          if (panel.chartType === "section") {
+            fail("clearHeight is not supported on section panels", {
+              errorCode: "invalid_dashboard_mutation",
+              statusCode: 422,
+            });
+          }
+          const hadHeight = Object.prototype.hasOwnProperty.call(
+            panel,
+            "height",
+          );
+          if (hadHeight) {
+            delete panel.height;
+            changedPanelIds.add(op.panelId);
+          }
+          commandLog.push(
+            `clearPanelHeight(${op.panelId}${hadHeight ? "" : ": no height"})`,
+          );
+          break;
+        }
         case "updatePanelPath": {
           const panel = requirePanel(panelsFromConfig(config), op.panelId);
           const result = setConfigPath(panel, op.path, op.value);
@@ -1016,31 +1131,41 @@ export function applyDashboardMutationOperations(
           break;
         }
         case "insertPanel": {
+          const before = layoutSnapshot(config);
           const index = insertPanel(config, op.panel, targetFromOperation(op));
           const id = assertString(op.panel.id, "panel.id");
+          before.panels.set(id, panelLayout(op.panel));
           changedPanelIds.add(id);
           insertedPanelIds.add(id);
-          commandLog.push(`insertPanel(${id}) -> index ${index}`);
+          commandLog.push(
+            `insertPanel(${id}) -> index ${index}${reflowNote(before, config)}`,
+          );
           break;
         }
         case "duplicatePanel": {
-          const index = duplicatePanel(
+          const before = layoutSnapshot(config);
+          const duplicate = duplicateOfPanel(
             config,
             op.panelId,
             op.newPanelId,
             op.patch ?? {},
-            targetFromOperation(op),
           );
+          const index = insertPanel(config, duplicate, targetFromOperation(op));
+          before.panels.set(op.newPanelId, panelLayout(duplicate));
           changedPanelIds.add(op.newPanelId);
           insertedPanelIds.add(op.newPanelId);
           commandLog.push(
-            `duplicatePanel(${op.panelId} -> ${op.newPanelId}) -> index ${index}`,
+            `duplicatePanel(${op.panelId} -> ${op.newPanelId}) -> index ${index}${reflowNote(before, config)}`,
           );
           break;
         }
         case "setDashboard": {
           const changedFields: string[] = [];
-          for (const [key, value] of Object.entries(op.patch)) {
+          for (const [key, patch] of Object.entries(op.patch)) {
+            const value =
+              key === "annotations"
+                ? patchedAnnotations(config.annotations, patch)
+                : patch;
             if (hasSameJsonProperty(config, key, value)) continue;
             config[key] = value;
             dashboardFieldsChanged.add(key);
@@ -1353,9 +1478,23 @@ function targetFromChainCall(call: ParsedCall): MutationTarget {
 }
 
 function operationFromPanelCommand(
+  config: Record<string, unknown>,
   panelIds: string[],
   command: ParsedCall,
 ): DashboardMutationOperation[] {
+  if (
+    (command.name === "setHeight" || command.name === "clearHeight") &&
+    panelsFromConfig(config).some(
+      (panel) =>
+        panelIds.includes(panelId(panel)) && panel.chartType === "section",
+    )
+  ) {
+    fail(`${command.name} is not supported on section panels`, {
+      errorCode: "invalid_dashboard_mutation",
+      statusCode: 422,
+    });
+  }
+
   switch (command.name) {
     case "moveToTop":
     case "moveToBottom":
@@ -1410,6 +1549,23 @@ function operationFromPanelCommand(
         panelId,
         patch: { width },
       }));
+    }
+    case "setHeight": {
+      const height = assertNumber(command.args[0], "height");
+      return panelIds.map((panelId) => ({
+        op: "updatePanel",
+        panelId,
+        patch: { height },
+      }));
+    }
+    case "clearHeight": {
+      if (command.args.length !== 0) {
+        fail("clearHeight does not accept arguments", {
+          errorCode: "invalid_dashboard_mutation",
+          statusCode: 422,
+        });
+      }
+      return panelIds.map((panelId) => ({ op: "clearPanelHeight", panelId }));
     }
     case "setConfig": {
       const configPatch = assertObject(command.args[0], "config patch");
@@ -1540,7 +1696,7 @@ function operationsFromStatement(
         },
       ];
     }
-    return operationFromPanelCommand([sectionId], command);
+    return operationFromPanelCommand(config, [sectionId], command);
   }
 
   let panelIds: string[];
@@ -1570,7 +1726,7 @@ function operationsFromStatement(
   for (let index = 0; index < commands.length; index++) {
     const command = commands[index];
     if (command.name !== "duplicate") {
-      operations.push(...operationFromPanelCommand(panelIds, command));
+      operations.push(...operationFromPanelCommand(config, panelIds, command));
       continue;
     }
     if (panelIds.length !== 1) {
@@ -1616,9 +1772,18 @@ export function parseDashboardMutationScript(
     try {
       return operationsFromStatement(config, statement);
     } catch (err: any) {
-      throw new Error(
-        `statement ${index + 1} (${JSON.stringify(statement)}): ${err.message}`,
-      );
+      const message = `statement ${index + 1} (${JSON.stringify(statement)}): ${err.message}`;
+      if (isActionContractError(err)) {
+        fail(message, {
+          errorCode: err.errorCode,
+          statusCode: err.statusCode,
+          details: err.details,
+        });
+      }
+      fail(message, {
+        errorCode: "invalid_dashboard_mutation",
+        statusCode: 422,
+      });
     }
   });
 }

@@ -9,6 +9,7 @@ import {
 } from "@playwright/test";
 
 import { e2eBaseURL } from "./base-url";
+import { waitForEditorBoot } from "./editor-boot";
 import { FIXTURE_HTML, SEED_TITLE } from "./global-setup";
 
 export async function readSeedDesignId(): Promise<string> {
@@ -49,6 +50,35 @@ async function postAction(
     );
   }
   return res.json();
+}
+
+export async function grantLocalhostWriteConsent(
+  page: Page,
+  input: { designId: string; connectionId: string },
+): Promise<void> {
+  const url = appPath("/_agent-native/actions/grant-localhost-write-consent");
+  expect(new URL(page.url()).origin, "consent setup needs the app page").toBe(
+    new URL(url).origin,
+  );
+  const result = await page.evaluate(
+    async ({ url, input }) => {
+      const response = await fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Agent-Native-Frontend": "1",
+        },
+        body: JSON.stringify(input),
+      });
+      return { status: response.status, body: await response.text() };
+    },
+    { url, input },
+  );
+  expect(
+    result.status,
+    `grant-localhost-write-consent failed: ${result.body}`,
+  ).toBe(200);
 }
 
 export async function createFixtureDesign(
@@ -142,9 +172,7 @@ export async function enableFeatureFlag(
 const DESIGN_PREVIEW_IFRAME_SELECTOR = "iframe[data-design-preview-iframe]";
 const DESIGN_SCREEN_IFRAME_SELECTOR = `${DESIGN_PREVIEW_IFRAME_SELECTOR}[data-screen-iframe-id]`;
 const BOARD_SURFACE_IFRAME_SELECTOR = `[data-board-surface-layer] ${DESIGN_PREVIEW_IFRAME_SELECTOR}`;
-const E2E_BASE_URL =
-  process.env.E2E_BASE_URL ??
-  `http://127.0.0.1:${process.env.E2E_PORT ?? "9333"}`;
+const E2E_BASE_URL = e2eBaseURL();
 const E2E_BASE_PATH = (() => {
   try {
     return new URL(E2E_BASE_URL).pathname.replace(/\/$/, "");
@@ -160,6 +188,146 @@ export function appPath(path: string): string {
   url.search = route.search;
   url.hash = route.hash;
   return url.toString();
+}
+
+/** This tab's selection: parallel workers share one user, so the global key is anyone's. */
+export async function selectionState(page: Page) {
+  const tabId = await page.evaluate(() =>
+    sessionStorage.getItem("agent-native:browser-tab-id"),
+  );
+  expect(tabId).toBeTruthy();
+  const response = await page.request.get(
+    appPath(
+      `/_agent-native/application-state/${encodeURIComponent(`design-selection:${tabId}`)}`,
+    ),
+  );
+  expect(response.ok()).toBe(true);
+  // An empty body: the editor has not written a selection yet.
+  const body = await response.text();
+  return body
+    ? (JSON.parse(body) as {
+        activeFileId?: string | null;
+        selectedScreenIds?: string[];
+        selectedElement?: { sourceId?: string } | null;
+      })
+    : null;
+}
+
+export async function panTargetIntoUnobscuredCanvas(
+  page: Page,
+  target: Locator,
+  targetName: string,
+) {
+  const edgeInset = 24;
+  const maxPanStep = 200;
+
+  for (let step = 0; step < 16; step += 1) {
+    const box = await target.boundingBox();
+    expect(box, `${targetName} should have rendered bounds`).not.toBeNull();
+    const geometry = await page.evaluate(
+      ({ target, inset, panStep }) => {
+        const surface = document.querySelector<HTMLElement>(
+          "[data-multi-screen-canvas-surface]",
+        );
+        if (!surface) return null;
+        const bounds = (selector: string) => {
+          const element = document.querySelector<HTMLElement>(selector);
+          if (!element || getComputedStyle(element).display === "none") {
+            return null;
+          }
+          const rect = element.getBoundingClientRect();
+          return rect.width && rect.height
+            ? {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+              }
+            : null;
+        };
+        const surfaceRect = surface.getBoundingClientRect();
+        const leftShell = bounds('[data-design-chrome-region="left-shell"]');
+        const rightPanel = bounds('[data-design-chrome-region="right-panel"]');
+        const topBar = bounds('[data-design-chrome-region="top-bar"]');
+        const visible = {
+          left: Math.max(0, surfaceRect.left, leftShell?.right ?? 0) + inset,
+          top: Math.max(0, surfaceRect.top, topBar?.bottom ?? 0) + inset,
+          right:
+            Math.min(
+              innerWidth,
+              surfaceRect.right,
+              rightPanel?.left ?? innerWidth,
+            ) - inset,
+          bottom: Math.min(innerHeight, surfaceRect.bottom) - inset,
+        };
+        const inside =
+          target.x >= visible.left &&
+          target.x + target.width <= visible.right &&
+          target.y >= visible.top &&
+          target.y + target.height <= visible.bottom;
+        const delta = {
+          x:
+            target.x + target.width > visible.right
+              ? panStep
+              : target.x < visible.left
+                ? -panStep
+                : 0,
+          y:
+            target.y + target.height > visible.bottom
+              ? panStep
+              : target.y < visible.top
+                ? -panStep
+                : 0,
+        };
+        const wheelPoint = [
+          { x: visible.left + 16, y: visible.top + 64 },
+          { x: visible.left + 32, y: visible.top + 112 },
+          { x: visible.left + 64, y: visible.top + 64 },
+          { x: visible.left + 16, y: (visible.top + visible.bottom) / 2 },
+          { x: (visible.left + visible.right) / 2, y: visible.top + 64 },
+        ].find((point) => {
+          const hit = document.elementFromPoint(point.x, point.y);
+          return Boolean(
+            hit && surface.contains(hit) && !hit.closest("iframe"),
+          );
+        });
+        return { visible, inside, delta, wheelPoint: wheelPoint ?? null };
+      },
+      { target: box!, inset: edgeInset, panStep: maxPanStep },
+    );
+    expect(
+      geometry,
+      "the overview canvas surface should be mounted",
+    ).not.toBeNull();
+    expect(
+      geometry!.visible.right - geometry!.visible.left,
+    ).toBeGreaterThanOrEqual(box!.width);
+    expect(
+      geometry!.visible.bottom - geometry!.visible.top,
+    ).toBeGreaterThanOrEqual(box!.height);
+    if (geometry!.inside) return;
+    expect(
+      Math.abs(geometry!.delta.x) + Math.abs(geometry!.delta.y),
+      `${targetName} should be reachable by panning inside the canvas`,
+    ).toBeGreaterThan(0);
+    expect(
+      geometry!.wheelPoint,
+      "a clear point on the overview canvas should be available for panning",
+    ).not.toBeNull();
+
+    await page.mouse.move(geometry!.wheelPoint!.x, geometry!.wheelPoint!.y);
+    await page.mouse.wheel(geometry!.delta.x, geometry!.delta.y);
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+  }
+
+  throw new Error(
+    `${targetName} did not move inside the unobscured canvas after 16 wheel pans`,
+  );
 }
 
 function activeScreenTargetFromUrl(page: Page): string | undefined {
@@ -289,7 +457,7 @@ export async function expandAllLayers(page: Page): Promise<void> {
     .getByRole("tree", { name: "Layers" })
     .getByRole("treeitem")
     .first()
-    .waitFor({ timeout: 30_000 });
+    .waitFor();
   for (let depth = 0; depth < 128; depth += 1) {
     const expand = page.getByRole("button", { name: "Expand layer" }).first();
     if ((await expand.count()) === 0) return;
@@ -386,16 +554,20 @@ export async function openAppMenuSubmenu(
 
 export async function gotoEditor(page: Page, designId: string): Promise<void> {
   await resetPersistedCanvasState(page);
+  const startedAt = Date.now();
   await page.goto(appPath(`/design/${designId}`), {
     waitUntil: "domcontentloaded",
   });
-  await expect(
-    page.getByRole("button", { name: "Move", exact: true }),
-  ).toBeVisible({ timeout: 30_000 });
-  await waitForDesignBridgeReady(page);
+  await waitForEditorBoot(page, startedAt);
+  const designMode = page.locator(
+    '[data-design-top-bar] [data-design-mode="edit"]',
+  );
+  await expect(designMode).toBeVisible();
+  await expect(designMode).toHaveAttribute("aria-pressed", "true");
+  await waitForDesignPreviewReady(page);
 }
 
-async function waitForDesignBridgeReady(page: Page): Promise<void> {
+export async function waitForDesignPreviewReady(page: Page): Promise<void> {
   await expect(
     page.locator(DESIGN_PREVIEW_IFRAME_SELECTOR).first(),
   ).toBeVisible();
@@ -460,7 +632,7 @@ export async function enterDirectMode(
     await allScreens.click();
     await expect(allScreens).toHaveAttribute("aria-current", "page");
   }
-  await waitForDesignBridgeReady(page);
+  await waitForDesignPreviewReady(page);
   // The board surface iframe carries no data-screen-iframe-id, so a `screen=`
   // URL that targets the board never matches a Screen iframe.
   const targetsBoard =
@@ -528,15 +700,14 @@ export async function enterInteractView(
   page: Page,
   options?: { screenId?: string },
 ): Promise<void> {
-  const fullView = options?.screenId
-    ? page
-        .locator(
-          `[data-screen-shell][data-frame-id="${options.screenId.replace(/"/g, '\\"')}"]`,
-        )
-        .locator("[data-frame-full-view]")
-    : page.locator("[data-frame-full-view]").last();
-  await expect(fullView).toHaveCount(1);
-  const screenShell = fullView.locator("xpath=ancestor::*[@data-screen-shell]");
+  const screenShell = options?.screenId
+    ? page.locator(
+        `[data-screen-shell][data-frame-id="${options.screenId.replace(/"/g, '\\"')}"]`,
+      )
+    : page
+        .locator("[data-screen-shell]")
+        .filter({ has: page.locator("[data-screen-card]") })
+        .last();
   await expect(screenShell).toHaveAttribute(
     "data-screen-interact-mode",
     "false",
@@ -545,11 +716,8 @@ export async function enterInteractView(
     .locator(DESIGN_PREVIEW_IFRAME_SELECTOR)
     .first();
   await expect(previewIframe).toBeVisible();
-  // The frame's "Focus screen" button only selects the Screen and fits the
-  // camera to it; Interact is entered from the top bar for that focused Screen.
-  await fullView.evaluate((element) => {
-    (element as HTMLButtonElement).click();
-  });
+  // Double-click the screen label to open its focused view before entering Interact.
+  await screenShell.locator("[data-frame-title]").first().dblclick();
   await expect(previewIframe).toBeVisible();
   await page
     .locator('[data-design-top-bar] [data-design-mode="interact"]')

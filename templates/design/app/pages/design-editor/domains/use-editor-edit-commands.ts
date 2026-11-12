@@ -19,7 +19,9 @@ import {
   findCodeLayerSiblingOrder,
   preferredCodeLayerSelector,
 } from "../code-layer-state";
+import { toastLayoutMoveRefusal } from "../commands/align-selection";
 import { runChangeSelectedZIndex } from "../commands/change-selected-z-index";
+import { copyVisualProperties } from "../commands/copy-properties";
 import { releaseCrossScreenDropAdmission } from "../commands/cross-screen-element-drop";
 import {
   cancelCrossScreenRollbackTimeout,
@@ -35,7 +37,7 @@ import { runRedo } from "../commands/redo";
 import { runUndo } from "../commands/undo";
 import { applyDesignDataOperations } from "../data-operations";
 import { getDesignDataRecord } from "../design-data-geometry-utils";
-import { type UndoRedoOrderKind } from "../editor-state";
+import { designMetadataQueryKey } from "../design-query-key";
 import {
   type ContentHistoryChange,
   type FileDeletionRestoreClaim,
@@ -45,7 +47,10 @@ import {
   pendingLiveStructureEditsFromEdit,
   pendingLiveStructureEditsFromUndoEntry,
 } from "../pending-edits";
-import { overviewSelectionTargetsElement } from "../selection-state";
+import {
+  overviewNudgeTargetsElement,
+  overviewSelectionTargetsElement,
+} from "../selection-state";
 import { type DesignFile } from "../types";
 import type { EditorActiveScreenAndGeometry } from "./use-editor-active-screen-and-geometry";
 import type { EditorCanvasAndScreens } from "./use-editor-canvas-and-screens";
@@ -151,14 +156,13 @@ export function useEditorEditCommands({
     fileHistoryMutationPendingRef,
     historyOrderRef,
     redoOrderRef,
-    selectionUndoStackRef,
-    selectionRedoStackRef,
     clearRedoStacks,
     clearPendingHistoryDirections,
     syncUndoRedoState,
     recordLocalContentHistoryChangeFallback,
     flushPendingFileCreationHistoryEntries,
     discardPendingLiveStructureTransaction,
+    captureCurrentSelection,
   } = editorHistory;
   const {
     restoreSelectionSnapshot,
@@ -167,6 +171,7 @@ export function useEditorEditCommands({
     canEditLiveScreens,
     rawServerFilesByIdRef,
     historyFilesRef,
+    leaseSources,
     pendingLocalFileContentsRef,
     markPendingLocalFileContent,
     createFileMutation,
@@ -241,7 +246,8 @@ export function useEditorEditCommands({
     pendingStructureRedoPreparedEditsRef,
     recordPendingLiveStructureEdit,
   } = editorScreenChangeHandlers;
-  const { handleDeleteSelection } = editorClipboard;
+  const { cancelPendingPastedMediaForHistoryReplay, handleDeleteSelection } =
+    editorClipboard;
   const {
     runtimeStructureDeleteRequest,
     setRuntimeStructureDeleteRequest,
@@ -514,8 +520,8 @@ export function useEditorEditCommands({
           deletedFileSnapshots: FileDeletionHistorySnapshot[],
         ) => void;
       },
-    ) =>
-      runDeleteFiles(
+    ) => {
+      return runDeleteFiles(
         {
           activeFile,
           canvasFrameGeometryById,
@@ -537,15 +543,13 @@ export function useEditorEditCommands({
           files,
           geometryRedoStackRef,
           geometryUndoStackRef,
-          historyOrderRef: historyOrderRef as React.RefObject<
-            UndoRedoOrderKind[]
-          >,
+          historyOrderRef,
           id,
           latestClipboardMutationContentRef,
           localContentRedoStackRef,
           localContentUndoStackRef,
           queryClient,
-          redoOrderRef: redoOrderRef as React.RefObject<UndoRedoOrderKind[]>,
+          redoOrderRef,
           selectionRevisionRef,
           overviewSelectedScreenIds,
           selectedElement,
@@ -560,7 +564,8 @@ export function useEditorEditCommands({
         },
         filesToDelete,
         options,
-      ),
+      );
+    },
     [
       activeFile,
       canvasFrameGeometryById,
@@ -583,18 +588,10 @@ export function useEditorEditCommands({
       if (fileHistoryMutationPendingRef.current) {
         throw new Error(t("common.genericError"));
       }
-      const queryKey = ["action", "get-design", { id }] as const;
-      let file =
+      const file =
         files.find((candidate) => candidate.id === fileId) ??
         rawServerFilesByIdRef.current.get(fileId) ??
         historyFilesRef.current.find((candidate) => candidate.id === fileId);
-      if (!file) {
-        await queryClient.refetchQueries({ queryKey, exact: true });
-        const refreshed = queryClient.getQueryData<{
-          files?: DesignFile[];
-        }>(queryKey);
-        file = refreshed?.files?.find((candidate) => candidate.id === fileId);
-      }
       if (!file) throw new Error(t("common.genericError"));
 
       const targetFile = file;
@@ -610,18 +607,22 @@ export function useEditorEditCommands({
     [canEditDesign, files, id, performDeleteFiles, queryClient, t],
   );
 
-  const handleOverviewNudgeSelection = useCallback(() => {
-    if (
-      overviewSelectionTargetsElement({
+  const handleOverviewNudgeSelection = useCallback(
+    (targetScreenIds: string[]) =>
+      !overviewNudgeTargetsElement({
+        targetScreenIds,
+        explicitScreenIds: explicitOverviewScreenSelectionRef.current,
         selectedElement,
         selectedLayerIds: selectedLayerIdsState,
         fileIds: files.map((file) => file.id),
-      })
-    ) {
-      return false;
-    }
-    return true;
-  }, [files, selectedElement, selectedLayerIdsState]);
+      }),
+    [
+      explicitOverviewScreenSelectionRef,
+      files,
+      selectedElement,
+      selectedLayerIdsState,
+    ],
+  );
 
   const handleDeleteOverviewSelection = useCallback(
     (selectedIds: string[], explicitScreenDeletion = false) => {
@@ -634,12 +635,14 @@ export function useEditorEditCommands({
       const selectedFiles = files.filter(
         (file) => selectedIdSet.has(file.id) && overviewScreenIds.has(file.id),
       );
-      const explicitlySelectedFiles = selectedFiles.filter((file) =>
-        explicitOverviewScreenSelectionRef.current.includes(file.id),
+      const explicitlySelectedIds = selectedIds.filter(
+        (id) =>
+          overviewScreenIds.has(id) &&
+          explicitOverviewScreenSelectionRef.current.includes(id),
       );
       if (
         !explicitScreenDeletion &&
-        explicitlySelectedFiles.length === 0 &&
+        explicitlySelectedIds.length === 0 &&
         overviewSelectionTargetsElement({
           selectedElement,
           selectedLayerIds: selectedLayerIdsState,
@@ -649,58 +652,76 @@ export function useEditorEditCommands({
         handleDeleteSelection();
         return false;
       }
-      const filesToDelete =
-        explicitlySelectedFiles.length > 0
-          ? explicitlySelectedFiles
-          : selectedFiles;
-      if (!filesToDelete.length) return false;
-
+      const intendedIds =
+        explicitlySelectedIds.length > 0
+          ? explicitlySelectedIds
+          : selectedIds.filter((id) => overviewScreenIds.has(id));
+      if (!intendedIds.length) return false;
       const explicitScreenIds = explicitScreenDeletion
-        ? filesToDelete.map((file) => file.id)
-        : explicitlySelectedFiles.map((file) => file.id);
+        ? intendedIds
+        : explicitlySelectedIds;
       const selectionRevisionAtStart = selectionRevisionRef.current;
-      explicitOverviewScreenSelectionRef.current = [];
-      performDeleteFiles(filesToDelete, {
-        recordDeletionHistory: true,
-        onMutationSettled: (deletedFiles) => {
-          if (selectionRevisionRef.current !== selectionRevisionAtStart) return;
-          const deletedIds = new Set(deletedFiles.map((file) => file.id));
-          explicitOverviewScreenSelectionRef.current = explicitScreenIds.filter(
-            (fileId) => !deletedIds.has(fileId),
-          );
+      const deleteScreens = (filesToDelete: DesignFile[]) => {
+        explicitOverviewScreenSelectionRef.current = [];
+        void performDeleteFiles(filesToDelete, {
+          recordDeletionHistory: true,
+          onMutationSettled: (deletedFiles) => {
+            if (selectionRevisionRef.current !== selectionRevisionAtStart)
+              return;
+            const deletedIds = new Set(deletedFiles.map((file) => file.id));
+            explicitOverviewScreenSelectionRef.current =
+              explicitScreenIds.filter((fileId) => !deletedIds.has(fileId));
+          },
+        });
+      };
+      const unloadedIds = intendedIds.filter(
+        (id) => !selectedFiles.some((file) => file.id === id),
+      );
+      if (!unloadedIds.length) {
+        deleteScreens(
+          selectedFiles.filter((file) => intendedIds.includes(file.id)),
+        );
+        return false;
+      }
+      // Undo restores a deleted screen from its source, so load it first.
+      void leaseSources(unloadedIds).then(
+        (release) => {
+          try {
+            if (selectionRevisionRef.current !== selectionRevisionAtStart)
+              return;
+            const loaded = historyFilesRef.current.filter((file) =>
+              intendedIds.includes(file.id),
+            );
+            if (loaded.length !== intendedIds.length)
+              throw new Error("Screen source could not be loaded");
+            deleteScreens(loaded);
+          } catch {
+            toast.error(t("designEditor.sourceLoadFailed"));
+          } finally {
+            release();
+          }
         },
-      });
+        () => toast.error(t("designEditor.sourceLoadFailed")),
+      );
       return false;
     },
     [
       canEditDesign,
       files,
+      historyFilesRef,
+      leaseSources,
       performDeleteFiles,
       handleDeleteSelection,
       overviewScreens,
       selectedElement,
       selectedLayerIdsState,
+      t,
     ],
   );
 
   const handleCopyProps = useCallback(() => {
     if (!selectedElement) return;
-    copiedStylePropsRef.current = {
-      color: selectedElement.computedStyles.color,
-      backgroundColor: selectedElement.computedStyles.backgroundColor,
-      borderColor: selectedElement.computedStyles.borderColor,
-      borderStyle: selectedElement.computedStyles.borderStyle,
-      borderWidth: selectedElement.computedStyles.borderWidth,
-      borderRadius: selectedElement.computedStyles.borderRadius,
-      boxShadow: selectedElement.computedStyles.boxShadow,
-      opacity: selectedElement.computedStyles.opacity,
-      fontFamily: selectedElement.computedStyles.fontFamily,
-      fontSize: selectedElement.computedStyles.fontSize,
-      fontWeight: selectedElement.computedStyles.fontWeight,
-      lineHeight: selectedElement.computedStyles.lineHeight,
-      letterSpacing: selectedElement.computedStyles.letterSpacing,
-      textAlign: selectedElement.computedStyles.textAlign,
-    };
+    copiedStylePropsRef.current = copyVisualProperties(selectedElement);
     setHasPropsClipboard(true);
   }, [selectedElement]);
 
@@ -817,6 +838,7 @@ export function useEditorEditCommands({
           return;
         }
       }
+      if (!activeFile) return;
       return runChangeSelectedZIndex(
         {
           activeFile,
@@ -915,8 +937,9 @@ export function useEditorEditCommands({
   }, [restoreSelectionChrome]);
 
   const handleNudgeSelection = useCallback(
-    (direction: "up" | "right" | "down" | "left", largeStep: boolean) =>
-      runNudgeSelection(
+    (direction: "up" | "right" | "down" | "left", largeStep: boolean) => {
+      if (!activeFile) return;
+      return runNudgeSelection(
         {
           activeFile,
           applyLinkedComponentEdit,
@@ -933,6 +956,7 @@ export function useEditorEditCommands({
           getFreshActiveContent,
           handleGeometryCommit,
           hideSelectionChromeForNudge,
+          refuseMove: (refusal) => toastLayoutMoveRefusal(t, refusal),
           overviewScreens,
           overviewSelectedScreenIds,
           selectedElement,
@@ -945,7 +969,8 @@ export function useEditorEditCommands({
         },
         direction,
         largeStep,
-      ),
+      );
+    },
     [
       activeCanvasSourceType,
       activeFile,
@@ -968,6 +993,7 @@ export function useEditorEditCommands({
       runtimeLayerSnapshotsById,
       selectedElement,
       selectedLayerIdsState,
+      t,
     ],
   );
 
@@ -1010,10 +1036,12 @@ export function useEditorEditCommands({
           locallyPinnedHeightIdsRef.current.delete(screenId);
         }
       }
-      queryClient.setQueryData(["action", "get-design", { id }], (old: any) =>
-        old && typeof old === "object"
-          ? { ...old, data: JSON.stringify(nextData) }
-          : old,
+      queryClient.setQueryData(
+        designMetadataQueryKey(id),
+        (old: Record<string, unknown> | undefined) =>
+          old && typeof old === "object"
+            ? { ...old, data: JSON.stringify(nextData) }
+            : old,
       );
       return enqueueFrameGeometryDataSave(operations, {
         restoreClaims: direction === "undo" ? restoreClaims : undefined,
@@ -1025,9 +1053,15 @@ export function useEditorEditCommands({
     for (const change of changes) {
       const content = direction === "undo" ? change.before : change.after;
       if (change.before === change.after) continue;
-      applyFileContentUpdate(change.fileId, content, {
+      const result = applyFileContentUpdate(change.fileId, content, {
         recordHistory: false,
       });
+      if (result.status === "accepted")
+        cancelPendingPastedMediaForHistoryReplay(
+          change.fileId,
+          direction === "undo" ? change.after : change.before,
+          content,
+        );
     }
     if (direction !== "commit") {
       applyDesignDataHistoryChanges(changes, direction);
@@ -1044,8 +1078,10 @@ export function useEditorEditCommands({
         applyGeometryHistoryContentChanges: (changes, direction) =>
           applyGeometryHistoryContentChangesRef.current(changes, direction),
         applyLocalContentUpdate,
+        cancelPendingPastedMediaForHistoryReplay,
         canEditDesign,
         allowPendingLiveEdits: canEditLiveScreens && !canEditDesign,
+        captureCurrentSelection,
         clipboardPasteRedoStackRef,
         clipboardPasteUndoStackRef,
         codeLayerOwnerByNodeIdRef,
@@ -1097,8 +1133,6 @@ export function useEditorEditCommands({
         requestPendingLiveNonStyleRevert,
         requestPendingVisualStyleRevert,
         restoreSelectionSnapshot,
-        selectionRedoStackRef,
-        selectionUndoStackRef,
         setActiveFileId,
         setContentRenderRevision,
         setHoveredElement,
@@ -1120,10 +1154,12 @@ export function useEditorEditCommands({
     [
       ydoc,
       activeFile,
+      captureCurrentSelection,
       applyFileContentUpdate,
       applyDesignDataHistoryChanges,
       applyGeometryHistoryContentChangesRef,
       applyLocalContentUpdate,
+      cancelPendingPastedMediaForHistoryReplay,
       canEditDesign,
       canEditLiveScreens,
       clearPendingHistoryDirections,
@@ -1160,6 +1196,7 @@ export function useEditorEditCommands({
       runRedo({
         activeEditorDragRef,
         activeFile,
+        cancelPendingPastedMediaForHistoryReplay,
         applyFileContentUpdate,
         applyDesignDataHistoryChanges,
         applyGeometryHistoryContentChanges: (changes, direction) =>
@@ -1226,8 +1263,6 @@ export function useEditorEditCommands({
         restoreSelectionSnapshot,
         runtimeStructureInsertRevisionRef,
         runtimeStructureMoveRevisionRef,
-        selectionRedoStackRef,
-        selectionUndoStackRef,
         setContentRenderRevision,
         setHoveredElement,
         setPendingLayerNameReplayRequest,

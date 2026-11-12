@@ -171,6 +171,11 @@ describe("embedded Agent-Native host fixture", () => {
         identity_id TEXT
       )
     `);
+    await getDbExec().execute({
+      sql: `INSERT INTO organizations (id, name, created_by, created_at, identity_authority, identity_id)
+        VALUES (?, ?, ?, ?, NULL, NULL)`,
+      args: ["host-org-1", "Host organization", "alice@host.test", Date.now()],
+    });
 
     await getDbExec().execute(`
       CREATE TABLE IF NOT EXISTS org_members (
@@ -652,5 +657,34 @@ describe("embedded Agent-Native host fixture", () => {
       status: 200,
       body: { ok: true },
     });
+    await getDbExec().execute({
+      sql: `DELETE FROM tool_shares WHERE id IN (?, ?)`,
+      args: [
+        "embedded-extension-editor-share",
+        "embedded-extension-admin-share",
+      ],
+    });
+    for (const email of ["editor@host.test", "admin@host.test"]) {
+      currentUser = { ...currentUser, email, orgRole: "member" };
+      const denied = await dispatch(
+        nitroApp,
+        `/_agent-native/extensions/data/${extensionId}/notes`,
+        {
+          method: "POST",
+          headers: { "X-Agent-Native-CSRF": "1" },
+          body: {
+            id: "revoked-write",
+            scope: "org",
+            data: { text: "Must not persist" },
+          },
+        },
+      );
+      expect(denied.status).toBe(404);
+    }
+    const revokedWrites = await getDbExec().execute({
+      sql: `SELECT id FROM tool_data WHERE tool_id = ? AND id = ?`,
+      args: [extensionId, "revoked-write"],
+    });
+    expect(revokedWrites.rows).toEqual([]);
   }, 15_000);
 });

@@ -18,7 +18,14 @@ import {
   type WorkspaceConnectionProvider,
 } from "../connections/catalog.js";
 import {
+  isSigmaApiBaseUrl,
+  normalizeSigmaApiBaseUrl,
+  SIGMA_DEFAULT_API_BASE_URL,
+} from "../connections/sigma-api.js";
+import { getDbExec, withDbExec } from "../db/client.js";
+import {
   OAuthAccountOwnedByOtherUserError,
+  getOAuthTokens,
   saveOAuthTokens,
   setOAuthDisplayName,
 } from "../oauth-tokens/store.js";
@@ -26,7 +33,13 @@ import { getRegisteredAppRoles, resolveAppRole } from "../org/app-roles.js";
 import { getOrgContext } from "../org/context.js";
 import { decryptSecretValue, encryptSecretValue } from "../secrets/crypto.js";
 import {
+  readAppSecret,
+  readAppSecretMeta,
+  writeAppSecret,
+} from "../secrets/storage.js";
+import {
   listWorkspaceConnections,
+  normalizeOAuthScope,
   upsertWorkspaceConnection,
   upsertWorkspaceConnectionGrant,
 } from "../workspace-connections/store.js";
@@ -63,7 +76,8 @@ export type GenericWorkspaceOAuthProvider =
   | "salesforce"
   | "jira"
   | "sentry"
-  | "notion";
+  | "notion"
+  | "sigma";
 
 const SUPPORTED_PROVIDERS = new Set<GenericWorkspaceOAuthProvider>([
   "figma",
@@ -80,12 +94,14 @@ const SUPPORTED_PROVIDERS = new Set<GenericWorkspaceOAuthProvider>([
   "jira",
   "sentry",
   "notion",
+  "sigma",
 ]);
 const FLOW_TTL_SECONDS = 10 * 60;
 const PROVIDER_REQUEST_TIMEOUT_MS = 10_000;
 const PROVIDER_RESPONSE_MAX_BYTES = 256 * 1024;
 const SALESFORCE_PRODUCTION_LOGIN_URL = "https://login.salesforce.com";
 const SALESFORCE_SANDBOX_LOGIN_URL = "https://test.salesforce.com";
+const SIGMA_OAUTH_CLIENTS_SECRET = "SIGMA_OAUTH_CLIENT_REGISTRATIONS";
 const WORKSPACE_OAUTH_ADMIN_ERROR =
   "This shared connection requires organization or app-admin access. Personal connections can be connected by any workspace member.";
 const OAUTH_ACCOUNT_OWNERSHIP_ERROR =
@@ -120,6 +136,7 @@ export function shouldUseRootGoogleOAuthCallback(
 export async function hasWorkspaceProviderOAuthCredentials(
   provider: GenericWorkspaceOAuthProvider,
 ): Promise<boolean> {
+  if (provider === "sigma") return true;
   const [clientId, clientSecret] =
     await resolveProviderClientCredentials(provider);
   return Boolean(clientId && clientSecret);
@@ -134,8 +151,20 @@ export interface WorkspaceProviderOAuthFlow {
   orgId?: string;
   appId: string;
   scope: WorkspaceProviderOAuthScope;
+  requestedScopes?: string[];
+  optionalScopes?: string[];
+  targetAccountEmail?: string;
   returnUrl?: string;
   salesforceLoginUrl?: string;
+  sigmaApiBaseUrl?: string;
+  sigmaAuthorizationUrl?: string;
+  sigmaTokenUrl?: string;
+  sigmaOAuthClientId?: string;
+  sigmaOAuthClientSecret?: string;
+  sigmaTokenEndpointAuthMethod?:
+    | "none"
+    | "client_secret_basic"
+    | "client_secret_post";
   expiresAt: number;
 }
 
@@ -159,9 +188,37 @@ function isWorkspaceProviderOAuthFlow(
     typeof flow.appId === "string" &&
     flow.appId.length > 0 &&
     isWorkspaceProviderOAuthScope(flow.scope) &&
+    (flow.requestedScopes === undefined ||
+      (Array.isArray(flow.requestedScopes) &&
+        flow.requestedScopes.length > 0 &&
+        flow.requestedScopes.every(
+          (scope) => typeof scope === "string" && scope.length > 0,
+        ) &&
+        new Set(flow.requestedScopes).size === flow.requestedScopes.length)) &&
+    (flow.optionalScopes === undefined ||
+      (Array.isArray(flow.optionalScopes) &&
+        flow.optionalScopes.every(
+          (scope) => typeof scope === "string" && scope.length > 0,
+        ))) &&
+    (flow.targetAccountEmail === undefined ||
+      isTargetAccountEmail(flow.targetAccountEmail)) &&
     (flow.returnUrl === undefined || typeof flow.returnUrl === "string") &&
     (flow.salesforceLoginUrl === undefined ||
       typeof flow.salesforceLoginUrl === "string") &&
+    (flow.provider !== "sigma" ||
+      (isSigmaApiBaseUrl(flow.sigmaApiBaseUrl) &&
+        isSigmaOAuthEndpoint(
+          flow.sigmaAuthorizationUrl,
+          flow.sigmaApiBaseUrl,
+        ) &&
+        isSigmaOAuthEndpoint(flow.sigmaTokenUrl, flow.sigmaApiBaseUrl) &&
+        typeof flow.sigmaOAuthClientId === "string" &&
+        flow.sigmaOAuthClientId.length > 0 &&
+        (flow.sigmaOAuthClientSecret === undefined ||
+          typeof flow.sigmaOAuthClientSecret === "string") &&
+        (flow.sigmaTokenEndpointAuthMethod === "none" ||
+          flow.sigmaTokenEndpointAuthMethod === "client_secret_basic" ||
+          flow.sigmaTokenEndpointAuthMethod === "client_secret_post"))) &&
     typeof flow.expiresAt === "number" &&
     Number.isFinite(flow.expiresAt),
   );
@@ -216,18 +273,43 @@ export async function handleWorkspaceProviderOAuthStart(
   providerId: GenericWorkspaceOAuthProvider,
 ): Promise<Response | Record<string, unknown>> {
   if (getMethod(event) !== "GET") return methodNotAllowed(event);
-  const session = await getSession(event).catch(() => null);
+  const session = await getSession(event);
   if (!session?.email) return unauthorized(event);
   const query = getQuery(event);
-  const appId = normalizeAppId(
-    text(query.appId) ?? getAppConfig().app.workspaceId ?? "creative-context",
-  );
   const requestedScope = parseWorkspaceProviderOAuthScope(text(query.scope));
   if (!requestedScope) {
     return oauthFlowFailure(
       event,
       400,
       "OAuth connection scope must be user, organization, or app.",
+    );
+  }
+  const requestedAppId = text(query.appId);
+  const appId =
+    providerId === "sigma"
+      ? currentWorkspaceProviderOAuthAppId()
+      : requestedAppId
+        ? normalizedAppIdOrNull(requestedAppId)
+        : currentWorkspaceProviderOAuthAppId();
+  if (!appId && providerId !== "sigma") {
+    return oauthFlowFailure(
+      event,
+      400,
+      requestedAppId
+        ? "OAuth appId is invalid."
+        : "OAuth start requires an app id.",
+    );
+  }
+  if (
+    !appId ||
+    (providerId === "sigma" &&
+      (requestedScope !== "user" ||
+        (requestedAppId && normalizedAppIdOrNull(requestedAppId) !== appId)))
+  ) {
+    return oauthFlowFailure(
+      event,
+      403,
+      "This Sigma OAuth request does not match the current app.",
     );
   }
   const orgContext = await requireWorkspaceProviderOAuthAccess(
@@ -243,6 +325,32 @@ export async function handleWorkspaceProviderOAuthStart(
     return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
   }
   const provider = requiredProvider(providerId);
+  const requestedScopes = parseRequestedWorkspaceOAuthScopes(
+    query.requestedScopes,
+    provider.oauth.scopes,
+  );
+  if (requestedScopes === null) {
+    return oauthFlowFailure(
+      event,
+      400,
+      "Requested OAuth scopes are invalid or unsupported.",
+    );
+  }
+  const optionalScopes = parseRequestedWorkspaceOAuthScopes(
+    query.optionalScopes,
+    provider.oauth.scopes,
+  );
+  if (optionalScopes === null) {
+    return oauthFlowFailure(
+      event,
+      400,
+      "Optional OAuth scopes are invalid or unsupported.",
+    );
+  }
+  const targetAccountEmail = text(query.targetAccountEmail);
+  if (targetAccountEmail && !isTargetAccountEmail(targetAccountEmail)) {
+    return oauthFlowFailure(event, 400, "Target account email is invalid.");
+  }
   const salesforceLoginUrl =
     providerId === "salesforce"
       ? resolveSalesforceOAuthLoginUrl(text(query.environment))
@@ -289,8 +397,10 @@ export async function handleWorkspaceProviderOAuthStart(
     { userEmail: session.email, orgId },
     async () => {
       const [clientId, clientSecret] =
-        await resolveProviderClientCredentials(providerId);
-      if (!clientId || !clientSecret) {
+        providerId === "sigma"
+          ? [null, null]
+          : await resolveProviderClientCredentials(providerId);
+      if (providerId !== "sigma" && (!clientId || !clientSecret)) {
         return oauthFlowFailure(
           event,
           503,
@@ -325,13 +435,56 @@ export async function handleWorkspaceProviderOAuthStart(
         orgId,
         appId,
         scope: orgContext.oauthScope,
+        ...(requestedScopes ? { requestedScopes } : {}),
+        ...(optionalScopes ? { optionalScopes } : {}),
+        ...(targetAccountEmail ? { targetAccountEmail } : {}),
         ...(returnUrl ? { returnUrl } : {}),
         ...(salesforceLoginUrl ? { salesforceLoginUrl } : {}),
         expiresAt: Date.now() + FLOW_TTL_SECONDS * 1_000,
       };
+      if (providerId === "sigma") {
+        const sigmaApiBaseUrl = normalizeSigmaApiBaseUrl(
+          text(query.baseUrl) ?? SIGMA_DEFAULT_API_BASE_URL,
+        );
+        if (!sigmaApiBaseUrl) {
+          return oauthFlowFailure(
+            event,
+            400,
+            "Choose a supported Sigma API region.",
+          );
+        }
+        try {
+          const metadata = await discoverSigmaOAuthMetadata(sigmaApiBaseUrl);
+          const client = await loadOrCreateSigmaOAuthClient({
+            owner: session.email,
+            appId,
+            redirectUri,
+            apiBaseUrl: sigmaApiBaseUrl,
+            registrationUrl: metadata.registrationUrl,
+          });
+          Object.assign(flow, {
+            sigmaApiBaseUrl,
+            sigmaAuthorizationUrl: metadata.authorizationUrl,
+            sigmaTokenUrl: metadata.tokenUrl,
+            sigmaOAuthClientId: client.clientId,
+            ...(client.clientSecret
+              ? { sigmaOAuthClientSecret: client.clientSecret }
+              : {}),
+            sigmaTokenEndpointAuthMethod: client.tokenEndpointAuthMethod,
+          });
+        } catch (error) {
+          return oauthFlowFailure(
+            event,
+            502,
+            error instanceof Error
+              ? error.message
+              : "Sigma OAuth setup failed. Try again.",
+          );
+        }
+      }
       setCookie(
         event,
-        flowCookieName(providerId),
+        flowCookieName(providerId, flowId),
         encryptSecretValue(JSON.stringify(flow)),
         {
           httpOnly: true,
@@ -343,13 +496,26 @@ export async function handleWorkspaceProviderOAuthStart(
       );
       const authorizationUrl = buildWorkspaceProviderAuthorizationUrl({
         provider,
-        clientId,
+        clientId: providerId === "sigma" ? flow.sigmaOAuthClientId! : clientId!,
         redirectUri,
         state,
         challenge,
-        loginHint: session.email,
-        includeGrantedScopes:
-          providerId !== "google_calendar" && providerId !== "google_sheets",
+        loginHint: targetAccountEmail ?? session.email,
+        includeGrantedScopes: sharesGoogleTokenRow(provider),
+        ...(requestedScopes || optionalScopes
+          ? {
+              requestedScopes: mergeWorkspaceOAuthValues(
+                requestedScopes ?? provider.oauth.scopes,
+                optionalScopes ?? [],
+              ),
+            }
+          : {}),
+        ...(providerId === "sigma"
+          ? {
+              authorizationUrl: flow.sigmaAuthorizationUrl,
+              resource: `${flow.sigmaApiBaseUrl}/v2`,
+            }
+          : {}),
         ...(salesforceLoginUrl
           ? {
               authorizationUrl: salesforceOAuthEndpoint(
@@ -369,29 +535,8 @@ export async function handleWorkspaceProviderOAuthCallback(
   providerId: GenericWorkspaceOAuthProvider,
 ): Promise<Response | Record<string, unknown>> {
   if (getMethod(event) !== "GET") return methodNotAllowed(event);
-  const session = await getSession(event).catch(() => null);
+  const session = await getSession(event);
   if (!session?.email) return unauthorized(event);
-  const storedFlow = readStoredFlow(event, providerId);
-  if (!storedFlow.flow) {
-    return oauthFlowFailure(
-      event,
-      400,
-      `OAuth flow cookie ${storedFlow.reason}.`,
-    );
-  }
-  const flow = storedFlow.flow;
-  const orgContext = await requireWorkspaceProviderOAuthAccess(
-    event,
-    flow.appId,
-    flow.scope,
-  );
-  if (!orgContext) {
-    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
-  }
-  const orgId = orgContext.orgId;
-  if (!orgId) {
-    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
-  }
   const query = getQuery(event);
   const code = text(query.code);
   const stateParam = text(query.state);
@@ -410,7 +555,6 @@ export async function handleWorkspaceProviderOAuthCallback(
       "OAuth callback is missing code or state.",
     );
   }
-  deleteCookie(event, flowCookieName(providerId), { path: "/" });
   const state = decodeOAuthState(stateParam, "");
   if (!state.ok) {
     logOAuthStateDecodeFailure(event, state.reason, providerId);
@@ -419,6 +563,41 @@ export async function handleWorkspaceProviderOAuthCallback(
       400,
       "OAuth state rejected: state is missing, malformed, or has an invalid signature. Start the connection again.",
     );
+  }
+  if (!state.flowId) {
+    return oauthFlowFailure(
+      event,
+      400,
+      "OAuth state rejected: state is missing, malformed, or has an invalid signature. Start the connection again.",
+    );
+  }
+  const storedFlow = readStoredFlow(event, providerId, state.flowId);
+  if (!storedFlow.flow) {
+    return oauthFlowFailure(
+      event,
+      400,
+      `OAuth flow cookie ${storedFlow.reason}.`,
+    );
+  }
+  const flow = storedFlow.flow;
+  if (providerId === "sigma" && !sigmaOAuthFlowMatchesCurrentApp(flow)) {
+    return oauthFlowFailure(
+      event,
+      403,
+      "This Sigma OAuth request does not match the current app.",
+    );
+  }
+  const orgContext = await requireWorkspaceProviderOAuthAccess(
+    event,
+    flow.appId,
+    flow.scope,
+  );
+  if (!orgContext) {
+    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
+  }
+  const orgId = orgContext.orgId;
+  if (!orgId) {
+    return oauthFlowFailure(event, 403, WORKSPACE_OAUTH_ADMIN_ERROR);
   }
   const stateError = workspaceProviderOAuthFlowInvalidReason({
     flow,
@@ -434,24 +613,39 @@ export async function handleWorkspaceProviderOAuthCallback(
       `OAuth state rejected: ${stateError}. Start the connection again.`,
     );
   }
+  deleteCookie(event, storedFlow.cookieName, { path: "/" });
   const provider = requiredProvider(providerId);
   return runWithRequestContext(
     { userEmail: session.email, orgId },
     async () => {
-      const [clientId, clientSecret] =
-        await resolveProviderClientCredentials(providerId);
-      if (!clientId || !clientSecret) {
-        return oauthFlowFailure(
-          event,
-          503,
-          `${provider.label} OAuth client credentials are not configured.`,
-        );
+      let clientId: string;
+      let clientSecret: string;
+      if (providerId === "sigma") {
+        if (!flow.sigmaOAuthClientId) {
+          return oauthFlowFailure(
+            event,
+            503,
+            "Sigma OAuth client registration is missing. Start the connection again.",
+          );
+        }
+        clientId = flow.sigmaOAuthClientId;
+        clientSecret = flow.sigmaOAuthClientSecret ?? "";
+      } else {
+        const credentials = await resolveProviderClientCredentials(providerId);
+        if (!credentials[0] || !credentials[1]) {
+          return oauthFlowFailure(
+            event,
+            503,
+            `${provider.label} OAuth client credentials are not configured.`,
+          );
+        }
+        [clientId, clientSecret] = credentials;
       }
       const tokens = await exchangeWorkspaceProviderOAuthCode({
         providerId,
         provider,
         clientId,
-        clientSecret,
+        clientSecret: clientSecret ?? "",
         code,
         verifier: flow.verifier,
         redirectUri: flow.redirectUri,
@@ -461,6 +655,15 @@ export async function handleWorkspaceProviderOAuthCallback(
                 flow.salesforceLoginUrl ?? SALESFORCE_PRODUCTION_LOGIN_URL,
                 "token",
               ),
+            }
+          : {}),
+        ...(providerId === "sigma"
+          ? {
+              sigma: {
+                apiBaseUrl: flow.sigmaApiBaseUrl!,
+                tokenUrl: flow.sigmaTokenUrl!,
+                tokenEndpointAuthMethod: flow.sigmaTokenEndpointAuthMethod!,
+              },
             }
           : {}),
       });
@@ -473,10 +676,27 @@ export async function handleWorkspaceProviderOAuthCallback(
           `${provider.label} OAuth did not return an accessible account.`,
         );
       }
+      const targetAccountEmail = flow.targetAccountEmail?.toLowerCase();
+      if (
+        targetAccountEmail &&
+        !identities.some(
+          (identity) => identity.accountId.toLowerCase() === targetAccountEmail,
+        )
+      ) {
+        return oauthFlowFailure(
+          event,
+          400,
+          `Choose ${flow.targetAccountEmail} on Google's account screen to reconnect it.`,
+        );
+      }
       const existingConnections = await listWorkspaceConnections({
         provider: providerId,
         includeDisabled: true,
       });
+      const googleGrant = sharesGoogleTokenRow(provider)
+        ? resolveGoogleGrant(tokens, flow, provider)
+        : null;
+      let sigmaConnectionId: string | undefined;
       for (const identity of identities) {
         const accountId = scopedOAuthAccountId(
           providerId,
@@ -484,10 +704,20 @@ export async function handleWorkspaceProviderOAuthCallback(
           identity.accountId,
         );
         try {
+          const previousTokens =
+            googleGrant && !googleGrant.explicitScope
+              ? await getOAuthTokens("google", accountId, session.email)
+              : null;
+          const tokenScope = googleGrant
+            ? mergeWorkspaceOAuthValues(
+                [...googleGrant.heldScopes],
+                previousTokens ? tokenScopes(previousTokens, []) : [],
+              ).join(" ")
+            : undefined;
           await saveOAuthTokens(
             provider.oauth!.provider,
             accountId,
-            tokens,
+            googleGrant ? { ...tokens, scope: tokenScope } : tokens,
             session.email,
           );
         } catch (error) {
@@ -516,18 +746,30 @@ export async function handleWorkspaceProviderOAuthCallback(
                       allowedApp.toLowerCase() === flow.appId.toLowerCase(),
                   )),
         );
-        const scopes = mergeWorkspaceOAuthValues(
-          identity.scopes ?? [],
-          tokenScopes(tokens, provider.oauth!.scopes),
-        );
+        const scopes =
+          googleGrant?.scopes ??
+          mergeWorkspaceOAuthValues(
+            identity.scopes ?? [],
+            tokenScopes(
+              tokens,
+              mergeWorkspaceOAuthValues(
+                flow.requestedScopes ?? provider.oauth.scopes,
+                flow.optionalScopes ?? [],
+              ),
+            ),
+          );
         const connectionConfig = {
           credentialMode: "oauth",
+          ...(googleGrant?.missingScopes.length
+            ? { missingScopes: googleGrant.missingScopes }
+            : {}),
           ...(providerId === "hubspot" ||
           providerId === "salesforce" ||
           providerId === "jira"
             ? { externalAccountId: identity.accountId }
             : {}),
           ...(identity.config ?? {}),
+          workspaceConnectionScope: flow.scope,
           ...(providerId === "salesforce"
             ? {
                 salesforceLoginUrl:
@@ -541,18 +783,27 @@ export async function handleWorkspaceProviderOAuthCallback(
           label: `${provider.label}: ${identity.label}`,
           accountId,
           accountLabel: identity.label,
-          status: "connected",
+          status: googleGrant?.missingRequired ? "needs_reauth" : "connected",
           scopes,
           allowedApps:
-            existing?.allowedApps ?? (flow.scope === "app" ? [flow.appId] : []),
+            providerId === "sigma"
+              ? preserveSigmaWorkspaceOAuthAppAccess(
+                  existing?.allowedApps,
+                  flow.appId,
+                )
+              : (existing?.allowedApps ??
+                (flow.scope === "app" ? [flow.appId] : [])),
           allowedUsers:
             flow.scope === "user"
               ? [session.email]
               : (existing?.allowedUsers ?? []),
           config: connectionConfig,
           lastCheckedAt: new Date(),
-          lastError: null,
+          lastError: googleGrant?.missingScopes.length
+            ? "Google granted only part of the requested access."
+            : null,
         });
+        if (providerId === "sigma") sigmaConnectionId = connection.id;
         await upsertWorkspaceConnectionGrant({
           connectionId: connection.id,
           appId: flow.appId,
@@ -560,14 +811,25 @@ export async function handleWorkspaceProviderOAuthCallback(
           scopes,
           config: connectionConfig,
         });
+        if (googleGrant?.explicitScope) {
+          await dropGoogleScopesTokenLacks(
+            connection.id,
+            accountId,
+            googleGrant.heldScopes,
+          );
+        }
       }
       const returnPath =
         flow.returnUrl ??
         state.returnUrl ??
         `/settings/integrations?connected=${encodeURIComponent(providerId)}`;
+      const returnUrl = new URL(getAppUrl(event, returnPath));
+      if (providerId === "sigma" && sigmaConnectionId) {
+        returnUrl.searchParams.set("sigmaConnectionId", sigmaConnectionId);
+      }
       return queryEchoSafeRedirect(
         event,
-        redirectWithStagedCookies(event, getAppUrl(event, returnPath)),
+        redirectWithStagedCookies(event, returnUrl.href),
       );
     },
   );
@@ -582,9 +844,23 @@ export function buildWorkspaceProviderAuthorizationUrl(input: {
   authorizationUrl?: string;
   loginHint?: string;
   includeGrantedScopes?: boolean;
+  requestedScopes?: readonly string[];
+  resource?: string;
 }): string {
   if (!input.provider.oauth)
     throw new Error("Provider does not support OAuth.");
+  const requestedScopes = input.requestedScopes ?? input.provider.oauth.scopes;
+  if (
+    input.requestedScopes &&
+    !isAllowedWorkspaceOAuthScopes(requestedScopes, input.provider.oauth.scopes)
+  ) {
+    throw new Error("Requested OAuth scopes are invalid or unsupported.");
+  }
+  // The callback identifies the account through OIDC userinfo, even for an
+  // API-only consent request.
+  const scopes = isGoogleWorkspaceOAuthProvider(input.provider.id)
+    ? [...new Set(["openid", "email", ...requestedScopes])]
+    : requestedScopes;
   const url = new URL(
     input.authorizationUrl ?? input.provider.oauth.authorizationUrl,
   );
@@ -592,7 +868,11 @@ export function buildWorkspaceProviderAuthorizationUrl(input: {
   url.searchParams.set("redirect_uri", input.redirectUri);
   url.searchParams.set("response_type", "code");
   url.searchParams.set("state", input.state);
-  if (input.provider.id === "figma" || input.provider.id === "sentry") {
+  if (
+    input.provider.id === "figma" ||
+    input.provider.id === "sentry" ||
+    input.provider.id === "sigma"
+  ) {
     url.searchParams.set("code_challenge", input.challenge);
     url.searchParams.set("code_challenge_method", "S256");
   }
@@ -612,9 +892,10 @@ export function buildWorkspaceProviderAuthorizationUrl(input: {
     url.searchParams.set("prompt", "consent select_account");
     if (input.loginHint) url.searchParams.set("login_hint", input.loginHint);
   }
-  if (input.provider.oauth.scopes.length) {
-    url.searchParams.set("scope", input.provider.oauth.scopes.join(" "));
+  if (scopes.length) {
+    url.searchParams.set("scope", scopes.join(" "));
   }
+  if (input.resource) url.searchParams.set("resource", input.resource);
   if (input.provider.id === "notion") url.searchParams.set("owner", "user");
   return url.href;
 }
@@ -628,10 +909,68 @@ export async function exchangeWorkspaceProviderOAuthCode(input: {
   verifier: string;
   redirectUri: string;
   tokenUrl?: string;
+  sigma?: {
+    apiBaseUrl: string;
+    tokenUrl: string;
+    tokenEndpointAuthMethod:
+      | "none"
+      | "client_secret_basic"
+      | "client_secret_post";
+  };
 }): Promise<Record<string, unknown>> {
   const tokenUrl = input.tokenUrl ?? input.provider.oauth?.tokenUrl;
   if (!tokenUrl) throw new Error("Provider does not support OAuth.");
   const authorization = `Basic ${Buffer.from(`${input.clientId}:${input.clientSecret}`).toString("base64")}`;
+  if (input.providerId === "sigma" && input.sigma) {
+    const fields = new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: input.clientId,
+      code: input.code,
+      code_verifier: input.verifier,
+      redirect_uri: input.redirectUri,
+    });
+    const headers: Record<string, string> = {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Accept: "application/json",
+    };
+    if (input.sigma.tokenEndpointAuthMethod === "client_secret_basic") {
+      headers.Authorization = authorization;
+    } else if (input.sigma.tokenEndpointAuthMethod === "client_secret_post") {
+      fields.set("client_secret", input.clientSecret);
+    }
+    const { response, body } = await fetchBoundedProviderJson(
+      input.sigma.tokenUrl,
+      { method: "POST", headers, body: fields, redirect: "error" },
+      input.provider.label,
+    );
+    const accessToken = text(body.access_token);
+    const refreshToken = text(body.refresh_token);
+    const expiresIn = Number(body.expires_in);
+    if (
+      !response.ok ||
+      !accessToken ||
+      !refreshToken ||
+      !Number.isFinite(expiresIn) ||
+      expiresIn <= 0
+    ) {
+      throw new Error(
+        `${input.provider.label} OAuth token exchange failed (${response.status}).`,
+      );
+    }
+    return {
+      ...body,
+      sigma_api_base_url: input.sigma.apiBaseUrl,
+      sigma_token_url: input.sigma.tokenUrl,
+      sigma_client_id: input.clientId,
+      ...(input.clientSecret
+        ? { sigma_client_secret: input.clientSecret }
+        : {}),
+      sigma_token_endpoint_auth_method: input.sigma.tokenEndpointAuthMethod,
+      ...(Number.isFinite(expiresIn) && expiresIn > 0
+        ? { expiry_date: Date.now() + expiresIn * 1_000 }
+        : {}),
+    };
+  }
   if (input.providerId === "github") {
     const { response, body } = await fetchBoundedProviderJson(
       tokenUrl,
@@ -979,6 +1318,39 @@ async function resolveWorkspaceProviderIdentitySingle(
       },
     };
   }
+  if (providerId === "sigma") {
+    const accessToken = text(tokens.access_token);
+    const apiBaseUrl = normalizeSigmaApiBaseUrl(
+      text(tokens.sigma_api_base_url) ?? "",
+    );
+    if (!accessToken || !apiBaseUrl) {
+      throw new Error("Sigma OAuth response did not identify an account.");
+    }
+    const { response, body } = await fetchBoundedProviderJson(
+      `${apiBaseUrl}/v2/whoami`,
+      {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        redirect: "error",
+      },
+      "Sigma",
+    );
+    const userId = scalarText(body.userId);
+    const organizationId = scalarText(body.organizationId);
+    if (!response.ok || !userId || !organizationId) {
+      throw new Error(
+        "Sigma OAuth response did not identify the connected user.",
+      );
+    }
+    const label = text(body.email) ?? text(body.name) ?? `Sigma user ${userId}`;
+    return {
+      accountId: `${organizationId}:${userId}`,
+      label,
+      config: { sigmaBaseUrl: apiBaseUrl },
+    };
+  }
   if (providerId === "sentry") {
     const accessToken = text(tokens.access_token)!;
     const { response, body: user } = await fetchBoundedProviderJson(
@@ -1040,38 +1412,74 @@ async function resolveWorkspaceProviderIdentitySingle(
 
 function requiredProvider(
   providerId: GenericWorkspaceOAuthProvider,
-): WorkspaceConnectionProvider {
+): WorkspaceConnectionProvider & {
+  oauth: NonNullable<WorkspaceConnectionProvider["oauth"]>;
+} {
   const provider = getWorkspaceConnectionProvider(providerId);
   if (!provider?.oauth)
     throw new Error(`${providerId} OAuth is not configured.`);
-  return provider;
+  return { ...provider, oauth: provider.oauth };
 }
 
 function readStoredFlow(
   event: H3Event,
   provider: GenericWorkspaceOAuthProvider,
-): { flow: WorkspaceProviderOAuthFlow | null; reason: string } {
-  const encrypted = getCookie(event, flowCookieName(provider));
-  if (!encrypted) return { flow: null, reason: "is missing" };
+  flowId: string,
+): {
+  flow: WorkspaceProviderOAuthFlow | null;
+  reason: string;
+  cookieName: string;
+} {
+  const scopedCookieName = flowCookieName(provider, flowId);
+  const scopedEncrypted = getCookie(event, scopedCookieName);
+  const legacyCookieName = legacyFlowCookieName(provider);
+  const encrypted = scopedEncrypted ?? getCookie(event, legacyCookieName);
+  const cookieName = scopedEncrypted ? scopedCookieName : legacyCookieName;
+  if (!encrypted) return { flow: null, reason: "is missing", cookieName };
   let decrypted: string;
   try {
     decrypted = decryptSecretValue(encrypted);
   } catch {
-    return { flow: null, reason: "could not be decrypted" };
+    return { flow: null, reason: "could not be decrypted", cookieName };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(decrypted);
   } catch {
-    return { flow: null, reason: "is malformed" };
+    return { flow: null, reason: "is malformed", cookieName };
   }
   const parsedRecord = record(parsed);
   if (parsedRecord && !isWorkspaceProviderOAuthScope(parsedRecord.scope)) {
-    return { flow: null, reason: "has an invalid scope" };
+    return { flow: null, reason: "has an invalid scope", cookieName };
+  }
+  if (parsedRecord?.requestedScopes !== undefined) {
+    const providerConfig =
+      typeof parsedRecord.provider === "string" &&
+      SUPPORTED_PROVIDERS.has(
+        parsedRecord.provider as GenericWorkspaceOAuthProvider,
+      )
+        ? getWorkspaceConnectionProvider(
+            parsedRecord.provider as GenericWorkspaceOAuthProvider,
+          )
+        : undefined;
+    if (
+      !Array.isArray(parsedRecord.requestedScopes) ||
+      !providerConfig?.oauth ||
+      !isAllowedWorkspaceOAuthScopes(
+        parsedRecord.requestedScopes,
+        providerConfig.oauth.scopes,
+      )
+    ) {
+      return {
+        flow: null,
+        reason: "has invalid requested scopes",
+        cookieName,
+      };
+    }
   }
   return isWorkspaceProviderOAuthFlow(parsed)
-    ? { flow: parsed, reason: "is valid" }
-    : { flow: null, reason: "is malformed" };
+    ? { flow: parsed, reason: "is valid", cookieName }
+    : { flow: null, reason: "is malformed", cookieName };
 }
 
 export function workspaceProviderOAuthFlowInvalidReason(input: {
@@ -1141,7 +1549,8 @@ export function scopedOAuthAccountId(
   if (
     provider !== "hubspot" &&
     provider !== "salesforce" &&
-    provider !== "jira"
+    provider !== "jira" &&
+    provider !== "sigma"
   ) {
     return accountId;
   }
@@ -1151,6 +1560,258 @@ export function scopedOAuthAccountId(
     .digest("hex")
     .slice(0, 24);
   return `${accountId}::${ownerKey}`;
+}
+
+function isSigmaOAuthEndpoint(
+  value: unknown,
+  apiBaseUrl: unknown,
+): value is string {
+  if (typeof value !== "string" || !isSigmaApiBaseUrl(apiBaseUrl)) return false;
+  if (!URL.canParse(value)) return false;
+  const url = new URL(value);
+  return (
+    url.protocol === "https:" &&
+    url.origin === apiBaseUrl &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash
+  );
+}
+
+interface SigmaOAuthMetadata {
+  authorizationUrl: string;
+  tokenUrl: string;
+  registrationUrl: string;
+}
+
+interface SigmaOAuthClientRegistration {
+  clientId: string;
+  clientSecret?: string;
+  tokenEndpointAuthMethod:
+    | "none"
+    | "client_secret_basic"
+    | "client_secret_post";
+  expiresAt?: number;
+}
+
+async function discoverSigmaOAuthMetadata(
+  apiBaseUrl: string,
+): Promise<SigmaOAuthMetadata> {
+  const baseUrl = normalizeSigmaApiBaseUrl(apiBaseUrl);
+  if (!baseUrl) throw new Error("Choose a supported Sigma API region.");
+  const { response, body } = await fetchBoundedProviderJson(
+    `${baseUrl}/.well-known/oauth-authorization-server`,
+    { headers: { Accept: "application/json" } },
+    "Sigma",
+  );
+  if (!response.ok) {
+    throw new Error(`Sigma OAuth discovery failed (${response.status}).`);
+  }
+  const origin = new URL(baseUrl).origin;
+  const endpoint = (value: unknown): string | null => {
+    if (typeof value !== "string" || !URL.canParse(value)) return null;
+    const url = new URL(value);
+    return url.protocol === "https:" &&
+      url.origin === origin &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+      ? url.href
+      : null;
+  };
+  const issuer = endpoint(body.issuer);
+  const authorizationUrl = endpoint(body.authorization_endpoint);
+  const tokenUrl = endpoint(body.token_endpoint);
+  const registrationUrl = endpoint(body.registration_endpoint);
+  if (
+    !issuer ||
+    new URL(issuer).pathname.replace(/\/$/, "") !== "" ||
+    !authorizationUrl ||
+    !tokenUrl ||
+    !registrationUrl ||
+    !Array.isArray(body.code_challenge_methods_supported) ||
+    !body.code_challenge_methods_supported.includes("S256") ||
+    !Array.isArray(body.grant_types_supported) ||
+    !body.grant_types_supported.includes("authorization_code") ||
+    !body.grant_types_supported.includes("refresh_token") ||
+    !Array.isArray(body.response_types_supported) ||
+    !body.response_types_supported.includes("code") ||
+    !Array.isArray(body.scopes_supported) ||
+    !body.scopes_supported.includes("api:access") ||
+    !Array.isArray(body.token_endpoint_auth_methods_supported) ||
+    !body.token_endpoint_auth_methods_supported.includes("none")
+  ) {
+    throw new Error("Sigma's OAuth server metadata is incomplete or invalid.");
+  }
+  return { authorizationUrl, tokenUrl, registrationUrl };
+}
+
+const sigmaRegistrationPromises = new Map<
+  string,
+  Promise<SigmaOAuthClientRegistration>
+>();
+
+async function loadOrCreateSigmaOAuthClient(input: {
+  owner: string;
+  appId: string;
+  redirectUri: string;
+  apiBaseUrl: string;
+  registrationUrl: string;
+}): Promise<SigmaOAuthClientRegistration> {
+  const registrationUrl = isSigmaOAuthEndpoint(
+    input.registrationUrl,
+    input.apiBaseUrl,
+  )
+    ? input.registrationUrl
+    : null;
+  if (!registrationUrl)
+    throw new Error("Sigma OAuth registration URL is invalid.");
+  const key = crypto
+    .createHash("sha256")
+    .update(
+      `${input.owner.trim().toLowerCase()}:${input.apiBaseUrl}:${input.redirectUri}`,
+    )
+    .digest("hex");
+  const pending = sigmaRegistrationPromises.get(key);
+  if (pending) return pending;
+  const registration = (async () => {
+    const dbExec = getDbExec();
+    if (!dbExec.transaction) {
+      throw new Error(
+        "Sigma OAuth client registration requires database transaction support.",
+      );
+    }
+    return dbExec.transaction(async (tx) =>
+      withDbExec(tx, async () => {
+        await tx.execute({
+          sql: "SELECT pg_advisory_xact_lock(hashtextextended(?, 0::bigint))",
+          args: [
+            `sigma-oauth-client-registrations:${input.owner.trim().toLowerCase()}`,
+          ],
+        });
+        const ref = {
+          key: SIGMA_OAUTH_CLIENTS_SECRET,
+          scope: "user" as const,
+          scopeId: input.owner,
+        };
+        const [secret, secretMeta] = await Promise.all([
+          readAppSecret(ref),
+          readAppSecretMeta(ref),
+        ]);
+        let registrations: Record<string, unknown> = {};
+        let cacheNeedsRepair = false;
+        if (secretMeta && !secret) {
+          // Unreadable registrations cannot be recovered from this blob, so
+          // rebuild it only after Sigma accepts a new registration.
+          cacheNeedsRepair = true;
+        } else if (secret) {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(secret.value);
+          } catch {
+            cacheNeedsRepair = true;
+          }
+          if (
+            !cacheNeedsRepair &&
+            (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+          ) {
+            cacheNeedsRepair = true;
+          }
+          if (!cacheNeedsRepair) {
+            registrations = parsed as Record<string, unknown>;
+          }
+        }
+        const existingValue = cacheNeedsRepair ? undefined : registrations[key];
+        const existing = parseSigmaOAuthClientRegistration(existingValue);
+        if (
+          existing &&
+          (!existing.expiresAt || existing.expiresAt > Date.now())
+        ) {
+          return existing;
+        }
+        const { response, body } = await fetchBoundedProviderJson(
+          registrationUrl,
+          {
+            method: "POST",
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+            },
+            redirect: "error",
+            body: JSON.stringify({
+              client_name: `Agent-Native ${input.appId}`,
+              redirect_uris: [input.redirectUri],
+              grant_types: ["authorization_code", "refresh_token"],
+              response_types: ["code"],
+              token_endpoint_auth_method: "none",
+              scope: "api:access",
+            }),
+          },
+          "Sigma",
+        );
+        const created = parseSigmaOAuthClientRegistration(body);
+        if (!response.ok || !created) {
+          throw new Error(
+            `Sigma OAuth client registration failed (${response.status}).`,
+          );
+        }
+        await writeAppSecret({
+          key: SIGMA_OAUTH_CLIENTS_SECRET,
+          value: JSON.stringify({
+            ...(cacheNeedsRepair ? {} : registrations),
+            [key]: created,
+          }),
+          scope: "user",
+          scopeId: input.owner,
+          description:
+            "Sigma OAuth client registration for Analytics connections.",
+        });
+        return created;
+      }),
+    );
+  })();
+  sigmaRegistrationPromises.set(key, registration);
+  try {
+    return await registration;
+  } finally {
+    sigmaRegistrationPromises.delete(key);
+  }
+}
+
+function parseSigmaOAuthClientRegistration(
+  value: unknown,
+): SigmaOAuthClientRegistration | null {
+  const entry = record(value);
+  const clientId = text(entry?.clientId) ?? text(entry?.client_id);
+  const clientSecret = text(entry?.clientSecret) ?? text(entry?.client_secret);
+  const authMethod =
+    text(entry?.tokenEndpointAuthMethod) ??
+    text(entry?.token_endpoint_auth_method) ??
+    (clientSecret ? "client_secret_basic" : "none");
+  if (
+    !clientId ||
+    (authMethod !== "none" &&
+      authMethod !== "client_secret_basic" &&
+      authMethod !== "client_secret_post") ||
+    (authMethod !== "none" && !clientSecret)
+  ) {
+    return null;
+  }
+  const expiryValue = Number(
+    entry?.expiresAt ?? entry?.client_secret_expires_at,
+  );
+  const expiry =
+    Number.isFinite(expiryValue) && expiryValue > 0 && expiryValue < 1e12
+      ? expiryValue * 1_000
+      : expiryValue;
+  return {
+    clientId,
+    ...(clientSecret ? { clientSecret } : {}),
+    tokenEndpointAuthMethod: authMethod,
+    ...(Number.isFinite(expiry) && expiry > 0 ? { expiresAt: expiry } : {}),
+  };
 }
 
 async function fetchBoundedProviderJson(
@@ -1217,12 +1878,120 @@ async function fetchBoundedProviderJsonValue(
   }
 }
 
-function tokenScopes(
+export function tokenScopes(
   tokens: Record<string, unknown>,
   fallback: readonly string[],
 ): string[] {
   const scope = text(tokens.scope);
-  return scope ? scope.split(/[ ,]+/).filter(Boolean) : [...fallback];
+  if (scope) return scope.split(/[ ,]+/).filter(Boolean);
+  // HubSpot's token endpoint returns the granted scopes as a `scopes` array.
+  if (Array.isArray(tokens.scopes)) {
+    const scopes = tokens.scopes.filter(
+      (value): value is string => typeof value === "string" && value !== "",
+    );
+    if (scopes.length) return scopes;
+  }
+  return [...fallback];
+}
+
+function sharesGoogleTokenRow(provider: WorkspaceConnectionProvider): boolean {
+  return provider.oauth?.provider === "google";
+}
+
+/**
+ * Gmail, Calendar and every other `google` connection for an account share one
+ * token row, so each connect must return the account's whole grant
+ * (include_granted_scopes) or it takes access away from the others. A connection
+ * then records only the scopes its own flow wants, read from Google's token
+ * response: the row holds the whole grant, and an app's scope check must not see
+ * another connection's scopes.
+ */
+function resolveGoogleGrant(
+  tokens: Record<string, unknown>,
+  flow: WorkspaceProviderOAuthFlow,
+  provider: ReturnType<typeof requiredProvider>,
+) {
+  const requested = flow.requestedScopes ?? provider.oauth.scopes;
+  const optional = flow.optionalScopes ?? [];
+  if (tokens.scope !== undefined && typeof tokens.scope !== "string") {
+    throw new Error("Google returned an invalid OAuth scope.");
+  }
+  const explicitScope = typeof tokens.scope === "string";
+  // RFC 6749 permits omission only when the grant matches the request. An
+  // omitted scope does not establish revocation of earlier account grants.
+  const heldScopes = new Set(
+    (explicitScope
+      ? (tokens.scope as string).split(/[ ,]+/)
+      : mergeWorkspaceOAuthValues(
+          ["openid", "email"],
+          mergeWorkspaceOAuthValues(requested, optional),
+        )
+    )
+      .filter(Boolean)
+      .map(normalizeOAuthScope),
+  );
+  const missingScopes = requested.filter((scope) => !heldScopes.has(scope));
+  return {
+    heldScopes,
+    explicitScope,
+    scopes: mergeWorkspaceOAuthValues(requested, optional).filter((scope) =>
+      heldScopes.has(scope),
+    ),
+    missingScopes,
+    missingRequired: missingScopes.some((scope) => !optional.includes(scope)),
+  };
+}
+
+async function dropGoogleScopesTokenLacks(
+  connectionId: string,
+  accountId: string,
+  heldScopes: ReadonlySet<string>,
+): Promise<void> {
+  const connections = await listWorkspaceConnections({ includeDisabled: true });
+  for (const sibling of connections) {
+    if (
+      sibling.id === connectionId ||
+      sibling.accountId !== accountId ||
+      getWorkspaceConnectionProvider(sibling.provider)?.oauth?.provider !==
+        "google"
+    ) {
+      continue;
+    }
+    const scopes = sibling.scopes.filter((scope) =>
+      heldScopes.has(normalizeOAuthScope(scope)),
+    );
+    if (scopes.length === sibling.scopes.length) continue;
+    await upsertWorkspaceConnection({ ...sibling, scopes });
+  }
+}
+
+function isTargetAccountEmail(value: unknown): value is string {
+  return (
+    typeof value === "string" && value.length <= 320 && value.includes("@")
+  );
+}
+
+function parseRequestedWorkspaceOAuthScopes(
+  value: unknown,
+  allowedScopes: readonly string[],
+): string[] | undefined | null {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length > 2_048) return null;
+  const scopes = value.trim().split(/\s+/).filter(Boolean);
+  return isAllowedWorkspaceOAuthScopes(scopes, allowedScopes) ? scopes : null;
+}
+
+function isAllowedWorkspaceOAuthScopes(
+  scopes: readonly unknown[],
+  allowedScopes: readonly string[],
+): scopes is readonly string[] {
+  return (
+    scopes.length > 0 &&
+    scopes.length <= allowedScopes.length &&
+    scopes.every((scope) => typeof scope === "string" && scope.length > 0) &&
+    new Set(scopes).size === scopes.length &&
+    scopes.every((scope) => allowedScopes.includes(scope as string))
+  );
 }
 
 export function mergeWorkspaceOAuthValues(
@@ -1230,6 +1999,14 @@ export function mergeWorkspaceOAuthValues(
   incoming: readonly string[],
 ): string[] {
   return [...new Set([...existing, ...incoming])];
+}
+
+function preserveSigmaWorkspaceOAuthAppAccess(
+  existing: readonly string[] | undefined,
+  appId: string,
+): string[] {
+  if (existing?.length === 0) return [];
+  return mergeWorkspaceOAuthValues(existing ?? [], [appId]);
 }
 
 function clientCredentialKeys(
@@ -1345,16 +2122,38 @@ async function resolveProviderClientCredentials(
   return [clientId, clientSecret];
 }
 
-function flowCookieName(provider: GenericWorkspaceOAuthProvider): string {
+function flowCookieName(
+  provider: GenericWorkspaceOAuthProvider,
+  flowId: string,
+): string {
+  return `an_workspace_oauth_${provider}_${flowId}`;
+}
+
+function legacyFlowCookieName(provider: GenericWorkspaceOAuthProvider): string {
   return `an_workspace_oauth_${provider}`;
 }
 
-function normalizeAppId(value: string): string {
-  const normalized = value.trim().toLowerCase();
-  if (!/^[a-z0-9][a-z0-9_-]{0,99}$/.test(normalized)) {
-    throw new Error("OAuth appId is invalid.");
-  }
-  return normalized;
+function normalizedAppIdOrNull(value: string | undefined): string | null {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && /^[a-z0-9][a-z0-9_-]{0,99}$/.test(normalized)
+    ? normalized
+    : null;
+}
+
+function currentWorkspaceProviderOAuthAppId(): string | null {
+  const app = getAppConfig().app;
+  return normalizedAppIdOrNull(app.workspaceId ?? app.id);
+}
+
+function sigmaOAuthFlowMatchesCurrentApp(
+  flow: WorkspaceProviderOAuthFlow,
+): boolean {
+  const appId = currentWorkspaceProviderOAuthAppId();
+  return Boolean(
+    appId &&
+    flow.scope === "user" &&
+    normalizedAppIdOrNull(flow.appId) === appId,
+  );
 }
 
 function text(value: unknown): string | undefined {
@@ -1397,7 +2196,7 @@ async function requireWorkspaceProviderOAuthAccess(
     })
   | null
 > {
-  const context = await getOrgContext(event).catch(() => null);
+  const context = await getOrgContext(event);
   if (!context || !context.orgId) {
     setResponseStatus(event, 403);
     return null;

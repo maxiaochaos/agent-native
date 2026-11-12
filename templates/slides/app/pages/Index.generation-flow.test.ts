@@ -37,8 +37,10 @@ describe("new deck generation flow", () => {
     expect(source).toContain("<LazyChunkErrorBoundary");
   });
 
-  it("opens the generating editor before persistence and dynamic questions", () => {
-    const persistIndex = flow.indexOf("await ensureDeckPersisted(deck.id)");
+  it("persists prompt context before opening the generating editor", () => {
+    const persistIndex = flow.indexOf(
+      "persisted = await ensureDeckPersisted(deckId)",
+    );
     const openEditorIndex = flow.indexOf(
       "generationSubmitId=${encodeURIComponent(generationSubmitMessageId)}",
     );
@@ -46,7 +48,7 @@ describe("new deck generation flow", () => {
 
     expect(persistIndex).toBeGreaterThan(-1);
     expect(openEditorIndex).toBeGreaterThan(-1);
-    expect(openEditorIndex).toBeLessThan(persistIndex);
+    expect(persistIndex).toBeLessThan(openEditorIndex);
     expect(flow).toContain(
       "generation_attempt_id=${encodeURIComponent(generationAttemptId)}",
     );
@@ -56,8 +58,14 @@ describe("new deck generation flow", () => {
     expect(flow).toContain("recoverFromGenerationSetupFailure");
   });
 
-  it("defers new empty deck persistence until generation setup is ready", () => {
+  it("persists new decks before context setup and preserves source import ordering", () => {
     const createIndex = flow.indexOf("deck = createDeck(undefined, {");
+    const initialContextIndex = flow.indexOf(
+      "generationContext: { ...initialGenerationContext }",
+    );
+    const initialPersistenceIndex = flow.indexOf(
+      "persisted = await ensureDeckPersisted(deckId)",
+    );
     const validationIndex = flow.indexOf("validateUploadedDeckImport(");
     const hydrationIndex = flow.indexOf("await hydrateReferenceDocuments(");
     const contextLoadIndex = flow.indexOf(
@@ -67,12 +75,8 @@ describe("new deck generation flow", () => {
       "await ensureDeckPersisted(deck.id)",
     );
     const sourceImportIndex = flow.indexOf("await importUploadedDeckIntoDeck(");
-    const contextIndex = flow.indexOf(
-      "updateDeck(deckId, { generationContext:",
-    );
-    const latePersistenceIndex = flow.indexOf(
-      "const persisted = await ensureDeckPersisted(deckId)",
-      contextIndex,
+    const finalContextPersistenceIndex = flow.indexOf(
+      "await persistDeckGenerationContext(deckId, generationContext)",
     );
 
     expect(createIndex).toBeGreaterThan(-1);
@@ -82,15 +86,16 @@ describe("new deck generation flow", () => {
     expect(flow.slice(createIndex, createIndex + 260)).toContain(
       "undoableCreation: false",
     );
-    expect(validationIndex).toBeGreaterThan(createIndex);
+    expect(initialContextIndex).toBeGreaterThan(createIndex);
+    expect(initialContextIndex).toBeLessThan(initialPersistenceIndex);
+    expect(initialPersistenceIndex).toBeLessThan(hydrationIndex);
+    expect(validationIndex).toBeGreaterThan(initialPersistenceIndex);
     expect(validationIndex).toBeLessThan(hydrationIndex);
-    expect(contextIndex).toBeGreaterThan(hydrationIndex);
     expect(hydrationIndex).toBeLessThan(sourcePersistenceIndex);
     expect(contextLoadIndex).toBeLessThan(sourcePersistenceIndex);
-    expect(latePersistenceIndex).toBeGreaterThan(contextIndex);
     expect(sourcePersistenceIndex).toBeGreaterThan(-1);
     expect(sourceImportIndex).toBeGreaterThan(sourcePersistenceIndex);
-    expect(sourceImportIndex).toBeLessThan(contextIndex);
+    expect(sourceImportIndex).toBeLessThan(finalContextPersistenceIndex);
     expect(flow).toContain("if (sourceImprovementRequest)");
   });
 
@@ -98,7 +103,7 @@ describe("new deck generation flow", () => {
     expect(source).toContain(
       "retryReferenceSelection?: NewDeckReferenceSelection",
     );
-    expect(source).toContain("retryReferenceSelection: referenceSelection");
+    // oracle-change: retry state stays in memory; Index.home exercises reference recovery.
     expect(source).toContain("setNewDeckRetryRequiresExactPrompt(true)");
     expect(source).toContain(
       "withoutAutomaticReferenceDeck(state.retryReferenceSelection)",
@@ -231,7 +236,7 @@ describe("new deck generation flow", () => {
     expect(source).toContain("PENDING_PROMPT_MODEL_SELECTION_KEY");
     expect(source).toContain("retryContext?: string");
     expect(source).toContain("modelSelection?: DeckModelSelection");
-    expect(flow).toContain("retryContext: additionalContext || undefined");
+    // oracle-change: Index.home exercises hidden context recovery without history serialization.
     expect(flow).toContain("modelSelection,");
     expect(source).toContain("newDeckRetryPrompt");
     expect(source).toContain(
@@ -290,9 +295,7 @@ describe("new deck generation flow", () => {
       "infer a coherent multi-slide outline from the scope",
     );
     expect(flow).toContain("Do not call the legacy generate-slides-ai action");
-    expect(flow).toContain(
-      "Treat each successful write and compact readback as confirmation",
-    );
+    expect(flow).toContain("Treat each successful write as confirmation");
     expect(flow).toContain("deck-level visual contract");
     expect(flow).toContain(
       "Add every generated slide ONE AT A TIME using the `add-slide` action",
@@ -300,11 +303,17 @@ describe("new deck generation flow", () => {
     expect(flow).toContain(
       "Do not use `patch-deck` to append generated slides because `add-slide` records per-slide Creative Context provenance",
     );
-    expect(flow).toContain(
-      "call `get-deck` with its returned slideId and compact=false",
-    );
+    expect(flow).toContain("do not read a slide back to continue");
+    expect(flow).not.toContain("Use create-deck");
     expect(flow).not.toContain("at most three `add-slide` operations");
     expect(flow).toContain("Never issue parallel writes to the same deck");
+  });
+
+  it("keeps slide authoring inside Slides instead of handing decks to Design", () => {
+    expect(flow).toContain("SLIDE_AUTHORING_OWNERSHIP_INSTRUCTION,");
+    expect(generationLibSource).toContain(
+      "Keep deck generation and edits in Slides",
+    );
   });
 
   it("keeps unreferenced decks coherent instead of inventing text-covering boxes", () => {

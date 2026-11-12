@@ -3,13 +3,18 @@ import { describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   discoverAgents: vi.fn(),
   getBuiltinAgents: vi.fn(),
-  getRequestUserEmail: vi.fn(() => "owner@example.test"),
+  getRequestUserEmail: vi.fn<() => string | undefined>(
+    () => "owner@example.test",
+  ),
   resourceGet: vi.fn(),
   resourceListAccessible: vi.fn(async (): Promise<unknown[]> => []),
   parseRemoteAgentManifest: vi.fn(),
   shouldIncludeRemoteAgentManifest: vi.fn(() => true),
   loadWorkspaceAppsManifest: vi.fn(
     async (): Promise<Array<{ id: string }> | null> => null,
+  ),
+  getOrgSetting: vi.fn(
+    async (): Promise<Record<string, unknown> | null> => null,
   ),
 }));
 
@@ -31,7 +36,15 @@ vi.mock("@agent-native/core/resources/store", () => ({
 }));
 
 vi.mock("@agent-native/core/server", () => ({
+  getRequestOrgId: () => "org-1",
   getRequestUserEmail: () => mocks.getRequestUserEmail(),
+}));
+
+vi.mock("@agent-native/core/settings", () => ({
+  getOrgSetting: (...args: unknown[]) => mocks.getOrgSetting(...args),
+  getUserSetting: vi.fn(),
+  putOrgSetting: vi.fn(),
+  putUserSetting: vi.fn(),
 }));
 
 vi.mock("@agent-native/core/server/agent-discovery", () => ({
@@ -79,6 +92,62 @@ describe("list-connected-agents", () => {
       homeUrl: "https://clips.agent-native.com",
       source: "builtin",
     });
+  });
+
+  it("marks hosted apps hidden from launchers when the organization hides them", async () => {
+    const clips = {
+      id: "clips",
+      name: "Clips",
+      description: "",
+      url: "https://clips.agent-native.com",
+      color: "#000000",
+    };
+    const partner = { ...clips, id: "partner", url: "https://p.example.test" };
+    mocks.getBuiltinAgents.mockReturnValue([clips]);
+    mocks.discoverAgents.mockResolvedValue([clips, partner]);
+    mocks.resourceListAccessible.mockImplementation(async () => []);
+    mocks.getOrgSetting.mockResolvedValueOnce({ showHostedApps: false });
+
+    const { default: action } = await import("./list-connected-agents.js");
+    const agents = await action.run({});
+
+    expect(
+      agents.map((agent: { id: string; hiddenFromLaunchers?: boolean }) => [
+        agent.id,
+        agent.hiddenFromLaunchers === true,
+      ]),
+    ).toEqual([
+      ["clips", true],
+      ["partner", false],
+    ]);
+  });
+
+  it("hides hosted apps instead of failing the list when the stored setting is invalid", async () => {
+    const clips = {
+      id: "clips",
+      name: "Clips",
+      description: "",
+      url: "https://clips.agent-native.com",
+      color: "#000000",
+    };
+    const partner = { ...clips, id: "partner", url: "https://p.example.test" };
+    mocks.getBuiltinAgents.mockReturnValue([clips]);
+    mocks.discoverAgents.mockResolvedValue([clips, partner]);
+    mocks.resourceListAccessible.mockImplementation(async () => []);
+    mocks.getOrgSetting.mockResolvedValueOnce({ showHostedApps: "no" });
+
+    const { default: action } = await import("./list-connected-agents.js");
+    const agents = await action.run({});
+
+    expect(
+      agents.map((agent: { id: string; hiddenFromLaunchers?: boolean }) => [
+        agent.id,
+        agent.hiddenFromLaunchers === true,
+      ]),
+    ).toEqual([
+      ["clips", true],
+      ["partner", false],
+    ]);
   });
 
   it("does not surface seeded manifests for built-ins that are not enabled as custom agents", async () => {
@@ -140,5 +209,19 @@ describe("list-connected-agents", () => {
 
     expect(entry).toMatchObject({ id: "mail", source: "workspace" });
     expect(entry).not.toHaveProperty("homeUrl");
+  });
+
+  it("returns a typed authentication error when the session has no user email", async () => {
+    mocks.discoverAgents.mockResolvedValue([]);
+    mocks.getBuiltinAgents.mockReturnValue([]);
+    mocks.loadWorkspaceAppsManifest.mockResolvedValue(null);
+    mocks.getRequestUserEmail.mockReturnValueOnce(undefined);
+
+    const { default: action } = await import("./list-connected-agents.js");
+
+    await expect(action.run({})).rejects.toMatchObject({
+      statusCode: 401,
+      errorCode: "dispatch_user_identity_missing",
+    });
   });
 });

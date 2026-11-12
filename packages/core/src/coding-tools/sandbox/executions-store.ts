@@ -46,7 +46,8 @@ import {
   ensureIndexExists,
   ensureTableExists,
 } from "../../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../../db/request-pool-context.js";
+import { defineStore } from "../../db/store-registry.js";
+import { isOrgMember } from "../../org/membership.js";
 
 export type SandboxExecutionStatus =
   | "queued"
@@ -111,26 +112,13 @@ export const SANDBOX_EXECUTION_MAX_STORED_OUTPUT_CHARS = 200_000;
 
 const TABLE = "sandbox_executions";
 
-let _initPromise: Promise<void> | undefined;
-
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    _initPromise = retainRequestDbPoolScope(
-      _doEnsureTable().catch((err) => {
-        _initPromise = undefined;
-        throw err;
-      }),
-    );
-  }
-  return _initPromise;
-}
-
-export function resetSandboxExecutionsStoreForTests(): void {
-  _initPromise = undefined;
-}
-
-async function _doEnsureTable(): Promise<void> {
-  const createSql = `
+export const sandboxExecutionsStore = defineStore({
+  id: "sandbox_executions",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const createSql = `
     CREATE TABLE IF NOT EXISTS ${TABLE} (
       id TEXT PRIMARY KEY,
       owner TEXT NOT NULL,
@@ -160,28 +148,37 @@ async function _doEnsureTable(): Promise<void> {
       updated_at BIGINT NOT NULL
     )
   `;
-  const ownerIdxSql = `CREATE INDEX IF NOT EXISTS sandbox_executions_owner_created_idx ON ${TABLE} (owner, created_at)`;
-  const dueIdxSql = `CREATE INDEX IF NOT EXISTS sandbox_executions_due_idx ON ${TABLE} (status, lease_expires_at)`;
+        const ownerIdxSql = `CREATE INDEX IF NOT EXISTS sandbox_executions_owner_created_idx ON ${TABLE} (owner, created_at)`;
+        const dueIdxSql = `CREATE INDEX IF NOT EXISTS sandbox_executions_due_idx ON ${TABLE} (status, lease_expires_at)`;
 
-  {
-    await ensureTableExists(TABLE, createSql);
-    const pgColumns: Array<[string, string]> = [
-      ["bridge_tools_used", "TEXT"],
-      ["allowed_action_names", "TEXT"],
-    ];
-    for (const [col, def] of pgColumns) {
-      await ensureColumnExists(
-        TABLE,
-        col,
-        `ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS ${col} ${def}`,
-      );
-    }
-    await ensureIndexExists(
-      "sandbox_executions_owner_created_idx",
-      ownerIdxSql,
-    );
-    await ensureIndexExists("sandbox_executions_due_idx", dueIdxSql);
-  }
+        await ensureTableExists(TABLE, createSql);
+        const pgColumns: Array<[string, string]> = [
+          ["bridge_tools_used", "TEXT"],
+          ["allowed_action_names", "TEXT"],
+        ];
+        for (const [col, def] of pgColumns) {
+          await ensureColumnExists(
+            TABLE,
+            col,
+            `ALTER TABLE ${TABLE} ADD COLUMN IF NOT EXISTS ${col} ${def}`,
+          );
+        }
+        await ensureIndexExists(
+          "sandbox_executions_owner_created_idx",
+          ownerIdxSql,
+        );
+        await ensureIndexExists("sandbox_executions_due_idx", dueIdxSql);
+      },
+    },
+  ],
+});
+
+export function ensureTable(): Promise<void> {
+  return sandboxExecutionsStore.ready();
+}
+
+export function resetSandboxExecutionsStoreForTests(): void {
+  sandboxExecutionsStore.reset();
 }
 
 function capOutput(
@@ -325,15 +322,23 @@ export async function createSandboxExecution(
 export async function getSandboxExecutionForOwner(
   id: string,
   owner: string,
+  orgId: string | null,
 ): Promise<SandboxExecutionRow | null> {
   if (!id || !owner) return null;
   await ensureTable();
   const client = getDbExec();
   const result = await client.execute({
-    sql: `SELECT * FROM ${TABLE} WHERE id = ? AND owner = ? LIMIT 1`,
-    args: [id, owner],
+    sql: "SELECT * FROM sandbox_executions WHERE id = ? AND owner = ? AND org_id IS NOT DISTINCT FROM ? LIMIT 1",
+    args: [id, owner, orgId],
   });
   const raw = result.rows?.[0] as Record<string, unknown> | undefined;
+  if (
+    raw &&
+    orgId &&
+    !(await isOrgMember(orgId, owner, { requireOrganizationMetadata: true }))
+  ) {
+    return null;
+  }
   return raw ? rowFromDb(raw) : null;
 }
 

@@ -9,6 +9,10 @@ import {
   isBuilderCreditsExhaustedMessage,
 } from "@shared/builder-credits";
 import {
+  formatSrt,
+  IMPORTED_TRANSCRIPT_SOURCE,
+} from "@shared/transcript-import";
+import {
   IconSearch,
   IconCopy,
   IconDownload,
@@ -17,11 +21,13 @@ import {
   IconLoader2,
   IconBolt,
   IconRefresh,
+  IconAlertTriangle,
 } from "@tabler/icons-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 
 import { useAiSetupHref } from "@/components/settings/settings-links";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Empty, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Input } from "@/components/ui/input";
@@ -34,6 +40,15 @@ import { isExcluded, parseEdits } from "@/lib/timestamp-mapping";
 import { cn } from "@/lib/utils";
 
 import { TranscriptSegmentRow } from "../transcript/transcript-segment-row";
+import {
+  TranscriptHistoryButton,
+  type TranscriptVersion,
+} from "./transcript-history-button";
+import {
+  TranscriptImportButton,
+  type TranscriptImportRequest,
+  type TranscriptReplacement,
+} from "./transcript-import-button";
 
 export interface TranscriptSegment {
   startMs: number;
@@ -52,11 +67,21 @@ export interface TranscriptPanelProps {
   onSeek: (ms: number) => void;
   status?: "pending" | "ready" | "failed";
   failureReason?: string | null;
+  /** Saved lines that can't be read, which isn't having no transcript. */
+  unreadable?: boolean;
   recordingTitle?: string;
   audience?: "creator" | "viewer";
   onRetry?: () => void;
   onRegenerate?: () => void;
   isRegenerating?: boolean;
+  transcriptSource?: string | null;
+  transcriptImportId?: string | null;
+  onImportTranscript?: (request: TranscriptImportRequest) => Promise<unknown>;
+  isImporting?: boolean;
+  /** Listed only to editors; absent for viewers. */
+  transcriptVersions?: TranscriptVersion[];
+  onRestoreTranscript?: (versionId: string) => Promise<boolean>;
+  restoringVersionId?: string | null;
 }
 
 const DISPLAY_MAX_WORDS = 36;
@@ -151,14 +176,24 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
     onSeek,
     status,
     failureReason,
+    unreadable = false,
     recordingTitle,
     audience = "creator",
     onRetry,
     onRegenerate,
     isRegenerating = false,
+    transcriptSource,
+    transcriptImportId = null,
+    onImportTranscript,
+    isImporting = false,
+    transcriptVersions = [],
+    onRestoreTranscript,
+    restoringVersionId = null,
   } = props;
   const [query, setQuery] = useState("");
   const [copied, setCopied] = useState(false);
+  const [importReplacement, setImportReplacement] =
+    useState<TranscriptReplacement | null>(null);
   const visibleSegments = useMemo(() => {
     const edits = parseEdits(editsJson);
     return segments.filter((segment) => !isExcluded(segment.startMs, edits));
@@ -219,7 +254,7 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
   }
 
   function downloadSrt() {
-    const srt = toSrt(
+    const srt = formatSrt(
       visibleSegments.length > 0 ? visibleSegments : displaySegments,
     );
     const blob = new Blob([srt], { type: "text/srt;charset=utf-8" });
@@ -231,6 +266,50 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
     URL.revokeObjectURL(url);
   }
 
+  const hasReadyTranscript =
+    status === "ready" && (segments.length > 0 || Boolean(fullText?.trim()));
+  const importButton = (variant: "icon" | "button") =>
+    onImportTranscript ? (
+      <TranscriptImportButton
+        variant={variant}
+        durationMs={durationMs}
+        hasReadyTranscript={hasReadyTranscript}
+        readyImportId={transcriptImportId}
+        isImporting={isImporting}
+        onImport={onImportTranscript}
+        replacement={importReplacement}
+        onReplacementChange={setImportReplacement}
+      />
+    ) : null;
+  const historyButton = (variant: "icon" | "button") =>
+    onRestoreTranscript && transcriptVersions.length > 0 ? (
+      <TranscriptHistoryButton
+        variant={variant}
+        versions={transcriptVersions}
+        restoringVersionId={restoringVersionId}
+        onRestore={onRestoreTranscript}
+      />
+    ) : null;
+  const withImport = (content: ReactNode) => {
+    const importAction = importButton("button");
+    const historyAction = historyButton("button");
+    return importAction || historyAction ? (
+      <div>
+        {content}
+        <div className="flex flex-wrap items-center gap-2 px-4 pb-4">
+          {importAction}
+          {historyAction}
+        </div>
+      </div>
+    ) : (
+      content
+    );
+  };
+
+  const partialTranscript =
+    status === "failed" &&
+    (segments.some((segment) => segment.text.trim()) ||
+      Boolean(fullText?.trim()));
   const noSpeechFailure = isNoSpeechTranscriptFailure(failureReason);
   const builderCreditsPaused = isBuilderCreditsExhaustedMessage(failureReason);
   const needsSetup =
@@ -238,7 +317,7 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
     !builderCreditsPaused &&
     isTranscriptionSetupNeeded(failureReason);
 
-  if (status === "failed" && audience === "viewer") {
+  if (status === "failed" && !partialTranscript && audience === "viewer") {
     return (
       <div className="p-4">
         <p className="text-sm text-muted-foreground">
@@ -248,22 +327,22 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
     );
   }
 
-  if (status === "failed" && builderCreditsPaused) {
-    return (
+  if (status === "failed" && !partialTranscript && builderCreditsPaused) {
+    return withImport(
       <div className="p-4">
         <BuilderCreditsPausedNotice onRetry={onRetry} />
-      </div>
+      </div>,
     );
   }
 
-  if (status === "failed" && needsSetup) {
-    return (
-      <TranscriptSetupCard failureReason={failureReason} onRetry={onRetry} />
+  if (status === "failed" && !partialTranscript && needsSetup) {
+    return withImport(
+      <TranscriptSetupCard failureReason={failureReason} onRetry={onRetry} />,
     );
   }
 
   if (status === "pending") {
-    return (
+    return withImport(
       <div className="p-4 text-sm text-muted-foreground flex items-start gap-2">
         <IconLoader2 className="h-4 w-4 animate-spin mt-0.5 shrink-0" />
         <div>
@@ -272,12 +351,12 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
             {t("transcriptPanel.pendingDescription")}
           </p>
         </div>
-      </div>
+      </div>,
     );
   }
 
-  if (status === "failed" && noSpeechFailure) {
-    return (
+  if (status === "failed" && !partialTranscript && noSpeechFailure) {
+    return withImport(
       <div className="p-4 space-y-3">
         <div>
           <p className="text-sm font-medium">
@@ -302,12 +381,12 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
               : t("transcriptPanel.regenerate")}
           </Button>
         ) : null}
-      </div>
+      </div>,
     );
   }
 
-  if (status === "failed") {
-    return (
+  if (status === "failed" && !partialTranscript) {
+    return withImport(
       <div className="p-4 space-y-3">
         <div className="text-sm text-destructive">
           {t("transcriptPanel.transcriptUnavailable", {
@@ -331,6 +410,57 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
             </Button>
           ) : null}
         </div>
+      </div>,
+    );
+  }
+
+  // With no lines to show, search, copy and download have nothing to act on,
+  // so this renders like the failed states above, without the toolbar.
+  if (unreadable && displaySegments.length === 0 && audience === "viewer") {
+    return (
+      <div className="p-4">
+        <p className="text-sm text-muted-foreground">
+          {t("transcriptBubbles.unreadable")}
+        </p>
+      </div>
+    );
+  }
+
+  if (unreadable && displaySegments.length === 0) {
+    const importAction = importButton("button");
+    const historyAction = historyButton("button");
+    return (
+      <div className="p-4 space-y-3">
+        <div>
+          <p className="text-sm font-medium">
+            {t("transcriptBubbles.unreadable")}
+          </p>
+          {onRegenerate ? (
+            <p className="mt-1 text-sm text-muted-foreground">
+              {t("transcriptPanel.unreadableDescription")}
+            </p>
+          ) : null}
+        </div>
+        {onRegenerate || importAction || historyAction ? (
+          <div className="flex flex-wrap items-center gap-2">
+            {onRegenerate ? (
+              <Button
+                size="sm"
+                onClick={onRegenerate}
+                disabled={isRegenerating}
+              >
+                {isRegenerating ? (
+                  <IconLoader2 className="size-4 animate-spin" />
+                ) : null}
+                {isRegenerating
+                  ? t("transcriptPanel.transcribing")
+                  : t("transcriptPanel.regenerate")}
+              </Button>
+            ) : null}
+            {importAction}
+            {historyAction}
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -349,6 +479,11 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
             className="pl-8 text-xs"
           />
         </div>
+        {transcriptSource === IMPORTED_TRANSCRIPT_SOURCE ? (
+          <Badge variant="secondary" className="shrink-0 font-medium">
+            {t("transcriptImport.imported")}
+          </Badge>
+        ) : null}
         <div className="flex items-center gap-0.5">
           <Tooltip>
             <TooltipTrigger asChild>
@@ -382,6 +517,8 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
             </TooltipTrigger>
             <TooltipContent>{t("transcriptPanel.downloadSrt")}</TooltipContent>
           </Tooltip>
+          {importButton("icon")}
+          {historyButton("icon")}
           {onRegenerate ? (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -403,6 +540,37 @@ export function TranscriptPanel(props: TranscriptPanelProps) {
         </div>
       </div>
 
+      {partialTranscript && audience !== "viewer" && builderCreditsPaused ? (
+        <div className="border-b border-border p-3">
+          <BuilderCreditsPausedNotice {...(onRetry ? { onRetry } : {})} />
+        </div>
+      ) : null}
+      {partialTranscript && audience !== "viewer" && needsSetup ? (
+        <div className="border-b border-border">
+          <TranscriptSetupCard
+            {...(failureReason !== undefined ? { failureReason } : {})}
+            {...(onRetry ? { onRetry } : {})}
+          />
+        </div>
+      ) : null}
+      {partialTranscript ? (
+        <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-xs text-muted-foreground">
+          <IconAlertTriangle className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">
+            {t("transcriptPanel.partialTranscript")}
+          </span>
+          {onRetry ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onRetry}
+              disabled={isRegenerating}
+            >
+              {t("transcriptPanel.regenerate")}
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       <div className="flex-1 overflow-y-auto px-3">
         {filtered.length === 0 ? (
           <Empty className="min-h-full gap-2 rounded-none p-4 md:p-6">
@@ -486,24 +654,6 @@ function highlight(text: string, q: string): string {
     (match) =>
       `<mark class="rounded bg-primary/15 px-0.5 text-foreground">${match}</mark>`,
   );
-}
-
-function msToSrtTime(ms: number): string {
-  const h = String(Math.floor(ms / 3600000)).padStart(2, "0");
-  const m = String(Math.floor((ms % 3600000) / 60000)).padStart(2, "0");
-  const s = String(Math.floor((ms % 60000) / 1000)).padStart(2, "0");
-  const millis = String(ms % 1000).padStart(3, "0");
-  return `${h}:${m}:${s},${millis}`;
-}
-
-function toSrt(segments: TranscriptSegment[]): string {
-  return segments
-    .map((seg, i) => {
-      return `${i + 1}\n${msToSrtTime(seg.startMs)} --> ${msToSrtTime(
-        seg.endMs,
-      )}\n${seg.text}\n`;
-    })
-    .join("\n");
 }
 
 function sanitizeFilename(s: string): string {

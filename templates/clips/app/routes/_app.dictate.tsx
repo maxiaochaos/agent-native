@@ -5,7 +5,8 @@ import {
 } from "@agent-native/core/client/hooks";
 import { useFormatters, useT } from "@agent-native/core/client/i18n";
 import { useLabState } from "@agent-native/core/client/labs";
-import { CLIPS_WISPRFLOW } from "@shared/labs";
+import { reportWriteFailure } from "@agent-native/core/client/write-failure";
+import { CLIPS_VOICE_DICTATION } from "@shared/labs";
 import {
   IconChevronDown,
   IconChevronRight,
@@ -570,8 +571,8 @@ function DictationCard({
             queryKey: ["action", "list-dictations"],
           });
         },
-        onError: () => {
-          toast.error(t("dictateRoute.deleteFailed"));
+        onError: (error) => {
+          reportWriteFailure(error, { label: t("dictateRoute.deleteFailed") });
         },
       },
     );
@@ -782,7 +783,7 @@ function DictationEmptyState({
 }
 
 export default function DictateRoute() {
-  const lab = useLabState(CLIPS_WISPRFLOW.key);
+  const lab = useLabState(CLIPS_VOICE_DICTATION.key);
   const t = useT();
   const [searchParams] = useSearchParams();
   const selectedDictationId = searchParams.get("dictationId");
@@ -858,9 +859,6 @@ export default function DictateRoute() {
           void qc.invalidateQueries({
             queryKey: ["action", "list-dictations"],
           });
-        },
-        onError: (err: Error) => {
-          toast.error(err.message || "Couldn't save dictation");
         },
         onSettled: () => {
           finishingRef.current = false;
@@ -1009,7 +1007,7 @@ export default function DictateRoute() {
           <PageBreadcrumb items={[{ label: t("navigation.dictate") }]} />
         </div>
         <div className="ms-auto flex shrink-0 items-center gap-2">
-          <VocabularyManager />
+          <VocabularyManager disabled={listening} />
           {(dictations.length > 0 || hasCaptureActivity) && (
             <PageHeaderPrimaryAction
               type="button"

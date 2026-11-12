@@ -20,6 +20,15 @@ import {
   docSourceSlugFromFilename,
   preferMdxDocSourceFiles,
 } from "../lib/docs-source";
+import {
+  ARTICLES_BASE,
+  ARTICLES_PAGE_SIZE,
+  USE_CASES_BASE,
+  articleMarkdown,
+  translatedArticleLocales,
+  type SiteContent,
+} from "../lib/site-content";
+import { loadSiteContentFromDisk } from "../lib/site-content-node";
 import { communityApps } from "./components/community-apps";
 import {
   DOCS_LOCALES,
@@ -184,6 +193,103 @@ export function buildAgentWebPages(rootDir: string): AgentWebPage[] {
     .map(({ docSlug: _docSlug, draft: _draft, ...page }) => page);
 }
 
+export function buildSiteContentPages(content: SiteContent): AgentWebPage[] {
+  const { useCases, articles } = content;
+  const latestDate = (dates: string[]): Date | undefined => {
+    const latest = dates.sort().at(-1);
+    return latest ? new Date(`${latest}T00:00:00Z`) : undefined;
+  };
+  // A language's grid lists every article, translated where it can be.
+  const articleIndex = (locale: string): AgentWebPage[] => {
+    const base = sitePathForLocale(ARTICLES_BASE, locale);
+    const cards = articles.map((entry) => {
+      const translation = entry.translations[locale];
+      return {
+        title: (translation ?? entry).title,
+        updated: (translation ?? entry).updated,
+        path: sitePathForLocale(
+          `${ARTICLES_BASE}/${entry.slug}/`,
+          translation ? locale : DEFAULT_LOCALE,
+        ),
+      };
+    });
+    const lastmod = latestDate(cards.map((card) => card.updated));
+    return Array.from(
+      { length: Math.max(1, Math.ceil(cards.length / ARTICLES_PAGE_SIZE)) },
+      (_, index) => ({
+        path: index === 0 ? base : `${base}page/${index + 1}/`,
+        title: "Articles",
+        markdown: `# Articles\n\n${cards
+          .slice(index * ARTICLES_PAGE_SIZE, (index + 1) * ARTICLES_PAGE_SIZE)
+          .map((card) => `- [${card.title}](${card.path})`)
+          .join("\n")}\n`,
+        ...(lastmod ? { lastmod } : {}),
+      }),
+    );
+  };
+  const useCasesUpdated = latestDate(useCases.map((item) => item.updated));
+  const pages: AgentWebPage[] = [
+    {
+      path: `${USE_CASES_BASE}/`,
+      title: "Use cases",
+      markdown: `# Use cases\n\n${useCases.map((item) => `- [${item.title}](${USE_CASES_BASE}/${item.slug}/)`).join("\n")}\n`,
+      ...(useCasesUpdated ? { lastmod: useCasesUpdated } : {}),
+    },
+    ...useCases
+      .flatMap((entry) => [
+        { page: entry, locale: DEFAULT_LOCALE },
+        ...Object.entries(entry.translations).flatMap(([locale, page]) =>
+          page ? [{ page, locale }] : [],
+        ),
+      ])
+      .map(({ page, locale }) => ({
+        path: sitePathForLocale(`${USE_CASES_BASE}/${page.slug}/`, locale),
+        title: page.seo_title,
+        description: page.meta_description,
+        lastmod: new Date(`${page.updated}T00:00:00Z`),
+        markdown:
+          [
+            `# ${page.title}`,
+            page.hero.body,
+            `## ${page.how_to.heading}`,
+            ...page.how_to.steps.map(
+              (step, index) => `${index + 1}. **${step.title}.** ${step.body}`,
+            ),
+            `## ${page.features.heading}`,
+            ...page.features.items.map(
+              (item) => `- **${item.title}.** ${item.body}`,
+            ),
+            `## ${page.integrations.heading}`,
+            ...page.integrations.cards.map(
+              (card) =>
+                `- **${card.title}** (${card.logos.map((logo) => logo.name).join(", ")}). ${card.body}`,
+            ),
+            `## ${page.faqs.heading}`,
+            ...page.faqs.items.flatMap((faq) => [`### ${faq.q}`, faq.a]),
+          ].join("\n\n") + "\n",
+      })),
+    ...[DEFAULT_LOCALE, ...translatedArticleLocales(articles)].flatMap(
+      articleIndex,
+    ),
+    ...articles
+      .flatMap((entry) => [
+        { article: entry, locale: DEFAULT_LOCALE },
+        ...Object.entries(entry.translations).flatMap(([locale, article]) =>
+          article ? [{ article, locale }] : [],
+        ),
+      ])
+      .map(({ article, locale }) => ({
+        path: sitePathForLocale(`${ARTICLES_BASE}/${article.slug}/`, locale),
+        title: article.title,
+        description: article.meta_description,
+        lastmod: new Date(`${article.updated}T00:00:00Z`),
+        markdown: articleMarkdown(article),
+        markdownPath: `${sitePathForLocale(ARTICLES_BASE, locale)}${article.slug}.md`,
+      })),
+  ];
+  return pages;
+}
+
 type DocsSitePage = AgentWebPage & { docSlug?: string; draft?: boolean };
 
 function buildDocsSitePages(rootDir: string): DocsSitePage[] {
@@ -212,7 +318,7 @@ function buildDocsSitePages(rootDir: string): DocsSitePage[] {
     return {
       path: docsPathForSlug(slug),
       title: data.title || titleFromSlug(slug),
-      description: data.description,
+      ...(data.description ? { description: data.description } : {}),
       markdown: localizeDocsMarkdownLinks(
         docsBodyToMarkdownMirror(body),
         DEFAULT_LOCALE,
@@ -245,7 +351,7 @@ function buildDocsSitePages(rootDir: string): DocsSitePage[] {
             return {
               path: docsPathForSlug(slug, locale as DocsLocale),
               title: data.title || titleFromSlug(slug),
-              description: data.description,
+              ...(data.description ? { description: data.description } : {}),
               markdown: localizeDocsMarkdownLinks(
                 docsBodyToMarkdownMirror(body),
                 locale as DocsLocale,
@@ -487,6 +593,7 @@ Agent-Native is an open source framework for building apps where AI agents and U
         "# Agent Skills\n\nInstall app-backed skills your coding agent runs as slash commands. `/visual-plan` opens structured visual plans before you build; `/visual-recap` turns a PR diff into a high-altitude review. Install with `npx @agent-native/core@latest skills add visual-plan`.\n",
       lastmod: gitLastmod(path.resolve(rootDir, "app/routes/skills.tsx")),
     },
+    ...buildSiteContentPages(loadSiteContentFromDisk(rootDir)),
     ...docsPages,
     ...localizedDocsPages,
     ...templatePages,

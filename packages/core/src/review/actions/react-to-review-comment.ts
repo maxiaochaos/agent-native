@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { defineAction, fail } from "../../action.js";
-import { assertReviewableResourceAccess } from "../registry.js";
+import { assertReviewCommentAccess } from "../registry.js";
 import { getReviewCommentById, setReviewCommentReaction } from "../store.js";
 
 export default defineAction({
@@ -13,12 +13,16 @@ export default defineAction({
     reaction: z.string().trim().min(1).max(32),
     active: z.boolean(),
   }),
+  mcpAnnotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
   run: async (args, ctx) => {
-    await assertReviewableResourceAccess(
+    await assertReviewCommentAccess(
       args.resourceType,
       args.resourceId,
       ctx as any,
-      "commenter",
     );
     const comment = await getReviewCommentById(
       args.commentId,

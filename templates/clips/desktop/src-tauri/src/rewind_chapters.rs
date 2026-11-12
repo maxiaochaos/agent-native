@@ -1,4 +1,3 @@
-
 #[cfg(test)]
 use crate::config::RewindCaptureMode;
 use crate::screen_memory::{ScreenMemoryEvent, ScreenMemorySegmentMetadata};
@@ -9,7 +8,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-const CHAPTERS_FILE: &str = "chapters.json";
+pub(crate) const CHAPTERS_FILE: &str = "chapters.json";
 const HARD_GAP_MS: i64 = 1_500;
 const SCENE_SLICE_MS: i64 = 30_000;
 const MAX_CHAPTER_SPAN_MS: i64 = 60 * 60 * 1_000;
@@ -213,15 +212,6 @@ pub(crate) fn rebuild(
     let bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| format!("chapter manifest encode failed: {e}"))?;
     write_atomic(&dir.join(CHAPTERS_FILE), &bytes)
-}
-
-pub(crate) fn clear(dir: &Path) -> Result<(), String> {
-    let path = dir.join(CHAPTERS_FILE);
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("chapter manifest remove failed: {e}")),
-    }
 }
 
 fn build(

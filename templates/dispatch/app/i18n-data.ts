@@ -5,6 +5,8 @@ import zhTW from "./i18n/zh-TW";
 
 const enUS = {
   root: {
+    builderWorkspaceNotice: "Builder team apps are in the Builder workspace.",
+    openBuilderWorkspace: "Open Builder workspace",
     commandActions: "Actions",
     commandSearch: "Search",
     commandAppearance: "Appearance",
@@ -312,6 +314,10 @@ const enUS = {
     },
   },
   dispatch: {
+    sidebar: {
+      showLocalChats: "Show local chats",
+      showAllChats: "Show all chats",
+    },
     nav: {
       admin: "Admin",
       automations: "Automations",
@@ -324,6 +330,9 @@ const enUS = {
       agent: "Agent",
     },
     pages: {
+      chatFirstCopySessionId: "Copy session ID",
+      chatFirstSessionIdCopied: "Session ID copied",
+      chatFirstWatchSession: "Watch",
       adminDescription: "Workspace controls and operations",
       simpleAgentsDescription:
         "Create reusable agents in minutes, or import a setup you already made in Claude or another agent tool.",
@@ -351,6 +360,10 @@ const enUS = {
       dataLoadFailed: "Couldn't load data",
       dataLoadFailedDescription: "Dispatch couldn't load this data.",
       appAdoption: "App adoption",
+      appProfileWhenToUse: "When to use",
+      appProfileWhenToUsePlaceholder: "One example request per line",
+      appProfileWhenToUseHint:
+        "Add up to 6 examples, with no more than 140 characters each.",
       appAdoptionFor: "{{name}} adoption",
       yourAppActivity: "Your app activity",
       appAdoptionDefinition:
@@ -452,7 +465,6 @@ const enUS = {
       threadDebugNoThreads: "No threads found.",
       threadDebugSelectPrompt: "Select a failed run or thread to inspect.",
       chatFirstWorkspaceApps: "Workspace apps",
-      chatFirstNewApp: "New",
       chatFirstOpenInNewTab: "Open in new tab",
       chatFirstDefaultDescriptionCalendar:
         "Agent-Native Google Calendar — manage events, sync, and public booking",
@@ -469,6 +481,25 @@ const enUS = {
       clearAppSearch: "Clear search",
       noAppsMatch: "No apps match your search",
       connectApps: "Connect apps",
+      communityApps: "Community apps",
+      communityAppsEmpty: "No reviewed community apps are available yet.",
+      communityAppsWorkspaceRequired:
+        "Connect this organization to a workspace to install this app.",
+      communityAppsBuilderInstallUnavailable:
+        "Builder workspace installs are disabled until generated files can be verified.",
+      communityAppsIdConflict:
+        "This app ID is already in use, so this app cannot be installed.",
+      communityAppsLicense: "License",
+      communityAppsTemplateSource: "View template source",
+      communityAppsInstall: "Install",
+      communityAppsInstalling: "Starting…",
+      communityAppsInstalled: "Installed",
+      communityAppsPending: "Installation in progress",
+      communityAppsInstallStarted: "Community app installation started.",
+      communityAppsAlreadyInstalled: "This community app is already installed.",
+      communityAppsLocalRequestReady:
+        "The community app request is ready for the local agent.",
+      communityAppsInstallFailed: "Could not install this community app.",
       availableApps: "Available apps",
       connectApp: "Connect",
       openApp: "Open",
@@ -485,20 +516,30 @@ const enUS = {
         "This app has not opted into one-click identity connect yet.",
       connectAppsPrivacy:
         "No shared cookie or app secret is used. The identity hub sends a signed, one-time handoff.",
-      pinApp: "Pin this app",
-      unpinApp: "Unpin this app",
+      pinApp: "Pin {{name}}",
+      unpinApp: "Unpin {{name}}",
+      hostedApps: "Agent-Native.com hosted apps",
+      pinnedApps: "Pinned apps",
+      workspaceApps: "Workspace apps",
+      newApp: "New app",
+      viewAllApps: "View all",
+      manageHostedApps: "Manage",
+      manageHostedAppsAdminOnly:
+        "Only organization admins can change Agent-Native.com hosted apps.",
+      showHostedApps: "Show Agent-Native.com hosted apps",
+      hostedAppsSaveFailed:
+        "The Agent-Native.com hosted apps setting could not be saved.",
+      hostedAppsSettingInvalid:
+        "The stored Agent-Native.com hosted apps setting is invalid. Saving a value replaces it.",
       appPinSaveFailed: "App pins could not be saved.",
-      appPinSavedLocally: "App pins are saved on this device only.",
+      appPinSavedToWorkspaceOnly:
+        "App pins are saved to your workspace but not on this device.",
       chatFirstCreateWorkspaceApp: "Create workspace app",
       chatFirstOpenApp: "Open {{name}}",
       chatFirstAppsLoadError: "Workspace apps could not be loaded",
       chatFirstNoWorkspaceApps: "No workspace apps yet.",
       chatFirstCreateApp: "Create app",
       chatFirstRetry: "Retry",
-      chatFirstUnpinApp: "Unpin this app",
-      chatFirstPinApp: "Pin this app",
-      chatFirstRemovePinned: "Remove from pinned apps",
-      chatFirstPinTop: "Pin app to the top",
       chatFirstOpenSideSurfaces: "Open side surfaces",
       chatFirstCloseTab: "Close {{name}}",
       chatFirstClose: "Close",
@@ -572,6 +613,7 @@ type PartialMessages = {
       } & Record<string, unknown>
     : K extends "dispatch"
       ? {
+          sidebar?: Partial<Messages["dispatch"]["sidebar"]>;
           nav?: Partial<Messages["dispatch"]["nav"]> & Record<string, unknown>;
           pages?: Partial<Messages["dispatch"]["pages"]> &
             Record<string, unknown>;
@@ -900,9 +942,277 @@ const integrationGroupOverrides: Record<
   },
 };
 
+const appProfilePageTranslations: Record<
+  LocaleCode,
+  Partial<Messages["dispatch"]["pages"]>
+> = {
+  "en-US": {},
+  "zh-CN": {
+    appProfileWhenToUse: "适用场景",
+    appProfileWhenToUsePlaceholder: "每行填写一个示例请求",
+    appProfileWhenToUseHint: "最多 6 个示例，每个不超过 140 个字符。",
+    communityApps: "社区应用",
+    communityAppsEmpty: "暂无经过审核的社区应用。",
+    communityAppsWorkspaceRequired: "请将此组织连接到工作区，以安装此应用。",
+    communityAppsBuilderInstallUnavailable:
+      "在生成的文件可供验证之前，Builder 工作区中的社区应用安装已停用。",
+    communityAppsIdConflict: "此应用 ID 已被占用，无法安装此应用。",
+    communityAppsLicense: "许可证",
+    communityAppsTemplateSource: "查看範本來源",
+    communityAppsInstall: "安装",
+    communityAppsInstalling: "正在启动…",
+    communityAppsInstalled: "已安装",
+    communityAppsPending: "正在安装",
+    communityAppsInstallStarted: "已开始安装社区应用。",
+    communityAppsAlreadyInstalled: "此社区应用已安装。",
+    communityAppsLocalRequestReady:
+      "社区应用安装请求已准备好，等待本地代理处理。",
+    communityAppsInstallFailed: "无法安装此社区应用。",
+  },
+  "zh-TW": {
+    appProfileWhenToUse: "何時使用",
+    appProfileWhenToUsePlaceholder: "每行填寫一個範例請求",
+    appProfileWhenToUseHint: "最多新增 6 個範例，每個不超過 140 個字元。",
+    communityApps: "社群應用程式",
+    communityAppsEmpty: "目前沒有可用的已審核社群應用程式。",
+    communityAppsWorkspaceRequired:
+      "請將此組織連結至工作區，以安裝此應用程式。",
+    communityAppsBuilderInstallUnavailable:
+      "在生成檔案可供驗證之前，Builder 工作區中的社群應用程式安裝已停用。",
+    communityAppsIdConflict: "此應用程式 ID 已被使用，因此無法安裝。",
+    communityAppsLicense: "授權條款",
+    communityAppsTemplateSource: "查看範本來源",
+    communityAppsInstall: "安裝",
+    communityAppsInstalling: "正在啟動…",
+    communityAppsInstalled: "已安裝",
+    communityAppsPending: "安裝進行中",
+    communityAppsInstallStarted: "已開始安裝社群應用程式。",
+    communityAppsAlreadyInstalled: "此社群應用程式已安裝。",
+    communityAppsLocalRequestReady:
+      "社群應用程式安裝請求已準備好，等待本機代理處理。",
+    communityAppsInstallFailed: "無法安裝此社群應用程式。",
+  },
+  "es-ES": {
+    appProfileWhenToUse: "Cuándo usarlo",
+    appProfileWhenToUsePlaceholder: "Un ejemplo de solicitud por línea",
+    appProfileWhenToUseHint:
+      "Añade hasta 6 ejemplos, con un máximo de 140 caracteres cada uno.",
+    communityApps: "Aplicaciones de la comunidad",
+    communityAppsEmpty:
+      "Todavía no hay aplicaciones de la comunidad revisadas disponibles.",
+    communityAppsWorkspaceRequired:
+      "Conecta esta organización a un espacio de trabajo para instalar esta aplicación.",
+    communityAppsBuilderInstallUnavailable:
+      "La instalación de aplicaciones comunitarias en espacios de trabajo de Builder está desactivada hasta que se puedan verificar los archivos generados.",
+    communityAppsIdConflict:
+      "Este ID de aplicación ya está en uso, por lo que no se puede instalar.",
+    communityAppsLicense: "Licencia",
+    communityAppsTemplateSource: "Ver el código fuente de la plantilla",
+    communityAppsInstall: "Instalar",
+    communityAppsInstalling: "Iniciando…",
+    communityAppsInstalled: "Instalada",
+    communityAppsPending: "Instalación en curso",
+    communityAppsInstallStarted:
+      "Se ha iniciado la instalación de la aplicación de la comunidad.",
+    communityAppsAlreadyInstalled:
+      "Esta aplicación de la comunidad ya está instalada.",
+    communityAppsLocalRequestReady:
+      "La solicitud de la aplicación de la comunidad está lista para el agente local.",
+    communityAppsInstallFailed:
+      "No se ha podido instalar esta aplicación de la comunidad.",
+  },
+  "fr-FR": {
+    appProfileWhenToUse: "Quand l’utiliser",
+    appProfileWhenToUsePlaceholder: "Un exemple de demande par ligne",
+    appProfileWhenToUseHint:
+      "Ajoutez jusqu’à 6 exemples, de 140 caractères maximum chacun.",
+    communityApps: "Applications de la communauté",
+    communityAppsEmpty:
+      "Aucune application de la communauté vérifiée n’est encore disponible.",
+    communityAppsWorkspaceRequired:
+      "Connectez cette organisation à un espace de travail pour installer cette application.",
+    communityAppsBuilderInstallUnavailable:
+      "L’installation d’applications communautaires dans les espaces de travail Builder est désactivée tant que les fichiers générés ne peuvent pas être vérifiés.",
+    communityAppsIdConflict:
+      "Cet ID d’application est déjà utilisé. Cette application ne peut donc pas être installée.",
+    communityAppsLicense: "Licence",
+    communityAppsTemplateSource: "Voir la source du modèle",
+    communityAppsInstall: "Installer",
+    communityAppsInstalling: "Démarrage…",
+    communityAppsInstalled: "Installée",
+    communityAppsPending: "Installation en cours",
+    communityAppsInstallStarted:
+      "L’installation de l’application de la communauté a démarré.",
+    communityAppsAlreadyInstalled:
+      "Cette application de la communauté est déjà installée.",
+    communityAppsLocalRequestReady:
+      "La demande d’application de la communauté est prête pour l’agent local.",
+    communityAppsInstallFailed:
+      "Impossible d’installer cette application de la communauté.",
+  },
+  "de-DE": {
+    appProfileWhenToUse: "Wann verwenden",
+    appProfileWhenToUsePlaceholder: "Eine Beispielanfrage pro Zeile",
+    appProfileWhenToUseHint:
+      "Füge bis zu 6 Beispiele mit jeweils höchstens 140 Zeichen hinzu.",
+    communityApps: "Community-Apps",
+    communityAppsEmpty:
+      "Es sind noch keine geprüften Community-Apps verfügbar.",
+    communityAppsWorkspaceRequired:
+      "Verbinde diese Organisation mit einem Workspace, um diese App zu installieren.",
+    communityAppsBuilderInstallUnavailable:
+      "Installationen von Community-Apps in Builder-Workspaces sind deaktiviert, bis die generierten Dateien überprüft werden können.",
+    communityAppsIdConflict:
+      "Diese App-ID wird bereits verwendet. Die App kann daher nicht installiert werden.",
+    communityAppsLicense: "Lizenz",
+    communityAppsTemplateSource: "Vorlagenquelle anzeigen",
+    communityAppsInstall: "Installieren",
+    communityAppsInstalling: "Wird gestartet…",
+    communityAppsInstalled: "Installiert",
+    communityAppsPending: "Installation läuft",
+    communityAppsInstallStarted:
+      "Die Installation der Community-App wurde gestartet.",
+    communityAppsAlreadyInstalled:
+      "Diese Community-App ist bereits installiert.",
+    communityAppsLocalRequestReady:
+      "Die Anfrage für die Community-App ist für den lokalen Agent bereit.",
+    communityAppsInstallFailed:
+      "Diese Community-App konnte nicht installiert werden.",
+  },
+  "ja-JP": {
+    appProfileWhenToUse: "利用する場面",
+    appProfileWhenToUsePlaceholder: "例となる依頼を1行に1つ入力",
+    appProfileWhenToUseHint: "例は最大6件、各140文字以内です。",
+    communityApps: "コミュニティアプリ",
+    communityAppsEmpty: "審査済みのコミュニティアプリはまだありません。",
+    communityAppsWorkspaceRequired:
+      "このアプリをインストールするには、この組織をワークスペースに接続してください。",
+    communityAppsBuilderInstallUnavailable:
+      "生成されたファイルを検証できるようになるまで、Builder ワークスペースでのコミュニティアプリのインストールは無効です。",
+    communityAppsIdConflict:
+      "このアプリIDはすでに使用されているため、インストールできません。",
+    communityAppsLicense: "ライセンス",
+    communityAppsTemplateSource: "テンプレートのソースを表示",
+    communityAppsInstall: "インストール",
+    communityAppsInstalling: "開始中…",
+    communityAppsInstalled: "インストール済み",
+    communityAppsPending: "インストール中",
+    communityAppsInstallStarted:
+      "コミュニティアプリのインストールを開始しました。",
+    communityAppsAlreadyInstalled:
+      "このコミュニティアプリはすでにインストールされています。",
+    communityAppsLocalRequestReady:
+      "コミュニティアプリのインストールリクエストをローカルエージェントが処理できる状態です。",
+    communityAppsInstallFailed:
+      "このコミュニティアプリをインストールできませんでした。",
+  },
+  "ko-KR": {
+    appProfileWhenToUse: "사용 시점",
+    appProfileWhenToUsePlaceholder: "요청 예시를 한 줄에 하나씩 입력",
+    appProfileWhenToUseHint:
+      "예시를 최대 6개까지 추가할 수 있으며, 각 예시는 140자 이하여야 합니다.",
+    communityApps: "커뮤니티 앱",
+    communityAppsEmpty: "아직 검토를 마친 커뮤니티 앱이 없습니다.",
+    communityAppsWorkspaceRequired:
+      "이 앱을 설치하려면 이 조직을 워크스페이스에 연결하세요.",
+    communityAppsBuilderInstallUnavailable:
+      "생성된 파일을 검증할 수 있을 때까지 Builder 워크스페이스에서 커뮤니티 앱을 설치할 수 없습니다.",
+    communityAppsIdConflict:
+      "이 앱 ID는 이미 사용 중이므로 설치할 수 없습니다.",
+    communityAppsLicense: "라이선스",
+    communityAppsTemplateSource: "템플릿 소스 보기",
+    communityAppsInstall: "설치",
+    communityAppsInstalling: "시작 중…",
+    communityAppsInstalled: "설치됨",
+    communityAppsPending: "설치 진행 중",
+    communityAppsInstallStarted: "커뮤니티 앱 설치를 시작했습니다.",
+    communityAppsAlreadyInstalled: "이 커뮤니티 앱은 이미 설치되어 있습니다.",
+    communityAppsLocalRequestReady:
+      "커뮤니티 앱 설치 요청이 로컬 에이전트에서 처리할 수 있도록 준비되었습니다.",
+    communityAppsInstallFailed: "이 커뮤니티 앱을 설치할 수 없습니다.",
+  },
+  "pt-BR": {
+    appProfileWhenToUse: "Quando usar",
+    appProfileWhenToUsePlaceholder: "Um exemplo de solicitação por linha",
+    appProfileWhenToUseHint:
+      "Adicione até 6 exemplos, com no máximo 140 caracteres cada.",
+    communityApps: "Aplicativos da comunidade",
+    communityAppsEmpty:
+      "Ainda não há aplicativos da comunidade analisados disponíveis.",
+    communityAppsWorkspaceRequired:
+      "Conecte esta organização a um espaço de trabalho para instalar este aplicativo.",
+    communityAppsBuilderInstallUnavailable:
+      "A instalação de aplicativos da comunidade em espaços de trabalho do Builder está desativada até que os arquivos gerados possam ser verificados.",
+    communityAppsIdConflict:
+      "Este ID de aplicativo já está em uso, então ele não pode ser instalado.",
+    communityAppsLicense: "Licença",
+    communityAppsTemplateSource: "Ver código-fonte do modelo",
+    communityAppsInstall: "Instalar",
+    communityAppsInstalling: "Iniciando…",
+    communityAppsInstalled: "Instalado",
+    communityAppsPending: "Instalação em andamento",
+    communityAppsInstallStarted:
+      "A instalação do aplicativo da comunidade foi iniciada.",
+    communityAppsAlreadyInstalled:
+      "Este aplicativo da comunidade já está instalado.",
+    communityAppsLocalRequestReady:
+      "A solicitação do aplicativo da comunidade está pronta para o agente local.",
+    communityAppsInstallFailed:
+      "Não foi possível instalar este aplicativo da comunidade.",
+  },
+  "hi-IN": {
+    appProfileWhenToUse: "कब उपयोग करें",
+    appProfileWhenToUsePlaceholder: "हर पंक्ति में एक उदाहरण अनुरोध",
+    appProfileWhenToUseHint: "अधिकतम 6 उदाहरण जोड़ें, हर एक 140 वर्णों से अधिक न हो।",
+    communityApps: "समुदाय ऐप्स",
+    communityAppsEmpty: "अभी तक कोई समीक्षित समुदाय ऐप उपलब्ध नहीं है।",
+    communityAppsWorkspaceRequired:
+      "इस ऐप को इंस्टॉल करने के लिए इस संगठन को किसी वर्कस्पेस से कनेक्ट करें।",
+    communityAppsBuilderInstallUnavailable:
+      "जनरेट की गई फ़ाइलों का सत्यापन संभव होने तक Builder वर्कस्पेस में समुदाय ऐप इंस्टॉलेशन बंद है।",
+    communityAppsIdConflict:
+      "यह ऐप ID पहले से उपयोग में है, इसलिए इस ऐप को इंस्टॉल नहीं किया जा सकता।",
+    communityAppsLicense: "लाइसेंस",
+    communityAppsTemplateSource: "टेम्पलेट स्रोत देखें",
+    communityAppsInstall: "इंस्टॉल करें",
+    communityAppsInstalling: "शुरू हो रहा है…",
+    communityAppsInstalled: "इंस्टॉल हो गया",
+    communityAppsPending: "इंस्टॉलेशन जारी है",
+    communityAppsInstallStarted: "समुदाय ऐप का इंस्टॉलेशन शुरू हो गया है।",
+    communityAppsAlreadyInstalled: "यह समुदाय ऐप पहले से इंस्टॉल है।",
+    communityAppsLocalRequestReady:
+      "समुदाय ऐप का अनुरोध स्थानीय एजेंट के लिए तैयार है।",
+    communityAppsInstallFailed: "यह समुदाय ऐप इंस्टॉल नहीं किया जा सका।",
+  },
+  "ar-SA": {
+    appProfileWhenToUse: "متى يُستخدم",
+    appProfileWhenToUsePlaceholder: "مثال واحد على طلب في كل سطر",
+    appProfileWhenToUseHint: "أضف حتى 6 أمثلة، على ألا يتجاوز كل منها 140 حرفًا.",
+    communityApps: "تطبيقات المجتمع",
+    communityAppsEmpty: "لا تتوفر تطبيقات مجتمع مراجَعة بعد.",
+    communityAppsWorkspaceRequired:
+      "اربط هذه المؤسسة بمساحة عمل لتثبيت هذا التطبيق.",
+    communityAppsBuilderInstallUnavailable:
+      "تم تعطيل تثبيت تطبيقات المجتمع في مساحات عمل Builder إلى أن يصبح بالإمكان التحقق من الملفات المُنشأة.",
+    communityAppsIdConflict:
+      "معرّف هذا التطبيق مستخدم بالفعل، لذلك لا يمكن تثبيت هذا التطبيق.",
+    communityAppsLicense: "الترخيص",
+    communityAppsTemplateSource: "عرض مصدر القالب",
+    communityAppsInstall: "تثبيت",
+    communityAppsInstalling: "جارٍ البدء…",
+    communityAppsInstalled: "تم التثبيت",
+    communityAppsPending: "التثبيت جارٍ",
+    communityAppsInstallStarted: "بدأ تثبيت تطبيق المجتمع.",
+    communityAppsAlreadyInstalled: "تطبيق المجتمع هذا مثبّت بالفعل.",
+    communityAppsLocalRequestReady: "طلب تطبيق المجتمع جاهز للوكيل المحلي.",
+    communityAppsInstallFailed: "تعذّر تثبيت تطبيق المجتمع.",
+  },
+};
+
 function mergeMessages(
   overrides: PartialMessages,
   localizedIntegrations: Partial<Messages["integrations"]> = {},
+  locale: LocaleCode = "en-US",
 ): Messages {
   return {
     root: { ...enUS.root, ...overrides.root },
@@ -960,6 +1270,10 @@ function mergeMessages(
     dispatch: {
       ...enUS.dispatch,
       ...overrides.dispatch,
+      sidebar: {
+        ...enUS.dispatch.sidebar,
+        ...overrides.dispatch?.sidebar,
+      },
       nav: {
         ...enUS.dispatch.nav,
         ...(overrides.dispatch as { nav?: Record<string, string> } | undefined)
@@ -970,6 +1284,7 @@ function mergeMessages(
         ...(
           overrides.dispatch as { pages?: Record<string, string> } | undefined
         )?.pages,
+        ...appProfilePageTranslations[locale],
       },
     },
   };
@@ -977,7 +1292,7 @@ function mergeMessages(
 
 export const messagesByLocale = {
   "en-US": enUS,
-  "zh-TW": mergeMessages(zhTW),
+  "zh-TW": mergeMessages(zhTW, {}, "zh-TW"),
   "zh-CN": mergeMessages(
     {
       routeTitles: {
@@ -988,6 +1303,9 @@ export const messagesByLocale = {
         settings: "设置 - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Builder \u56e2\u961f\u5e94\u7528\u4f4d\u4e8e Builder \u5de5\u4f5c\u533a\u3002",
+        openBuilderWorkspace: "\u6253\u5f00 Builder \u5de5\u4f5c\u533a",
         commandActions: "操作",
         commandSearch: "搜索",
         commandAppearance: "外观",
@@ -1245,6 +1563,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "显示本地聊天",
+          showAllChats: "显示所有聊天",
+        },
         nav: {
           admin: "管理",
           automations: "自动化",
@@ -1257,7 +1579,24 @@ export const messagesByLocale = {
           agent: "代理",
         },
         pages: {
+          chatFirstCopySessionId: "复制会话 ID",
+          chatFirstSessionIdCopied: "会话 ID 已复制",
+          chatFirstWatchSession: "观看",
           ...chatFirstPageTranslations["zh-CN"],
+          pinApp: "固定 {{name}}",
+          unpinApp: "取消固定 {{name}}",
+          hostedApps: "Agent-Native.com 托管应用",
+          pinnedApps: "已固定的应用",
+          workspaceApps: "工作区应用",
+          newApp: "新建应用",
+          viewAllApps: "查看全部",
+          manageHostedApps: "管理",
+          manageHostedAppsAdminOnly:
+            "只有组织管理员可以更改 Agent-Native.com 托管应用。",
+          showHostedApps: "显示 Agent-Native.com 托管应用",
+          hostedAppsSaveFailed: "无法保存 Agent-Native.com 托管应用设置。",
+          hostedAppsSettingInvalid:
+            "存储的 Agent-Native.com 托管应用设置无效。保存一个值即可替换它。",
           adminDescription: "工作区控制与运营",
           connectApps: "连接应用",
           availableApps: "可用应用",
@@ -1400,6 +1739,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["zh-CN"],
+    "zh-CN",
   ),
   "es-ES": mergeMessages(
     {
@@ -1411,6 +1751,9 @@ export const messagesByLocale = {
         settings: "Ajustes - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Las aplicaciones del equipo de Builder est\u00e1n en el espacio de trabajo de Builder.",
+        openBuilderWorkspace: "Abrir espacio de trabajo de Builder",
         commandActions: "Acciones",
         commandSearch: "Buscar",
         commandAppearance: "Apariencia",
@@ -1696,6 +2039,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "Mostrar chats locales",
+          showAllChats: "Mostrar todos los chats",
+        },
         nav: {
           admin: "Administración",
           automations: "Automatizaciones",
@@ -1708,7 +2055,25 @@ export const messagesByLocale = {
           agent: "Agente",
         },
         pages: {
+          chatFirstCopySessionId: "Copiar ID de sesión",
+          chatFirstSessionIdCopied: "ID de sesión copiado",
+          chatFirstWatchSession: "Observar",
           ...chatFirstPageTranslations["es-ES"],
+          pinApp: "Fijar {{name}}",
+          unpinApp: "Desfijar {{name}}",
+          hostedApps: "Apps alojadas en Agent-Native.com",
+          pinnedApps: "Apps fijadas",
+          workspaceApps: "Apps del espacio de trabajo",
+          newApp: "Nueva app",
+          viewAllApps: "Ver todo",
+          manageHostedApps: "Gestionar",
+          manageHostedAppsAdminOnly:
+            "Solo los administradores de la organización pueden cambiar las apps alojadas en Agent-Native.com.",
+          showHostedApps: "Mostrar apps alojadas en Agent-Native.com",
+          hostedAppsSaveFailed:
+            "No se pudo guardar la configuración de apps alojadas en Agent-Native.com.",
+          hostedAppsSettingInvalid:
+            "La configuración guardada de apps alojadas en Agent-Native.com no es válida. Al guardar un valor se reemplaza.",
           adminDescription: "Controles y operaciones del espacio de trabajo",
           connectApps: "Conectar apps",
           availableApps: "Apps disponibles",
@@ -1866,6 +2231,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["es-ES"],
+    "es-ES",
   ),
   "fr-FR": mergeMessages(
     {
@@ -1877,6 +2243,9 @@ export const messagesByLocale = {
         settings: "Paramètres - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Les applications de l\u2019\u00e9quipe Builder se trouvent dans son espace de travail.",
+        openBuilderWorkspace: "Ouvrir l\u2019espace de travail Builder",
         commandActions: "Actions",
         commandSearch: "Rechercher",
         commandAppearance: "Apparence",
@@ -2161,6 +2530,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "Afficher les conversations locales",
+          showAllChats: "Afficher toutes les conversations",
+        },
         nav: {
           admin: "Administration",
           automations: "Automatisations",
@@ -2173,7 +2546,26 @@ export const messagesByLocale = {
           agent: "Agent",
         },
         pages: {
+          chatFirstCopySessionId: "Copier l’identifiant de session",
+          chatFirstSessionIdCopied: "Identifiant de session copié",
+          chatFirstWatchSession: "Observer",
           ...chatFirstPageTranslations["fr-FR"],
+          pinApp: "Épingler {{name}}",
+          unpinApp: "Désépingler {{name}}",
+          hostedApps: "Applications hébergées sur Agent-Native.com",
+          pinnedApps: "Applications épinglées",
+          workspaceApps: "Applications de l’espace de travail",
+          newApp: "Nouvelle app",
+          viewAllApps: "Tout afficher",
+          manageHostedApps: "Gérer",
+          manageHostedAppsAdminOnly:
+            "Seuls les administrateurs de l’organisation peuvent modifier les applications hébergées sur Agent-Native.com.",
+          showHostedApps:
+            "Afficher les applications hébergées sur Agent-Native.com",
+          hostedAppsSaveFailed:
+            "Impossible d’enregistrer le paramètre des applications hébergées sur Agent-Native.com.",
+          hostedAppsSettingInvalid:
+            "Le paramètre enregistré des applications hébergées sur Agent-Native.com n’est pas valide. Enregistrer une valeur le remplace.",
           adminDescription: "Contrôles et opérations de l’espace de travail",
           connectApps: "Connecter des apps",
           availableApps: "Applications disponibles",
@@ -2333,6 +2725,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["fr-FR"],
+    "fr-FR",
   ),
   "de-DE": mergeMessages(
     {
@@ -2344,6 +2737,9 @@ export const messagesByLocale = {
         settings: "Einstellungen - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Die Apps des Builder-Teams befinden sich im Builder-Arbeitsbereich.",
+        openBuilderWorkspace: "Builder-Arbeitsbereich \u00f6ffnen",
         commandActions: "Aktionen",
         commandSearch: "Suchen",
         commandAppearance: "Darstellung",
@@ -2617,6 +3013,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "Lokale Chats anzeigen",
+          showAllChats: "Alle Chats anzeigen",
+        },
         nav: {
           admin: "Administration",
           automations: "Automatisierungen",
@@ -2629,7 +3029,25 @@ export const messagesByLocale = {
           agent: "Agent",
         },
         pages: {
+          chatFirstCopySessionId: "Sitzungs-ID kopieren",
+          chatFirstSessionIdCopied: "Sitzungs-ID kopiert",
+          chatFirstWatchSession: "Beobachten",
           ...chatFirstPageTranslations["de-DE"],
+          pinApp: "{{name}} anheften",
+          unpinApp: "{{name}} loslösen",
+          hostedApps: "Auf Agent-Native.com gehostete Apps",
+          pinnedApps: "Angeheftete Apps",
+          workspaceApps: "Workspace-Apps",
+          newApp: "Neue App",
+          viewAllApps: "Alle anzeigen",
+          manageHostedApps: "Verwalten",
+          manageHostedAppsAdminOnly:
+            "Nur Organisationsadmins können auf Agent-Native.com gehostete Apps ändern.",
+          showHostedApps: "Auf Agent-Native.com gehostete Apps anzeigen",
+          hostedAppsSaveFailed:
+            "Die Einstellung für auf Agent-Native.com gehostete Apps konnte nicht gespeichert werden.",
+          hostedAppsSettingInvalid:
+            "Die gespeicherte Einstellung für auf Agent-Native.com gehostete Apps ist ungültig. Durch Speichern eines Werts wird sie ersetzt.",
           adminDescription: "Arbeitsbereichssteuerung und -betrieb",
           connectApps: "Apps verbinden",
           availableApps: "Verfügbare Apps",
@@ -2785,6 +3203,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["de-DE"],
+    "de-DE",
   ),
   "ja-JP": mergeMessages(
     {
@@ -2796,6 +3215,10 @@ export const messagesByLocale = {
         settings: "設定 - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Builder \u30c1\u30fc\u30e0\u306e\u30a2\u30d7\u30ea\u306f Builder \u30ef\u30fc\u30af\u30b9\u30da\u30fc\u30b9\u306b\u3042\u308a\u307e\u3059\u3002",
+        openBuilderWorkspace:
+          "Builder \u30ef\u30fc\u30af\u30b9\u30da\u30fc\u30b9\u3092\u958b\u304f",
         commandActions: "操作",
         commandSearch: "検索",
         commandAppearance: "外観",
@@ -3067,6 +3490,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "ローカルのチャットを表示",
+          showAllChats: "すべてのチャットを表示",
+        },
         nav: {
           admin: "管理",
           automations: "自動化",
@@ -3079,7 +3506,25 @@ export const messagesByLocale = {
           agent: "エージェント",
         },
         pages: {
+          chatFirstCopySessionId: "セッション ID をコピー",
+          chatFirstSessionIdCopied: "セッション ID をコピーしました",
+          chatFirstWatchSession: "ウォッチ",
           ...chatFirstPageTranslations["ja-JP"],
+          pinApp: "{{name}} を固定",
+          unpinApp: "{{name}} の固定を解除",
+          hostedApps: "Agent-Native.com のホスト型アプリ",
+          pinnedApps: "固定したアプリ",
+          workspaceApps: "ワークスペースのアプリ",
+          newApp: "新しいアプリ",
+          viewAllApps: "すべて表示",
+          manageHostedApps: "管理",
+          manageHostedAppsAdminOnly:
+            "Agent-Native.com のホスト型アプリを変更できるのは組織の管理者だけです。",
+          showHostedApps: "Agent-Native.com のホスト型アプリを表示",
+          hostedAppsSaveFailed:
+            "Agent-Native.com のホスト型アプリの設定を保存できませんでした。",
+          hostedAppsSettingInvalid:
+            "保存されている Agent-Native.com のホスト型アプリの設定が無効です。値を保存すると置き換えられます。",
           adminDescription: "ワークスペースの管理と運用",
           connectApps: "アプリを接続",
           availableApps: "利用可能なアプリ",
@@ -3232,6 +3677,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["ja-JP"],
+    "ja-JP",
   ),
   "ko-KR": mergeMessages(
     {
@@ -3243,6 +3689,10 @@ export const messagesByLocale = {
         settings: "설정 - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Builder \ud300 \uc571\uc740 Builder \uc6cc\ud06c\uc2a4\ud398\uc774\uc2a4\uc5d0 \uc788\uc2b5\ub2c8\ub2e4.",
+        openBuilderWorkspace:
+          "Builder \uc6cc\ud06c\uc2a4\ud398\uc774\uc2a4 \uc5f4\uae30",
         commandActions: "작업",
         commandSearch: "검색",
         commandAppearance: "모양",
@@ -3511,6 +3961,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "로컬 채팅 표시",
+          showAllChats: "모든 채팅 표시",
+        },
         nav: {
           admin: "관리",
           automations: "자동화",
@@ -3523,7 +3977,25 @@ export const messagesByLocale = {
           agent: "에이전트",
         },
         pages: {
+          chatFirstCopySessionId: "세션 ID 복사",
+          chatFirstSessionIdCopied: "세션 ID가 복사되었습니다",
+          chatFirstWatchSession: "지켜보기",
           ...chatFirstPageTranslations["ko-KR"],
+          pinApp: "{{name}} 고정",
+          unpinApp: "{{name}} 고정 해제",
+          hostedApps: "Agent-Native.com 호스팅 앱",
+          pinnedApps: "고정된 앱",
+          workspaceApps: "워크스페이스 앱",
+          newApp: "새 앱",
+          viewAllApps: "모두 보기",
+          manageHostedApps: "관리",
+          manageHostedAppsAdminOnly:
+            "조직 관리자만 Agent-Native.com 호스팅 앱을 변경할 수 있습니다.",
+          showHostedApps: "Agent-Native.com 호스팅 앱 표시",
+          hostedAppsSaveFailed:
+            "Agent-Native.com 호스팅 앱 설정을 저장하지 못했습니다.",
+          hostedAppsSettingInvalid:
+            "저장된 Agent-Native.com 호스팅 앱 설정이 올바르지 않습니다. 값을 저장하면 대체됩니다.",
           adminDescription: "워크스페이스 제어 및 운영",
           connectApps: "앱 연결",
           availableApps: "사용 가능한 앱",
@@ -3672,6 +4144,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["ko-KR"],
+    "ko-KR",
   ),
   "pt-BR": mergeMessages(
     {
@@ -3683,6 +4156,9 @@ export const messagesByLocale = {
         settings: "Configurações - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Os aplicativos da equipe Builder est\u00e3o no espa\u00e7o de trabalho Builder.",
+        openBuilderWorkspace: "Abrir espa\u00e7o de trabalho Builder",
         commandActions: "Ações",
         commandSearch: "Buscar",
         commandAppearance: "Aparência",
@@ -3963,6 +4439,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "Mostrar conversas locais",
+          showAllChats: "Mostrar todas as conversas",
+        },
         nav: {
           admin: "Administração",
           automations: "Automações",
@@ -3975,7 +4455,25 @@ export const messagesByLocale = {
           agent: "Agente",
         },
         pages: {
+          chatFirstCopySessionId: "Copiar ID da sessão",
+          chatFirstSessionIdCopied: "ID da sessão copiado",
+          chatFirstWatchSession: "Observar",
           ...chatFirstPageTranslations["pt-BR"],
+          pinApp: "Fixar {{name}}",
+          unpinApp: "Desafixar {{name}}",
+          hostedApps: "Apps hospedados no Agent-Native.com",
+          pinnedApps: "Apps fixados",
+          workspaceApps: "Apps do espaço de trabalho",
+          newApp: "Novo app",
+          viewAllApps: "Ver tudo",
+          manageHostedApps: "Gerenciar",
+          manageHostedAppsAdminOnly:
+            "Somente administradores da organização podem alterar os apps hospedados no Agent-Native.com.",
+          showHostedApps: "Mostrar apps hospedados no Agent-Native.com",
+          hostedAppsSaveFailed:
+            "Não foi possível salvar a configuração de apps hospedados no Agent-Native.com.",
+          hostedAppsSettingInvalid:
+            "A configuração salva de apps hospedados no Agent-Native.com é inválida. Salvar um valor a substitui.",
           adminDescription: "Controles e operações do espaço de trabalho",
           connectApps: "Conectar apps",
           availableApps: "Apps disponíveis",
@@ -4133,6 +4631,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["pt-BR"],
+    "pt-BR",
   ),
   "hi-IN": mergeMessages(
     {
@@ -4144,6 +4643,10 @@ export const messagesByLocale = {
         settings: "सेटिंग्स - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "Builder \u091f\u0940\u092e \u0915\u0947 \u0910\u092a\u094d\u0938 Builder \u0915\u093e\u0930\u094d\u092f\u0938\u094d\u0925\u093e\u0928 \u092e\u0947\u0902 \u0939\u0948\u0902\u0964",
+        openBuilderWorkspace:
+          "Builder \u0915\u093e\u0930\u094d\u092f\u0938\u094d\u0925\u093e\u0928 \u0916\u094b\u0932\u0947\u0902",
         commandActions: "क्रियाएं",
         commandSearch: "खोजें",
         commandAppearance: "रूप",
@@ -4408,6 +4911,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "स्थानीय चैट दिखाएँ",
+          showAllChats: "सभी चैट दिखाएँ",
+        },
         nav: {
           admin: "व्यवस्थापक",
           automations: "ऑटोमेशन",
@@ -4420,7 +4927,25 @@ export const messagesByLocale = {
           agent: "एजेंट",
         },
         pages: {
+          chatFirstCopySessionId: "सत्र ID कॉपी करें",
+          chatFirstSessionIdCopied: "सत्र ID कॉपी किया गया",
+          chatFirstWatchSession: "देखें",
           ...chatFirstPageTranslations["hi-IN"],
+          pinApp: "{{name}} को पिन करें",
+          unpinApp: "{{name}} से पिन हटाएं",
+          hostedApps: "Agent-Native.com पर होस्ट किए गए ऐप",
+          pinnedApps: "पिन किए गए ऐप",
+          workspaceApps: "वर्कस्पेस ऐप",
+          newApp: "नया ऐप",
+          viewAllApps: "सभी देखें",
+          manageHostedApps: "प्रबंधित करें",
+          manageHostedAppsAdminOnly:
+            "केवल संगठन के एडमिन ही Agent-Native.com पर होस्ट किए गए ऐप बदल सकते हैं।",
+          showHostedApps: "Agent-Native.com पर होस्ट किए गए ऐप दिखाएं",
+          hostedAppsSaveFailed:
+            "Agent-Native.com पर होस्ट किए गए ऐप की सेटिंग सहेजी नहीं जा सकी।",
+          hostedAppsSettingInvalid:
+            "सहेजी गई Agent-Native.com पर होस्ट किए गए ऐप की सेटिंग अमान्य है। कोई मान सहेजने पर यह बदल जाएगी।",
           adminDescription: "वर्कस्पेस नियंत्रण और संचालन",
           connectApps: "ऐप कनेक्ट करें",
           availableApps: "उपलब्ध ऐप्स",
@@ -4566,6 +5091,7 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["hi-IN"],
+    "hi-IN",
   ),
   "ar-SA": mergeMessages(
     {
@@ -4577,6 +5103,10 @@ export const messagesByLocale = {
         settings: "الإعدادات - Dispatch",
       },
       root: {
+        builderWorkspaceNotice:
+          "\u062a\u0648\u062c\u062f \u062a\u0637\u0628\u064a\u0642\u0627\u062a \u0641\u0631\u064a\u0642 Builder \u0641\u064a \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644 Builder.",
+        openBuilderWorkspace:
+          "\u0641\u062a\u062d \u0645\u0633\u0627\u062d\u0629 \u0639\u0645\u0644 Builder",
         commandActions: "الإجراءات",
         commandSearch: "بحث",
         commandAppearance: "المظهر",
@@ -4881,6 +5411,10 @@ export const messagesByLocale = {
       },
 
       dispatch: {
+        sidebar: {
+          showLocalChats: "إظهار المحادثات المحلية",
+          showAllChats: "إظهار جميع المحادثات",
+        },
         nav: {
           admin: "الإدارة",
           automations: "الأتمتة",
@@ -4893,7 +5427,25 @@ export const messagesByLocale = {
           agent: "الوكيل",
         },
         pages: {
+          chatFirstCopySessionId: "نسخ معرّف الجلسة",
+          chatFirstSessionIdCopied: "تم نسخ معرّف الجلسة",
+          chatFirstWatchSession: "مشاهدة",
           ...chatFirstPageTranslations["ar-SA"],
+          pinApp: "تثبيت {{name}}",
+          unpinApp: "إلغاء تثبيت {{name}}",
+          hostedApps: "التطبيقات المستضافة على Agent-Native.com",
+          pinnedApps: "التطبيقات المثبتة",
+          workspaceApps: "تطبيقات مساحة العمل",
+          newApp: "تطبيق جديد",
+          viewAllApps: "عرض الكل",
+          manageHostedApps: "إدارة",
+          manageHostedAppsAdminOnly:
+            "يمكن لمسؤولي المؤسسة فقط تغيير التطبيقات المستضافة على Agent-Native.com.",
+          showHostedApps: "إظهار التطبيقات المستضافة على Agent-Native.com",
+          hostedAppsSaveFailed:
+            "تعذّر حفظ إعداد التطبيقات المستضافة على Agent-Native.com.",
+          hostedAppsSettingInvalid:
+            "إعداد التطبيقات المستضافة على Agent-Native.com المحفوظ غير صالح. يؤدي حفظ قيمة إلى استبداله.",
           adminDescription: "عناصر التحكم في مساحة العمل وعملياتها",
           connectApps: "توصيل التطبيقات",
           availableApps: "التطبيقات المتاحة",
@@ -5045,5 +5597,6 @@ export const messagesByLocale = {
       },
     },
     integrationGroupOverrides["ar-SA"],
+    "ar-SA",
   ),
 } satisfies Record<LocaleCode, Messages>;

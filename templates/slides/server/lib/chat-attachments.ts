@@ -15,12 +15,26 @@ import { parseBase64DataUrl } from "@agent-native/core/shared";
 import { resolveAccess } from "@agent-native/core/sharing";
 
 import {
-  isSlidesReferenceFileExtension,
   MAX_INLINE_IMAGE_BYTES,
   MAX_REFERENCE_FILES,
   MAX_REFERENCE_FILE_BYTES,
 } from "../../shared/upload-types.js";
 import { saveUploadedReferenceFile } from "../handlers/uploads.js";
+import { rememberThreadUploads } from "./thread-uploads.js";
+
+// Text files keep their hosted URL readable by core's attachment reader.
+const SLIDES_IMPORT_EXTENSIONS = new Set([
+  ".pptx",
+  ".docx",
+  ".pdf",
+  ".fig",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".svg",
+]);
 
 const MAX_CHAT_UPLOAD_BYTES = MAX_REFERENCE_FILE_BYTES;
 const MAX_CHAT_UPLOAD_TOTAL_BYTES = MAX_REFERENCE_FILE_BYTES;
@@ -199,6 +213,7 @@ export async function prepareSlidesChatAttachments(args: {
   ownerEmail: string | null;
   message: string;
   attachments: AgentChatAttachment[];
+  threadId?: string;
 }): Promise<{ message?: string; attachments?: AgentChatAttachment[] } | void> {
   const generationContext = await readSlidesDeckGenerationContext();
   if (!args.ownerEmail || args.attachments.length === 0) {
@@ -211,9 +226,10 @@ export async function prepareSlidesChatAttachments(args: {
 
   const uploaded: Array<{
     originalName: string;
-    path: string;
+    path?: string;
     url?: string;
     type: string;
+    isVisual?: boolean;
     size?: number;
   }> = [];
   const failed: Array<{ name: string; reason: string }> = [];
@@ -230,7 +246,7 @@ export async function prepareSlidesChatAttachments(args: {
       typeof attachment.data !== "string" &&
       typeof attachment.url === "string"
     ) {
-      if (isSlidesReferenceFileExtension(ext)) {
+      if (SLIDES_IMPORT_EXTENSIONS.has(ext)) {
         urlOnlyReferenceCount++;
         if (urlOnlyReferenceCount > MAX_REFERENCE_FILES) {
           failed.push({
@@ -242,9 +258,9 @@ export async function prepareSlidesChatAttachments(args: {
         if (isVisualAttachment(attachment)) {
           uploaded.push({
             originalName: attachment.name,
-            path: attachment.url,
             url: attachment.url,
             type: attachment.contentType || "application/octet-stream",
+            isVisual: true,
           });
         } else {
           try {
@@ -293,7 +309,7 @@ export async function prepareSlidesChatAttachments(args: {
     const dataUrl = attachmentDataUrl(attachment);
     if (!dataUrl) continue;
 
-    if (!isSlidesReferenceFileExtension(ext)) continue;
+    if (!SLIDES_IMPORT_EXTENSIONS.has(ext)) continue;
 
     const decoded = decodeDataUrl(dataUrl);
     if (!decoded) continue;
@@ -330,16 +346,45 @@ export async function prepareSlidesChatAttachments(args: {
     return message === args.message ? undefined : { message };
   }
 
-  const fileList = uploaded
+  const filesWithPaths = uploaded.filter(
+    (file): file is typeof file & { path: string } => Boolean(file.path),
+  );
+  if (args.threadId && filesWithPaths.length > 0) {
+    try {
+      await rememberThreadUploads(
+        args.threadId,
+        filesWithPaths.map((file) => ({
+          name: file.originalName,
+          path: file.path,
+        })),
+      );
+    } catch (error) {
+      // coercion-ok: this turn still lists every path below; only a later turn's by-name lookup loses this file.
+      console.warn(
+        "[slides] could not record this thread's uploads for later turns",
+        error,
+      );
+    }
+  }
+  const urlOnlyImages = uploaded.filter(
+    (file) =>
+      !file.path &&
+      Boolean(file.url) &&
+      (file.isVisual || file.type.startsWith("image/")),
+  );
+  const fileList = filesWithPaths
     .map(
       (file) =>
         `- ${file.originalName} (${file.type}${typeof file.size === "number" ? `, ${(file.size / 1024).toFixed(1)}KB` : ""}) at path: ${file.path}${file.url ? `; embeddable URL: ${file.url}` : ""}`,
     )
     .join("\n");
+  const urlOnlyImageList = urlOnlyImages
+    .map((file) => `- ${file.originalName} (embeddable URL: ${file.url})`)
+    .join("\n");
   const failureList = failed
     .map((file) => `- ${file.name}: ${file.reason}`)
     .join("\n");
-  const unembeddableImages = uploaded.filter(
+  const unembeddableImages = filesWithPaths.filter(
     (file) => !file.url && file.type.startsWith("image/"),
   );
   const unembeddableImageList = unembeddableImages
@@ -347,22 +392,29 @@ export async function prepareSlidesChatAttachments(args: {
     .join("\n");
   const attachmentContext = [
     "<slides-chat-attachments>",
-    uploaded.length > 0
+    filesWithPaths.length > 0
       ? [
-          "The user attached file(s) in chat. They have been saved as real server upload paths that Slides import actions can read:",
+          "The user attached file(s) in chat. These are saved server upload paths that Slides import actions can read:",
           fileList,
           "",
           "File handling rules:",
-          "- Pass `filePath` exactly as listed above, or use the attachment's file name. Never shorten, edit, or re-type the path.",
+          "- Pass `filePath` exactly as listed above, or use the attachment's exact file name. If its name is unclear, use a generic reference such as `the attached document` only when exactly one compatible document is attached. Do not substitute a specific unmatched filename. Never shorten, edit, or re-type a path.",
           '- Attachments are reference context by default. When the user explicitly asks to import or convert an attached PDF or PPTX into the current or visible deck, call `view-screen` when the deckId is not already known, then call `import-file` with `{ filePath: "<path>", format: "pdf" or "pptx", deckId: "<deckId>", importIntoDeck: true }`. Verify the result reports `imported: true` and a positive `slideCount`; do not use extraction-only mode or recreate the imported pages with `add-slide`.',
-          "- An attachment alone never imports. Use `import-pptx` with `deckId` only for an explicit whole-deck replacement because it replaces all slides.",
+          "- An attachment alone never imports. Use `import-pptx` with `deckId` and `replaceExisting: true` only for an explicit whole-deck replacement because it replaces all slides and the title.",
           "- If the request refers to the current or visible deck, call `view-screen` first to confirm the active deckId, then pass that deckId to import or slide-edit actions.",
-          '- PPTX files: for an explicit whole-deck replacement, call `import-pptx --filePath "<path>" --deckId <deckId>` because it replaces all slides. For deck-wide improvement or append/import requests, use `import-file` with `format: "pptx"`, `deckId`, and `importIntoDeck: true`, then patch the imported slides. Use `update-slide` only for a targeted one-slide edit. Do not rebuild the source deck with add-slide.',
+          '- PPTX files: for an explicit whole-deck replacement, call `import-pptx --filePath "<path>" --deckId <deckId> --replaceExisting true` because it replaces all slides. For deck-wide improvement or append/import requests, use `import-file` with `format: "pptx"`, `deckId`, and `importIntoDeck: true`, then patch the imported slides. Use `update-slide` only for a targeted one-slide edit. Do not rebuild the source deck with add-slide.',
           '- PDF and DOCX files: call `import-file --filePath "<path>" --format auto --deckId <deckId>` and use the returned extracted text as source material before creating editable slides. For a visual PDF that the user wants preserved, beautified, or restyled from its original layout, pass `--importIntoDeck true` first: a PDF exported from this app restores its original editable slides, and any other PDF is rebuilt into positioned text boxes and images. Keep what the import produced and style around it rather than retyping it; source text is persisted in slide notes for inspection.',
           '- Figma `.fig` files: call `import-file --filePath "<path>" --format fig` to start Builder design-system indexing. Do not create a local design system directly from the upload.',
           "- For short, fully planned deck-generation requests, pass all slides to one create-deck call after extracting source material. For long or live in-app generation, start mutating promptly and add slides sequentially as they are authored.",
           '- Image files with an embeddable URL can be inserted directly into slide HTML as `<img src="...">` or used as visual references.',
           "- Do not say no PDF/PPTX/DOCX/FIG/image was attached when a matching saved path is listed here.",
+        ].join("\n")
+      : "",
+    urlOnlyImages.length > 0
+      ? [
+          "The user attached image(s) with an embeddable URL but no private import path:",
+          urlOnlyImageList,
+          "Use the URL directly as an image reference or slide image source. Do not pass this URL or filename to `import-file`; no uploaded file reference exists for it.",
         ].join("\n")
       : "",
     unembeddableImages.length > 0
@@ -410,7 +462,13 @@ function stripForwardedAttachmentData(
   if (saved.url) {
     (next as any).url = saved.url;
   } else if (attachment.url && !isVisualAttachment(attachment)) {
-    delete next.url;
+    if (next.data) {
+      delete next.url;
+    } else {
+      // With neither data nor URL the chat builder tells the model the file is
+      // unreadable; keep the URL as a reference and let actions read the saved path.
+      next.referenceOnly = true;
+    }
   }
   return next;
 }

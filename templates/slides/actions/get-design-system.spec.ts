@@ -7,6 +7,7 @@ const mockAccessFilter = vi.fn(() => "access-filter");
 const mockWhere = vi.fn();
 const mockSet = vi.fn(() => ({ where: mockWhere }));
 const mockUpdate = vi.fn(() => ({ set: mockSet }));
+const mockReadDeckLinkedDesignSystem = vi.fn();
 
 vi.mock("@agent-native/core/server", () => ({
   hydrateBuilderDesignSystemReference: (
@@ -37,12 +38,20 @@ vi.mock("../server/db/index.js", () => ({
   },
 }));
 
+vi.mock("./_linked-design-system.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./_linked-design-system.js")>()),
+  readDeckLinkedDesignSystem: (...args: unknown[]) =>
+    mockReadDeckLinkedDesignSystem(...args),
+}));
+
 import action from "./get-design-system.js";
 
 describe("get-design-system", () => {
-  it("classifies its Builder doc-count cache refresh as a write", () => {
-    expect(action.readOnly).toBe(false);
-    expect(action.mcpAnnotations?.readOnlyHint).toBe(false);
+  it("is classified read-only so read-scoped MCP grants can call it", () => {
+    // oracle-change: only the app's own UI refreshes the Builder doc-count cache now, so the read is read-only for every outside caller.
+    expect(action.readOnly).toBe(true);
+    // oracle-change: same reclassification, surfaced to MCP clients.
+    expect(action.mcpAnnotations?.readOnlyHint).toBe(true);
     expect(action.mcpAnnotations?.openWorldHint).toBe(true);
   });
 
@@ -187,7 +196,8 @@ describe("get-design-system", () => {
   );
 
   it("persists the hydrated docCount onto the row when it changes", async () => {
-    await action.run({ id: "builder-ds-1" });
+    // oracle-change: the refresh is now saved only for the app's own UI caller.
+    await action.run({ id: "builder-ds-1" }, { caller: "frontend" });
 
     expect(mockUpdate).toHaveBeenCalledTimes(1);
     expect(mockAccessFilter).toHaveBeenCalledWith(
@@ -229,11 +239,62 @@ describe("get-design-system", () => {
     });
   });
 
-  it("does not persist the Builder doc-count cache from a widget read", async () => {
-    const result = await action.run(
-      { id: "builder-ds-1" },
-      { caller: "mcp-widget" },
+  it("serves a deck reader the deck's linked design system without writing to it", async () => {
+    const deck = { designSystemId: "builder-ds-1", data: "{}" };
+    const { resource } = await mockResolveAccess();
+    mockResolveAccess.mockImplementation((type: string) =>
+      Promise.resolve(type === "deck" ? { resource: deck } : null),
     );
+    mockReadDeckLinkedDesignSystem.mockResolvedValue({
+      resource,
+      viaDeck: true,
+    });
+
+    const result = await action.run({ id: "builder-ds-1", deckId: "deck-1" });
+
+    expect(mockReadDeckLinkedDesignSystem).toHaveBeenCalledWith(
+      deck,
+      "builder-ds-1",
+    );
+    expect(Object.keys(result).sort()).toEqual(["data", "id", "title"]);
+    expect(mockHydrateBuilderDesignSystemReference).not.toHaveBeenCalled();
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "mcp",
+    "tool",
+    "a2a",
+    "webmcp",
+    "cli",
+    "automation",
+    "http",
+    "mcp-widget",
+    "mcp-widget-write",
+  ] as const)(
+    "never saves the Builder doc-count cache for a %s caller",
+    async (caller) => {
+      const result = await action.run({ id: "builder-ds-1" }, { caller });
+
+      expect(result.builder).toMatchObject({ docCount: 1 });
+      expect(mockUpdate).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not save the Builder doc-count cache for a frontend claim with a bearer credential", async () => {
+    await action.run(
+      { id: "builder-ds-1" },
+      {
+        caller: "frontend",
+        requestHeaders: new Headers({ authorization: "Bearer test-token" }),
+      },
+    );
+
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not save the Builder doc-count cache for a nested read with no caller", async () => {
+    const result = await action.run({ id: "builder-ds-1" });
 
     expect(result.builder).toMatchObject({ docCount: 1 });
     expect(mockUpdate).not.toHaveBeenCalled();
@@ -262,7 +323,7 @@ describe("get-design-system", () => {
       },
     });
 
-    await action.run({ id: "builder-ds-1" });
+    await action.run({ id: "builder-ds-1" }, { caller: "frontend" });
 
     expect(mockUpdate).not.toHaveBeenCalled();
   });

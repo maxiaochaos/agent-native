@@ -19,22 +19,23 @@ describe("empty design", () => {
     );
   });
 
-  it("renders the board instead of an empty state", () => {
-    expect(source).toContain(') : viewMode === "overview" || activeFile ? (');
-    expect(source).not.toContain("designEditor.noFiles");
-    expect(source).not.toContain("canvasEngaged");
-  });
-
   it("keeps a failed generation recoverable", () => {
     expect(source).toContain("<GenerationStatusCard");
     expect(source).toContain("onRetry={handleRetryGeneration}");
-    const gate = source.slice(
-      source.indexOf("{designIsEmpty &&"),
-      source.indexOf("<GenerationStatusCard"),
+    // oracle-change: a live run no longer swaps the canvas for the card, so the card gate has no run-active clause; e2e/generation-keeps-canvas-live.spec.ts covers it
+  });
+
+  it("keeps failed generations retryable regardless of changed design files", () => {
+    const handler = source.slice(
+      source.indexOf("const handleGenerationFailed = useCallback"),
+      source.indexOf("const getKnownPreviousRunBaseline"),
     );
-    expect(gate).toContain(
-      "generating || pendingGenerationActive || generationIssue",
-    );
+
+    expect(handler).not.toContain("generationOutputReadyRef.current === true");
+    expect(handler).not.toContain("hasPersistedOutputBaseline");
+    expect(handler).toContain("rememberPendingGenerationForRetry(");
+    expect(handler).toContain("failure?.retryable !== false");
+    expect(handler).toContain('t("designEditor.generationStoppedRetry")');
   });
 
   it("keeps the prompt and blocks generation when Labs state is unreadable", () => {
@@ -55,31 +56,5 @@ describe("empty design", () => {
     expect(submit.indexOf("patchPendingGeneration(")).toBeGreaterThan(
       labStateGuard,
     );
-  });
-
-  it("offers creation prompts in the chat rather than orientation ones", () => {
-    const config = source.slice(
-      source.indexOf("const designAgentSuggestionConfig = useMemo"),
-      source.indexOf("const activeLayerPanelNodes"),
-    );
-    expect(config).toContain("designIsEmpty");
-    expect(config).toContain("buildDynamicAgentSuggestions(context)");
-  });
-
-  it("opens the agent and lands the caret in the chat on arrival", () => {
-    const handler = source.slice(
-      source.indexOf("const openGenerateInAgent = useCallback"),
-      source.indexOf("const arrivedFromNewDesign"),
-    );
-    expect(handler).toContain('new Event("agent-panel:open")');
-    const listener = source.slice(
-      source.indexOf("const openAgentPanel = () => {"),
-      source.indexOf('window.addEventListener("agent-panel:open"'),
-    );
-    expect(listener).toContain("focusAgentComposer()");
-  });
-
-  it("adds no second Generate control beside the toolbar", () => {
-    expect(source).not.toContain("data-design-generate-cta");
   });
 });

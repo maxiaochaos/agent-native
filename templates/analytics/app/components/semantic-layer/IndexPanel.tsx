@@ -105,6 +105,8 @@ interface DbtConnection {
   semanticLayerBaseUrl: string | null;
   tokenConfigured: boolean;
   canManage: boolean;
+  // Several granted rows make the top-level fields null, so the panel must say so.
+  connections: Array<{ id: string }>;
 }
 
 interface DbtConnectionFields {
@@ -207,12 +209,16 @@ function sourceStateLabel(status: BrainSourceStatus, t: Translate): string {
       return t("dataStatus.connected");
     case "configured":
       return t("dataStatus.configuredUnverified");
+    case "checking":
+      return t("indexPanel.dbtChecking");
     case "not-connected":
       return t("dataStatus.notConnected");
     case "needs-reauth":
       return t("dataStatus.needsReauth");
     case "error":
       return t("dataStatus.error");
+    case "unknown":
+      return t("dataStatus.unknown");
   }
 }
 
@@ -303,17 +309,20 @@ function SourceStatusRowView({
   const t = useT();
   const formatters = useFormatters();
   const actionLabel =
-    row.status === "needs-reauth"
-      ? t("dataSources.reconnect")
-      : row.status === "connected" ||
-          row.status === "configured" ||
-          row.status === "error"
-        ? t("dataSources.manage")
-        : t("dataSources.connect");
+    row.status === "unknown"
+      ? t("dataSources.manage")
+      : row.status === "needs-reauth"
+        ? t("dataSources.reconnect")
+        : row.status === "connected" ||
+            row.status === "configured" ||
+            row.status === "error"
+          ? t("dataSources.manage")
+          : t("dataSources.connect");
   // Only sources with a data-source card have a page to act on.
   const showLink =
     row.status !== null &&
     row.status !== "connected" &&
+    row.status !== "unknown" &&
     getDataSourceById(row.id) !== undefined;
 
   return (
@@ -482,7 +491,9 @@ function BuildSection() {
     retry: false,
     staleTime: 30_000,
   });
-  const build = useActionMutation("build-data-index");
+  const build = useActionMutation("build-data-index", {
+    errorNotification: "caller",
+  });
   const overview = overviewQuery.data as BrainOverview | undefined;
   const building = build.isPending || overview?.index.state === "running";
 
@@ -522,7 +533,9 @@ function ScheduleSection() {
     retry: false,
     staleTime: 30_000,
   });
-  const save = useActionMutation("set-index-schedule");
+  const save = useActionMutation("set-index-schedule", {
+    errorNotification: "caller",
+  });
   const saved = query.data as IndexSchedule | undefined;
   // Keyed on the saved value, not dataUpdatedAt: saving the other form
   // invalidates every action query, and that must not drop this unsaved edit.
@@ -668,7 +681,9 @@ function DbtRepositorySection() {
     retry: false,
     staleTime: 30_000,
   });
-  const save = useActionMutation("set-dbt-repository");
+  const save = useActionMutation("set-dbt-repository", {
+    errorNotification: "caller",
+  });
   const saved = query.data as DbtRepository | null | undefined;
   // Keyed on the saved value so a save elsewhere does not drop this unsaved edit.
   const savedKey = JSON.stringify(saved);
@@ -824,6 +839,15 @@ function DbtConnectionSection() {
     return (
       <p role="alert" className="text-sm text-destructive">
         {t("indexPanel.dbtReadFailed")}
+      </p>
+    );
+  }
+  // Blank fields here would read as "not connected" and invite a save that the
+  // action refuses. With several rows, show the reason and no form.
+  if (connection.connections.length > 1) {
+    return (
+      <p role="alert" className="text-sm text-muted-foreground">
+        {t("indexPanel.dbtSeveralConnections")}
       </p>
     );
   }

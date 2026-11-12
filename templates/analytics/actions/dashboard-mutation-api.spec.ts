@@ -188,6 +188,27 @@ describe("dashboard mutation api", () => {
     ]);
   });
 
+  it("keeps the hidden notes when a patch changes only the hidden key-date sets", () => {
+    const root: Record<string, unknown> = clone(config());
+    root.annotations = {
+      hiddenKeyDateSets: ["launches"],
+      hiddenDataNotes: [{ noteId: "connect-undercount", panelId: "funnel" }],
+    };
+
+    const result = applyDashboardMutationOperations(root, [
+      {
+        op: "setDashboard",
+        patch: { annotations: { hiddenKeyDateSets: ["product-changes"] } },
+      },
+    ]);
+
+    expect(root.annotations).toEqual({
+      hiddenKeyDateSets: ["product-changes"],
+      hiddenDataNotes: [{ noteId: "connect-undercount", panelId: "funnel" }],
+    });
+    expect(result.dashboardFieldsChanged).toEqual(["annotations"]);
+  });
+
   it("supports matching panels by metadata and appending to a section", () => {
     const root = clone(config());
     const operations = parseDashboardMutationScript(
@@ -209,12 +230,62 @@ describe("dashboard mutation api", () => {
     ]);
   });
 
+  it("rejects setHeight when the selected panel is a section", () => {
+    for (const statement of [
+      'dashboard.section("section").setHeight(2);',
+      'dashboard.panel("section").setHeight(2);',
+    ]) {
+      expect(() => parseDashboardMutationScript(config(), statement)).toThrow(
+        /setHeight is not supported on section panels/,
+      );
+    }
+  });
+
+  it("parses and applies clearHeight as a return to content-based height", () => {
+    const root = clone(config());
+    const selected = root.panels[0] as Record<string, unknown>;
+    selected.height = 3;
+
+    const operations = parseDashboardMutationScript(
+      root,
+      'dashboard.panel("a").clearHeight();',
+    );
+    expect(operations).toEqual([{ op: "clearPanelHeight", panelId: "a" }]);
+
+    const result = applyDashboardMutationOperations(root, operations);
+
+    expect(selected).not.toHaveProperty("height");
+    expect(result.changedPanelIds).toEqual(["a"]);
+    expect(result.commandLog).toEqual(["clearPanelHeight(a)"]);
+  });
+
+  it("rejects clearHeight on sections and with arguments", () => {
+    for (const statement of [
+      'dashboard.section("section").clearHeight();',
+      'dashboard.panel("section").clearHeight();',
+      'dashboard.panel("a").clearHeight(2);',
+    ]) {
+      expect(() => parseDashboardMutationScript(config(), statement)).toThrow(
+        statement.includes("clearHeight(2)")
+          ? /clearHeight does not accept arguments/
+          : /clearHeight is not supported on section panels/,
+      );
+    }
+
+    expect(() =>
+      applyDashboardMutationOperations(clone(config()), [
+        { op: "clearPanelHeight", panelId: "section" },
+      ]),
+    ).toThrow(/operation 1 \(clearPanelHeight\).*clearHeight is not supported/);
+  });
+
   it("supports bulk field edits and nested config path edits", () => {
     const root = clone(config());
     const operations = parseDashboardMutationScript(
       root,
       [
         'dashboard.panelsMatching({"titleIncludes":"Signed-In"}).setWidth(2);',
+        'dashboard.panels(["b","c"]).setHeight(3);',
         'dashboard.panels(["b","c"]).setConfigPath("yAxis.format","percent");',
       ].join("\n"),
     );
@@ -225,6 +296,7 @@ describe("dashboard mutation api", () => {
     );
 
     expect(signedInPanels.map((p) => p.width)).toEqual([2, 2]);
+    expect(signedInPanels.map((p) => p.height)).toEqual([3, 3]);
     expect(signedInPanels.map((p) => p.config)).toEqual([
       { yAxis: { format: "percent" } },
       { yAxis: { format: "percent" } },
@@ -233,6 +305,8 @@ describe("dashboard mutation api", () => {
     expect(result.commandLog).toEqual([
       "updatePanel(b: width)",
       "updatePanel(c: width)",
+      "updatePanel(b: height)",
+      "updatePanel(c: height)",
       "updatePanelPath(b: config.yAxis.format)",
       "updatePanelPath(c: config.yAxis.format)",
     ]);
@@ -352,7 +426,7 @@ describe("dashboard mutation api", () => {
     expect(root.columns).toBe(3);
     expect(renderedRows(root)).toEqual([["a", "b", "b-bar"], ["c"], ["d"]]);
     expect(result.commandLog).toEqual([
-      "duplicatePanel(b -> b-bar) -> index 2",
+      "duplicatePanel(b -> b-bar) -> index 2; also changed dashboard columns 2 to 3, c width 1 to 3",
     ]);
   });
 
@@ -398,7 +472,124 @@ describe("dashboard mutation api", () => {
     ]);
     expect(root.columns).toBe(3);
     expect(renderedRows(root)).toEqual([["a", "b", "new"], ["c"], ["d"]]);
-    expect(result.commandLog).toEqual(["insertPanel(new) -> index 2"]);
+    expect(result.commandLog).toEqual([
+      "insertPanel(new) -> index 2; also changed dashboard columns 2 to 3, c width 1 to 3",
+    ]);
+    expect(root.panels.find((p) => p.id === "d")?.width).toBe(1);
+  });
+
+  it("names the placed panel's own resize, against the width an insert asked for", () => {
+    const inserted = clone(config());
+    const insert = applyDashboardMutationOperations(
+      inserted,
+      parseDashboardMutationScript(
+        inserted,
+        'dashboard.insertPanel({"id":"new","title":"New","source":"first-party","chartType":"metric","width":2,"sql":"SELECT COUNT(*) AS value FROM analytics_events"}).nextTo("b");',
+      ),
+    );
+    expect(renderedRows(inserted)).toEqual([["a", "b", "new"], ["c"], ["d"]]);
+    expect(insert.commandLog).toEqual([
+      "insertPanel(new) -> index 2; also changed dashboard columns 2 to 3, new width 2 to 1, c width 1 to 3",
+    ]);
+
+    const root = {
+      name: "Moved",
+      columns: 2,
+      panels: [{ ...panel("a"), width: 2 }, panel("b"), panel("c")],
+    };
+    const move = applyDashboardMutationOperations(
+      root,
+      parseDashboardMutationScript(root, 'dashboard.panel("a").nextTo("b");'),
+    );
+    expect(renderedRows(root)).toEqual([["b", "a", "c"]]);
+    expect(move.commandLog).toEqual([
+      "movePanels(a) -> index 1; also changed dashboard columns 2 to 3, a width 2 to 1",
+    ]);
+  });
+
+  it("pins a section that follows the dashboard's columns when an insert widens them", () => {
+    const root = {
+      name: "Inherited",
+      columns: 2,
+      panels: [
+        panel("a"),
+        panel("b"),
+        { id: "section", title: "Section", chartType: "section", width: 1 },
+        ...["c", "d", "e", "f"].map((id) => panel(id)),
+      ],
+    };
+    const operations = parseDashboardMutationScript(
+      root,
+      'dashboard.insertPanel({"id":"new","title":"New","source":"first-party","chartType":"metric","width":1,"sql":"SELECT COUNT(*) AS value FROM analytics_events"}).nextTo("a");',
+    );
+
+    const result = applyDashboardMutationOperations(root, operations);
+
+    expect(root.columns).toBe(3);
+    expect(renderedRows(root)).toEqual([
+      ["a", "new", "b"],
+      ["c", "d"],
+      ["e", "f"],
+    ]);
+    expect(result.commandLog).toEqual([
+      "insertPanel(new) -> index 1; also changed dashboard columns 2 to 3, section columns unset to 2",
+    ]);
+  });
+
+  it("resizes only the row a nextTo insert joins and names that resize", () => {
+    const root = {
+      name: "Nurture",
+      columns: 2,
+      panels: [
+        panel("a"),
+        panel("b"),
+        panel("c"),
+        {
+          id: "nurture",
+          title: "Nurture",
+          chartType: "section",
+          width: 1,
+          columns: 3,
+        },
+        { ...panel("p"), width: 2 },
+        panel("q"),
+        panel("r"),
+        {
+          id: "later",
+          title: "Later",
+          chartType: "section",
+          width: 1,
+          columns: 2,
+        },
+        panel("x"),
+        panel("y"),
+      ],
+    };
+    const widths = () => root.panels.map((p) => [p.id, p.width]);
+    const before = widths();
+    const operations = parseDashboardMutationScript(
+      root,
+      'dashboard.insertPanel({"id":"new","title":"New","source":"first-party","chartType":"metric","width":1,"sql":"SELECT COUNT(*) AS value FROM analytics_events"}).nextTo("r");',
+    );
+
+    const result = applyDashboardMutationOperations(root, operations);
+
+    expect(renderedRows(root)).toEqual([
+      ["a", "b"],
+      ["c"],
+      ["p", "q"],
+      ["r", "new"],
+      ["x", "y"],
+    ]);
+    expect(widths()).toEqual(
+      [...before.slice(0, 7), ["new", 1], ...before.slice(7)].map(
+        ([id, width]) => [id, id === "r" ? 2 : width],
+      ),
+    );
+    expect(root.columns).toBe(2);
+    expect(result.commandLog).toEqual([
+      "insertPanel(new) -> index 7; also changed r width 1 to 2",
+    ]);
   });
 
   it("places inserted panels by 1-based visible row number", () => {
@@ -509,6 +700,10 @@ describe("dashboard mutation api", () => {
   });
 
   it("teaches only config keys the renderer honors", () => {
+    expect(DASHBOARD_MUTATION_API_TYPES).toContain(
+      'type SectionSelection = Omit<PanelSelection, "setHeight" | "clearHeight"> & {',
+    );
+    expect(DASHBOARD_MUTATION_API_TYPES).toContain("clearHeight(): void;");
     expect(DASHBOARD_MUTATION_API_TYPES).not.toContain("yAxis");
     expect(DASHBOARD_MUTATION_API_TYPES).toContain('e.g. "yFormatter"');
     expect(DASHBOARD_MUTATION_EXAMPLES).toContain(

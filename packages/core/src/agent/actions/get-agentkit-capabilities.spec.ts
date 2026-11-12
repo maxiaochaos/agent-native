@@ -11,13 +11,13 @@ import action from "./get-agentkit-capabilities.js";
 describe("get-agentkit-capabilities", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("requires an authenticated Design or Slides app context", async () => {
+  it("requires an authenticated supported app context", async () => {
     await expect(action.run({}, { appId: "design" })).rejects.toMatchObject({
       statusCode: 401,
       errorCode: "unauthorized",
     });
     await expect(
-      action.run({}, { appId: "templates", userEmail: "a@example.test" }),
+      action.run({}, { userEmail: "a@example.test" }),
     ).rejects.toMatchObject({
       statusCode: 400,
       errorCode: "agentkit_capabilities_unsupported_app",
@@ -53,4 +53,30 @@ describe("get-agentkit-capabilities", () => {
       readOnly: true,
     });
   });
+
+  it.each(["slides", "chat", "analytics", "clips", "custom-workspace-app"])(
+    "preserves the trusted %s app identity for capability discovery",
+    async (appId) => {
+      const result = {
+        sources: { figma: { available: false } },
+        integrations: [],
+      };
+      mocks.list.mockResolvedValue(result);
+
+      await expect(
+        action.run(
+          {},
+          {
+            appId,
+            userEmail: "member@example.test",
+            orgId: "org-1",
+          },
+        ),
+      ).resolves.toEqual(result);
+      expect(mocks.list).toHaveBeenCalledWith(appId, {
+        userEmail: "member@example.test",
+        orgId: "org-1",
+      });
+    },
+  );
 });

@@ -1,4 +1,4 @@
-import { defineAction } from "@agent-native/core/action";
+import { defineAction, fail } from "@agent-native/core/action";
 import {
   getRequestUserEmail,
   getRequestOrgId,
@@ -9,6 +9,7 @@ import { nanoid } from "nanoid";
 import { z } from "zod";
 
 import { getDb, schema } from "../server/db/index.js";
+import { designOutputWriteReceipt } from "../shared/generation-output-receipt.js";
 import { annotateScreenHtmlForPersist } from "../shared/screen-annotation.js";
 import { trackDesignCreated } from "./_design-tracking.js";
 
@@ -25,7 +26,12 @@ export default defineAction({
   }),
   run: async ({ id, title }, ctx) => {
     const access = await resolveAccess("design", id);
-    if (!access) throw new Error(`Design not found: ${id}`);
+    if (!access) {
+      fail(`Design not found: ${id}`, {
+        errorCode: "design_not_found",
+        statusCode: 404,
+      });
+    }
 
     const source = access.resource;
     const db = getDb();
@@ -64,7 +70,12 @@ export default defineAction({
     const orgId = getRequestOrgId() || null;
     const ownerEmail = (() => {
       const e = getRequestUserEmail();
-      if (!e) throw new Error("no authenticated user");
+      if (!e) {
+        fail("Sign in to duplicate a design.", {
+          errorCode: "unauthenticated",
+          statusCode: 401,
+        });
+      }
       return e;
     })();
 
@@ -98,7 +109,7 @@ export default defineAction({
       }
     });
 
-    trackDesignCreated(
+    await trackDesignCreated(
       newId,
       {
         creationMethod: "duplicate",
@@ -113,6 +124,7 @@ export default defineAction({
       id: newId,
       title: newTitle,
       fileCount: files.length,
+      _receipt: designOutputWriteReceipt(newId, files.length),
     };
   },
 });

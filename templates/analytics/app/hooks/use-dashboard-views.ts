@@ -1,4 +1,5 @@
 import { callAction, useSession } from "@agent-native/core/client/hooks";
+import { surfaceMutationError } from "@agent-native/core/client/write-failure";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { dashboardCacheScope } from "@/lib/prefetch-keys";
@@ -59,6 +60,7 @@ export function useDashboardViews(dashboardId: string | undefined) {
   });
 
   const { mutateAsync: deleteView } = useMutation({
+    meta: surfaceMutationError(),
     mutationFn: async (viewId: string) => {
       if (!dashboardId) return;
       await callAction(
@@ -77,7 +79,8 @@ export function useDashboardViews(dashboardId: string | undefined) {
     views,
     isLoading: viewsQuery.isLoading,
     isSuccess: viewsQuery.isSuccess,
-    isSettled: viewsQuery.isSuccess || viewsQuery.isError,
+    isError: viewsQuery.isError,
+    isFetching: viewsQuery.isFetching,
     error: viewsQuery.error,
     refetch: viewsQuery.refetch,
     saveView,

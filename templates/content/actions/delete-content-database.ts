@@ -12,9 +12,11 @@ import {
   refreshAfterSetup,
   setupAuditSummary,
 } from "./_database-setup-mutation.js";
+import { assertAgentsMayEditPageText } from "./_document-agent-lock.js";
 import {
-  lockDatabasesForTrash,
+  lockLifecycleGroup,
   trashDocumentSubtree,
+  type LifecycleGroupLocks,
 } from "./delete-document.js";
 
 export default defineAction({
@@ -53,14 +55,14 @@ export default defineAction({
     summary: (_args, result) =>
       setupAuditSummary(result, "Moved Content database to recoverable Trash"),
   },
-  run: async (args, context) => {
-    if (context?.caller === "mcp") setupLifecycleSchema.parse(args);
+  run: async (args, ctx) => {
+    if (ctx?.caller === "mcp") setupLifecycleSchema.parse(args);
     if ("target" in args) {
       const input = setupLifecycleSchema.parse(args);
       const { database } = await assertContentDatabaseLifecycleAccess(
         input.target.databaseId,
       );
-      let lockedIds: ReadonlySet<string> | undefined;
+      let locks: LifecycleGroupLocks | undefined;
       const result = await runDatabaseSetupMutation({
         operation: "delete-content-database",
         input,
@@ -68,11 +70,13 @@ export default defineAction({
         role: "admin",
         includeDeleted: true,
         lock: async (tx) => {
-          lockedIds = await lockDatabasesForTrash(
-            tx,
-            database.documentId,
-            database.ownerEmail,
-          );
+          locks = await lockLifecycleGroup(tx, {
+            operation: "trash",
+            roots: [
+              { id: database.documentId, ownerEmail: database.ownerEmail },
+            ],
+            alsoLockDatabaseIds: [database.id],
+          });
         },
         apply: async (tx, context) => {
           if (context.database.ownerDocumentId)
@@ -90,7 +94,9 @@ export default defineAction({
                 context.database.documentId,
                 context.database.ownerEmail,
                 deletedAt,
-                lockedIds,
+                locks!,
+                undefined,
+                ctx,
               );
           return {
             outcome: context.database.deletedAt
@@ -115,22 +121,25 @@ export default defineAction({
     if (database.systemRole) {
       throw new Error("System Content databases cannot be deleted");
     }
-    await assertAccess("document", database.documentId, "admin");
+    const access = await assertAccess("document", database.documentId, "admin");
+    if (!database.deletedAt) assertAgentsMayEditPageText(access.resource, ctx);
     const db = getDb();
     const deletedAt = database.deletedAt ?? new Date().toISOString();
     const deletedDocumentIds = await db.transaction(async (tx) => {
       const transactionDb = tx as unknown as ReturnType<typeof getDb>;
-      const lockedDatabaseIds = await lockDatabasesForTrash(
-        transactionDb,
-        database.documentId,
-        database.ownerEmail,
-      );
+      const locks = await lockLifecycleGroup(transactionDb, {
+        operation: "trash",
+        roots: [{ id: database.documentId, ownerEmail: database.ownerEmail }],
+        alsoLockDatabaseIds: [database.id],
+      });
       return trashDocumentSubtree(
         transactionDb,
         database.documentId,
         database.ownerEmail,
         deletedAt,
-        lockedDatabaseIds,
+        locks,
+        undefined,
+        ctx,
       );
     });
 

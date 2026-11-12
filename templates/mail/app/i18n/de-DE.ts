@@ -34,8 +34,12 @@ const messages = {
       newest: "Neueste",
       priority: "Priorität",
       priorityFailed: "Der Posteingang konnte nicht sortiert werden.",
+      priorityProviderRequired:
+        "Verbinde einen KI-Anbieter, um nach Priorität zu sortieren.",
+      priorityPartialFailed:
+        "Für {{count}} Nachrichten konnte keine Priorität ermittelt werden. Sie erscheinen nach den bewerteten Nachrichten.",
       priorityScoreHelp:
-        "Ein höherer Wert bedeutet, dass Jev die Nachricht für wichtiger hält.",
+        "Ein höherer Wert bedeutet, dass diese Nachricht wahrscheinlich wichtiger ist.",
       priorityFeedbackSuggestion:
         "Mach aus diesem Feedback eine Regel für Wichtigkeit oder automatisches Archivieren.",
       priorityFeedbackAskAgent: "Agent um Regelvorschläge bitten",
@@ -318,7 +322,12 @@ const messages = {
       openProviderSettings: "Open {{provider}} Settings",
       apolloDescription: "Kontaktanreicherung und Unternehmensdaten",
       hubspotDescription: "CRM-Kontakte, Deals und Tickets",
-      gongDescription: "Aktuelle Anrufe und Gesprächsintelligenz",
+      gongDescription: "Gong-Anrufverlauf",
+      gongAccessCheckFailed:
+        "Es konnte nicht geprüft werden, ob du Gong verbinden darfst.",
+      gongKeyPlaceholder: "Gong-API-Schlüssel",
+      gongKeyFormatHint:
+        "Gib Zugriffsschlüssel und Geheimnis im Format access_key:secret ein.",
       pylonDescription: "Supportfälle und Kontodaten",
       gongCalls: "Gong-Anrufe",
       deals: "Deals",
@@ -442,6 +451,7 @@ const messages = {
       tryDifferentKeywords: "Andere Schlüsselwörter versuchen",
       nothingHere: "Hier ist noch nichts",
       loadingMore: "Mehr wird geladen...",
+      openAllMailForOlder: "Alle E-Mails öffnen für ältere Nachrichten",
     },
     toasts: {
       noEmailSelected: "Keine E-Mail ausgewählt.",
@@ -472,9 +482,20 @@ const messages = {
       scheduledCancelFailed: "Geplante E-Mail konnte nicht abgebrochen werden",
       failedToAttachFile: "No se pudo adjuntar el archivo",
       failedToUploadImage: "Bild konnte nicht hochgeladen werden",
+      storageBuilderRefused:
+        "Builder.io hat die Dateispeicher-Verbindung von Mail abgelehnt, daher wurde die Datei nicht angehängt. Verbinde Builder.io neu oder nutze deinen eigenen Speicher und versuche es dann erneut.",
+      storageRefused:
+        "Dein Speicher-Bucket hat diesen Upload abgelehnt, daher wurde die Datei nicht angehängt. Prüfe den Bucket und seine Schlüssel und versuche es dann erneut.",
+      storageNotConfigured:
+        "Es ist kein Dateispeicher eingerichtet, daher wurde die Datei nicht angehängt. Verbinde Builder.io oder deinen eigenen Speicher-Bucket und versuche es dann erneut.",
+      openStorageSettings: "Speichereinstellungen öffnen",
+      reconnectBuilderStorage: "Builder.io neu verbinden",
+      useOwnStorage: "Eigenen Speicher verwenden",
       failedToSendEmail: "No se pudo enviar el email",
       messageSent: "Nachricht gesendet.",
       failedToSaveDraft: "Entwurf konnte nicht gespeichert werden.",
+      failedToRefreshInbox:
+        "Posteingang konnte nicht aktualisiert werden. Bitte versuche es gleich noch einmal.",
       failedToDeleteDraft: "Entwurf konnte nicht gelöscht werden.",
       failedToScheduleEmailDraftKeptOpen:
         "No se pudo programar el email - borrador abierto",
@@ -739,14 +760,16 @@ const messages = {
       tagTabsHelp: "Jedes Tag wird zu einem Tab im Posteingang",
       addTag: "Tag hinzufügen",
       triageTitle: "KI-Triage",
-      connectJev: "Jev verbinden",
-      connectJevToRunTriage: "Verbinde Jev, um die Triage auszuführen",
+      connectJev: "KI-Anbieter verbinden",
+      connectJevToRunTriage:
+        "Verbinde einen KI-Anbieter, um die Triage auszuführen",
       freeBuilderOrApiKey:
         "Kostenlos mit Builder.io oder füge einen API-Schlüssel hinzu.",
       jevAvailabilityFailed:
-        "Die Verfügbarkeit von Jev konnte nicht geprüft werden.",
+        "Die Verfügbarkeit eines KI-Entscheidungsanbieters konnte nicht geprüft werden.",
       connectBuilder: "Builder.io verwenden",
-      addJevApiKey: "API-Schlüssel hinzufügen",
+      addJevApiKey: "Jev-API-Schlüssel hinzufügen",
+      addOpenAiApiKey: "OpenAI-API-Schlüssel hinzufügen",
     },
     draftQueue: {
       title: "Cola de borradores",
@@ -788,6 +811,17 @@ const messages = {
       emailThread: "Conversación de email",
       unableToLoadThread: "No se pudo cargar la conversación",
       openInApp: "Abrir en la app",
+      draft: "E-Mail-Entwurf - Mail",
+    },
+    draftCard: {
+      loadFailed: "Dieser Entwurf konnte nicht geladen werden.",
+      notFoundTitle: "Entwurf nicht gefunden",
+      goneTitle: "Dieser Entwurf wurde gesendet oder gelöscht.",
+      threadUnavailable:
+        "Die früheren Nachrichten dieser Unterhaltung konnten nicht geladen werden.",
+      earlierMessages: "Frühere Nachrichten ({{count}})",
+      sendInMail: "In Mail senden",
+      openBlocked: "Dein Browser hat den neuen Tab blockiert.",
     },
     agentEngine: {
       activeEngine: "Motor activo",
@@ -949,15 +983,19 @@ const messages = {
     shortcutsList: "Nachrichtenliste",
     shortcutsThread: "Konversation",
     shortcutsCompose: "Verfassen",
+    askAi: "KI fragen",
     backToCommands: "Zurück zu den Befehlen",
     backToMessageList: "Zur Nachrichtenliste zurückkehren",
     cycleTabs: "Zwischen Tabs wechseln",
     extendSelection: "Auswahl erweitern",
+    goToUnread: "Zu Ungelesen",
     moveSelection: "Auswahl verschieben",
     nextPreviousConversation: "Nächste / vorherige Unterhaltung",
     nextPreviousMessage: "Nächste / vorherige Nachricht",
     openMessage: "Nachricht öffnen",
+    pageDownUp: "Seite nach unten / oben",
     selectAllConversations: "Alle Unterhaltungen auswählen",
+    selectConversation: "Unterhaltung auswählen",
     sendAndMarkDone: "Senden und als erledigt markieren",
     toggleMessageExpansion: "Nachricht ein- / ausklappen",
     toggleReadState: "Lesestatus umschalten",

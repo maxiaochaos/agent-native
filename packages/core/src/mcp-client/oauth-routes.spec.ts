@@ -95,6 +95,11 @@ import {
   mcpUrlRequiresOrganizationScope,
 } from "../client/resources/mcp-integration-catalog.js";
 import { CredentialStoreUnavailableError } from "../server/credential-provider.js";
+import {
+  SessionResolutionUnavailableError,
+  SessionResolutionLookupError,
+} from "../server/session-resolution-errors.js";
+import { ForbiddenError } from "../sharing/errors.js";
 import { McpOAuthRegistrationUnsupportedError } from "./oauth-client.js";
 import {
   bindMcpOAuthAuthorizationScope,
@@ -240,6 +245,107 @@ describe("MCP OAuth callback flow validation", () => {
     });
   });
 
+  describe.each(["start", "callback"] as const)(
+    "%s identity failures",
+    (phase) => {
+      describe.each(["session", "org"] as const)("%s lookup", (boundary) => {
+        it.each(["transient", "permanent", "forbidden"] as const)(
+          "preserves %s failures before OAuth work",
+          async (kind) => {
+            const cause = Object.assign(
+              new Error("fake private OAuth membership failure"),
+              { code: "57014" },
+            );
+            const failure =
+              kind === "transient"
+                ? new SessionResolutionUnavailableError({ cause })
+                : kind === "permanent"
+                  ? new SessionResolutionLookupError(cause)
+                  : new ForbiddenError();
+            const routes: Array<{ handler: (event: H3Event) => unknown }> = [];
+            callbackMocks.getH3App.mockReturnValue({
+              use: (_base: string, handler: (event: H3Event) => unknown) =>
+                routes.push({ handler }),
+            });
+            callbackMocks.getSession.mockResolvedValue({
+              email: "alice@example.com",
+            });
+            callbackMocks.getOrgContext.mockResolvedValue({
+              email: "alice@example.com",
+              orgId: "org-acme",
+              role: "owner",
+            });
+            callbackMocks[
+              boundary === "session" ? "getSession" : "getOrgContext"
+            ].mockRejectedValue(failure);
+            const flow: McpOAuthFlow = {
+              ...baseFlow,
+              scope: "org",
+              scopeId: "org-acme",
+              orgId: "org-acme",
+              expiresAt: Date.now() + 60_000,
+            };
+            const writeEvent = mockEvent(
+              new Request("https://app.example.com/start"),
+            );
+            setMcpOAuthFlowCookie(writeEvent, flow, false);
+            const cookie = writeEvent.res.headers
+              .getSetCookie()
+              .map((value) => value.split(";", 1)[0])
+              .join("; ");
+            const url =
+              phase === "start"
+                ? "https://app.example.com/start?name=linear&url=https%3A%2F%2Fmcp.example.com%2Fmcp&scope=org"
+                : `https://app.example.com/callback?state=${encodeURIComponent(flow.state)}&code=fake-code`;
+            const event = mockEvent(new Request(url, { headers: { cookie } }));
+            const reconfigure = vi.fn(async () => true);
+            mountMcpOAuthRoutes({}, { reconfigure });
+            const handler = routes[0]?.handler;
+            if (!handler) throw new Error("Missing OAuth test route");
+            await expect(Promise.resolve(handler(event))).rejects.toBe(failure);
+            expect(event.res.headers.getSetCookie()).toEqual([]);
+            expect(
+              callbackMocks.startMcpOAuthAuthorization,
+            ).not.toHaveBeenCalled();
+            expect(
+              callbackMocks.finishMcpOAuthAuthorization,
+            ).not.toHaveBeenCalled();
+            expect(callbackMocks.addOAuthRemoteServer).not.toHaveBeenCalled();
+            expect(
+              callbackMocks.replaceOAuthRemoteServer,
+            ).not.toHaveBeenCalled();
+            expect(reconfigure).not.toHaveBeenCalled();
+            if (
+              phase === "callback" &&
+              boundary === "org" &&
+              kind === "transient"
+            ) {
+              callbackMocks.getOrgContext.mockResolvedValue({
+                email: "alice@example.com",
+                orgId: "org-acme",
+                role: "owner",
+              });
+              const retry = mockEvent(
+                new Request(url, { headers: { cookie } }),
+              );
+              const result = await handler(retry);
+              expect(result).toBeInstanceOf(Response);
+              expect(
+                callbackMocks.finishMcpOAuthAuthorization,
+              ).toHaveBeenCalledTimes(1);
+              expect(callbackMocks.addOAuthRemoteServer).toHaveBeenCalledWith(
+                "org",
+                "org-acme",
+                expect.objectContaining({ name: flow.name, url: flow.url }),
+              );
+              expect(reconfigure).toHaveBeenCalledTimes(1);
+            }
+          },
+        );
+      });
+    },
+  );
+
   it("rejects anonymous OAuth starts before org lookup or MCP work", async () => {
     const routes: Array<{ handler: (event: H3Event) => unknown }> = [];
     callbackMocks.getH3App.mockReturnValue({
@@ -374,7 +480,12 @@ describe("MCP OAuth callback flow validation", () => {
   });
 
   describe("workspace callback URIs", () => {
-    async function startWorkspaceOAuth(serverUrl: string, extraQuery = "") {
+    async function startWorkspaceOAuth(
+      serverUrl: string,
+      extraQuery = "",
+      acceptHtml = false,
+      acceptLanguage?: string,
+    ) {
       vi.stubEnv("AGENT_NATIVE_WORKSPACE", "1");
       vi.stubEnv("APP_BASE_PATH", "/dispatch");
       const routes: Array<{ handler: (event: H3Event) => unknown }> = [];
@@ -395,7 +506,12 @@ describe("MCP OAuth callback flow validation", () => {
         new Request(
           `https://app.example.com/start?name=remote&url=${encodeURIComponent(serverUrl)}&scope=user${extraQuery}`,
           {
-            headers: { host: "app.example.com", "x-forwarded-proto": "https" },
+            headers: {
+              host: "app.example.com",
+              "x-forwarded-proto": "https",
+              ...(acceptHtml ? { accept: "text/html" } : {}),
+              ...(acceptLanguage ? { "accept-language": acceptLanguage } : {}),
+            },
           },
         ),
       );
@@ -443,6 +559,37 @@ describe("MCP OAuth callback flow validation", () => {
       expect(redirectUrl).toBe(
         "https://app.example.com/_agent-native/mcp/servers/oauth/callback",
       );
+    });
+
+    it("returns to the integration that started OAuth when HubSpot setup is missing", async () => {
+      resolveSecretPairsMock.mockResolvedValue(null);
+
+      const { result } = await startWorkspaceOAuth(
+        "https://mcp.hubspot.com/",
+        `&return=${encodeURIComponent("/dispatch/settings/integrations?tab=mcp")}`,
+        true,
+        "fr-FR",
+      );
+
+      expect((result as Response).status).toBe(400);
+      const html = await (result as Response).text();
+      expect(html).toContain('href="/dispatch/settings/integrations?tab=mcp"');
+      expect(html).toContain("Retour à l’application");
+      expect(callbackMocks.startMcpOAuthAuthorization).not.toHaveBeenCalled();
+    });
+
+    it("uses a mount-aware integrations fallback when the return path is missing", async () => {
+      resolveSecretPairsMock.mockResolvedValue(null);
+
+      const { result } = await startWorkspaceOAuth(
+        "https://mcp.hubspot.com/",
+        "",
+        true,
+      );
+
+      const html = await (result as Response).text();
+      expect(html).toContain('href="/dispatch/settings/integrations"');
+      expect(callbackMocks.startMcpOAuthAuthorization).not.toHaveBeenCalled();
     });
 
     it("uses the app mount when an optional managed client falls back to dynamic registration", async () => {
@@ -507,12 +654,30 @@ describe("MCP OAuth callback flow validation", () => {
     expect(resolveMcpOAuthReturnPath(false, { ...baseFlow })).toBe(
       "/settings/integrations",
     );
+  });
+
+  it("preserves a supplied return route after a successful OAuth connection", () => {
     expect(
       resolveMcpOAuthReturnPath(true, {
         ...baseFlow,
         returnUrl: "/chat?thread=meeting-actions",
       }),
     ).toBe("/chat?thread=meeting-actions");
+    expect(resolveMcpOAuthReturnPath(true, { ...baseFlow })).toBe(
+      "/settings/integrations?connected=mcp-linear",
+    );
+  });
+
+  it("preserves the connection completion page for popup OAuth flows", () => {
+    expect(
+      resolveMcpOAuthReturnPath(true, {
+        ...baseFlow,
+        returnUrl:
+          "/_agent-native/oauth/popup?complete=workspace-connection&resume=8d1bd7cf-419e-4ff0-8545-19dedb819154",
+      }),
+    ).toBe(
+      "/_agent-native/oauth/popup?complete=workspace-connection&resume=8d1bd7cf-419e-4ff0-8545-19dedb819154",
+    );
   });
 
   it("carries staged cookies on native redirects", () => {

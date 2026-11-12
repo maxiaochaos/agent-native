@@ -35,6 +35,7 @@ import {
   type AutomationFailure,
 } from "./automation-outcome.js";
 import {
+  AutomationRecoveryProjectionDeferredError,
   AutomationRecoveryStorageError,
   deliveryNoteForEvents,
   inspectAutomationRecovery,
@@ -46,6 +47,7 @@ import {
   isBackgroundAutomationRunActive,
   resolveBackgroundAutomationIdentity,
   runBackgroundAutomation,
+  runJobRunner,
   startBackgroundAutomationHistory,
   type BackgroundAutomationContext,
   type BackgroundAutomationDeps,
@@ -72,6 +74,7 @@ import {
   finishRemoteAutomationHistory,
   getRemoteAutomationStatus,
 } from "./remote-execution.js";
+import { automationRunOwnership } from "./run-history-ownership.js";
 import {
   automationRunClaimLeaseMs,
   claimAutomationRun,
@@ -115,6 +118,8 @@ export type RecurringJobContext = BackgroundAutomationContext;
 
 export interface SchedulerDeps extends BackgroundAutomationDeps {
   getInitialToolNames?: (job?: RecurringJobContext) => string[] | undefined;
+  /** Job `appId` values this scheduler runs besides `appId`; the lease and run history stay under `appId`. */
+  additionalJobAppIds?: readonly string[];
 }
 
 const MAX_CONCURRENT_SCHEDULED_JOBS = 8;
@@ -124,11 +129,6 @@ const MAX_PAUSED_RECHECKS_PER_TICK = 8;
 const PAUSED_RECHECK_MS = 15 * 60_000;
 const _activeScheduledJobs = new Set<string>();
 const _preflightingScheduledJobs = new Set<string>();
-
-let _hasJobsCache: boolean | undefined;
-let _lastJobsCheck = 0;
-const JOBS_CHECK_INTERVAL_MS = 5 * 60_000;
-let _emitterSubscribed = false;
 
 async function recordSchedulerHealthForScopes(input: {
   appId?: string;
@@ -159,25 +159,6 @@ async function recordSchedulerHealthForScopes(input: {
       );
     }
   }
-}
-
-function subscribeToJobsResourceEvents(): void {
-  if (_emitterSubscribed) return;
-  _emitterSubscribed = true;
-  import("../resources/emitter.js")
-    .then(({ getResourcesEmitter }) => {
-      getResourcesEmitter().on("resources", (event: any) => {
-        if (typeof event?.path === "string" && event.path.startsWith("jobs/")) {
-          _hasJobsCache = undefined;
-        }
-      });
-    })
-    .catch((err) => {
-      console.warn(
-        "[jobs] resource-event subscription failed:",
-        err instanceof Error ? err.message : err,
-      );
-    });
 }
 
 export async function processRecurringJobs(deps: SchedulerDeps): Promise<void> {
@@ -246,8 +227,6 @@ async function processRecurringJobsWithLease(
   leaseSignal: AbortSignal,
   assertCanStart: () => Promise<void>,
 ): Promise<void> {
-  subscribeToJobsResourceEvents();
-
   try {
     const { runUploadReceiptCleanupOnce } =
       await import("../file-upload/actions/upload-image.js");
@@ -275,17 +254,6 @@ async function processRecurringJobsWithLease(
     orgIds: [],
     checkedAt: nowMs,
   });
-  if (
-    _hasJobsCache === false &&
-    nowMs - _lastJobsCheck < JOBS_CHECK_INTERVAL_MS
-  ) {
-    await recordSchedulerHealthForScopes({
-      appId: deps.appId,
-      orgIds: [],
-      checkedAt: nowMs,
-    });
-    return;
-  }
 
   const reservedJobKeys = new Set<string>();
   const startedJobKeys = new Set<string>();
@@ -294,12 +262,16 @@ async function processRecurringJobsWithLease(
   let dispatchedAt: number | undefined;
 
   try {
+    // Read jobs/ on every tick. Any instance can create an automation, so a
+    // remembered "no jobs" here would hold its first run back until it lapsed.
     const jobResources = await resourceListAllOwners("jobs/");
-    _hasJobsCache = jobResources.some(
-      (r) => r.path.endsWith(".md") && !r.path.endsWith(".keep"),
-    );
-    _lastJobsCheck = nowMs;
-    if (!_hasJobsCache) return;
+    if (
+      !jobResources.some(
+        (r) => r.path.endsWith(".md") && !r.path.endsWith(".keep"),
+      )
+    ) {
+      return;
+    }
     const now = new Date();
 
     const dueJobCandidates: Array<{
@@ -318,7 +290,7 @@ async function processRecurringJobsWithLease(
 
       const { meta, body } = parseJobFrontmatter(resource.content);
       if (
-        !jobBelongsToApp(meta, deps.appId) &&
+        !jobBelongsToApp(meta, deps.appId, deps.additionalJobAppIds) &&
         !isRecoveredFactoryJob(meta, resource.path, deps.appId, resource.owner)
       ) {
         continue;
@@ -336,9 +308,14 @@ async function processRecurringJobsWithLease(
         continue;
       }
 
-      // Settled before the pause check: "Run now" on a paused job leaves it
+      // Legacy jobs have no explicit trigger type. Explicit automations are
+      // acquired here only when they positively declare a schedule trigger.
+      const isScheduleTrigger =
+        meta.triggerType === undefined || meta.triggerType === "schedule";
+
+      // Settled before the enabled check: "Run now" on a paused job leaves it
       // `running`, and only these branches finish that run.
-      if (meta.lastStatus === "running" && meta.executionHostId) {
+      if (meta.lastStatus === "running" && remoteExecutionHostId(meta)) {
         await reconcileRemoteJob(resource, meta, now);
         continue;
       }
@@ -448,13 +425,15 @@ async function processRecurringJobsWithLease(
         }
         if (await updateResource(resource, meta, body)) {
           await recoverStaleAutomationHistory(
-            resource.owner,
+            staleHistoryOwner(resource, meta),
             resource.path,
             now,
           );
         }
         continue;
       }
+
+      if (!isScheduleTrigger) continue;
 
       if (isPausedByFramework(meta)) {
         const kind = isTransientPauseProbeDue(meta, now)
@@ -469,8 +448,9 @@ async function processRecurringJobsWithLease(
         continue;
       }
 
-      if (!meta.enabled || !meta.schedule) continue;
-      if (!isValidCron(meta.schedule)) continue;
+      if (!meta.enabled || !meta.schedule || !isValidCron(meta.schedule)) {
+        continue;
+      }
 
       if (meta.nextRun) {
         const nextRunDate = new Date(meta.nextRun);
@@ -649,8 +629,6 @@ async function processRecurringJobsWithLease(
     const { isConnectionError } = await import("../db/client.js");
     if (isConnectionError(err)) {
       healthError = "The scheduler could not reach the database.";
-      _hasJobsCache = undefined;
-      _lastJobsCheck = 0;
       return;
     }
     const detail =
@@ -671,6 +649,27 @@ async function processRecurringJobsWithLease(
       error: healthError,
     });
   }
+}
+
+/**
+ * The owner the runner recorded this automation's history under: a legacy
+ * shared resource has no organization in its owner, so the resolved execution
+ * identity decides (the organization for an org-bound run, the creator
+ * otherwise). Recovery must query that owner, not the resource owner.
+ */
+function staleHistoryOwner(resource: Resource, meta: JobFrontmatter): string {
+  const effectiveRunAs = meta.runAs ?? "creator";
+  const executionOwner =
+    effectiveRunAs === "creator"
+      ? meta.createdBy?.trim() || resource.owner
+      : resource.owner;
+  return automationRunOwnership(
+    resource.owner,
+    executionOwner,
+    recoveredFactoryOwnerOrgId(meta, resource.path, resource.owner) ??
+      meta.orgId ??
+      null,
+  ).owner;
 }
 
 async function recoverStaleAutomationHistory(
@@ -704,7 +703,7 @@ async function recoverStaleAutomationHistory(
       // Until its claim lease passes, its worker (or the redelivery sweep) can
       // still pick it up, so it is not stale however old the frontmatter lock
       // it inherits is. This reads the stored claim, not the derived status: a
-      // row past the read-liveness ceiling still reports `interrupted`.
+      // claimed row stays live even when its queue age exceeds the ceiling.
       const lastQueueTouch = run.claimedAt ?? run.startedAt;
       const dispatchIsClaimable =
         run.dispatchPending &&
@@ -868,6 +867,11 @@ function jobNameOf(resource: Resource): string {
   return resource.path.replace(/^jobs\//, "").replace(/\.md$/, "");
 }
 
+/** A runner job never goes to a host; `runJobRunner` refuses the pair loudly. */
+function remoteExecutionHostId(meta: JobFrontmatter): string | undefined {
+  return meta.runner ? undefined : meta.executionHostId;
+}
+
 function isRecheckDue(meta: JobFrontmatter, now: Date): boolean {
   const lastCheckMs = meta.lastCheck ? Date.parse(meta.lastCheck) : Number.NaN;
   return (
@@ -911,7 +915,18 @@ async function clearPauseFields(
   meta: JobFrontmatter,
   body: string,
 ): Promise<void> {
-  await updateResource(resource, meta, body, RESUME_AUTOMATION_PATCH);
+  // Whoever flipped `enabled` left the old pause fields behind. A run may still
+  // be active behind them ("Run now" on a paused job), so the cleanup lifts the
+  // pause without clearing the run marker or the failure detail its outcome
+  // still needs.
+  await updateResource(
+    resource,
+    meta,
+    body,
+    meta.lastStatus === "running"
+      ? { pausedReason: undefined, pausedAt: undefined, lastStatus: "running" }
+      : RESUME_AUTOMATION_PATCH,
+  );
 }
 
 interface PausedRecheck {
@@ -970,6 +985,12 @@ async function resumeRecoveredPauses(
             {
               ownerEmail: identity.identity.userEmail,
               orgId: identity.identity.orgId,
+              ...(identity.identity.orgScope === "personal"
+                ? { orgScope: "personal" as const }
+                : {}),
+              ...(identity.identity.defaultAgentEngineScope === "deployment"
+                ? { defaultAgentEngineScope: "deployment" as const }
+                : {}),
             },
             deps,
             meta.model,
@@ -1184,6 +1205,7 @@ async function executeJob(
     return { status: "skipped", error };
   }
 
+  const remoteHostId = remoteExecutionHostId(meta);
   let historyId = options.historyId;
   const runningMeta = { ...meta };
   if (!options.resume) {
@@ -1195,7 +1217,7 @@ async function executeJob(
   runningMeta.lastStatus = "running";
   runningMeta.lastError = undefined;
   let markerWritten: boolean;
-  if (!historyId && !meta.executionHostId) {
+  if (!historyId && !remoteHostId) {
     await ensureResourcesTable();
     const conflict = Symbol("automation firing marker conflict");
     let notifyMarker: (() => Promise<void>) | undefined;
@@ -1277,7 +1299,7 @@ async function executeJob(
     ? `[Manual Automation Run: ${jobName}]\nThis run was explicitly started by the automation owner. Execute the following instructions now:\n\n${body}`
     : `[Recurring Job: ${jobName}]\nSchedule: ${describeCron(meta.schedule, effectiveTimezone(meta.timezone))}\n\nExecute the following job instructions:\n\n${body}`;
 
-  if (meta.executionHostId) {
+  if (remoteHostId) {
     try {
       const dispatch = await dispatchRemoteAutomation({
         resource,
@@ -1340,8 +1362,14 @@ async function executeJob(
     }
   }
 
-  const requestContext =
-    meta.originScopeId && meta.deliveryPlatform && meta.deliveryDestination
+  const requestContext = {
+    ...(identity.identity.orgScope === "personal"
+      ? { orgScope: "personal" as const }
+      : {}),
+    ...(identity.identity.defaultAgentEngineScope === "deployment"
+      ? { defaultAgentEngineScope: "deployment" as const }
+      : {}),
+    ...(meta.originScopeId && meta.deliveryPlatform && meta.deliveryDestination
       ? {
           isIntegrationCaller: true as const,
           integration: {
@@ -1364,43 +1392,57 @@ async function executeJob(
             },
           },
         }
-      : undefined;
+      : {}),
+  };
 
   let result: BackgroundAutomationRunResult;
   try {
-    result = await runBackgroundAutomation(
-      {
-        automation: jobContext,
-        ownerEmail: jobUserEmail,
-        orgId: jobOrgId,
-        prompt,
-        threadTitle: `${options.manual ? "Automation" : "Job"}: ${jobName} — ${now.toLocaleDateString()}`,
-        runIdPrefix: `${options.manual ? "manual" : "job"}-${jobName}`,
-        usageLabel: `${options.manual ? "manual-automation" : "recurring-job"}:${jobName}`,
-        requestContext,
-        ...(historyId ? { historyId } : {}),
-        assertCanStart: options.assertCanStart,
-        ...(options.resume
-          ? {
-              resume: options.resume,
-              hardDeadlineAt: options.resume.hardDeadlineAt,
-            }
-          : {}),
-        ...(options.manual ? { manual: true } : {}),
-        actionCaller: "automation" as const,
-        actionAutomation: {
-          triggerId: resource.id,
-          triggerName: jobName,
-          ...(meta.delegatedPolicyId
-            ? { policyId: meta.delegatedPolicyId }
-            : {}),
-        },
-      },
-      deps,
-    );
+    result = meta.runner
+      ? await runJobRunner({
+          runnerId: meta.runner,
+          automation: jobContext,
+          ownerEmail: jobUserEmail,
+          orgId: jobOrgId,
+          historyId,
+          requestContext,
+          assertCanStart: options.assertCanStart,
+          ...(options.resume ? { resume: options.resume } : {}),
+          ...(options.manual ? { manual: true } : {}),
+        })
+      : await runBackgroundAutomation(
+          {
+            automation: jobContext,
+            ownerEmail: jobUserEmail,
+            orgId: jobOrgId,
+            prompt,
+            threadTitle: `${options.manual ? "Automation" : "Job"}: ${jobName} — ${now.toLocaleDateString()}`,
+            runIdPrefix: `${options.manual ? "manual" : "job"}-${jobName}`,
+            usageLabel: `${options.manual ? "manual-automation" : "recurring-job"}:${jobName}`,
+            requestContext,
+            ...(historyId ? { historyId } : {}),
+            assertCanStart: options.assertCanStart,
+            ...(options.resume
+              ? {
+                  resume: options.resume,
+                  hardDeadlineAt: options.resume.hardDeadlineAt,
+                }
+              : {}),
+            ...(options.manual ? { manual: true } : {}),
+            actionCaller: "automation" as const,
+            actionAutomation: {
+              triggerId: resource.id,
+              triggerName: jobName,
+              ...(meta.delegatedPolicyId
+                ? { policyId: meta.delegatedPolicyId }
+                : {}),
+            },
+          },
+          deps,
+        );
   } catch (err) {
     const failure = classifyAutomationFailure(err);
     if (err instanceof AutomationSchedulerLeaseLostError) throw err;
+    if (err instanceof AutomationRecoveryProjectionDeferredError) throw err;
     if (err instanceof AutomationRecoveryStorageError) throw err;
     if (failure.code === "background_automation_history_write_failed")
       throw err;

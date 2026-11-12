@@ -1,6 +1,10 @@
 import { createSign } from "node:crypto";
 
 import { resolveConnectorSecret } from "../connectors/credentials.js";
+import {
+  SECRET_UNREADABLE_CODE,
+  UnreadableSecretError,
+} from "../lib/unreadable-secret.js";
 import type { TriageCoverage } from "./contracts.js";
 import type { ReviewCommentObservation } from "./pr-babysit.js";
 import type {
@@ -10,6 +14,8 @@ import type {
 
 const DEFAULT_BASE_URL = "https://api.github.com";
 const MAX_PAGE_SIZE = 100;
+const APPROVAL_REQUEST_TIMEOUT_MS = 10_000;
+const ISSUE_WRITE_TIMEOUT_MS = 15_000;
 
 type FetchLike = typeof fetch;
 
@@ -75,9 +81,13 @@ export interface GitHubPullRequest {
   draft: boolean;
   merged: boolean;
   mergedAt: string | null;
+  /** Present once GitHub has produced the merge commit. */
+  mergeCommitSha?: string;
   htmlUrl: string;
   userId: number;
   userLogin: string;
+  /** GitHub's `user.type` for the pull-request author when provided. */
+  userType?: string;
   headSha: string;
   headRef: string;
   baseRef: string;
@@ -99,12 +109,25 @@ export interface GitHubIssue {
 }
 
 export interface GitHubPullRequestSummary extends GitHubPullRequest {
+  /** Current GitHub assignees, identified by immutable user ID and login. */
+  assignees: readonly GitHubPullRequestAssignee[];
+  /** `owner/name` of the repository the branch is pushed to; null once GitHub no longer has it (a deleted fork). */
+  headRepository: string | null;
+  /** `owner/name` of the repository the pull request merges into. */
+  baseRepository: string;
+  /** The default branch of the base repository. */
+  baseDefaultBranch: string;
   additions: number;
   deletions: number;
   changedFiles: number;
   mergeable: boolean | null;
   mergeableState: string | null;
   reviewComments: number;
+}
+
+export interface GitHubPullRequestAssignee {
+  id: number;
+  login: string;
 }
 
 export interface GitHubMemberCheck {
@@ -125,10 +148,17 @@ export interface GitHubMergeResult {
   message: string;
 }
 
-export interface GitHubComment {
-  id: number;
-  htmlUrl: string;
-  author: string;
+export type GitHubMergeMethod = "merge" | "squash" | "rebase";
+
+export interface GitHubRepositoryMergeSettings {
+  allowMergeCommit: boolean;
+  allowSquashMerge: boolean;
+  allowRebaseMerge: boolean;
+}
+
+interface GitHubPullRequestChecks {
+  checks: PullRequestCheckObservation[];
+  checksCoverage: TriageCoverage;
 }
 
 export interface GitHubIssueCommentObservation {
@@ -144,6 +174,13 @@ export interface GitHubIssueCommentPage {
   truncated: boolean;
 }
 
+export interface GitHubLabelRemoval {
+  /** False when the item did not carry the label, so nothing changed. */
+  removed: boolean;
+  /** The labels left on the item; null when it never carried the one asked for. */
+  labels: readonly string[] | null;
+}
+
 export class GitHubRequestError extends Error {
   constructor(
     message: string,
@@ -153,6 +190,35 @@ export class GitHubRequestError extends Error {
   ) {
     super(message);
     this.name = "GitHubRequestError";
+  }
+}
+
+/**
+ * A request that never left because the token is saved but cannot be decrypted.
+ * Readers of `requestAttempted` still see a request that never left; readers of
+ * the typed failure (an action's output, `failGitHubStep`) see core's code, so
+ * it is neither read as "not connected" nor retried.
+ */
+export class GitHubTokenUnreadableError extends GitHubRequestError {
+  readonly actionContractError = true as const;
+  readonly errorCode = SECRET_UNREADABLE_CODE;
+  readonly statusCode = 412;
+  readonly keys: readonly string[];
+  cause: UnreadableSecretError;
+
+  constructor(cause: UnreadableSecretError) {
+    super(cause.message, false);
+    this.name = "GitHubTokenUnreadableError";
+    this.keys = cause.keys;
+    this.cause = cause;
+  }
+}
+
+/** GitHub answered a merge request with `merged: false`: nothing was merged. */
+export class GitHubMergeNotCompletedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitHubMergeNotCompletedError";
   }
 }
 
@@ -182,6 +248,8 @@ export interface GitHubOpenItemPage<T> {
 
 const MAX_REVIEW_PAGES = 5;
 const MAX_ISSUE_COMMENT_PAGES = 5;
+// A head commit with more than this many check runs is not read as complete.
+const MAX_CHECK_PAGES = 5;
 
 interface JsonResponse {
   ok: boolean;
@@ -261,15 +329,65 @@ function parsePullRequest(value: unknown): GitHubPullRequest {
       item.merged_at === null || item.merged_at === undefined
         ? null
         : requiredString(item.merged_at, "pull request merged time"),
+    ...(typeof item.merge_commit_sha === "string" && item.merge_commit_sha
+      ? { mergeCommitSha: item.merge_commit_sha }
+      : {}),
     htmlUrl: requiredString(item.html_url, "pull request URL"),
     userId: requiredNumber(user.id, "pull request author ID"),
     userLogin: requiredString(user.login, "pull request author"),
+    ...(typeof user.type === "string" ? { userType: user.type } : {}),
     headSha: requiredString(head.sha, "pull request head SHA"),
     headRef: requiredString(head.ref, "pull request head branch"),
     baseRef: requiredString(base.ref, "pull request base ref"),
     createdAt: requiredString(item.created_at, "pull request created time"),
     updatedAt: requiredString(item.updated_at, "pull request updated time"),
   };
+}
+
+/** Where a pull request comes from and where it lands. GitHub sends `head.repo: null` for a deleted fork, which is not the same as a response without one. */
+function parsePullRequestRepositories(
+  value: Record<string, unknown>,
+): Pick<
+  GitHubPullRequestSummary,
+  "headRepository" | "baseRepository" | "baseDefaultBranch"
+> {
+  const head = record(value.head);
+  const baseRepo = record(record(value.base).repo);
+  return {
+    headRepository:
+      head.repo === null
+        ? null
+        : requiredString(
+            record(head.repo).full_name,
+            "pull request head repository",
+          ),
+    baseRepository: requiredString(
+      baseRepo.full_name,
+      "pull request base repository",
+    ),
+    baseDefaultBranch: requiredString(
+      baseRepo.default_branch,
+      "pull request base default branch",
+    ),
+  };
+}
+
+function parsePullRequestAssignees(
+  value: unknown,
+): GitHubPullRequestAssignee[] {
+  return requireArray(value, "pull request assignees").map((assignee) => {
+    const item = record(assignee);
+    const id = requiredNumber(item.id, "pull request assignee ID");
+    if (!Number.isInteger(id) || id < 1) {
+      throw new Error(
+        "GitHub response has an invalid pull request assignee ID",
+      );
+    }
+    return {
+      id,
+      login: requiredString(item.login, "pull request assignee login"),
+    };
+  });
 }
 
 function requireArray(value: unknown, field: string): unknown[] {
@@ -290,6 +408,19 @@ function requirePositivePullRequestNumber(pullRequestNumber: number): void {
   if (!Number.isInteger(pullRequestNumber) || pullRequestNumber < 1) {
     throw new Error("GitHub pull request number must be a positive integer");
   }
+}
+
+function requirePositiveIssueNumber(issueNumber: number): void {
+  if (!Number.isInteger(issueNumber) || issueNumber < 1) {
+    throw new Error("GitHub issue number must be a positive integer");
+  }
+}
+
+/** The names on a labels response; one without a name is not a labels response. */
+function parseLabelNames(value: unknown): string[] {
+  return requireArray(value, "label").map((label) =>
+    requiredString(record(label).name, "label name"),
+  );
 }
 
 function normalizeReviewState(
@@ -319,12 +450,13 @@ function normalizeCheckState(
   switch (conclusion) {
     case "success":
       return "passed";
+    // A check GitHub gave up waiting on ran to no result, like a cancelled one.
     case "cancelled":
     case "timed_out":
+    case "stale":
       return "cancelled";
     case "neutral":
     case "skipped":
-    case "stale":
       return "informational";
     default:
       return "failed";
@@ -470,13 +602,26 @@ function parseReview(
   const submittedAt =
     (typeof item.submitted_at === "string" && item.submitted_at) ||
     fallbackObservedAt;
+  const author = loginFromUser(item.user, "review");
+  const reviewer = record(item.user);
   return {
-    author: loginFromUser(item.user, "review"),
+    author,
+    ...(typeof reviewer.id === "number" &&
+    Number.isSafeInteger(reviewer.id) &&
+    reviewer.id > 0
+      ? { authorId: reviewer.id }
+      : {}),
     state: normalizeReviewState(
       requiredString(item.state, "review state").toUpperCase(),
     ),
     ...(typeof item.commit_id === "string" && item.commit_id.trim()
       ? { commitSha: item.commit_id }
+      : {}),
+    ...(typeof item.author_association === "string" && item.author_association
+      ? { authorAssociation: item.author_association }
+      : {}),
+    ...(typeof reviewer.type === "string" && reviewer.type
+      ? { authorType: reviewer.type }
       : {}),
     ...(typeof item.html_url === "string" && item.html_url
       ? { htmlUrl: item.html_url }
@@ -556,6 +701,7 @@ export function createGitHubClient(options: GitHubClientOptions) {
 
   let cachedAppConfig: GitHubAppConfig | null | undefined;
   let cachedInstallationToken: { value: string; expiresAt: number } | undefined;
+  let cachedConnectorToken: string | undefined;
   let cachedAppBotIdentity: { login: string; id: number } | undefined;
 
   async function connectorSecret(key: string): Promise<string | undefined> {
@@ -592,7 +738,7 @@ export function createGitHubClient(options: GitHubClientOptions) {
     return cachedAppConfig;
   }
 
-  async function token(): Promise<string> {
+  async function token(signal?: AbortSignal): Promise<string> {
     const app = await appConfig();
     if (app) {
       const now = Math.floor(Date.now() / 1000);
@@ -613,6 +759,7 @@ export function createGitHubClient(options: GitHubClientOptions) {
             Authorization: `Bearer ${jwt}`,
             "X-GitHub-Api-Version": "2022-11-28",
           },
+          signal,
         },
       )) as JsonResponse;
       if (!response.ok) {
@@ -630,10 +777,48 @@ export function createGitHubClient(options: GitHubClientOptions) {
       cachedInstallationToken = { value, expiresAt };
       return value;
     }
+    if (cachedConnectorToken) return cachedConnectorToken;
     const value = await connectorSecret("GITHUB_TOKEN");
     if (!value)
       throw new Error("GITHUB_TOKEN is not configured for this workspace");
-    return value;
+    cachedConnectorToken = value;
+    return cachedConnectorToken;
+  }
+
+  /**
+   * Every item of a list GitHub reports with a `total_count`, a page at a time.
+   * A list that ends before its total, or that is still going after
+   * `MAX_CHECK_PAGES`, is a failure, never a shorter list: a missing check
+   * could be the failing one.
+   */
+  async function listCountedPages<T>(
+    path: string,
+    key: string,
+    label: string,
+    parse: (value: unknown) => T,
+  ): Promise<T[]> {
+    const perPage = pageSize();
+    const joiner = path.includes("?") ? "&" : "?";
+    const items: T[] = [];
+    for (let page = 1; page <= MAX_CHECK_PAGES; page += 1) {
+      const body = record(
+        await request<unknown>(
+          `${path}${joiner}per_page=${perPage}&page=${page}`,
+        ),
+      );
+      const rows = requireArray(body[key], label);
+      const total = requiredNumber(body.total_count, `${label} total_count`);
+      items.push(...rows.map(parse));
+      if (items.length >= total) return items;
+      if (rows.length < perPage) {
+        throw new Error(
+          `GitHub ${label} page was truncated; cannot treat CI as complete.`,
+        );
+      }
+    }
+    throw new Error(
+      `GitHub ${label} list was truncated; cannot treat CI as complete: it has more than ${MAX_CHECK_PAGES * perPage}.`,
+    );
   }
 
   async function graphqlRequest<T>(
@@ -665,6 +850,9 @@ export function createGitHubClient(options: GitHubClientOptions) {
       return (await response.json()) as T;
     } catch (error) {
       if (error instanceof GitHubRequestError) throw error;
+      if (error instanceof UnreadableSecretError) {
+        throw new GitHubTokenUnreadableError(error);
+      }
       throw new GitHubRequestError(
         error instanceof Error
           ? error.message
@@ -681,7 +869,7 @@ export function createGitHubClient(options: GitHubClientOptions) {
   ): Promise<T> {
     let requestAttempted = false;
     try {
-      const authorization = `Bearer ${await token()}`;
+      const authorization = `Bearer ${await token(init.signal ?? undefined)}`;
       requestAttempted = true;
       const response = (await fetchImpl(`${baseUrl}${path}`, {
         ...init,
@@ -711,6 +899,9 @@ export function createGitHubClient(options: GitHubClientOptions) {
       return (await response.json()) as T;
     } catch (error) {
       if (error instanceof GitHubRequestError) throw error;
+      if (error instanceof UnreadableSecretError) {
+        throw new GitHubTokenUnreadableError(error);
+      }
       throw new GitHubRequestError(
         error instanceof Error ? error.message : "GitHub request failed",
         requestAttempted,
@@ -851,6 +1042,37 @@ export function createGitHubClient(options: GitHubClientOptions) {
       }
     },
 
+    async getPullRequestChecks(
+      repository: GitHubRepositoryRef,
+      headSha: string,
+    ): Promise<GitHubPullRequestChecks> {
+      const sha = headSha.trim();
+      if (!sha) throw new Error("GitHub pull request head SHA is required");
+      const root = repositoryPath(repository);
+      let checks: PullRequestCheckObservation[];
+      let checksCoverage: TriageCoverage = "complete";
+      try {
+        checks = await listCountedPages(
+          `${root}/commits/${encodeURIComponent(sha)}/check-runs`,
+          "check_runs",
+          "check-run",
+          parseCheckRun,
+        );
+      } catch (error) {
+        if (!isChecksPermissionDenied(error)) throw error;
+
+        checksCoverage = "partial";
+
+        checks = await listCountedPages(
+          `${root}/actions/runs?head_sha=${encodeURIComponent(sha)}`,
+          "workflow_runs",
+          "workflow-run",
+          parseWorkflowRun,
+        );
+      }
+      return { checks, checksCoverage };
+    },
+
     async getPullRequestEvidence(
       repository: GitHubRepositoryRef,
       pullRequestNumber: number,
@@ -885,50 +1107,10 @@ export function createGitHubClient(options: GitHubClientOptions) {
       }
       const reviews = reviewPage.reviews;
       const reviewsTruncated = reviewPage.reviewsTruncated;
-      let checks: PullRequestCheckObservation[];
-      let checksCoverage: TriageCoverage = "complete";
-      try {
-        const checkBody = record(
-          await request<unknown>(
-            `${root}/commits/${encodeURIComponent(sha)}/check-runs?per_page=${page}`,
-          ),
-        );
-        const checkRuns = requireArray(checkBody.check_runs, "check-run");
-        const totalCount = requiredNumber(
-          checkBody.total_count,
-          "check-run total_count",
-        );
-        if (totalCount > checkRuns.length) {
-          throw new Error(
-            "GitHub check-run page was truncated; cannot treat CI as complete.",
-          );
-        }
-        checks = checkRuns.map(parseCheckRun);
-      } catch (error) {
-        if (!isChecksPermissionDenied(error)) throw error;
-
-        checksCoverage = "partial";
-
-        const workflowBody = record(
-          await request<unknown>(
-            `${root}/actions/runs?head_sha=${encodeURIComponent(sha)}&per_page=${page}`,
-          ),
-        );
-        const workflowRuns = requireArray(
-          workflowBody.workflow_runs,
-          "workflow-run",
-        );
-        const totalCount = requiredNumber(
-          workflowBody.total_count,
-          "workflow-run total_count",
-        );
-        if (totalCount > workflowRuns.length) {
-          throw new Error(
-            "GitHub workflow-run page was truncated; cannot treat CI as complete.",
-          );
-        }
-        checks = workflowRuns.map(parseWorkflowRun);
-      }
+      const { checks, checksCoverage } = await this.getPullRequestChecks(
+        repository,
+        sha,
+      );
       return {
         comments,
         commentsTruncated,
@@ -973,6 +1155,8 @@ export function createGitHubClient(options: GitHubClientOptions) {
       const pullRequest = parsePullRequest(item);
       return {
         ...pullRequest,
+        assignees: parsePullRequestAssignees(item.assignees),
+        ...parsePullRequestRepositories(item),
         additions: requiredNumber(item.additions, "pull request additions"),
         deletions: requiredNumber(item.deletions, "pull request deletions"),
         changedFiles: requiredNumber(
@@ -1145,6 +1329,7 @@ export function createGitHubClient(options: GitHubClientOptions) {
               ...(body ? { body: body.slice(0, 4_000) } : {}),
               ...(commitSha ? { commit_id: commitSha } : {}),
             }),
+            signal: AbortSignal.timeout(APPROVAL_REQUEST_TIMEOUT_MS),
           },
         ),
       );
@@ -1155,33 +1340,23 @@ export function createGitHubClient(options: GitHubClientOptions) {
       };
     },
 
-    async createPullRequestComment(
+    async getRepositoryMergeSettings(
       repository: GitHubRepositoryRef,
-      pullRequestNumber: number,
-      body: string,
-    ): Promise<GitHubComment> {
-      if (!Number.isInteger(pullRequestNumber) || pullRequestNumber < 1) {
-        throw new Error(
-          "GitHub pull request number must be a positive integer",
-        );
-      }
-      const trimmedBody = body.trim();
-      if (!trimmedBody)
-        throw new Error("GitHub pull request comment body is required");
-      const item = record(
-        await request<unknown>(
-          `${repositoryPath(repository)}/issues/${pullRequestNumber}/comments`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ body: trimmedBody.slice(0, 65_536) }),
-          },
-        ),
-      );
+    ): Promise<GitHubRepositoryMergeSettings> {
+      const item = record(await request<unknown>(repositoryPath(repository)));
       return {
-        id: requiredNumber(item.id, "comment id"),
-        htmlUrl: requiredString(item.html_url, "comment URL"),
-        author: loginFromUser(item.user, "issue comment"),
+        allowMergeCommit: requiredBoolean(
+          item.allow_merge_commit,
+          "repository merge-commit setting",
+        ),
+        allowSquashMerge: requiredBoolean(
+          item.allow_squash_merge,
+          "repository squash-merge setting",
+        ),
+        allowRebaseMerge: requiredBoolean(
+          item.allow_rebase_merge,
+          "repository rebase-merge setting",
+        ),
       };
     },
 
@@ -1190,6 +1365,7 @@ export function createGitHubClient(options: GitHubClientOptions) {
       pullRequestNumber: number,
       commitMessage?: string,
       expectedHeadSha?: string,
+      mergeMethod?: GitHubMergeMethod,
     ): Promise<GitHubMergeResult> {
       if (!Number.isInteger(pullRequestNumber) || pullRequestNumber < 1)
         throw new Error(
@@ -1201,21 +1377,18 @@ export function createGitHubClient(options: GitHubClientOptions) {
           {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(
-              commitMessage
-                ? {
-                    commit_message: commitMessage.slice(0, 4_000),
-                    ...(expectedHeadSha ? { sha: expectedHeadSha } : {}),
-                  }
-                : expectedHeadSha
-                  ? { sha: expectedHeadSha }
-                  : {},
-            ),
+            body: JSON.stringify({
+              ...(commitMessage
+                ? { commit_message: commitMessage.slice(0, 4_000) }
+                : {}),
+              ...(expectedHeadSha ? { sha: expectedHeadSha } : {}),
+              ...(mergeMethod ? { merge_method: mergeMethod } : {}),
+            }),
           },
         ),
       );
       if (item.merged !== true)
-        throw new Error(
+        throw new GitHubMergeNotCompletedError(
           `GitHub merge was not completed: ${requiredString(item.message, "merge message")}`,
         );
       return {
@@ -1223,6 +1396,60 @@ export function createGitHubClient(options: GitHubClientOptions) {
         merged: true,
         message: requiredString(item.message, "merge message"),
       };
+    },
+
+    /** Adds labels; one already on the item stays, so a repeat changes nothing. Returns every label the item carries now. */
+    async addIssueLabels(
+      repository: GitHubRepositoryRef,
+      issueNumber: number,
+      labels: readonly string[],
+    ): Promise<string[]> {
+      requirePositiveIssueNumber(issueNumber);
+      if (labels.length === 0) {
+        // An empty list would clear every label, which no caller asks for.
+        throw new Error("GitHub labels to add must not be empty");
+      }
+      return parseLabelNames(
+        await request<unknown>(
+          `${repositoryPath(repository)}/issues/${issueNumber}/labels`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ labels }),
+            signal: AbortSignal.timeout(ISSUE_WRITE_TIMEOUT_MS),
+          },
+        ),
+      );
+    },
+
+    /** Removes one label. GitHub answers 404 "Label does not exist" for one the item never had; that is `removed: false`, not a missing item. */
+    async removeIssueLabel(
+      repository: GitHubRepositoryRef,
+      issueNumber: number,
+      label: string,
+    ): Promise<GitHubLabelRemoval> {
+      requirePositiveIssueNumber(issueNumber);
+      try {
+        const labels = parseLabelNames(
+          await request<unknown>(
+            `${repositoryPath(repository)}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,
+            {
+              method: "DELETE",
+              signal: AbortSignal.timeout(ISSUE_WRITE_TIMEOUT_MS),
+            },
+          ),
+        );
+        return { removed: true, labels };
+      } catch (error) {
+        if (
+          error instanceof GitHubRequestError &&
+          error.status === 404 &&
+          /label does not exist/i.test(error.message)
+        ) {
+          return { removed: false, labels: null };
+        }
+        throw error;
+      }
     },
   };
 }

@@ -1,5 +1,8 @@
 use tauri::AppHandle;
 
+#[cfg(target_os = "macos")]
+pub(crate) mod mic_capture;
+
 #[tauri::command]
 pub async fn native_speech_start(
     app: AppHandle,
@@ -7,6 +10,7 @@ pub async fn native_speech_start(
     mic_device_id: Option<String>,
     mic_device_label: Option<String>,
     owner: Option<String>,
+    run_id: Option<u64>,
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -16,11 +20,12 @@ pub async fn native_speech_start(
             mic_device_id,
             mic_device_label,
             macos::SessionOwner::from_param(owner),
+            run_id,
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (app, locale, mic_device_id, mic_device_label, owner);
+        let _ = (app, locale, mic_device_id, mic_device_label, owner, run_id);
         Err("Native speech recognition is only supported on macOS.".into())
     }
 }
@@ -51,43 +56,61 @@ pub async fn native_speech_request_permission() -> Result<bool, String> {
     }
 }
 
+/// Stops recognition. A dictation returns whether its audio held speech.
 #[tauri::command]
-pub async fn native_speech_stop(app: AppHandle, owner: Option<String>) -> Result<(), String> {
+pub async fn native_speech_stop(
+    app: AppHandle,
+    owner: Option<String>,
+    run_id: Option<u64>,
+) -> Result<Option<crate::whisper_speech::DictationStop>, String> {
     #[cfg(target_os = "macos")]
     {
-        macos::native_speech_stop_impl(app, owner.map(|o| macos::SessionOwner::from_param(Some(o))))
+        macos::native_speech_stop_impl(
+            app,
+            owner.map(|o| macos::SessionOwner::from_param(Some(o))),
+            run_id,
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (app, owner);
-        Ok(())
+        let _ = (app, owner, run_id);
+        Ok(None)
     }
 }
 
 #[tauri::command]
-pub async fn native_speech_cancel(app: AppHandle, owner: Option<String>) -> Result<(), String> {
+pub async fn native_speech_cancel(
+    app: AppHandle,
+    owner: Option<String>,
+    run_id: Option<u64>,
+) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         macos::native_speech_cancel_impl(
             app,
             owner.map(|o| macos::SessionOwner::from_param(Some(o))),
+            run_id,
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (app, owner);
+        let _ = (app, owner, run_id);
         Ok(())
     }
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos {
+    use std::collections::HashSet;
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
 
+    use crate::speech_capture_ownership::{
+        claim as claim_speech_capture, SpeechCaptureEngine, SpeechCaptureLease, SpeechCaptureOwner,
+    };
     use block2::{RcBlock, StackBlock};
     use dispatch2::{DispatchQueue, DispatchRetained};
     use objc2::rc::Retained;
@@ -114,7 +137,7 @@ pub(crate) mod macos {
         AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
     };
     use objc2_core_audio_types::kAudioFormatLinearPCM;
-    use objc2_core_media::CMSampleBuffer;
+    use objc2_core_media::{CMAudioFormatDescriptionGetStreamBasicDescription, CMSampleBuffer};
     use objc2_foundation::{
         NSArray, NSBundle, NSDictionary, NSError, NSLocale, NSNumber, NSString,
     };
@@ -125,11 +148,14 @@ pub(crate) mod macos {
     use serde::Serialize;
     use tauri::{AppHandle, Emitter};
 
+    use crate::silero_vad::SpeechCheck;
+    use crate::whisper_speech::DictationStop;
     use screencapturekit::audio_devices::AudioInputDevice;
 
     const SPEECH_USAGE_DESCRIPTION_KEY: &str = "NSSpeechRecognitionUsageDescription";
     const SPEECH_USAGE_DESCRIPTION_ERROR: &str =
         "Clips cannot start macOS speech recognition because the app bundle is missing NSSpeechRecognitionUsageDescription.";
+    const START_SUPERSEDED: &str = "speech-engine-start-superseded";
 
     fn is_macos_app_bundle_path(path: &std::path::Path) -> bool {
         let Some(contents) = path.parent().and_then(|path| path.parent()) else {
@@ -207,6 +233,22 @@ pub(crate) mod macos {
         }
     }
 
+    fn session_start_error(active: SessionOwner, requested: SessionOwner) -> Option<&'static str> {
+        match (active, requested) {
+            (SessionOwner::Meeting, SessionOwner::Dictation) => Some("speech-engine-busy-meeting"),
+            (SessionOwner::Dictation, SessionOwner::Meeting) => {
+                Some("speech-engine-busy-dictation")
+            }
+            _ => None,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MicVoiceProcessingMode {
+        Disabled,
+        Bypassed,
+    }
+
     fn native_speech_voice_processing_mode(owner: SessionOwner) -> MicVoiceProcessingMode {
         match owner {
             SessionOwner::Meeting => MicVoiceProcessingMode::Bypassed,
@@ -228,6 +270,7 @@ pub(crate) mod macos {
     /// impl we need, and we mark it manually below.
     struct SpeechSession {
         generation: u64,
+        run_id: Option<u64>,
         completion_started: Arc<AtomicBool>,
         callback_finished: Arc<AtomicBool>,
         audio: SpeechAudio,
@@ -236,6 +279,7 @@ pub(crate) mod macos {
         cancelled: Arc<AtomicBool>,
         stopped: Arc<AtomicBool>,
         owner: SessionOwner,
+        _capture_lease: SpeechCaptureLease,
     }
 
     enum SpeechAudio {
@@ -250,54 +294,148 @@ pub(crate) mod macos {
     // inner pointers across threads — the session is moved through a Mutex.
     unsafe impl Send for SpeechSession {}
 
-    #[derive(Clone, PartialEq, Eq)]
-    struct RawMicDeviceKey {
-        id: Option<String>,
-        label: Option<String>,
+    struct SessionRegistry<T> {
+        active: Option<T>,
+        finishing: Vec<T>,
+        starting: Option<PendingSpeechStart>,
     }
 
-    impl RawMicDeviceKey {
-        fn from_selection(device_id: Option<&str>, device_label: Option<&str>) -> Self {
-            Self {
-                id: device_id
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
-                label: device_label
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned),
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct PendingSpeechStart {
+        owner: SessionOwner,
+        generation: u64,
+    }
+
+    fn session_registry_start_error<T>(
+        registry: &SessionRegistry<T>,
+        requested: SessionOwner,
+        owner: impl Fn(&T) -> SessionOwner,
+    ) -> Option<&'static str> {
+        registry
+            .active
+            .as_ref()
+            .and_then(|active| session_start_error(owner(active), requested))
+            .or_else(|| {
+                registry
+                    .starting
+                    .and_then(|starting| session_start_error(starting.owner, requested))
+            })
+    }
+
+    struct PendingSpeechStartGuard(PendingSpeechStart);
+
+    impl Drop for PendingSpeechStartGuard {
+        fn drop(&mut self) {
+            let mut registry = session_slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if registry.starting == Some(self.0) {
+                registry.starting = None;
             }
         }
     }
 
-    #[derive(Clone)]
-    struct RawMicTapTarget {
-        app: AppHandle,
-        on_samples: Arc<dyn Fn(&[f32]) + Send + Sync>,
-        level_tick: Arc<AtomicU32>,
+    #[derive(Default)]
+    struct DictationRunAuthority {
+        latest_run_id: Option<u64>,
+        cancelled_run_ids: HashSet<u64>,
     }
 
-    struct WarmedRawMicEngine {
-        engine: Retained<AVAudioEngine>,
-        input_node: Retained<AVAudioInputNode>,
-        device_key: RawMicDeviceKey,
-        target: Arc<Mutex<Option<RawMicTapTarget>>>,
+    fn dictation_run_authority() -> &'static Mutex<DictationRunAuthority> {
+        static SLOT: OnceLock<Mutex<DictationRunAuthority>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(DictationRunAuthority::default()))
     }
 
-    // SAFETY: Same argument as `SpeechSession` / `RawMicCapture`: AVAudioEngine
-    // and AVAudioInputNode are refcounted ObjC objects that we move through
-    // Mutex ownership, without sharing Rust references across threads.
-    unsafe impl Send for WarmedRawMicEngine {}
-
-    struct RawMicWarmCache {
-        device_key: RawMicDeviceKey,
-        target: Arc<Mutex<Option<RawMicTapTarget>>>,
+    fn begin_dictation_run(run_id: Option<u64>) -> bool {
+        let Some(run_id) = run_id else {
+            return true;
+        };
+        let mut authority = dictation_run_authority()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if authority
+            .latest_run_id
+            .is_some_and(|latest| latest > run_id)
+        {
+            return false;
+        }
+        authority.latest_run_id = Some(run_id);
+        authority
+            .cancelled_run_ids
+            .retain(|cancelled| *cancelled >= run_id);
+        !authority.cancelled_run_ids.contains(&run_id)
     }
 
-    struct SessionRegistry<T> {
-        active: Option<T>,
-        finishing: Vec<T>,
+    fn register_dictation_stop(authority: &mut DictationRunAuthority, run_id: u64) -> bool {
+        if authority
+            .latest_run_id
+            .is_some_and(|latest| latest > run_id)
+        {
+            return false;
+        }
+        authority.latest_run_id = Some(run_id);
+        true
+    }
+
+    fn dictation_run_is_current(authority: &DictationRunAuthority, run_id: Option<u64>) -> bool {
+        let Some(run_id) = run_id else {
+            return true;
+        };
+        authority.latest_run_id == Some(run_id) && !authority.cancelled_run_ids.contains(&run_id)
+    }
+
+    #[derive(Default)]
+    struct MeetingRunAuthority {
+        latest_run_id: Option<u64>,
+        cancelled_run_ids: HashSet<u64>,
+    }
+
+    fn meeting_run_authority() -> &'static Mutex<MeetingRunAuthority> {
+        static SLOT: OnceLock<Mutex<MeetingRunAuthority>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(MeetingRunAuthority::default()))
+    }
+
+    fn begin_meeting_run(authority: &mut MeetingRunAuthority, run_id: Option<u64>) -> bool {
+        let Some(run_id) = run_id else {
+            return true;
+        };
+        if authority
+            .latest_run_id
+            .is_some_and(|latest| latest > run_id)
+            || (authority.latest_run_id == Some(run_id)
+                && authority.cancelled_run_ids.contains(&run_id))
+        {
+            return false;
+        }
+        authority.latest_run_id = Some(run_id);
+        authority
+            .cancelled_run_ids
+            .retain(|cancelled| *cancelled >= run_id);
+        true
+    }
+
+    fn meeting_run_is_current(authority: &MeetingRunAuthority, run_id: Option<u64>) -> bool {
+        let Some(run_id) = run_id else {
+            return true;
+        };
+        authority.latest_run_id == Some(run_id) && !authority.cancelled_run_ids.contains(&run_id)
+    }
+
+    fn cancel_meeting_run(authority: &mut MeetingRunAuthority, run_id: u64) -> bool {
+        if authority
+            .latest_run_id
+            .is_some_and(|latest| latest > run_id)
+        {
+            return false;
+        }
+        if authority.latest_run_id != Some(run_id) {
+            authority.latest_run_id = Some(run_id);
+            authority
+                .cancelled_run_ids
+                .retain(|cancelled| *cancelled >= run_id);
+        }
+        authority.cancelled_run_ids.insert(run_id);
+        true
     }
 
     impl<T> Default for SessionRegistry<T> {
@@ -305,6 +443,7 @@ pub(crate) mod macos {
             Self {
                 active: None,
                 finishing: Vec::new(),
+                starting: None,
             }
         }
     }
@@ -312,11 +451,6 @@ pub(crate) mod macos {
     fn session_slot() -> &'static Mutex<SessionRegistry<SpeechSession>> {
         static SLOT: OnceLock<Mutex<SessionRegistry<SpeechSession>>> = OnceLock::new();
         SLOT.get_or_init(|| Mutex::new(SessionRegistry::default()))
-    }
-
-    fn warmed_raw_mic_engine_slot() -> &'static Mutex<Option<WarmedRawMicEngine>> {
-        static SLOT: OnceLock<Mutex<Option<WarmedRawMicEngine>>> = OnceLock::new();
-        SLOT.get_or_init(|| Mutex::new(None))
     }
 
     fn session_generation() -> &'static AtomicU64 {
@@ -360,6 +494,14 @@ pub(crate) mod macos {
 
     fn stop_generation_changed(start_stop_generation: u64, current_stop_generation: u64) -> bool {
         start_stop_generation != current_stop_generation
+    }
+
+    fn start_authority_result(is_current: bool) -> Result<(), &'static str> {
+        if is_current {
+            Ok(())
+        } else {
+            Err(START_SUPERSEDED)
+        }
     }
 
     fn superseded_start_result(
@@ -491,27 +633,39 @@ pub(crate) mod macos {
     const MAX_TRANSIENT_RESTARTS: u32 = 5;
 
     #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase")]
     struct PartialPayload {
         text: String,
         source: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<u64>,
     }
 
     #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase")]
     struct FinalPayload {
         text: String,
         source: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<u64>,
     }
 
     #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase")]
     struct ErrorPayload {
         error: String,
         source: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<u64>,
     }
 
     #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase")]
     pub(crate) struct AudioLevelPayload {
         pub level: f32,
         pub source: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub run_id: Option<u64>,
     }
 
     pub(crate) fn peak_level_for_pcm(buf: &AVAudioPCMBuffer) -> f32 {
@@ -550,47 +704,6 @@ pub(crate) mod macos {
                 }
             }
             peak.min(1.0)
-        }
-    }
-
-    fn mono_mix_pcm(buf: &AVAudioPCMBuffer) -> Vec<f32> {
-        // SAFETY: Same buffer layout as `peak_level_for_pcm`. Multi-channel
-        // built-in Mac microphones can put useful voice energy outside channel
-        // 0, so mix all channels for Whisper instead of forwarding only the
-        // first channel.
-        unsafe {
-            let frames = buf.frameLength() as usize;
-            if frames == 0 {
-                return Vec::new();
-            }
-            let channel_count = buf.format().channelCount() as usize;
-            if channel_count == 0 {
-                return Vec::new();
-            }
-            let channels_ptr = buf.floatChannelData();
-            if channels_ptr.is_null() {
-                return Vec::new();
-            }
-            let mut mono = vec![0.0_f32; frames];
-            let mut mixed_channels = 0usize;
-            for channel in 0..channel_count {
-                let channel_ptr = (*channels_ptr.add(channel)).as_ptr();
-                if channel_ptr.is_null() {
-                    continue;
-                }
-                let slice = std::slice::from_raw_parts(channel_ptr, frames);
-                for (dst, src) in mono.iter_mut().zip(slice.iter()) {
-                    *dst += *src;
-                }
-                mixed_channels += 1;
-            }
-            if mixed_channels > 1 {
-                let scale = 1.0 / mixed_channels as f32;
-                for sample in &mut mono {
-                    *sample *= scale;
-                }
-            }
-            mono
         }
     }
 
@@ -882,128 +995,6 @@ pub(crate) mod macos {
         }
     }
 
-    fn take_warmed_raw_mic_engine(device_key: &RawMicDeviceKey) -> Option<WarmedRawMicEngine> {
-        let mut slot = warmed_raw_mic_engine_slot().lock().ok()?;
-        let should_reuse = slot
-            .as_ref()
-            .map(|cached| &cached.device_key == device_key)
-            .unwrap_or(false);
-        if should_reuse {
-            slot.take()
-        } else {
-            if let Some(stale) = slot.take() {
-                discard_warmed_raw_mic_engine(stale);
-            }
-            None
-        }
-    }
-
-    fn store_warmed_raw_mic_engine(engine: WarmedRawMicEngine) {
-        if let Ok(mut slot) = warmed_raw_mic_engine_slot().lock() {
-            if let Some(previous) = slot.replace(engine) {
-                discard_warmed_raw_mic_engine(previous);
-            }
-        }
-    }
-
-    fn clear_warmed_raw_mic_engine() {
-        if let Ok(mut slot) = warmed_raw_mic_engine_slot().lock() {
-            if let Some(engine) = slot.take() {
-                discard_warmed_raw_mic_engine(engine);
-            }
-        }
-    }
-
-    fn discard_warmed_raw_mic_engine(engine: WarmedRawMicEngine) {
-        let WarmedRawMicEngine {
-            engine,
-            input_node,
-            device_key: _,
-            target,
-        } = engine;
-        if let Ok(mut current) = target.lock() {
-            *current = None;
-        }
-        unsafe {
-            if engine.isRunning() {
-                engine.stop();
-            }
-        }
-        let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-            input_node.removeTapOnBus(0);
-        }));
-    }
-
-    fn install_reusable_raw_mic_tap(
-        input_node: &AVAudioInputNode,
-        target: Arc<Mutex<Option<RawMicTapTarget>>>,
-    ) -> Result<(), String> {
-        let target_for_tap = target.clone();
-        let tap_block = StackBlock::new(
-            move |buffer: std::ptr::NonNull<AVAudioPCMBuffer>,
-                  _when: std::ptr::NonNull<AVAudioTime>| {
-                let Some(target) = target_for_tap
-                    .try_lock()
-                    .ok()
-                    .and_then(|guard| guard.as_ref().cloned())
-                else {
-                    return;
-                };
-                let buf = unsafe { buffer.as_ref() };
-                let mono = mono_mix_pcm(buf);
-                if !mono.is_empty() {
-                    (target.on_samples)(&mono);
-                }
-                let n = target.level_tick.fetch_add(1, Ordering::Relaxed);
-                if n % 2 == 0 {
-                    let level = peak_level_for_pcm(buf);
-                    let _ = target.app.emit(
-                        "voice:audio-level",
-                        AudioLevelPayload {
-                            level,
-                            source: "mic",
-                        },
-                    );
-                }
-            },
-        )
-        .copy();
-        let block_ptr: *mut block2::Block<
-            dyn Fn(std::ptr::NonNull<AVAudioPCMBuffer>, std::ptr::NonNull<AVAudioTime>) + 'static,
-        > = (&*tap_block) as *const _ as *mut _;
-        objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-            input_node.installTapOnBus_bufferSize_format_block(
-                0, 1024,
-                None, // use hardware's current format — avoids SCO↔A2DP stale-format race
-                block_ptr,
-            );
-        }))
-        .map_err(|e| format!("installTapOnBus threw: {e:?}"))
-    }
-
-    fn build_warmed_raw_mic_engine(
-        mic_device_id: Option<&str>,
-        mic_device_label: Option<&str>,
-        device_key: RawMicDeviceKey,
-    ) -> Result<WarmedRawMicEngine, String> {
-        configure_shared_mic_audio_session();
-        let engine: Retained<AVAudioEngine> = unsafe { AVAudioEngine::new() };
-        configure_engine_input_device(&engine, mic_device_id, mic_device_label)?;
-        let input_node: Retained<AVAudioInputNode> = unsafe { engine.inputNode() };
-        let _ = enable_voice_processing(&input_node);
-        objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe { engine.prepare() }))
-            .map_err(|e| format!("AVAudioEngine prepare threw: {e:?}"))?;
-        let target = Arc::new(Mutex::new(None));
-        install_reusable_raw_mic_tap(&input_node, target.clone())?;
-        disable_voice_processing_ducking(&input_node);
-        Ok(WarmedRawMicEngine {
-            engine,
-            input_node,
-            device_key,
-            target,
-        })
-    }
-
     fn stop_engine_and_remove_tap(session: &SpeechSession) {
         let (engine, tap_installed) = match &session.audio {
             SpeechAudio::Engine {
@@ -1030,8 +1021,10 @@ pub(crate) mod macos {
     struct DictationSampleIvars {
         request: Retained<SFSpeechAudioBufferRecognitionRequest>,
         app: AppHandle,
+        run_id: Option<u64>,
         buffers: AtomicU64,
         peak_bits: AtomicU32,
+        speech_check: SpeechCheck,
     }
 
     define_class!(
@@ -1055,7 +1048,12 @@ pub(crate) mod macos {
                 let ivars = self.ivars();
                 unsafe { ivars.request.appendAudioSampleBuffer(sample_buffer) };
                 let n = ivars.buffers.fetch_add(1, Ordering::Relaxed);
-                let level = peak_level_for_sample_buffer(sample_buffer);
+                let samples = sample_buffer_samples(sample_buffer);
+                if let Some(rate) = sample_buffer_rate(sample_buffer) {
+                    ivars.speech_check.set_sample_rate(rate);
+                }
+                ivars.speech_check.push(samples);
+                let level = peak_level(samples);
                 ivars
                     .peak_bits
                     .fetch_max(level.to_bits(), Ordering::Relaxed);
@@ -1065,6 +1063,7 @@ pub(crate) mod macos {
                         AudioLevelPayload {
                             level,
                             source: "mic",
+                            run_id: ivars.run_id,
                         },
                     );
                 }
@@ -1076,41 +1075,61 @@ pub(crate) mod macos {
         fn new(
             request: Retained<SFSpeechAudioBufferRecognitionRequest>,
             app: AppHandle,
+            run_id: Option<u64>,
         ) -> Retained<Self> {
+            let speech_check = SpeechCheck::for_dictation(&app, "apple-speech");
             let this = Self::alloc().set_ivars(DictationSampleIvars {
                 request,
                 app,
+                run_id,
                 buffers: AtomicU64::new(0),
                 peak_bits: AtomicU32::new(0),
+                speech_check,
             });
             unsafe { msg_send![super(this), init] }
         }
     }
 
     /// Mono float32 is requested in `capture_audio_settings`, so the block
-    /// buffer is a flat `f32` array. Non-negative floats order the same as
-    /// their bit patterns, which is what lets `peak_bits` use `fetch_max`.
-    fn peak_level_for_sample_buffer(sample_buffer: &CMSampleBuffer) -> f32 {
+    /// buffer is a flat `f32` array.
+    fn sample_buffer_samples(sample_buffer: &CMSampleBuffer) -> &[f32] {
         unsafe {
             let Some(block) = sample_buffer.data_buffer() else {
-                return 0.0;
+                return &[];
             };
             let mut length_at_offset = 0usize;
             let mut data: *mut std::ffi::c_char = std::ptr::null_mut();
             let status =
                 block.data_pointer(0, &mut length_at_offset, std::ptr::null_mut(), &mut data);
             if status != 0 || data.is_null() {
-                return 0.0;
+                return &[];
             }
-            let samples =
-                std::slice::from_raw_parts(data as *const f32, length_at_offset / size_of::<f32>());
-            let step = (samples.len() / 64).max(1);
-            samples
-                .iter()
-                .step_by(step)
-                .fold(0.0_f32, |peak, v| peak.max(v.abs()))
-                .min(1.0)
+            std::slice::from_raw_parts(data as *const f32, length_at_offset / size_of::<f32>())
         }
+    }
+
+    /// The capture runs at the device's own rate, which the settings leave
+    /// unset, so each buffer says what it is.
+    fn sample_buffer_rate(sample_buffer: &CMSampleBuffer) -> Option<f64> {
+        unsafe {
+            let format = sample_buffer.format_description()?;
+            let description = CMAudioFormatDescriptionGetStreamBasicDescription(&format);
+            description
+                .as_ref()
+                .map(|description| description.mSampleRate)
+                .filter(|rate| *rate > 0.0)
+        }
+    }
+
+    /// Non-negative floats order the same as their bit patterns, which is
+    /// what lets `peak_bits` use `fetch_max`.
+    fn peak_level(samples: &[f32]) -> f32 {
+        let step = (samples.len() / 64).max(1);
+        samples
+            .iter()
+            .step_by(step)
+            .fold(0.0_f32, |peak, v| peak.max(v.abs()))
+            .min(1.0)
     }
 
     fn capture_audio_settings() -> Option<Retained<NSDictionary<NSString, AnyObject>>> {
@@ -1143,7 +1162,7 @@ pub(crate) mod macos {
         session: Retained<AVCaptureSession>,
         output: Retained<AVCaptureAudioDataOutput>,
         delegate: Retained<DictationSampleDelegate>,
-        _queue: DispatchRetained<DispatchQueue>,
+        queue: DispatchRetained<DispatchQueue>,
         device_name: String,
         stopped: AtomicBool,
     }
@@ -1152,49 +1171,24 @@ pub(crate) mod macos {
         fn start(
             app: AppHandle,
             request: Retained<SFSpeechAudioBufferRecognitionRequest>,
+            run_id: Option<u64>,
             mic_device_id: Option<&str>,
             mic_device_label: Option<&str>,
         ) -> Result<Self, String> {
-            let device = resolve_capture_device(mic_device_id, mic_device_label)?;
-            let device_name = unsafe { device.localizedName() }.to_string();
-            let device_uid = unsafe { device.uniqueID() }.to_string();
-
-            let input = unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }
-                .map_err(|err| {
-                    format!(
-                        "Could not open microphone {device_name}: {}",
-                        ns_error_message(&err)
-                    )
-                })?;
-            let session = unsafe { AVCaptureSession::new() };
-            let output = unsafe { AVCaptureAudioDataOutput::new() };
-            unsafe {
-                if !session.canAddInput(&input) {
-                    return Err(format!("Microphone {device_name} cannot be captured."));
-                }
-                session.addInput(&input);
-                output.setAudioSettings(capture_audio_settings().as_deref());
-                if !session.canAddOutput(&output) {
-                    return Err("Audio capture output is unavailable.".into());
-                }
-                session.addOutput(&output);
-            }
-
-            let delegate = DictationSampleDelegate::new(request, app);
-            let queue = DispatchQueue::new("com.clips.dictation.capture", None);
-            unsafe {
-                output.setSampleBufferDelegate_queue(
-                    Some(ProtocolObject::from_ref(&*delegate)),
-                    Some(&queue),
-                );
-            }
-            objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-                session.startRunning()
-            }))
-            .map_err(|e| format!("AVCaptureSession start threw: {e:?}"))?;
-            if !unsafe { session.isRunning() } {
-                return Err(format!("Could not start capture from {device_name}."));
-            }
+            let delegate = DictationSampleDelegate::new(request, app, run_id);
+            let CaptureSession {
+                session,
+                output,
+                queue,
+                device_name,
+                device_uid,
+            } = start_capture_session(
+                mic_device_id,
+                mic_device_label,
+                capture_audio_settings().as_deref(),
+                ProtocolObject::from_ref(&*delegate),
+                "com.clips.dictation.capture",
+            )?;
             eprintln!(
                 "[voice-dictation] native speech capturing from {device_name} ({device_uid}) via AVCaptureSession"
             );
@@ -1202,10 +1196,14 @@ pub(crate) mod macos {
                 session,
                 output,
                 delegate,
-                _queue: queue,
+                queue,
                 device_name,
                 stopped: AtomicBool::new(false),
             })
+        }
+
+        fn speech_check(&self) -> &SpeechCheck {
+            &self.delegate.ivars().speech_check
         }
 
         fn stop(&self) {
@@ -1216,6 +1214,9 @@ pub(crate) mod macos {
                 self.session.stopRunning();
                 self.output.setSampleBufferDelegate_queue(None, None);
             }
+            // Buffers already queued still reach the delegate; wait for them so
+            // the speech check has heard every one before it is asked.
+            self.queue.exec_sync(|| {});
             let ivars = self.delegate.ivars();
             eprintln!(
                 "[voice-dictation] native capture from {} delivered {} buffers (peak {:.4})",
@@ -1240,6 +1241,85 @@ pub(crate) mod macos {
             .ok_or_else(|| "AVMediaTypeAudio is unavailable.".to_string())?;
         unsafe { AVCaptureDevice::defaultDeviceWithMediaType(media_type) }
             .ok_or_else(|| "No microphone is available.".into())
+    }
+
+    /// A running AVCaptureSession that hands one microphone's sample buffers
+    /// to a delegate on `queue`.
+    pub(super) struct CaptureSession {
+        pub(super) session: Retained<AVCaptureSession>,
+        pub(super) output: Retained<AVCaptureAudioDataOutput>,
+        pub(super) queue: DispatchRetained<DispatchQueue>,
+        pub(super) device_name: String,
+        pub(super) device_uid: String,
+    }
+
+    pub(super) fn start_capture_session(
+        mic_device_id: Option<&str>,
+        mic_device_label: Option<&str>,
+        audio_settings: Option<&NSDictionary<NSString, AnyObject>>,
+        delegate: &ProtocolObject<dyn AVCaptureAudioDataOutputSampleBufferDelegate>,
+        queue_label: &str,
+    ) -> Result<CaptureSession, String> {
+        let device = resolve_capture_device(mic_device_id, mic_device_label)?;
+        let device_name = unsafe { device.localizedName() }.to_string();
+        let device_uid = unsafe { device.uniqueID() }.to_string();
+
+        let input = unsafe { AVCaptureDeviceInput::deviceInputWithDevice_error(&device) }.map_err(
+            |err| {
+                format!(
+                    "Could not open microphone {device_name}: {}",
+                    ns_error_message(&err)
+                )
+            },
+        )?;
+        let session = unsafe { AVCaptureSession::new() };
+        let output = unsafe { AVCaptureAudioDataOutput::new() };
+        unsafe {
+            if !session.canAddInput(&input) {
+                return Err(format!("Microphone {device_name} cannot be captured."));
+            }
+            session.addInput(&input);
+        }
+        objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+            output.setAudioSettings(audio_settings)
+        }))
+        .map_err(|e| format!("Audio capture settings were rejected: {e:?}"))?;
+        unsafe {
+            if !session.canAddOutput(&output) {
+                return Err("Audio capture output is unavailable.".into());
+            }
+            session.addOutput(&output);
+        }
+
+        let queue = DispatchQueue::new(queue_label, None);
+        unsafe { output.setSampleBufferDelegate_queue(Some(delegate), Some(&queue)) };
+        let started = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+            session.startRunning()
+        }))
+        .map_err(|e| format!("AVCaptureSession start threw: {e:?}"))
+        .and_then(|()| {
+            if unsafe { session.isRunning() } {
+                Ok(())
+            } else {
+                Err(format!("Could not start capture from {device_name}."))
+            }
+        });
+        if let Err(error) = started {
+            unsafe {
+                session.stopRunning();
+                output.setSampleBufferDelegate_queue(None, None);
+            }
+            // The caller drops the delegate once this returns.
+            queue.exec_sync(|| {});
+            return Err(error);
+        }
+        Ok(CaptureSession {
+            session,
+            output,
+            queue,
+            device_name,
+            device_uid,
+        })
     }
 
     fn finish_session_callback(expected_generation: u64, callback_finished: &AtomicBool) {
@@ -1296,6 +1376,7 @@ pub(crate) mod macos {
         app: &AppHandle,
         request: &Retained<SFSpeechAudioBufferRecognitionRequest>,
         owner: SessionOwner,
+        run_id: Option<u64>,
         mic_device_id: Option<&str>,
         mic_device_label: Option<&str>,
     ) -> Result<SpeechAudio, String> {
@@ -1312,7 +1393,6 @@ pub(crate) mod macos {
                 enable_bypassed_voice_processing(&input_node)?;
                 true
             }
-            MicVoiceProcessingMode::Enabled => enable_voice_processing(&input_node).is_ok(),
             MicVoiceProcessingMode::Disabled => false,
         };
         objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe { engine.prepare() }))
@@ -1351,6 +1431,7 @@ pub(crate) mod macos {
                             AudioLevelPayload {
                                 level,
                                 source: "mic",
+                                run_id,
                             },
                         );
                     }
@@ -1400,6 +1481,7 @@ pub(crate) mod macos {
         mic_device_id: Option<String>,
         mic_device_label: Option<String>,
         owner: SessionOwner,
+        run_id: Option<u64>,
     ) -> Result<(), String> {
         native_speech_start_impl_inner(
             app,
@@ -1407,6 +1489,7 @@ pub(crate) mod macos {
             mic_device_id,
             mic_device_label,
             owner,
+            run_id,
             0,
             None,
             None,
@@ -1419,10 +1502,30 @@ pub(crate) mod macos {
         mic_device_id: Option<String>,
         mic_device_label: Option<String>,
         owner: SessionOwner,
+        run_id: Option<u64>,
         restart_attempt: u32,
         restart_guard: Option<RestartGuard>,
         restart_reserved_generation: Option<Arc<AtomicU64>>,
     ) -> Result<(), String> {
+        let capture_lease = claim_speech_capture(
+            match owner {
+                SessionOwner::Dictation => SpeechCaptureOwner::Dictation,
+                SessionOwner::Meeting => SpeechCaptureOwner::Meeting,
+            },
+            SpeechCaptureEngine::Native,
+        )
+        .map_err(str::to_owned)?;
+        if owner == SessionOwner::Dictation {
+            start_authority_result(begin_dictation_run(run_id)).map_err(str::to_owned)?;
+        }
+        if owner == SessionOwner::Meeting {
+            let mut authority = meeting_run_authority()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            start_authority_result(begin_meeting_run(&mut authority, run_id))
+                .map_err(str::to_owned)?;
+        }
+
         let start_stop_generation = owner_stop_generation(owner).load(Ordering::SeqCst);
         {
             let slot = session_slot().lock().map_err(|e| e.to_string())?;
@@ -1435,10 +1538,9 @@ pub(crate) mod macos {
                     return Ok(());
                 }
             }
-            if let Some(prev) = slot.active.as_ref() {
-                if prev.owner == SessionOwner::Meeting && owner == SessionOwner::Dictation {
-                    return Err("speech-engine-busy-meeting".into());
-                }
+            if let Some(error) = session_registry_start_error(&slot, owner, |session| session.owner)
+            {
+                return Err(error.into());
             }
         }
 
@@ -1450,7 +1552,7 @@ pub(crate) mod macos {
         }
         ensure_authorized()?;
 
-        let (my_gen, my_stop_gen) = {
+        let (my_gen, my_stop_gen, pending_start) = {
             let mut slot = session_slot().lock().map_err(|e| e.to_string())?;
             if let Some(guard) = restart_guard {
                 if !restart_guard_is_current(
@@ -1464,6 +1566,10 @@ pub(crate) mod macos {
             let current_stop_generation = owner_stop_generation(owner).load(Ordering::SeqCst);
             if stop_generation_changed(start_stop_generation, current_stop_generation) {
                 return Ok(());
+            }
+            if let Some(error) = session_registry_start_error(&slot, owner, |session| session.owner)
+            {
+                return Err(error.into());
             }
             let generation = session_generation().fetch_add(1, Ordering::SeqCst) + 1;
             if let Some(prev) = slot.active.take() {
@@ -1482,8 +1588,11 @@ pub(crate) mod macos {
                     unsafe { prev.task.cancel() };
                 }
             }
-            (generation, current_stop_generation)
+            let pending_start = PendingSpeechStart { owner, generation };
+            slot.starting = Some(pending_start);
+            (generation, current_stop_generation, pending_start)
         };
+        let _pending_start = PendingSpeechStartGuard(pending_start);
         if let Some(reserved_generation) = &restart_reserved_generation {
             reserved_generation.store(my_gen, Ordering::SeqCst);
         }
@@ -1526,6 +1635,7 @@ pub(crate) mod macos {
             SessionOwner::Dictation => SpeechAudio::Capture(DictationCapture::start(
                 app.clone(),
                 request.clone(),
+                run_id,
                 mic_device_id.as_deref(),
                 mic_device_label.as_deref(),
             )?),
@@ -1533,6 +1643,7 @@ pub(crate) mod macos {
                 &app,
                 &request,
                 owner,
+                run_id,
                 mic_device_id.as_deref(),
                 mic_device_label.as_deref(),
             )?,
@@ -1591,6 +1702,7 @@ pub(crate) mod macos {
                             ErrorPayload {
                                 error,
                                 source: "mic",
+                                run_id,
                             },
                         );
                     }
@@ -1622,6 +1734,7 @@ pub(crate) mod macos {
                                 mic_device_id,
                                 mic_device_label,
                                 owner,
+                                run_id,
                                 next_attempt,
                                 Some(guard),
                                 Some(reserved_generation.clone()),
@@ -1640,6 +1753,7 @@ pub(crate) mod macos {
                                         ErrorPayload {
                                             error: e,
                                             source: "mic",
+                                            run_id,
                                         },
                                     );
                                 }
@@ -1666,6 +1780,7 @@ pub(crate) mod macos {
                         FinalPayload {
                             text,
                             source: "mic",
+                            run_id,
                         },
                     );
                     finish_session_callback(my_gen, &callback_finished);
@@ -1677,6 +1792,7 @@ pub(crate) mod macos {
                         PartialPayload {
                             text,
                             source: "mic",
+                            run_id,
                         },
                     );
                 }
@@ -1693,6 +1809,7 @@ pub(crate) mod macos {
 
         let session = SpeechSession {
             generation: my_gen,
+            run_id,
             completion_started,
             callback_finished,
             audio,
@@ -1701,18 +1818,41 @@ pub(crate) mod macos {
             cancelled,
             stopped,
             owner,
+            _capture_lease: capture_lease,
         };
         let installed = {
+            let authority = dictation_run_authority()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let meeting_authority = meeting_run_authority()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut slot = session_slot().lock().map_err(|e| e.to_string())?;
             let current_generation = session_generation().load(Ordering::SeqCst);
-            if owner_stop_generation(owner).load(Ordering::SeqCst) == my_stop_gen {
-                put_session_if_current_generation(
+            let owns_pending_start = slot.starting == Some(pending_start);
+            let active_owner_conflict = slot
+                .active
+                .as_ref()
+                .and_then(|active| session_start_error(active.owner, owner));
+            if owns_pending_start
+                && active_owner_conflict.is_none()
+                && ((owner != SessionOwner::Dictation
+                    || dictation_run_is_current(&authority, run_id))
+                    && (owner != SessionOwner::Meeting
+                        || meeting_run_is_current(&meeting_authority, run_id)))
+                && owner_stop_generation(owner).load(Ordering::SeqCst) == my_stop_gen
+            {
+                let result = put_session_if_current_generation(
                     &mut slot.active,
                     session,
                     current_generation,
                     |session| session.generation,
                     |session| session.completion_started.load(Ordering::SeqCst),
-                )
+                );
+                if result.is_ok() {
+                    slot.starting = None;
+                }
+                result
             } else {
                 Err(session)
             }
@@ -1755,230 +1895,10 @@ pub(crate) mod macos {
         Ok(())
     }
 
-    pub(crate) struct RawMicCapture {
-        engine: Retained<AVAudioEngine>,
-        input_node: Retained<AVAudioInputNode>,
-        sample_rate: f64,
-        warm_cache: Option<RawMicWarmCache>,
-    }
-
-    // SAFETY: same argument as `SpeechSession` — refcounted ObjC objects that
-    // are message-thread-safe and only moved through ownership, never aliased.
-    unsafe impl Send for RawMicCapture {}
-
-    impl RawMicCapture {
-        pub(crate) fn sample_rate(&self) -> f64 {
-            self.sample_rate
-        }
-
-        pub(crate) fn stop(self) {
-            let RawMicCapture {
-                engine,
-                input_node,
-                sample_rate: _,
-                warm_cache,
-            } = self;
-            if let Some(cache) = warm_cache {
-                unsafe {
-                    if engine.isRunning() {
-                        engine.stop();
-                    }
-                }
-                if let Ok(mut target) = cache.target.lock() {
-                    *target = None;
-                }
-                store_warmed_raw_mic_engine(WarmedRawMicEngine {
-                    engine,
-                    input_node,
-                    device_key: cache.device_key,
-                    target: cache.target,
-                });
-                return;
-            }
-            unsafe {
-                input_node.removeTapOnBus(0);
-                if engine.isRunning() {
-                    engine.stop();
-                }
-            }
-        }
-    }
-
-    fn start_warmed_raw_mic_capture(
-        app: AppHandle,
-        mic_device_id: Option<String>,
-        mic_device_label: Option<String>,
-        on_samples: Arc<dyn Fn(&[f32]) + Send + Sync>,
-    ) -> Result<RawMicCapture, String> {
-        let device_key =
-            RawMicDeviceKey::from_selection(mic_device_id.as_deref(), mic_device_label.as_deref());
-        let warmed = match take_warmed_raw_mic_engine(&device_key) {
-            Some(warmed) => warmed,
-            None => build_warmed_raw_mic_engine(
-                mic_device_id.as_deref(),
-                mic_device_label.as_deref(),
-                device_key.clone(),
-            )?,
-        };
-        if let Ok(mut target) = warmed.target.lock() {
-            *target = Some(RawMicTapTarget {
-                app: app.clone(),
-                on_samples,
-                level_tick: Arc::new(AtomicU32::new(0)),
-            });
-        } else {
-            return Err("warmed mic target lock poisoned".into());
-        }
-
-        let start_result = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-            warmed.engine.startAndReturnError()
-        }))
-        .map_err(|e| format!("AVAudioEngine start threw: {e:?}"))
-        .and_then(|r| {
-            r.map_err(|e| format!("AVAudioEngine start failed: {}", ns_error_message(&e)))
-        });
-        if let Err(msg) = start_result {
-            if let Ok(mut target) = warmed.target.lock() {
-                *target = None;
-            }
-            return Err(msg);
-        }
-
-        let format = unsafe { warmed.input_node.outputFormatForBus(0) };
-        let sample_rate = unsafe { format.sampleRate() };
-        eprintln!(
-            "[whisper-mic] reused warm VPIO tap format: {} Hz, {} ch",
-            sample_rate as u32,
-            unsafe { format.channelCount() }
-        );
-
-        let WarmedRawMicEngine {
-            engine,
-            input_node,
-            device_key,
-            target,
-        } = warmed;
-        Ok(RawMicCapture {
-            engine,
-            input_node,
-            sample_rate,
-            warm_cache: Some(RawMicWarmCache { device_key, target }),
-        })
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum MicVoiceProcessingMode {
-        Disabled,
-        Enabled,
-        Bypassed,
-    }
-
-    pub(crate) fn start_raw_mic_capture(
-        app: AppHandle,
-        mic_device_id: Option<String>,
-        mic_device_label: Option<String>,
-        voice_processing: MicVoiceProcessingMode,
-        reuse_voice_processing_engine: bool,
-        on_samples: Arc<dyn Fn(&[f32]) + Send + Sync>,
-    ) -> Result<RawMicCapture, String> {
-        if voice_processing == MicVoiceProcessingMode::Enabled && reuse_voice_processing_engine {
-            return start_warmed_raw_mic_capture(app, mic_device_id, mic_device_label, on_samples);
-        }
-        clear_warmed_raw_mic_engine();
-
-        configure_shared_mic_audio_session();
-
-        let engine: Retained<AVAudioEngine> = unsafe { AVAudioEngine::new() };
-        configure_engine_input_device(
-            &engine,
-            mic_device_id.as_deref(),
-            mic_device_label.as_deref(),
-        )?;
-        let input_node: Retained<AVAudioInputNode> = unsafe { engine.inputNode() };
-
-        let voice_processing_enabled = match voice_processing {
-            MicVoiceProcessingMode::Bypassed => {
-                enable_bypassed_voice_processing(&input_node)?;
-                true
-            }
-            MicVoiceProcessingMode::Enabled => enable_voice_processing(&input_node).is_ok(),
-            MicVoiceProcessingMode::Disabled => {
-                eprintln!("[whisper-mic] voice processing disabled for shared mic capture");
-                false
-            }
-        };
-        objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe { engine.prepare() }))
-            .map_err(|e| format!("AVAudioEngine prepare threw: {e:?}"))?;
-
-        {
-            let on_samples = on_samples.clone();
-            let app_for_level = app.clone();
-            let level_tick = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let tap_block = StackBlock::new(
-                move |buffer: std::ptr::NonNull<AVAudioPCMBuffer>,
-                      _when: std::ptr::NonNull<AVAudioTime>| {
-                    let buf = unsafe { buffer.as_ref() };
-                    let mono = mono_mix_pcm(buf);
-                    if !mono.is_empty() {
-                        on_samples(&mono);
-                    }
-                    let n = level_tick.fetch_add(1, Ordering::Relaxed);
-                    if n % 2 == 0 {
-                        let level = peak_level_for_pcm(buf);
-                        let _ = app_for_level.emit(
-                            "voice:audio-level",
-                            AudioLevelPayload {
-                                level,
-                                source: "mic",
-                            },
-                        );
-                    }
-                },
-            )
-            .copy();
-            let block_ptr: *mut block2::Block<
-                dyn Fn(std::ptr::NonNull<AVAudioPCMBuffer>, std::ptr::NonNull<AVAudioTime>)
-                    + 'static,
-            > = (&*tap_block) as *const _ as *mut _;
-            objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-                input_node.installTapOnBus_bufferSize_format_block(
-                    0, 1024,
-                    None, // use hardware's current format — avoids SCO↔A2DP stale-format race
-                    block_ptr,
-                );
-            }))
-            .map_err(|e| format!("installTapOnBus threw: {e:?}"))?;
-        }
-
-        if let Err(err) = unsafe { engine.startAndReturnError() } {
-            let msg = ns_error_message(&err);
-            unsafe { input_node.removeTapOnBus(0) };
-            return Err(format!("AVAudioEngine start failed: {msg}"));
-        }
-
-        let format = unsafe { input_node.outputFormatForBus(0) };
-        let sample_rate = unsafe { format.sampleRate() };
-        eprintln!(
-            "[whisper-mic] tap format after start: {} Hz, {} ch",
-            sample_rate as u32,
-            unsafe { format.channelCount() }
-        );
-
-        if voice_processing_enabled {
-            disable_voice_processing_ducking(&input_node);
-        }
-
-        Ok(RawMicCapture {
-            engine,
-            input_node,
-            sample_rate,
-            warm_cache: None,
-        })
-    }
-
     fn take_session_for(
         slot: &mut SessionRegistry<SpeechSession>,
         owner: Option<SessionOwner>,
+        run_id: Option<u64>,
     ) -> Option<SpeechSession> {
         // Dictation and meeting transcription share one recognizer slot, so a
         // stop from one must not tear down the other's live session.
@@ -1989,24 +1909,69 @@ pub(crate) mod macos {
         if owned_by_other {
             return None;
         }
+        if let (Some(current), Some(run_id)) = (slot.active.as_ref(), run_id) {
+            if current.run_id != Some(run_id) {
+                return None;
+            }
+        }
         slot.active.take()
     }
 
     pub fn native_speech_stop_impl(
         _app: AppHandle,
         owner: Option<SessionOwner>,
-    ) -> Result<(), String> {
+        run_id: Option<u64>,
+    ) -> Result<Option<DictationStop>, String> {
+        let mut authority = if owner == Some(SessionOwner::Dictation) && run_id.is_some() {
+            Some(
+                dictation_run_authority()
+                    .lock()
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let mut meeting_authority = if owner == Some(SessionOwner::Meeting) && run_id.is_some() {
+            Some(meeting_run_authority().lock().map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        if let Some(authority) = authority.as_mut() {
+            let id = run_id.expect("the authority lock requires a run id");
+            if !register_dictation_stop(authority, id) {
+                return Ok(None);
+            }
+        }
+        if let Some(authority) = meeting_authority.as_mut() {
+            let id = run_id.expect("the meeting authority lock requires a run id");
+            if !cancel_meeting_run(authority, id) {
+                return Ok(None);
+            }
+        }
         let session = {
             let mut slot = session_slot().lock().map_err(|e| e.to_string())?;
+            let active_matches = slot.active.as_ref().is_some_and(|current| {
+                current.owner == owner.unwrap_or(SessionOwner::Dictation)
+                    && run_id.map_or(true, |id| current.run_id == Some(id))
+            });
+            if !active_matches {
+                if let (Some(authority), Some(id)) = (authority.as_mut(), run_id) {
+                    authority.cancelled_run_ids.insert(id);
+                }
+            }
             invalidate_restart(owner);
-            take_session_for(&mut slot, owner)
+            take_session_for(&mut slot, owner, run_id)
         };
         let Some(session) = session else {
-            return Ok(());
+            return Ok(None);
         };
 
         session.stopped.store(true, Ordering::SeqCst);
         stop_engine_and_remove_tap(&session);
+        let voice = match &session.audio {
+            SpeechAudio::Capture(capture) => Some(capture.speech_check().finish().voice),
+            SpeechAudio::Engine { .. } => None,
+        };
         // SAFETY: `endAudio()` signals that no more buffers are coming. The
         // result handler will still fire once more, so retain the session
         // until that callback finishes even if a newer start owns the slot.
@@ -2024,17 +1989,46 @@ pub(crate) mod macos {
                 |session| session.callback_finished.load(Ordering::SeqCst),
             );
         }
-        Ok(())
+        Ok(voice.map(|voice| DictationStop { voice }))
     }
 
     pub fn native_speech_cancel_impl(
         _app: AppHandle,
         owner: Option<SessionOwner>,
+        run_id: Option<u64>,
     ) -> Result<(), String> {
+        let mut authority = if owner == Some(SessionOwner::Dictation) && run_id.is_some() {
+            Some(
+                dictation_run_authority()
+                    .lock()
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        let mut meeting_authority = if owner == Some(SessionOwner::Meeting) && run_id.is_some() {
+            Some(meeting_run_authority().lock().map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        if let Some(authority) = authority.as_mut() {
+            let id = run_id.expect("the authority lock requires a run id");
+            if authority.latest_run_id.is_some_and(|latest| latest > id) {
+                return Ok(());
+            }
+            authority.latest_run_id = Some(id);
+            authority.cancelled_run_ids.insert(id);
+        }
+        if let Some(authority) = meeting_authority.as_mut() {
+            let id = run_id.expect("the meeting authority lock requires a run id");
+            if !cancel_meeting_run(authority, id) {
+                return Ok(());
+            }
+        }
         let session = {
             let mut slot = session_slot().lock().map_err(|e| e.to_string())?;
             invalidate_restart(owner);
-            take_session_for(&mut slot, owner)
+            take_session_for(&mut slot, owner, run_id)
         };
         let Some(session) = session else {
             return Ok(());
@@ -2050,6 +2044,7 @@ pub(crate) mod macos {
         let sessions = match session_slot().lock() {
             Ok(mut slot) => {
                 invalidate_restart(None);
+                slot.starting = None;
                 let mut sessions = slot.active.take().into_iter().collect::<Vec<_>>();
                 sessions.append(&mut slot.finishing);
                 sessions
@@ -2057,6 +2052,7 @@ pub(crate) mod macos {
             Err(poisoned) => {
                 let mut slot = poisoned.into_inner();
                 invalidate_restart(None);
+                slot.starting = None;
                 let mut sessions = slot.active.take().into_iter().collect::<Vec<_>>();
                 sessions.append(&mut slot.finishing);
                 sessions
@@ -2068,19 +2064,79 @@ pub(crate) mod macos {
             unsafe { session.task.cancel() };
             stop_engine_and_remove_tap(&session);
         }
-        clear_warmed_raw_mic_engine();
     }
 
     #[cfg(test)]
     mod tests {
         use super::{
+            begin_meeting_run, cancel_meeting_run, meeting_run_is_current,
             native_speech_voice_processing_mode, put_session_if_current_generation,
-            restart_guard_is_current, restart_setup_is_current, restore_stopped_session,
-            retain_session_until_callback, stop_generation_changed, superseded_start_result,
-            take_sessions_if_generation_matches, MicVoiceProcessingMode, RestartGuard,
+            register_dictation_stop, restart_guard_is_current, restart_setup_is_current,
+            restore_stopped_session, retain_session_until_callback, session_registry_start_error,
+            session_start_error, start_authority_result, stop_generation_changed,
+            superseded_start_result, take_sessions_if_generation_matches, DictationRunAuthority,
+            MeetingRunAuthority, MicVoiceProcessingMode, PendingSpeechStart, RestartGuard,
             SessionOwner, SessionRegistry, StoppedSessionDisposition,
         };
         use std::sync::Arc;
+
+        #[test]
+        fn active_engine_owner_cannot_be_preempted_by_another_owner() {
+            assert_eq!(
+                session_start_error(SessionOwner::Dictation, SessionOwner::Meeting),
+                Some("speech-engine-busy-dictation")
+            );
+            assert_eq!(
+                session_start_error(SessionOwner::Meeting, SessionOwner::Dictation),
+                Some("speech-engine-busy-meeting")
+            );
+            assert_eq!(
+                session_start_error(SessionOwner::Meeting, SessionOwner::Meeting),
+                None
+            );
+        }
+
+        #[test]
+        fn rejected_native_start_returns_a_typed_failure() {
+            assert_eq!(
+                start_authority_result(false),
+                Err("speech-engine-start-superseded")
+            );
+            assert_eq!(start_authority_result(true), Ok(()));
+        }
+
+        #[test]
+        fn pending_engine_start_reserves_its_owner() {
+            let mut registry = SessionRegistry::<()>::default();
+            registry.starting = Some(PendingSpeechStart {
+                owner: SessionOwner::Dictation,
+                generation: 5,
+            });
+
+            assert_eq!(
+                session_registry_start_error(&registry, SessionOwner::Meeting, |_| {
+                    SessionOwner::Dictation
+                }),
+                Some("speech-engine-busy-dictation")
+            );
+            assert_eq!(
+                session_registry_start_error(&registry, SessionOwner::Dictation, |_| {
+                    SessionOwner::Dictation
+                }),
+                None
+            );
+        }
+
+        #[test]
+        fn stale_dictation_stop_cannot_invalidate_a_newer_run() {
+            let mut authority = DictationRunAuthority {
+                latest_run_id: Some(12),
+                cancelled_run_ids: Default::default(),
+            };
+
+            assert!(!register_dictation_stop(&mut authority, 11));
+            assert_eq!(authority.latest_run_id, Some(12));
+        }
 
         #[derive(Debug)]
         struct TestResource;
@@ -2109,6 +2165,7 @@ pub(crate) mod macos {
             let mut registry = SessionRegistry {
                 active: Some(test_session(2)),
                 finishing: Vec::new(),
+                starting: None,
             };
 
             let removed =
@@ -2127,6 +2184,7 @@ pub(crate) mod macos {
             let mut registry = SessionRegistry {
                 active: Some(test_session(2)),
                 finishing: Vec::new(),
+                starting: None,
             };
             let old_session = test_session(1);
             let old_resource = Arc::downgrade(&old_session.resource);
@@ -2316,6 +2374,26 @@ pub(crate) mod macos {
         fn stop_during_authorization_cancels_before_resource_start() {
             assert!(stop_generation_changed(2, 3));
             assert!(!stop_generation_changed(2, 2));
+        }
+
+        #[test]
+        fn stale_meeting_stop_does_not_invalidate_a_newer_pending_start() {
+            let mut authority = MeetingRunAuthority::default();
+            assert!(begin_meeting_run(&mut authority, Some(10)));
+            assert!(begin_meeting_run(&mut authority, Some(11)));
+
+            assert!(!cancel_meeting_run(&mut authority, 10));
+            assert!(meeting_run_is_current(&authority, Some(11)));
+        }
+
+        #[test]
+        fn meeting_stop_before_start_registration_cancels_that_run() {
+            let mut authority = MeetingRunAuthority::default();
+
+            assert!(cancel_meeting_run(&mut authority, 10));
+            assert!(!begin_meeting_run(&mut authority, Some(10)));
+            assert!(!meeting_run_is_current(&authority, Some(10)));
+            assert!(begin_meeting_run(&mut authority, Some(11)));
         }
 
         #[test]

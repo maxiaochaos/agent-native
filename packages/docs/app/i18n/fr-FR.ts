@@ -1,6 +1,67 @@
-import enUS from "./en-US";
+import type { PluralLocaleMessages } from "./en-US";
 
 const frFR = {
+  siteContent: {
+    recipeWhen: "Quand",
+    howOften: "À quelle fréquence",
+    filterRole: "Rôle",
+    filterAll: "Tous",
+    filterEngineering: "Ingénierie",
+    filterProduct: "Produit",
+    filterDesign: "Design",
+    filterMarketing: "Marketing",
+    filterRevops: "RevOps",
+    filterSales: "Ventes",
+    filterFounders: "Fondateurs",
+    filterFinance: "Finance",
+    filterEmpty: "Aucun cas d’usage ne correspond à ces filtres.",
+    filterClear: "Effacer les filtres",
+    browseArticles:
+      "Ou parcourez les {{articles}} pour trouver des modèles et des tutoriels.",
+    articlesLink: "articles",
+    whatYouUse: "Ce que vous utilisez",
+    usedFor: "Pour",
+    whereItBreaks: "Les limites",
+    updatedDate: "Mis à jour le {{date}}",
+    publishedDate: "Publié le {{date}}",
+    useCases: "Cas d’usage",
+    useCasesDescription: "Pages pour les tâches récurrentes, par app",
+    useCasesTitle:
+      "Le travail récurrent, réalisé avec une app Agent-Native et votre agent IA",
+    useCasesIntro:
+      "Choisissez le travail que vous faites encore et encore, ou parcourez les {{articles}} pour trouver des modèles et des tutoriels.",
+    articles: "Articles",
+    articlesIntro:
+      "Des guides et des explications pour le travail récurrent avec des agents IA.",
+    articleCount_one: "{{count}} article",
+    articleCount_many: "{{count}} d’articles",
+    articleCount_other: "{{count}} articles",
+    copyPage: "Copier la page",
+    enlargeImage: "Agrandir l’image",
+    closeImage: "Fermer l’image",
+    copyPrompt: "Copier le prompt",
+    promptHint: "Collez le prompt dans la zone de saisie de {{app}}.",
+    copyLink: "Copier le lien",
+    copied: "Copié",
+    copyFailed: "Impossible de copier. Réessayez.",
+    breadcrumb: "Fil d’Ariane",
+    readTime_one: "{{count}} min de lecture",
+    readTime_many: "{{count}} min de lecture",
+    readTime_other: "{{count}} min de lecture",
+    partOf: "Fait partie de :",
+    moreArticles: "Plus d’articles {{category}}",
+    genericMore: "Plus d’articles",
+    showMore: "Afficher plus d’articles",
+    topics: {
+      clips:
+        "Enregistrements d’écran, réunions et dictées utilisables par votre agent IA",
+      design: "Prototypes interactifs avec votre agent IA",
+      slides: "Présentations conformes à votre marque avec votre agent IA",
+      plans:
+        "Plans visuels et récapitulatifs pour votre agent de développement IA",
+      analytics: "Questions en langage courant, graphiques et tableaux de bord",
+    },
+  },
   agentChat: {
     setup: {
       providerStatusUnavailable: "Impossible de confirmer que l’IA est prête.",
@@ -653,6 +714,9 @@ const frFR = {
     waitlistUnavailable:
       "Les inscriptions à la liste d'attente ne sont pas encore disponibles dans cet environnement. Essayez plutôt le site de documentation hébergé.",
     launchBuilder: "Lancer Builder",
+    newAppPrompt: "Crée une nouvelle application Agent-Native.",
+    customizeTemplatePrompt:
+      "Personnalise le modèle Agent-Native {{template}} selon mon flux de travail.",
   },
   templateCard: {
     pasteIntoTerminal: "Collez dans votre terminal.",
@@ -2648,6 +2712,7 @@ const frFR = {
     deploymentEnvironmentVariables: "Déploiement : Variables d'Environnement",
     updatingUiInProduction: "Mettre à Jour l'UI en Production",
     environmentVariables: "Variables d'environnement",
+    telemetry: "Télémétrie",
     progress: "Progression",
     authentication: "Authentification",
     multiTenancy: "Multilocation",
@@ -2659,6 +2724,7 @@ const frFR = {
     auditLog: "Journal d'audit",
     doctorCodeChecks: "Doctor (vérifications du code)",
     observability: "Observabilité",
+    recorder: "Enregistreur",
     observationalMemory: "Mémoire observationnelle",
     ciEvalGate: "Gate d'évals CI",
     usingYourAgentOverview: "Vue d'ensemble",
@@ -2712,7 +2778,9 @@ const frFR = {
     blueprintInstaller: "Installateur Blueprint",
     chat: "Chat",
     chatOverview: "Vue d'ensemble",
-    chatFirstEdits: "Votre première fonctionnalité",
+    chatFeatures: "Fonctionnalités",
+    chatAgent: "Parler à l'agent",
+    chatIntegrations: "Utilisation multi-apps",
     chatDevelopers: "Guide développeur",
     calendar: "Calendrier",
     calendarOverview: "Vue d'ensemble",
@@ -2786,6 +2854,6 @@ const frFR = {
     docsComponents: "Docs Components",
     formsDevelopers: "Guide développeur",
   },
-} satisfies typeof enUS;
+} satisfies PluralLocaleMessages;
 
 export default frFR;

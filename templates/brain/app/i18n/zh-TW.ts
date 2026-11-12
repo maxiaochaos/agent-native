@@ -1,6 +1,7 @@
 const messages = {
   common: {
     saving: "正在儲存",
+    incompleteTranscript: "逐字稿不完整。因隱私保護而隱藏的段落數：{{count}}。",
   },
   routeTitles: {
     extension: "擴充功能 - Brain",
@@ -408,6 +409,7 @@ const messages = {
       "Brain 每小時僅從已核准的系列匯入逐字稿。Zoom 帳戶中的其他會議絕不會被下載。變更清單會重新掃描回溯期間。",
     zoomAdminOnly:
       "只有組織擁有者和管理員可以變更 Zoom 設定。你仍然可以重新命名此來源。",
+    updatingSource: "正在更新…",
     approvedRepositories: "核准的儲存庫",
     githubRepositoriesDescription:
       "Brain 使用工作區 GitHub 憑證從這些儲存庫匯入有界問題和 pull request 脈絡。",
@@ -431,16 +433,20 @@ const messages = {
     nextSync: "下次同步 {{date}}",
     waitingForFirstSync: "等待首次同步",
     manualSync: "手動同步",
-    manualImportTitle: "將 Markdown 匯入 {{source}}",
+    manualImportTitle: "將文件匯入 {{source}}",
     manualImportDescription:
-      "選取資料夾或一批 Markdown 檔案。每個檔案都會成為可搜尋的文件，並遵循此來源的存取設定。",
-    chooseMarkdownFolder: "選取 Markdown 資料夾",
-    importMarkdownFiles: "匯入 Markdown 檔案",
-    manualImportNoFiles: "未選取 Markdown 檔案",
-    manualImportFilesSelected: "已選取 {{count}} 個 Markdown 檔案",
+      "選取 Markdown 或純文字的資料夾或檔案。每個檔案都會成為可搜尋的文件，並遵循此來源的存取設定。",
+    chooseMarkdownFolder: "選取資料夾",
+    importMarkdownFiles: "匯入文件",
+    companyContextUpload: "上傳公司脈絡",
+    companyContextAdminOnly: "只有組織擁有者和管理員可以上傳公司脈絡。",
+    companyContextOpenFailed: "無法開啟公司脈絡上傳。請再試一次。",
+    manualImportNoFiles: "未選取文件",
+    manualImportFilesSelected: "已選取 {{count}} 份文件",
     manualImportFileLimit:
-      "只會匯入 .md 和 .markdown 檔案。資料夾匯入上限為 100 個檔案和 400 萬個字元。",
-    manualImportSkippedFiles: "將略過 {{count}} 個非 Markdown 檔案。",
+      "支援 .md、.markdown 和 .txt。每次匯入上限為 100 個檔案和 400 萬個字元。",
+    chooseDocumentFiles: "選取檔案",
+    manualImportSkippedFiles: "將略過 {{count}} 個不支援的檔案。",
     manualImportMoreFiles: "+{{count}} 個其他檔案",
     manualImportResult:
       "{{imported}} 個已匯入、{{queued}} 個已排入蒸餾佇列、{{failed}} 個失敗、{{blocked}} 個遭封鎖",

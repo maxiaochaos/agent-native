@@ -4,6 +4,10 @@ import { resolveAccess } from "@agent-native/core/sharing";
 import { z } from "zod";
 
 import "../server/db/index.js";
+import {
+  privateMediaAgentLinks,
+  readsWithoutSessionCookie,
+} from "../server/lib/private-media-agent-links.js";
 import { isSoftDeletedDatabaseDocument } from "./_database-utils.js";
 import { flushOpenDocumentEditorToSql } from "./_document-flush.js";
 
@@ -30,8 +34,17 @@ export default defineAction({
   }),
   http: { method: "GET" },
   readOnly: true,
-  publicAgent: { expose: true, readOnly: true, requiresAuth: true },
-  run: async ({ id, format }) => {
+  // Saving an open editor first writes, so external agents get a write: a
+  // read-only MCP token cannot call it, and A2A does not offer it as a direct
+  // read. It only persists edits the editor already holds.
+  mcpAnnotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    openWorldHint: false,
+  },
+  mcpTool: true,
+  publicAgent: { expose: true, readOnly: false, requiresAuth: true },
+  run: async ({ id, format }, ctx) => {
     const access = await resolveAccess("document", id);
     if (
       !access ||
@@ -41,7 +54,7 @@ export default defineAction({
       throw new Error(`Document "${id}" not found`);
     }
 
-    await flushOpenDocumentEditorToSql({
+    const editorFlush = await flushOpenDocumentEditorToSql({
       documentId: id,
       ownerEmail: (access.resource.ownerEmail as string | undefined) || null,
     });
@@ -54,9 +67,16 @@ export default defineAction({
     ) {
       throw new Error(`Document "${id}" not found`);
     }
-    const doc = fresh.resource;
+    const snapshot =
+      editorFlush.status === "flushed" ? editorFlush.snapshot : undefined;
+    const doc = snapshot ? { ...fresh.resource, ...snapshot } : fresh.resource;
     const markdown = (doc.content as string) ?? "";
     const content = formatDocumentContent(markdown, format);
+    // Plain text drops images, so only Markdown needs their links.
+    const privateMediaLinks =
+      format === "markdown" && readsWithoutSessionCookie(ctx)
+        ? await privateMediaAgentLinks({ documentId: doc.id, content })
+        : undefined;
 
     return {
       id: doc.id,
@@ -64,6 +84,11 @@ export default defineAction({
       description: (doc.description as string | null | undefined) ?? "",
       content,
       format,
+      ...(privateMediaLinks ? { privateMediaLinks } : {}),
+      editorFlush:
+        editorFlush.status === "flushed"
+          ? { status: editorFlush.status, editors: editorFlush.editors }
+          : editorFlush,
       deepLink: buildDeepLink({
         app: "content",
         view: "editor",

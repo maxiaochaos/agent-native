@@ -31,7 +31,7 @@ export interface LayerSelectionChangeArgs {
     nextContent: string,
     options?: { recordHistory?: boolean },
   ) => ApplyFileContentUpdateResult;
-  activeFile: DesignFile;
+  activeFile: DesignFile | undefined;
   clearPendingOverviewLayerSelectionTimer: () => void;
   codeLayerOwnerByNodeId: ReadonlyMap<
     string,
@@ -243,6 +243,7 @@ export function runLayerSelectionChange(
       setActiveFileId(codeLayerOwner.fileId);
     }
     const nextSelectionState = getSidebarCodeLayerSelectionState({
+      activeFileId: activeFile?.id,
       currentViewMode: viewModeRef.current,
       ownerFileId: codeLayerOwner.fileId,
       overviewSelectedScreenIds,
@@ -285,9 +286,13 @@ export function runLayerSelectionChange(
     ? selectedId.slice("code:".length)
     : selectedId;
   if (screenFileIds.includes(fileId)) {
-    setOverviewSelectedScreenIds(
-      requestedScreenIds.length > 0 ? requestedScreenIds : [fileId],
-    );
+    const stayInSingleScreen =
+      viewModeRef.current === "single" && activeFile?.id === fileId;
+    if (!stayInSingleScreen) {
+      setOverviewSelectedScreenIds(
+        requestedScreenIds.length > 0 ? requestedScreenIds : [fileId],
+      );
+    }
     setActiveFileId(fileId);
     setSelectedElement(null);
     setSelectedLayerIdsState(
@@ -297,8 +302,10 @@ export function runLayerSelectionChange(
     );
     setActiveTool(resolveToolAfterSelection);
     setMode("edit");
-    viewModeRef.current = "overview";
-    setViewMode("overview");
+    if (!stayInSingleScreen) {
+      viewModeRef.current = "overview";
+      setViewMode("overview");
+    }
   }
   return nextLayerIds;
 }

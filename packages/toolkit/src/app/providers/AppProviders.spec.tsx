@@ -9,11 +9,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetAgentEngineReadinessForTests } from "../../../../core/src/client/agent-engine-readiness.js";
 
 const useSessionMock = vi.fn();
+const useThemeFamilyMock = vi.fn();
 vi.mock("@agent-native/core/client/use-session", async (importOriginal) => ({
   ...(await importOriginal<
     typeof import("@agent-native/core/client/use-session")
   >()),
   useSession: () => useSessionMock(),
+}));
+vi.mock("@agent-native/core/client/ui", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@agent-native/core/client/ui")>()),
+  useThemeFamily: () => useThemeFamilyMock(),
 }));
 vi.mock("@agent-native/core/client/action-query-cache", () => ({
   ActionQueryCacheGate: ({ children }: { children: React.ReactNode }) => (
@@ -37,8 +42,10 @@ vi.mock("@agent-native/toolkit/ui/sonner", () => ({
   ),
 }));
 
+import { reportWriteFailure } from "@agent-native/core/client/write-failure";
 import { encodeContinuation } from "@agent-native/core/shared/sign-in-journey";
 import { SsrSessionBootstrapContext } from "@agent-native/core/shared/ssr-session-bootstrap-slot";
+import { toast } from "sonner";
 
 import { AppProviders } from "./AppProviders.js";
 
@@ -48,8 +55,33 @@ let originalLocation: Location;
 let originalParent: Window;
 let originalFetch: typeof window.fetch;
 let originalModelContext: PropertyDescriptor | undefined;
+let originalLocalStorage: PropertyDescriptor | undefined;
 let originalDocumentTitle: string;
 let replaceMock: ReturnType<typeof vi.fn>;
+
+function createTestLocalStorage(): Storage {
+  const values = new Map<string, string>();
+  return {
+    get length() {
+      return values.size;
+    },
+    clear() {
+      values.clear();
+    },
+    getItem(key) {
+      return values.get(String(key)) ?? null;
+    },
+    key(index) {
+      return [...values.keys()][index] ?? null;
+    },
+    removeItem(key) {
+      values.delete(String(key));
+    },
+    setItem(key, value) {
+      values.set(String(key), String(value));
+    },
+  };
+}
 
 beforeEach(() => {
   resetAgentEngineReadinessForTests();
@@ -64,6 +96,14 @@ beforeEach(() => {
     document,
     "modelContext",
   );
+  originalLocalStorage = Object.getOwnPropertyDescriptor(
+    window,
+    "localStorage",
+  );
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: createTestLocalStorage(),
+  });
   Object.defineProperty(window, "fetch", {
     configurable: true,
     value: vi
@@ -102,6 +142,11 @@ afterEach(() => {
     configurable: true,
     value: originalFetch,
   });
+  if (originalLocalStorage) {
+    Object.defineProperty(window, "localStorage", originalLocalStorage);
+  } else {
+    delete (window as Window & { localStorage?: Storage }).localStorage;
+  }
   if (originalModelContext) {
     Object.defineProperty(document, "modelContext", originalModelContext);
   } else {
@@ -115,6 +160,7 @@ function renderProviders(props: {
   isPublicPath?: boolean;
   sessionBypass?: boolean;
   skipFirstRunOnboarding?: boolean;
+  enableThemeFamily?: boolean;
   disableWebMcp?: boolean;
   children?: React.ReactNode;
 }) {
@@ -183,6 +229,71 @@ const SIGNED_IN_SESSION = {
 };
 
 describe("AppProviders session gate", () => {
+  it("mounts theme-family sync by default in an authenticated app shell", async () => {
+    useSessionMock.mockReturnValue(SIGNED_IN_SESSION);
+
+    renderProviders({ skipFirstRunOnboarding: true });
+    await act(async () => {
+      await import("./ThemeFamilySync.js");
+    });
+
+    expect(useThemeFamilyMock).toHaveBeenCalledOnce();
+  });
+
+  it("renders next-themes' script as a data block inside the client-only shell", async () => {
+    useSessionMock.mockReturnValue(SIGNED_IN_SESSION);
+
+    renderProviders({ skipFirstRunOnboarding: true });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // React 19 logs "Encountered a script tag" for any executable <script> it
+    // creates on the client; the early head script already applies the theme.
+    const themeScripts = [...container.querySelectorAll("script")].filter(
+      (script) => script.textContent?.includes("prefers-color-scheme"),
+    );
+    expect(themeScripts.length).toBeGreaterThan(0);
+    for (const script of themeScripts) {
+      expect(script.getAttribute("type")).toBe("application/json");
+    }
+  });
+
+  it("keeps next-themes' executable script on public routes", () => {
+    useSessionMock.mockReturnValue(SIGNED_OUT_SESSION);
+
+    const html = renderToStaticMarkup(
+      <AppProviders
+        queryClient={new QueryClient()}
+        i18n={false}
+        toaster={null}
+        isPublicPath
+      >
+        <div />
+      </AppProviders>,
+    );
+
+    expect(html).toMatch(
+      /<script(?![^>]*type=)[^>]*>[^<]*prefers-color-scheme/,
+    );
+  });
+
+  it("allows an authenticated app shell to disable theme-family sync", () => {
+    useSessionMock.mockReturnValue(SIGNED_IN_SESSION);
+
+    renderProviders({ skipFirstRunOnboarding: true, enableThemeFamily: false });
+
+    expect(useThemeFamilyMock).not.toHaveBeenCalled();
+  });
+
+  it("does not load theme-family settings on public routes", () => {
+    useSessionMock.mockReturnValue(SIGNED_OUT_SESSION);
+
+    renderProviders({ isPublicPath: true });
+
+    expect(useThemeFamilyMock).not.toHaveBeenCalled();
+  });
+
   it("uses Toolkit's theme-aware toaster by default", () => {
     useSessionMock.mockReturnValue(SIGNED_OUT_SESSION);
 
@@ -203,6 +314,55 @@ describe("AppProviders session gate", () => {
     expect(toaster?.getAttribute("data-mobile-offset")).toBe(
       JSON.stringify({ bottom: 44, left: 16 }),
     );
+  });
+
+  it.each([
+    ["without the i18n provider", false],
+    ["inside the i18n provider", undefined],
+  ] as const)(
+    "shows a reported write failure %s when a toaster is present",
+    (_label, i18n) => {
+      useSessionMock.mockReturnValue(SIGNED_OUT_SESSION);
+      const error = vi.spyOn(toast, "error").mockImplementation(() => "");
+
+      act(() => {
+        root.render(
+          <AppProviders
+            queryClient={new QueryClient()}
+            i18n={i18n}
+            isPublicPath
+          >
+            <div>content</div>
+          </AppProviders>,
+        );
+      });
+      act(() => reportWriteFailure(new Error("boom")));
+
+      expect(error).toHaveBeenCalledTimes(1);
+      error.mockRestore();
+    },
+  );
+
+  it("still reports a write failure when the app renders its own toaster", () => {
+    useSessionMock.mockReturnValue(SIGNED_OUT_SESSION);
+    const error = vi.spyOn(toast, "error").mockImplementation(() => "");
+
+    act(() => {
+      root.render(
+        <AppProviders
+          queryClient={new QueryClient()}
+          i18n={false}
+          isPublicPath
+          toaster={null}
+        >
+          <div>content</div>
+        </AppProviders>,
+      );
+    });
+    act(() => reportWriteFailure(new Error("boom")));
+
+    expect(error).toHaveBeenCalledTimes(1);
+    error.mockRestore();
   });
 
   it("preserves a custom toaster without adding default offsets", () => {
@@ -335,6 +495,32 @@ describe("AppProviders session gate", () => {
       "html[data-agent-native-mcp-widget] [data-agent-native-app-skeleton] > :not(style)",
     );
     expect(publicMarkup).not.toContain("data-agent-native-mcp-widget-boot");
+  });
+
+  it("defers workspace widget storage-key resolution until the browser can read its mount", () => {
+    useSessionMock.mockReturnValue(SIGNED_OUT_SESSION);
+    vi.stubEnv("VITE_AGENT_NATIVE_WORKSPACE", "1");
+    vi.stubGlobal("window", undefined);
+    let markup: string;
+    try {
+      markup = renderToStaticMarkup(
+        <AppProviders queryClient={new QueryClient()} i18n={false}>
+          <div>content</div>
+        </AppProviders>,
+      );
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+
+    const bootScript = markup.match(
+      /<script data-agent-native-mcp-widget-boot="1">([\s\S]*?)<\/script>/,
+    )?.[1];
+    expect(bootScript).toContain(
+      'resolveMcpAppEmbedBasePath("workspace-path", w.location.pathname, workspaceOptions)',
+    );
+    expect(bootScript).not.toContain("agent-native:embed-auth-token:/");
+    expect(bootScript).not.toContain("agent-native:mcp-chat-bridge:/");
   });
 
   it("defaults public-path i18n to the non-persisting runtime so localization never resolves the session", () => {
@@ -662,5 +848,114 @@ describe("AppProviders session gate", () => {
     });
 
     await vi.waitFor(() => expect(document.title).toBe("Manage agent"));
+  });
+});
+
+describe("AppProviders MCP approval review", () => {
+  const ID = "0b7f4c1e-2f4a-4d1c-9a43-5f1e8f0d2c6b";
+
+  beforeEach(() => {
+    (window.location as { hash: string }).hash = `#mcpApproval=${ID}`;
+  });
+
+  function reviewShown() {
+    return vi
+      .mocked(window.fetch)
+      .mock.calls.some(([url]) => url === `/_agent-native/mcp/approvals/${ID}`);
+  }
+
+  it("shows the review the URL names in place of the app", () => {
+    useSessionMock.mockReturnValue(SIGNED_IN_SESSION);
+
+    renderProviders({ disableWebMcp: true });
+
+    expect(reviewShown()).toBe(true);
+    expect(container.querySelector('[data-testid="app-content"]')).toBeNull();
+  });
+
+  it("sends a signed-out reader to sign in and back to the same review", () => {
+    useSessionMock.mockReturnValue(SIGNED_OUT_SESSION);
+
+    renderProviders({});
+
+    expect(replaceMock).toHaveBeenCalledWith(
+      `/sign-in?c=${encodeContinuation(`/inbox#mcpApproval=${ID}`)}`,
+    );
+  });
+
+  it("lets a phone decide, where the app itself hands off to a larger screen", () => {
+    useSessionMock.mockReturnValue(SIGNED_IN_SESSION);
+    const matchMedia = window.matchMedia;
+    const screen = Object.getOwnPropertyDescriptors(window.screen);
+    window.matchMedia = ((query: string) => ({
+      matches: true,
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    Object.defineProperty(window.screen, "width", {
+      value: 390,
+      configurable: true,
+    });
+    Object.defineProperty(window.screen, "height", {
+      value: 844,
+      configurable: true,
+    });
+    try {
+      act(() => {
+        root.render(
+          <AppProviders
+            queryClient={new QueryClient()}
+            i18n={false}
+            toaster={null}
+            disableWebMcp
+            unsupportedDevice={{ appName: "Slides" }}
+          >
+            <div data-testid="app-content">content</div>
+          </AppProviders>,
+        );
+      });
+
+      expect(reviewShown()).toBe(true);
+    } finally {
+      window.matchMedia = matchMedia;
+      for (const key of ["width", "height"] as const) {
+        if (screen[key]) Object.defineProperty(window.screen, key, screen[key]);
+        else delete (window.screen as unknown as Record<string, unknown>)[key];
+      }
+    }
+  });
+
+  it("stays out of the server render, which has no window to read the review from", () => {
+    useSessionMock.mockReturnValue(SIGNED_IN_SESSION);
+    vi.stubGlobal("window", undefined);
+    let markup: string;
+    try {
+      markup = renderToStaticMarkup(
+        <AppProviders queryClient={new QueryClient()} i18n={false}>
+          <div>content</div>
+        </AppProviders>,
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(markup).toContain('data-agent-native-app-skeleton="true"');
+  });
+
+  it.each([
+    ["a token-authenticated surface", { sessionBypass: true }],
+    ["a public page", { isPublicPath: true }],
+  ])("never shows a review on %s", (_label, props) => {
+    useSessionMock.mockReturnValue(SIGNED_IN_SESSION);
+
+    renderProviders({ ...props, disableWebMcp: true });
+
+    expect(reviewShown()).toBe(false);
+    expect(
+      container.querySelector('[data-testid="app-content"]'),
+    ).not.toBeNull();
   });
 });

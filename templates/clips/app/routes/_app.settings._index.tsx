@@ -4,7 +4,11 @@ import {
   SettingsTabsPage,
   useAgentSettingsTabs,
 } from "@agent-native/toolkit/app/settings";
-import { CLIPS_LABS } from "@shared/labs";
+import {
+  CLIPS_LABS,
+  CLIPS_SCREENSHOTS,
+  CLIPS_VOICE_DICTATION,
+} from "@shared/labs";
 import { useMemo } from "react";
 
 import { useClipsSettingsRedesign } from "@/components/settings/clips-settings-redesign";
@@ -54,11 +58,18 @@ export default function SettingsIndexRoute() {
             description: t("settings.labLookbackContextDescription"),
           };
         }
-        if (lab.key === "clips.wisprflow") {
+        if (lab.key === CLIPS_SCREENSHOTS.key) {
           return {
             ...lab,
-            displayName: t("settings.labWisprFlow"),
-            description: t("settings.labWisprFlowDescription"),
+            displayName: t("navigation.screenshots"),
+            description: t("preRecord.takeScreenshot"),
+          };
+        }
+        if (lab.key === CLIPS_VOICE_DICTATION.key) {
+          return {
+            ...lab,
+            displayName: t("settings.labVoiceDictation"),
+            description: t("settings.labVoiceDictationDescription"),
           };
         }
         // Unknown labs keep their registry copy instead of inheriting another lab's text.

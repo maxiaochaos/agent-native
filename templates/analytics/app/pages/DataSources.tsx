@@ -12,9 +12,15 @@ import { useFormatters, useT } from "@agent-native/core/client/i18n";
 import { useOrgRole } from "@agent-native/core/client/org";
 import { mcpIntegrationLogo } from "@agent-native/core/client/resources/mcp-integration-logos";
 import { actionErrorMessage } from "@agent-native/core/client/use-action";
+import { surfaceMutationError } from "@agent-native/core/client/write-failure";
 import { docsUrl } from "@agent-native/core/shared";
+import { preparePromptComposerAgentHandoff } from "@agent-native/toolkit/app/chat";
 import { useSendToAgentChat } from "@agent-native/toolkit/app/chat";
-import { PromptComposer } from "@agent-native/toolkit/app/chat/composer/index";
+import {
+  PromptComposer,
+  type PromptComposerSubmitOptions,
+  type Reference,
+} from "@agent-native/toolkit/app/chat/composer/index";
 import {
   IntegrationGrid,
   type IntegrationGridItem,
@@ -47,6 +53,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
 
+import { useAnalyticsComposerMenuItems } from "@/components/AnalyticsComposerContext";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -116,6 +123,11 @@ import {
   type DataSourceCategory,
   type WalkthroughStep,
 } from "@/lib/data-sources";
+import {
+  SearchConsoleDetail,
+  searchConsoleState,
+  useContentCollectionStatus,
+} from "@/pages/data-sources/SearchConsoleDetail";
 
 import {
   ConnectionTestStatus,
@@ -152,9 +164,10 @@ interface FirstPartyAnalyticsHealthResponse {
   status: "healthy" | "monitor" | "recommend_bigquery" | "unavailable";
   externalBackendRecommendation?: "none" | "connect" | "use" | "unknown";
   metrics: {
-    eventCount: number;
-    slowQueryCount24h: number;
-    maxQueryDurationMs24h: number;
+    coverage: { kind: "all_time" | "recent_window" | "unavailable" };
+    eventCount: number | null;
+    slowQueryCount24h: number | null;
+    maxQueryDurationMs24h: number | null;
   };
   externalBackends?: Array<{
     id: "bigquery" | "amplitude";
@@ -848,6 +861,7 @@ function ConnectedView({
   });
 
   const disconnectMutation = useMutation({
+    meta: surfaceMutationError(),
     mutationFn: () => disconnectDataSource(source),
     onSuccess: () => {
       setDisconnectConfirmOpen(false);
@@ -1574,13 +1588,29 @@ function DataSourceDetail({
 
 function AddDataSourceCTA() {
   const t = useT();
+  const contextMenuItems = useAnalyticsComposerMenuItems();
   const [open, setOpen] = useState(false);
   const { send, isGenerating } = useSendToAgentChat();
 
-  function handleSubmit(text: string) {
+  async function handleSubmit(
+    text: string,
+    files: File[],
+    references: Reference[],
+    options: PromptComposerSubmitOptions,
+  ) {
     const trimmed = text.trim();
     if (!trimmed || isGenerating) return;
+    const handoff = await preparePromptComposerAgentHandoff(
+      files,
+      options,
+      t("composerSources.uploadFailed"),
+    );
     send({
+      ...handoff,
+      references,
+      model: options.model,
+      engine: options.engine,
+      effort: options.effort,
       message: trimmed,
       context:
         "The user wants to add a new data source integration to the analytics app. " +
@@ -1622,6 +1652,7 @@ function AddDataSourceCTA() {
           {t("dataSources.addDataSourceDescription")}
         </p>
         <PromptComposer
+          contextMenuItems={contextMenuItems}
           autoFocus
           requireAgentEngine
           disabled={isGenerating}
@@ -1828,10 +1859,16 @@ function FirstPartyAnalyticsDetail() {
             <div className="mt-4 grid grid-cols-3 gap-2">
               <div>
                 <div className="text-muted-foreground">
-                  {t("dataSources.analyticsEventCount")}
+                  {t(
+                    health.metrics.coverage.kind === "recent_window"
+                      ? "dataSources.analyticsRecentEventCount"
+                      : "dataSources.analyticsEventCount",
+                  )}
                 </div>
                 <div className="font-medium text-foreground">
-                  {formatNumber(health.metrics.eventCount)}
+                  {health.metrics.eventCount === null
+                    ? t("dataSources.statusUnknown")
+                    : formatNumber(health.metrics.eventCount)}
                 </div>
               </div>
               <div>
@@ -1839,7 +1876,9 @@ function FirstPartyAnalyticsDetail() {
                   {t("dataSources.slowQueries24h")}
                 </div>
                 <div className="font-medium text-foreground">
-                  {formatNumber(health.metrics.slowQueryCount24h)}
+                  {health.metrics.slowQueryCount24h === null
+                    ? t("dataSources.statusUnknown")
+                    : formatNumber(health.metrics.slowQueryCount24h)}
                 </div>
               </div>
               <div>
@@ -1847,10 +1886,14 @@ function FirstPartyAnalyticsDetail() {
                   {t("dataSources.maxQueryDuration")}
                 </div>
                 <div className="font-medium text-foreground">
-                  {formatNumber(health.metrics.maxQueryDurationMs24h / 1_000, {
-                    maximumFractionDigits: 1,
-                  })}
-                  s
+                  {health.metrics.maxQueryDurationMs24h === null
+                    ? t("dataSources.statusUnknown")
+                    : `${formatNumber(
+                        health.metrics.maxQueryDurationMs24h / 1_000,
+                        {
+                          maximumFractionDigits: 1,
+                        },
+                      )}s`}
                 </div>
               </div>
             </div>
@@ -2201,6 +2244,7 @@ export default function DataSources() {
       statusData.workspaceConnections?.available === false);
 
   const firstParty = useFirstPartyAnalyticsData();
+  const contentCollection = useContentCollectionStatus();
   const googleSheetsConnected =
     getGoogleSheetsConnection(statusData)?.grantState === "connected";
 
@@ -2364,6 +2408,55 @@ export default function DataSources() {
     ),
   };
 
+  const searchConsoleLabel = {
+    unavailable: {
+      label: t("dataSources.statusUnknown"),
+      className: "text-destructive",
+    },
+    collecting: {
+      label: t("dataSources.searchConsole.statusCollecting"),
+      className: "text-emerald-500",
+    },
+    needs_access: {
+      label: t("dataSources.searchConsole.statusNeedsAccess"),
+      className: "text-amber-600 dark:text-amber-400",
+    },
+    failed: {
+      label: t("dataSources.searchConsole.statusFailed"),
+      className: "text-destructive",
+    },
+    off: {
+      label: t("dataSources.notConfigured"),
+      className: "text-muted-foreground",
+    },
+  }[searchConsoleState(contentCollection.data, contentCollection.error)];
+  const searchConsoleEntry: SourceEntry = {
+    id: "google-search-console",
+    name: t("dataSources.searchConsole.name"),
+    description: t("dataSources.searchConsole.description"),
+    category: "seo",
+    logo: (
+      <SourceLogo
+        id="google-search-console"
+        name={t("dataSources.searchConsole.name")}
+        fallbackIcon={IconSearch}
+      />
+    ),
+    status: contentCollection.isLoading ? undefined : searchConsoleLabel.label,
+    statusClassName: searchConsoleLabel.className,
+    connected:
+      searchConsoleState(contentCollection.data, contentCollection.error) ===
+      "collecting",
+    searchText: [
+      t("dataSources.searchConsole.name"),
+      t("dataSources.searchConsole.description"),
+      "google search console gsc seo clicks impressions",
+    ]
+      .join(" ")
+      .toLowerCase(),
+    detail: <SearchConsoleDetail />,
+  };
+
   const customApiEntry: SourceEntry = {
     id: "custom-api",
     name: t("dataSources.customApi.title"),
@@ -2390,6 +2483,7 @@ export default function DataSources() {
     firstPartyEntry,
     ...sourceEntries,
     googleSheetsEntry,
+    searchConsoleEntry,
     customApiEntry,
   ];
   const activeEntry = entries.find((entry) => entry.id === activeId);

@@ -6,6 +6,13 @@ import { Alert, AlertDescription } from "../ui/alert.js";
 import { Button } from "../ui/button.js";
 import { Checkbox } from "../ui/checkbox.js";
 import {
+  Command,
+  CommandInput,
+  CommandList,
+  CommandGroup,
+  CommandItem,
+} from "../ui/command.js";
+import {
   Dialog,
   DialogContent,
   DialogFooter,
@@ -39,20 +46,188 @@ export function ComposerContextPickerDialog({
   const urlOnly = presentation?.mode === "url";
   const singleSelect = presentation?.mode === "single";
   const gallery =
-    presentation?.mode === "multiple" && presentation.layout === "gallery";
+    presentation?.mode !== "url" && presentation?.layout === "gallery";
   const id = useId();
   const input = useRef<HTMLInputElement>(null);
+  const searchDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [search, setSearch] = useState(location.search);
+  const [searchDebouncing, setSearchDebouncing] = useState(false);
+  const remoteGallery = gallery && Boolean(config.load);
+  const remoteSearch =
+    Boolean(config.load) && (gallery || presentation?.mode === "action");
+  const searchPending =
+    remoteSearch && (search !== location.search || searchDebouncing);
   const [touched, setTouched] = useState(false);
   useEffect(() => {
     input.current?.focus();
   }, [stage]);
+  useEffect(() => {
+    setSearch(location.search);
+  }, [location.search]);
+  useEffect(
+    () => () => {
+      if (searchDebounce.current) clearTimeout(searchDebounce.current);
+    },
+    [],
+  );
   const validation = touched && link.trim() ? picker.linkError : undefined;
   const error = stage === "link" ? picker.actionError?.message : picker.error;
   const attach = t("agentChat.composer.contextAttach", {
     defaultValue: "Attach",
   });
   const canAttach =
-    picker.selectedItems.length > 0 && !loading && !selecting && !error;
+    picker.selectedItems.length > 0 &&
+    !loading &&
+    !searchPending &&
+    !selecting &&
+    !error;
+  const changeSearch = (value: string) => {
+    setSearch(value);
+    if (searchDebounce.current) clearTimeout(searchDebounce.current);
+    if (remoteSearch) {
+      setSearchDebouncing(true);
+      searchDebounce.current = setTimeout(() => {
+        searchDebounce.current = null;
+        setSearchDebouncing(false);
+        if (value === location.search) return;
+        picker.cursors.current = [undefined];
+        picker.move({
+          search: value,
+          page: 1,
+          ...(location.url === undefined ? {} : { url: location.url }),
+        });
+      }, 200);
+    } else {
+      picker.cursors.current = [undefined];
+      picker.move({
+        search: value,
+        page: 1,
+        ...(location.url === undefined ? {} : { url: location.url }),
+      });
+    }
+  };
+  if (presentation?.mode === "action") {
+    const groups = new Map<string, typeof items>();
+    for (const item of items) {
+      const group = item.group ?? "";
+      groups.set(group, [...(groups.get(group) ?? []), item]);
+    }
+    return (
+      <Dialog
+        open
+        onOpenChange={(open) => {
+          if (!open) onClose();
+        }}
+      >
+        <DialogContent
+          aria-describedby={undefined}
+          closeLabel={t("agentChat.common.close", { defaultValue: "Close" })}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            onRestoreFocus();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle>{title}</DialogTitle>
+          </DialogHeader>
+          <Command
+            shouldFilter={false}
+            className="[&_[cmdk-group-heading]]:text-foreground"
+          >
+            {config.searchable !== false && (
+              <CommandInput
+                aria-label={config.searchPlaceholder}
+                placeholder={config.searchPlaceholder}
+                value={remoteSearch ? search : location.search}
+                onValueChange={changeSearch}
+              />
+            )}
+            <div
+              role="status"
+              aria-live="polite"
+              className={
+                loading || searchPending || (!error && !items.length)
+                  ? "p-3 text-foreground"
+                  : "sr-only"
+              }
+            >
+              {loading || searchPending
+                ? t("agentChat.composer.contextPending", {
+                    defaultValue: "Loading context…",
+                  })
+                : !error && !items.length
+                  ? (config.emptyMessage ??
+                    t("agentChat.mentions.noResults", {
+                      defaultValue: "No results found",
+                    }))
+                  : ""}
+            </div>
+            <CommandList aria-label={title}>
+              {loading || searchPending ? null : error ? (
+                <div role="alert" className="p-3 text-destructive">
+                  {error}
+                </div>
+              ) : !items.length ? null : (
+                Array.from(groups)
+                  .sort(([left], [right]) => left.localeCompare(right))
+                  .map(([group, entries]) => (
+                    <CommandGroup
+                      key={group}
+                      heading={
+                        group ? t(group, { defaultValue: group }) : undefined
+                      }
+                    >
+                      {entries.map((item) => (
+                        <CommandItem
+                          key={item.id}
+                          value={item.id}
+                          disabled={item.disabled || selecting}
+                          onSelect={() => {
+                            void picker.select(item);
+                          }}
+                          className="min-h-8 gap-2"
+                        >
+                          {item.icon}
+                          <span>{item.title}</span>
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  ))
+              )}
+            </CommandList>
+          </Command>
+          {error && picker.retry && (
+            <Button variant="outline" onClick={picker.retry}>
+              {t("agentChat.common.retry", { defaultValue: "Retry" })}
+            </Button>
+          )}
+          {config.footerAction && (
+            <DialogFooter>
+              {config.footerAction.renderLink ? (
+                <Button
+                  asChild
+                  variant="outline"
+                  disabled={config.footerAction.disabled}
+                >
+                  {config.footerAction.renderLink(config.footerAction.label)}
+                </Button>
+              ) : (
+                <Button
+                  variant="outline"
+                  disabled={config.footerAction.disabled || selecting}
+                  onClick={() => {
+                    void picker.select("footer");
+                  }}
+                >
+                  {config.footerAction.label}
+                </Button>
+              )}
+            </DialogFooter>
+          )}
+        </DialogContent>
+      </Dialog>
+    );
+  }
   return (
     <Dialog
       open
@@ -126,15 +301,8 @@ export function ComposerContextPickerDialog({
                 type="search"
                 aria-label={config.searchPlaceholder}
                 placeholder={config.searchPlaceholder}
-                value={location.search}
-                onChange={(event) => {
-                  picker.cursors.current = [undefined];
-                  picker.move({
-                    search: event.target.value,
-                    page: 1,
-                    url: location.url,
-                  });
-                }}
+                value={remoteGallery ? search : location.search}
+                onChange={(event) => changeSearch(event.target.value)}
               />
               {gallery ? (
                 <div className="agent-context-reference-gallery max-h-96 overflow-y-auto p-1">
@@ -142,11 +310,14 @@ export function ComposerContextPickerDialog({
                     items={items.map((item) => ({
                       ...item,
                       disabled:
-                        item.disabled || config.selectedIds?.includes(item.id),
+                        item.disabled ||
+                        (!singleSelect &&
+                          config.selectedIds?.includes(item.id)),
                     }))}
-                    loading={loading}
+                    loading={loading || searchPending}
                     error={error}
-                    disabled={selecting}
+                    disabled={selecting || loading || searchPending}
+                    onRetry={picker.retry}
                     labels={{
                       loading: t("agentChat.composer.contextPending", {
                         defaultValue: "Loading context…",
@@ -166,14 +337,18 @@ export function ComposerContextPickerDialog({
                         (selected) => selected.id === item.id,
                       )
                     }
-                    onSelect={(item) =>
+                    onSelect={(item) => {
+                      if (singleSelect) {
+                        void picker.select(item);
+                        return;
+                      }
                       picker.toggleItem(
                         item,
                         !picker.selectedItems.some(
                           (selected) => selected.id === item.id,
                         ),
-                      )
-                    }
+                      );
+                    }}
                     renderPreview={(item) => (
                       <div className="pointer-events-none relative h-full overflow-hidden bg-muted">
                         {item.preview}
@@ -287,7 +462,7 @@ export function ComposerContextPickerDialog({
                     <Button
                       type="button"
                       variant="outline"
-                      disabled={loading || selecting}
+                      disabled={loading || searchPending || selecting}
                       onClick={() =>
                         picker.move({
                           ...location,
@@ -305,7 +480,9 @@ export function ComposerContextPickerDialog({
                     <Button
                       type="button"
                       variant="outline"
-                      disabled={loading || selecting || Boolean(error)}
+                      disabled={
+                        loading || searchPending || selecting || Boolean(error)
+                      }
                       onClick={() => {
                         picker.cursors.current = [
                           ...picker.cursors.current.slice(0, location.page),
@@ -357,6 +534,7 @@ export function ComposerContextPickerDialog({
                 </Button>
               ))}
             {error &&
+              !gallery &&
               (stage === "link" ? picker.actionError?.retry : picker.retry) && (
                 <Button
                   type="button"

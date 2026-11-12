@@ -1,6 +1,9 @@
+import { noteExternalWrite } from "@agent-native/core/action";
 import { decodeHTML } from "entities";
 
 import { ensureGroupRuntime } from "../../shared/group-runtime.js";
+import { parseEffectsFromHtml } from "../../shared/native-effects.js";
+import { ensureNativeShaderRuntime } from "../../shared/shader-fills.js";
 import {
   isActiveXmlAttributeValue,
   isNonStaticExportElement,
@@ -80,6 +83,18 @@ ${combinedCss}
     : `${html.slice(0, closeHead)}${styleBlock}\n${html.slice(closeHead)}`;
 }
 
+function ensureNativeExportRuntime(html: string): string {
+  if (!html.includes("application/x-agent-native-effects")) return html;
+  const parsed = parseEffectsFromHtml(html);
+  if (parsed.errors.length)
+    throw new Error(
+      `Native effect manifest is unreadable: ${parsed.errors.join("; ")}`,
+    );
+  return parsed.document?.instances.length
+    ? ensureNativeShaderRuntime(html)
+    : html;
+}
+
 function standaloneScreenDocument(args: {
   title: string;
   content: string;
@@ -87,13 +102,16 @@ function standaloneScreenDocument(args: {
 }): string {
   const { title, content, combinedCss } = args;
   if (/<!doctype html|<html[\s>]/i.test(content)) {
-    return ensureGroupRuntime(
-      injectHiddenLayerExportStyle(injectExportCss(content, combinedCss)),
+    return ensureNativeExportRuntime(
+      ensureGroupRuntime(
+        injectHiddenLayerExportStyle(injectExportCss(content, combinedCss)),
+      ),
     );
   }
   const bodyContent = extractRenderableHtml(content);
 
-  return ensureGroupRuntime(`<!DOCTYPE html>
+  return ensureNativeExportRuntime(
+    ensureGroupRuntime(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -112,7 +130,8 @@ function standaloneScreenDocument(args: {
 <body>
   ${bodyContent}
 </body>
-</html>`);
+</html>`),
+  );
 }
 
 function buildStackedScreenHtml(args: {
@@ -233,14 +252,17 @@ export function buildStandaloneHtml(args: {
 
     html = injectExportCss(html, combinedCss);
 
-    return ensureGroupRuntime(injectHiddenLayerExportStyle(html));
+    return ensureNativeExportRuntime(
+      ensureGroupRuntime(injectHiddenLayerExportStyle(html)),
+    );
   }
 
   const combinedBody = [...htmlFiles, ...jsxFiles]
     .map((f) => extractRenderableHtml(f.content ?? ""))
     .join("\n\n");
 
-  return ensureGroupRuntime(`<!DOCTYPE html>
+  return ensureNativeExportRuntime(
+    ensureGroupRuntime(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -256,7 +278,8 @@ export function buildStandaloneHtml(args: {
 <body>
   ${combinedBody}
 </body>
-</html>`);
+</html>`),
+  );
 }
 
 function escapeXmlAttribute(value: string): string {
@@ -553,6 +576,7 @@ export async function trySaveExportFile(
   const filePath = path.join(exportDir, filename);
 
   try {
+    noteExternalWrite("local-disk");
     fs.mkdirSync(exportDir, { recursive: true });
     fs.writeFileSync(filePath, contents);
     return { filePath };

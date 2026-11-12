@@ -1,4 +1,11 @@
+import {
+  getOrCreateRequestDbPool,
+  retainRequestDbPoolScope,
+  runWithRequestDbPoolScope,
+} from "@agent-native/core/db/request-pool-context";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { runResolvedPanel } from "./dashboard-panel-runner";
 
 const mocks = vi.hoisted(() => ({
   queryFirstPartyAnalytics: vi.fn(),
@@ -17,6 +24,86 @@ describe("dashboard-panel-query: first-party source", () => {
   beforeEach(() => {
     mocks.queryFirstPartyAnalytics.mockReset();
   });
+
+  it.each([false, true])(
+    "returns first-party execution metadata unchanged on cache hit %s",
+    async (cached) => {
+      const response = {
+        rows: [{ count: 1 }],
+        schema: [{ name: "count", type: "INTEGER" }],
+        bytesProcessed: 4096,
+        cached,
+        providerCacheHit: false,
+        fetchedAt: "2026-10-14T12:00:00.000Z",
+        truncated: false,
+      };
+      mocks.queryFirstPartyAnalytics.mockResolvedValueOnce(response);
+      await expect(
+        runDashboardPanelQuery({
+          source: "first-party",
+          query: "SELECT COUNT(*) AS count FROM analytics_events",
+          ctx,
+        }),
+      ).resolves.toEqual(response);
+      expect(mocks.queryFirstPartyAnalytics).toHaveBeenCalledTimes(1);
+      expect(mocks.queryFirstPartyAnalytics.mock.calls[0]?.[2]).toEqual({
+        cache: true,
+      });
+    },
+  );
+
+  it.each(["deadline", "caller"])(
+    "propagates %s cancellation through the first-party dispatcher and releases the pool",
+    async (cause) => {
+      const caller = new AbortController();
+      let seenSignal: AbortSignal | undefined;
+      let providerWork: Promise<never> | undefined;
+      let announceStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        announceStarted = resolve;
+      });
+      const ended = vi.fn(async () => {});
+      mocks.queryFirstPartyAnalytics.mockImplementation(
+        (_query, _scope, options: { signal?: AbortSignal }) => {
+          seenSignal = options.signal;
+          providerWork = retainRequestDbPoolScope(
+            new Promise<never>((_resolve, reject) => {
+              options.signal?.addEventListener(
+                "abort",
+                () => reject(new Error("provider cancelled")),
+                { once: true },
+              );
+            }),
+          );
+          announceStarted();
+          return providerWork;
+        },
+      );
+      const result = await runWithRequestDbPoolScope(
+        true,
+        undefined,
+        async () => {
+          getOrCreateRequestDbPool("first-party-cancellation-fixture", () => ({
+            end: ended,
+          }));
+          const panel = runResolvedPanel({
+            source: "first-party",
+            query: "SELECT COUNT(*) FROM analytics_events",
+            ctx,
+            timeoutMs: cause === "deadline" ? 20 : 500,
+            signal: caller.signal,
+          });
+          await started;
+          if (cause === "caller") caller.abort();
+          return panel;
+        },
+      );
+      expect(result).toMatchObject({ status: "query-failed", timedOut: true });
+      expect(seenSignal?.aborted).toBe(true);
+      await expect(providerWork).rejects.toThrow("provider cancelled");
+      expect(ended).toHaveBeenCalledOnce();
+    },
+  );
 
   it("uses the report panel timeout for the scoped cached query", async () => {
     mocks.queryFirstPartyAnalytics.mockResolvedValue({

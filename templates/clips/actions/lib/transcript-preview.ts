@@ -6,6 +6,7 @@ export interface TranscriptPreview {
   recordingId: string;
   language: string | null | undefined;
   status: string | null | undefined;
+  source?: string | null;
   fullTextSnippet: string;
   fullTextLength: number;
   previewTruncated: boolean;
@@ -18,12 +19,14 @@ export function buildTranscriptPreview({
   recordingId,
   language,
   status,
+  source,
   fullText,
   segments,
 }: {
   recordingId: string;
   language: string | null | undefined;
   status: string | null | undefined;
+  source?: string | null;
   fullText: string | null | undefined;
   segments: unknown;
 }): TranscriptPreview {
@@ -38,6 +41,7 @@ export function buildTranscriptPreview({
     recordingId,
     language,
     status,
+    source,
     fullTextSnippet: text.slice(0, TRANSCRIPT_PREVIEW_CHARS),
     fullTextLength: text.length,
     previewTruncated,
@@ -64,10 +68,13 @@ export function boundTranscriptForAgent<T>({
   fullText,
   segments,
   fullTextOffset = 0,
+  action = "get-recording-player-data",
 }: {
   fullText: string | null | undefined;
   segments: T[];
   fullTextOffset?: number;
+  /** The action the note tells the agent to call again for the next chunk. */
+  action?: string;
 }): BoundedAgentTranscript<T> {
   const text = fullText ?? "";
   const offset = Math.min(Math.max(0, Math.floor(fullTextOffset)), text.length);
@@ -100,7 +107,7 @@ export function boundTranscriptForAgent<T>({
     previewTruncated,
     note:
       nextFullTextOffset !== null
-        ? `Agent transcript payload is bounded to ${AGENT_TRANSCRIPT_MAX_CHARS.toLocaleString()} text characters. It may end mid-sentence; call get-recording-player-data again with transcriptOffset=${nextFullTextOffset} to continue.`
+        ? `Agent transcript payload is bounded to ${AGENT_TRANSCRIPT_MAX_CHARS.toLocaleString()} text characters. It may end mid-sentence; call ${action} again with transcriptOffset=${nextFullTextOffset} to continue.`
         : previewTruncated
           ? `This is the final transcript text chunk. Segments are bounded to ${AGENT_TRANSCRIPT_SEGMENT_MAX_CHARS.toLocaleString()} serialized characters.`
           : "The complete transcript fits in this agent payload.",

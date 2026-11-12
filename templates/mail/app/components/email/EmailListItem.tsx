@@ -19,25 +19,36 @@ import {
   IconThumbDown,
   IconThumbUp,
 } from "@tabler/icons-react";
-import { memo, useRef, useState, useCallback, type CSSProperties } from "react";
+import {
+  memo,
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { Link } from "react-router";
 
+import {
+  ActionTooltip,
+  MAIL_ACTION_KEYS,
+} from "@/components/email/ActionTooltip";
 import { ImportanceFeedbackMenu } from "@/components/email/ImportanceFeedbackMenu";
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { useAccountFilter } from "@/hooks/use-account-filter";
 import { getLabelStyle } from "@/lib/label-colors";
 import { mailLabelDisplayName } from "@/lib/label-display";
+import { THREAD_PREFETCH_INTENT_MS } from "@/lib/thread-cache";
 import type { ThreadSummary } from "@/lib/threads";
 import { cn, formatEmailDate } from "@/lib/utils";
+
+const INTERACTIVE_ROW_CONTROL_SELECTOR =
+  'button, a, input, [role="checkbox"], [data-row-action]';
 
 interface EmailListItemProps {
   email: EmailMessage;
@@ -70,6 +81,7 @@ interface EmailListItemProps {
     thread: ThreadSummary,
   ) => void;
   onHover: (thread: ThreadSummary) => void;
+  onPrefetch?: (thread: ThreadSummary) => void;
   onSwipeArchive?: (thread: ThreadSummary) => void;
   onSwipeSnooze?: (thread: ThreadSummary) => void;
   highlight?: string;
@@ -151,6 +163,7 @@ export const EmailListItem = memo(function EmailListItem({
   onConfirmUncertainScheduled,
   onRetryUncertainScheduled,
   onHover,
+  onPrefetch,
   onSwipeArchive,
   onSwipeSnooze,
   highlight,
@@ -324,6 +337,41 @@ export const EmailListItem = memo(function EmailListItem({
     if (thread) onHover(thread);
   }, [onHover, thread]);
 
+  const prefetchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelPrefetch = useCallback(() => {
+    if (prefetchTimerRef.current === null) return;
+    clearTimeout(prefetchTimerRef.current);
+    prefetchTimerRef.current = null;
+  }, []);
+  useEffect(() => cancelPrefetch, [cancelPrefetch]);
+
+  const handleRowPointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLElement>) => {
+      // A touch pointer-down is the start of a swipe as often as a tap, and a
+      // swipe must not warm every row the finger crosses. Touch opens go
+      // through the explicit open path.
+      if (event.pointerType === "touch") return;
+      // Pointer-downs from inline controls (star, archive, select) bubble here.
+      // Triage is not a request to open the thread, so they must not prefetch.
+      const control =
+        event.target instanceof Element
+          ? event.target.closest(INTERACTIVE_ROW_CONTROL_SELECTOR)
+          : null;
+      if (control && event.currentTarget.contains(control)) return;
+      if (thread) onPrefetch?.(thread);
+    },
+    [onPrefetch, thread],
+  );
+
+  const handleRowMouseEnter = useCallback(() => {
+    if (!thread || !onPrefetch) return;
+    cancelPrefetch();
+    prefetchTimerRef.current = setTimeout(() => {
+      prefetchTimerRef.current = null;
+      onPrefetch(thread);
+    }, THREAD_PREFETCH_INTENT_MS);
+  }, [cancelPrefetch, onPrefetch, thread]);
+
   const handleRowKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
       if (!thread || e.target !== e.currentTarget) return;
@@ -343,6 +391,7 @@ export const EmailListItem = memo(function EmailListItem({
 
   const handleToggleMultiSelectClick = useCallback(
     (e: React.SyntheticEvent) => {
+      e.stopPropagation();
       if (thread) onToggleMultiSelect(e, thread);
     },
     [onToggleMultiSelect, thread],
@@ -511,6 +560,9 @@ export const EmailListItem = memo(function EmailListItem({
         aria-current={isFocused ? "true" : undefined}
         onClick={handleRowClick}
         onMouseMove={handleRowHover}
+        onMouseEnter={handleRowMouseEnter}
+        onMouseLeave={cancelPrefetch}
+        onPointerDown={handleRowPointerDown}
         onKeyDown={handleRowKeyDown}
         onTouchStart={canSwipe ? handleTouchStart : undefined}
         onTouchMove={canSwipe ? handleTouchMove : undefined}
@@ -793,134 +845,124 @@ export const EmailListItem = memo(function EmailListItem({
             )}
           >
             {onToggleRead && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={handleToggleReadClick}
-                    aria-label={t(
-                      isUnread
-                        ? "mail.actions.markRead"
-                        : "mail.actions.markUnread",
-                    )}
-                    className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  >
-                    {isUnread ? (
-                      <IconMailOpened className="h-3.5 w-3.5" />
-                    ) : (
-                      <IconMail className="h-3.5 w-3.5" />
-                    )}
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {isUnread
-                    ? t("mail.actions.markRead")
-                    : t("mail.actions.markUnread")}
-                </TooltipContent>
-              </Tooltip>
+              <ActionTooltip
+                label={t(
+                  isUnread
+                    ? "mail.actions.markRead"
+                    : "mail.actions.markUnread",
+                )}
+                keys={MAIL_ACTION_KEYS.toggleRead}
+              >
+                <button
+                  type="button"
+                  onClick={handleToggleReadClick}
+                  aria-label={t(
+                    isUnread
+                      ? "mail.actions.markRead"
+                      : "mail.actions.markUnread",
+                  )}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  {isUnread ? (
+                    <IconMailOpened className="h-3.5 w-3.5" />
+                  ) : (
+                    <IconMail className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </ActionTooltip>
             )}
             {showArchive && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={handleArchiveClick}
-                    aria-label={t("mail.actions.archive")}
-                    className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-emerald-500/10 hover:text-emerald-600 dark:hover:text-emerald-400"
-                  >
-                    <IconArchive className="h-3.5 w-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>{t("mail.actions.archive")}</TooltipContent>
-              </Tooltip>
+              <ActionTooltip
+                label={t("mail.actions.archive")}
+                keys={MAIL_ACTION_KEYS.archive}
+              >
+                <button
+                  type="button"
+                  onClick={handleArchiveClick}
+                  aria-label={t("mail.actions.archive")}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-emerald-500/10 hover:text-emerald-600 dark:hover:text-emerald-400"
+                >
+                  <IconArchive className="h-3.5 w-3.5" />
+                </button>
+              </ActionTooltip>
             )}
             {showSnooze && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={handleSnoozeClick}
-                    aria-label={t("mail.snooze.snooze")}
-                    className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-amber-500/10 hover:text-amber-600 dark:hover:text-amber-400"
-                  >
-                    <IconClock className="h-3.5 w-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>{t("mail.snooze.snooze")}</TooltipContent>
-              </Tooltip>
+              <ActionTooltip
+                label={t("mail.snooze.snooze")}
+                keys={MAIL_ACTION_KEYS.snooze}
+              >
+                <button
+                  type="button"
+                  onClick={handleSnoozeClick}
+                  aria-label={t("mail.snooze.snooze")}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-amber-500/10 hover:text-amber-600 dark:hover:text-amber-400"
+                >
+                  <IconClock className="h-3.5 w-3.5" />
+                </button>
+              </ActionTooltip>
             )}
             {showSendNow && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={handleSendNowClick}
-                    aria-label={t("mail.sendLater.sendNow")}
-                    className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  >
-                    <IconSend className="h-3.5 w-3.5 rtl:-scale-x-100" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>{t("mail.sendLater.sendNow")}</TooltipContent>
-              </Tooltip>
+              <ActionTooltip label={t("mail.sendLater.sendNow")}>
+                <button
+                  type="button"
+                  onClick={handleSendNowClick}
+                  aria-label={t("mail.sendLater.sendNow")}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <IconSend className="h-3.5 w-3.5 rtl:-scale-x-100" />
+                </button>
+              </ActionTooltip>
             )}
             {showCancelSchedule && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={handleCancelScheduleClick}
-                    aria-label={t("mail.sendLater.cancelScheduledSend")}
-                    className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                  >
-                    <IconX className="h-3.5 w-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>
-                  {t("mail.sendLater.cancelScheduledSend")}
-                </TooltipContent>
-              </Tooltip>
+              <ActionTooltip label={t("mail.sendLater.cancelScheduledSend")}>
+                <button
+                  type="button"
+                  onClick={handleCancelScheduleClick}
+                  aria-label={t("mail.sendLater.cancelScheduledSend")}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <IconX className="h-3.5 w-3.5" />
+                </button>
+              </ActionTooltip>
             )}
             {showTrash && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={handleTrashClick}
-                    aria-label={t("mail.actions.moveToTrash")}
-                    className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-                  >
-                    <IconTrash className="h-3.5 w-3.5" />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>{t("mail.actions.moveToTrash")}</TooltipContent>
-              </Tooltip>
+              <ActionTooltip
+                label={t("mail.actions.moveToTrash")}
+                keys={MAIL_ACTION_KEYS.trash}
+              >
+                <button
+                  type="button"
+                  onClick={handleTrashClick}
+                  aria-label={t("mail.actions.moveToTrash")}
+                  className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                >
+                  <IconTrash className="h-3.5 w-3.5" />
+                </button>
+              </ActionTooltip>
             )}
             {onImportanceFeedback && (
               <ImportanceFeedbackMenu onFeedback={onImportanceFeedback} />
             )}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={handleStarClick}
-                  aria-label={t(
-                    isStarred ? "mail.actions.unstar" : "mail.actions.star",
-                  )}
-                  className={cn(
-                    "flex h-6 w-6 items-center justify-center rounded transition-colors",
-                    isStarred
-                      ? "text-amber-400"
-                      : "text-muted-foreground hover:text-foreground hover:bg-accent",
-                  )}
-                >
-                  <IconStarFilled className="h-3.5 w-3.5" />
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>
-                {t(isStarred ? "mail.actions.unstar" : "mail.actions.star")}
-              </TooltipContent>
-            </Tooltip>
+            <ActionTooltip
+              label={t(isStarred ? "mail.actions.unstar" : "mail.actions.star")}
+              keys={MAIL_ACTION_KEYS.star}
+            >
+              <button
+                type="button"
+                onClick={handleStarClick}
+                aria-label={t(
+                  isStarred ? "mail.actions.unstar" : "mail.actions.star",
+                )}
+                className={cn(
+                  "flex h-6 w-6 items-center justify-center rounded transition-colors",
+                  isStarred
+                    ? "text-amber-400"
+                    : "text-muted-foreground hover:text-foreground hover:bg-accent",
+                )}
+              >
+                <IconStarFilled className="h-3.5 w-3.5" />
+              </button>
+            </ActionTooltip>
           </div>
         </div>
       </div>

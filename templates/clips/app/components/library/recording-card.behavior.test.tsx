@@ -509,6 +509,25 @@ describe("RecordingCard behavior", () => {
     },
   );
 
+  it.each([
+    [12_345, "0:12"],
+    [3_599_000, "59:59"],
+    [3_600_000, "1:00:00"],
+    [16_571_000, "4:36:11"],
+    [36_610_000, "10:10:10"],
+  ])("shows %i ms as %s on the thumbnail", (effectiveDurationMs, expected) => {
+    act(() => {
+      root.render(
+        <RecordingCard recording={{ ...recording, effectiveDurationMs }} />,
+      );
+    });
+
+    const thumbnail = container.querySelector('[role="article"] > div');
+    expect(
+      Array.from(thumbnail?.children ?? [], (child) => child.textContent),
+    ).toContain(expected);
+  });
+
   it("keeps screenshot cards free of playback duration", () => {
     act(() => {
       root.render(
@@ -533,11 +552,14 @@ describe("RecordingCard behavior", () => {
     );
   });
 
-  it("keeps checkboxes visible while recordings are being selected", () => {
+  it("keeps selection checkboxes outlined over dark thumbnails", () => {
+    const darkThumbnailUrl =
+      "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect width='1' height='1' fill='black'/%3E%3C/svg%3E";
+
     act(() => {
       root.render(
         <RecordingCard
-          recording={recording}
+          recording={{ ...recording, thumbnailUrl: darkThumbnailUrl }}
           selectionMode
           onToggleSelect={vi.fn()}
         />,
@@ -547,9 +569,15 @@ describe("RecordingCard behavior", () => {
     const checkbox = container.querySelector<HTMLInputElement>(
       'input[type="checkbox"]',
     );
+    const thumbnail = container.querySelector<HTMLImageElement>("img");
 
+    expect(thumbnail?.getAttribute("src")).toBe(darkThumbnailUrl);
+    expect(checkbox?.parentElement?.contains(thumbnail)).toBe(true);
     expect(checkbox?.className).toContain("sm:opacity-100");
     expect(checkbox?.className).not.toContain("sm:opacity-0");
+    expect(checkbox?.className).toContain("border-ring");
+    expect(checkbox?.className).toContain("ring-1 ring-ring");
+    expect(checkbox?.className).toContain("bg-background");
   });
 
   it("keeps the static thumbnail when the pointer enters a card", () => {

@@ -66,11 +66,13 @@ type AgentGeneratingSubmitOptions = Pick<
   AgentChatMessage,
   | "newTab"
   | "openSidebar"
+  | "submissionExpiresAt"
   | "referenceImagePaths"
   | "images"
   | "model"
   | "engine"
   | "effort"
+  | "references"
   | "submitMessageId"
   | "targetTabId"
 > & {

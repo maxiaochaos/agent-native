@@ -2,6 +2,9 @@ import { chatFirstPageTranslations } from "../chat-first-pages";
 
 const messages = {
   root: {
+    builderWorkspaceNotice:
+      "Builder \u5718\u968a\u61c9\u7528\u7a0b\u5f0f\u4f4d\u65bc Builder \u5de5\u4f5c\u5340\u3002",
+    openBuilderWorkspace: "\u958b\u555f Builder \u5de5\u4f5c\u5340",
     commandActions: "操作",
     commandSearch: "搜尋",
     commandAppearance: "外觀",
@@ -291,6 +294,10 @@ const messages = {
     },
   },
   dispatch: {
+    sidebar: {
+      showLocalChats: "顯示本機聊天",
+      showAllChats: "顯示所有聊天",
+    },
     nav: {
       admin: "管理",
       automations: "自動化",
@@ -303,7 +310,13 @@ const messages = {
       agent: "代理",
     },
     pages: {
+      chatFirstCopySessionId: "複製工作階段 ID",
+      chatFirstSessionIdCopied: "已複製工作階段 ID",
+      chatFirstWatchSession: "觀看",
       adminDescription: "工作區控制與營運",
+      appProfileWhenToUse: "使用時機",
+      appProfileWhenToUsePlaceholder: "每行填寫一個範例請求",
+      appProfileWhenToUseHint: "最多 6 個範例，每個不超過 140 個字元。",
       simpleAgentsDescription:
         "幾分鐘內建立可重複使用的代理，或匯入你已在 Claude 或其他代理工具中建立的設定。",
       adminNavigation: "管理導覽",
@@ -317,6 +330,23 @@ const messages = {
       adminAgentPlatform: "代理平台",
       adminWorkspaceExtensions: "工作區擴充功能",
       connectApps: "連接應用程式",
+      communityApps: "社群應用程式",
+      communityAppsEmpty: "目前沒有已審核的社群應用程式。",
+      communityAppsWorkspaceRequired:
+        "請先將此組織連接到工作區，才能安裝此應用程式。",
+      communityAppsBuilderInstallUnavailable:
+        "在生成檔案可供驗證之前，Builder 工作區中的社群應用程式安裝已停用。",
+      communityAppsIdConflict: "此應用程式 ID 已被使用，因此無法安裝。",
+      communityAppsLicense: "授權條款",
+      communityAppsTemplateSource: "查看範本來源",
+      communityAppsInstall: "安裝",
+      communityAppsInstalling: "正在啟動…",
+      communityAppsInstalled: "已安裝",
+      communityAppsPending: "正在安裝",
+      communityAppsInstallStarted: "已開始安裝社群應用程式。",
+      communityAppsAlreadyInstalled: "已安裝此社群應用程式。",
+      communityAppsLocalRequestReady: "社群應用程式請求已準備好交給本機代理。",
+      communityAppsInstallFailed: "無法安裝此社群應用程式。",
       availableApps: "可用應用程式",
       connectApp: "連接應用程式",
       openApp: "開啟應用程式",
@@ -438,6 +468,20 @@ const messages = {
       threadDebugNoThreads: "找不到討論串。",
       threadDebugSelectPrompt: "選取失敗執行或討論串以進行檢查。",
       ...chatFirstPageTranslations["zh-TW"],
+      pinApp: "釘選 {{name}}",
+      unpinApp: "取消釘選 {{name}}",
+      hostedApps: "Agent-Native.com 託管應用程式",
+      pinnedApps: "已釘選的應用程式",
+      workspaceApps: "工作區應用程式",
+      newApp: "新增應用程式",
+      viewAllApps: "查看全部",
+      manageHostedApps: "管理",
+      manageHostedAppsAdminOnly:
+        "只有組織管理員可以變更 Agent-Native.com 託管應用程式。",
+      showHostedApps: "顯示 Agent-Native.com 託管應用程式",
+      hostedAppsSaveFailed: "無法儲存 Agent-Native.com 託管應用程式設定。",
+      hostedAppsSettingInvalid:
+        "儲存的 Agent-Native.com 託管應用程式設定無效。儲存一個值即可取代它。",
     },
   },
 };

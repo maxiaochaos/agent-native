@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import {
+  defineAppConfig,
+  resetAppConfigForTests,
+} from "../app-config/index.js";
 import { getOnboardingAppProfile } from "./app-profile.js";
 import { WORKSPACE_SERVICES } from "./workspace-services.js";
 
@@ -23,6 +27,22 @@ const APP_IDS = [
 ] as const;
 
 describe("onboarding app profiles", () => {
+  it("exposes the app experiment and the deployment override", () => {
+    try {
+      defineAppConfig({ onboarding: { firstRunCreditsExperiment: "v2" } });
+      expect(getOnboardingAppProfile("design").firstRunCreditsExperiment).toBe(
+        "v2",
+      );
+      vi.stubEnv("FIRST_RUN_CREDITS_EXPERIMENT", "v1");
+      expect(getOnboardingAppProfile("design").firstRunCreditsExperiment).toBe(
+        "v1",
+      );
+    } finally {
+      vi.unstubAllEnvs();
+      resetAppConfigForTests();
+    }
+  });
+
   it.each(APP_IDS)("declares a usable profile for %s", (appId) => {
     const profile = getOnboardingAppProfile(appId);
 
@@ -87,8 +107,16 @@ describe("onboarding app profiles", () => {
       "embeddings",
       "background-agents",
       "browser-automation",
+      "web-search",
       "transcription",
     ]);
+    expect(
+      clips.capabilities.find((capability) => capability.id === "web-search"),
+    ).toMatchObject({
+      label: "Web search",
+      keySummary: "Web search",
+      builderIncluded: true,
+    });
     expect(clips.capabilities[2]).toMatchObject({
       required: false,
       suggested: true,
@@ -204,7 +232,7 @@ describe("onboarding app profiles", () => {
     },
   );
 
-  it("marks the Builder.io-only services and keeps them optional", () => {
+  it("keeps Builder-only services optional and recommends Builder-included search", () => {
     const capabilities = getOnboardingAppProfile("design").capabilities;
     const builderOnly = capabilities.filter(
       (capability) => capability.builderOnly,
@@ -220,6 +248,15 @@ describe("onboarding app profiles", () => {
         (capability) => !capability.required && !capability.suggested,
       ),
     ).toBe(true);
+    const webSearch = capabilities.find(
+      (capability) => capability.service === "web-search",
+    );
+    expect(webSearch).toMatchObject({
+      required: false,
+      suggested: true,
+      builderIncluded: true,
+    });
+    expect(webSearch?.builderOnly).toBeUndefined();
   });
 
   it("uses an app's declared capability for a service without lowering its tag", () => {

@@ -1,6 +1,65 @@
 import enUS from "./en-US";
 
 const deDE = {
+  siteContent: {
+    recipeWhen: "Wann",
+    howOften: "Wie oft",
+    filterRole: "Rolle",
+    filterAll: "Alle",
+    filterEngineering: "Entwicklung",
+    filterProduct: "Produkt",
+    filterDesign: "Design",
+    filterMarketing: "Marketing",
+    filterRevops: "RevOps",
+    filterSales: "Vertrieb",
+    filterFounders: "Gründer",
+    filterFinance: "Finanzen",
+    filterEmpty: "Keine Anwendungsfälle entsprechen diesen Filtern.",
+    filterClear: "Filter zurücksetzen",
+    browseArticles:
+      "Oder stöbere in den {{articles}} nach Vorlagen und Anleitungen.",
+    articlesLink: "Artikeln",
+    whatYouUse: "Was du verwendest",
+    usedFor: "Wofür",
+    whereItBreaks: "Wo es scheitert",
+    updatedDate: "Aktualisiert am {{date}}",
+    publishedDate: "Veröffentlicht am {{date}}",
+    useCases: "Anwendungsfälle",
+    useCasesDescription: "Seiten für wiederkehrende Aufgaben, nach App",
+    useCasesTitle:
+      "Wiederkehrende Arbeit, erledigt mit einer Agent-Native-App und deinem KI-Agenten",
+    useCasesIntro:
+      "Wähle die Arbeit, die du immer wieder erledigst, oder stöbere in den {{articles}} nach Vorlagen und Anleitungen.",
+    articles: "Artikel",
+    articlesIntro:
+      "Anleitungen und Erklärungen für wiederkehrende Arbeit mit KI-Agenten.",
+    articleCount_one: "{{count}} Artikel",
+    articleCount_other: "{{count}} Artikel",
+    copyPage: "Seite kopieren",
+    enlargeImage: "Bild vergrößern",
+    closeImage: "Bild schließen",
+    copyPrompt: "Prompt kopieren",
+    promptHint: "Füge den Prompt in das Eingabefeld von {{app}} ein.",
+    copyLink: "Link kopieren",
+    copied: "Kopiert",
+    copyFailed: "Kopieren fehlgeschlagen. Bitte erneut versuchen.",
+    breadcrumb: "Brotkrumennavigation",
+    readTime_one: "{{count}} Min. Lesezeit",
+    readTime_other: "{{count}} Min. Lesezeit",
+    partOf: "Teil von:",
+    moreArticles: "Weitere {{category}}-Artikel",
+    genericMore: "Weitere Artikel",
+    showMore: "Weitere Artikel anzeigen",
+    topics: {
+      clips:
+        "Bildschirmaufnahmen, Meetings und Diktate, die dein KI-Agent nutzen kann",
+      design: "Interaktive Prototypen mit deinem KI-Agenten",
+      slides: "Markenkonforme Präsentationen mit deinem KI-Agenten",
+      plans:
+        "Visuelle Pläne und Zusammenfassungen für deinen KI-Coding-Agenten",
+      analytics: "Fragen in Alltagssprache, Diagramme und Dashboards",
+    },
+  },
   agentChat: {
     setup: {
       providerStatusUnavailable:
@@ -655,6 +714,9 @@ const deDE = {
     waitlistUnavailable:
       "Wartelisten-Anmeldungen sind in dieser Umgebung noch nicht verfügbar. Bitte nutze stattdessen die gehostete Dokumentationsseite.",
     launchBuilder: "Builder starten",
+    newAppPrompt: "Erstelle eine neue Agent-Native-App.",
+    customizeTemplatePrompt:
+      "Passe die Agent-Native-Vorlage {{template}} an meinen Arbeitsablauf an.",
   },
   templateCard: {
     pasteIntoTerminal: "In Ihr Terminal einfügen.",
@@ -2644,6 +2706,7 @@ const deDE = {
     deploymentEnvironmentVariables: "Deployment: Umgebungsvariablen",
     updatingUiInProduction: "UI in Produktion Aktualisieren",
     environmentVariables: "Umgebungsvariablen",
+    telemetry: "Telemetrie",
     progress: "Fortschritt",
     authentication: "Authentifizierung",
     multiTenancy: "Mandantenfähigkeit",
@@ -2655,6 +2718,7 @@ const deDE = {
     auditLog: "Audit-Log",
     doctorCodeChecks: "Doctor (Code-Prüfungen)",
     observability: "Beobachtbarkeit",
+    recorder: "Rekorder",
     observationalMemory: "Beobachtungsspeicher",
     ciEvalGate: "CI-Eval-Gate",
     usingYourAgentOverview: "Überblick",
@@ -2708,7 +2772,9 @@ const deDE = {
     blueprintInstaller: "Blueprint-Installer",
     chat: "Chat",
     chatOverview: "Überblick",
-    chatFirstEdits: "Deine erste Funktion",
+    chatFeatures: "Funktionen",
+    chatAgent: "Mit dem Agent sprechen",
+    chatIntegrations: "Cross-App-Nutzung",
     chatDevelopers: "Entwicklerhandbuch",
     calendar: "Kalender",
     calendarOverview: "Überblick",

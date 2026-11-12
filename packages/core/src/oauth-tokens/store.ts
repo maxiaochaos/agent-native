@@ -1,14 +1,17 @@
 import { getDbExec } from "../db/client.js";
 import { ensureColumnExists, ensureTableExists } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { defineStore } from "../db/store-registry.js";
+import { fromMigrationEntries } from "../db/versioned-store-migrations.js";
 import { widenIntColumnsToBigInt } from "../db/widen-columns.js";
 import {
   encryptSecretValue,
   decryptSecretValue,
   isEncryptedSecretValue,
 } from "../secrets/crypto.js";
-
-let _initPromise: Promise<void> | undefined;
+import {
+  OAUTH_TOKEN_MIGRATIONS,
+  OAUTH_TOKEN_MIGRATIONS_TABLE,
+} from "./migrations.js";
 
 function serializeTokens(tokens: Record<string, unknown>): string {
   return encryptSecretValue(JSON.stringify(tokens));
@@ -44,24 +47,24 @@ function oauthTokensTable(): string {
   return "public.oauth_tokens";
 }
 
-export async function ensureTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const client = getDbExec();
-      const table = oauthTokensTable();
-      const createSql = `
-        CREATE TABLE IF NOT EXISTS ${table} (
-          provider TEXT NOT NULL,
-          account_id TEXT NOT NULL,
-          owner TEXT,
-          tokens TEXT NOT NULL,
-          updated_at BIGINT NOT NULL,
-          revision BIGINT NOT NULL,
-          PRIMARY KEY (provider, account_id)
-        )
-      `;
-
-      {
+export const oauthTokensStore = defineStore({
+  id: "oauth_tokens",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const table = oauthTokensTable();
+        const createSql = `
+          CREATE TABLE IF NOT EXISTS ${table} (
+            provider TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            owner TEXT,
+            tokens TEXT NOT NULL,
+            updated_at BIGINT NOT NULL,
+            revision BIGINT NOT NULL,
+            PRIMARY KEY (provider, account_id)
+          )
+        `;
         await ensureTableExists("oauth_tokens", createSql);
         await ensureColumnExists(
           "oauth_tokens",
@@ -78,22 +81,42 @@ export async function ensureTable(): Promise<void> {
           "revision",
           `ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS revision BIGINT`,
         );
-        await client.execute(
-          `UPDATE ${table} SET owner = account_id WHERE owner IS NULL`,
+      },
+    },
+    {
+      name: "backfill-owner",
+      kind: "data",
+      run: async (exec) => {
+        await exec.execute(
+          `UPDATE ${oauthTokensTable()} SET owner = account_id WHERE owner IS NULL`,
         );
-        await client.execute(
-          `UPDATE ${table} SET revision = updated_at WHERE revision IS NULL`,
+      },
+    },
+    {
+      name: "backfill-revision",
+      kind: "data",
+      run: async (exec) => {
+        await exec.execute(
+          `UPDATE ${oauthTokensTable()} SET revision = updated_at WHERE revision IS NULL`,
         );
-        await widenIntColumnsToBigInt("oauth_tokens", ["updated_at"], client);
-        return;
-      }
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+      },
+    },
+    {
+      name: "widen-bigint",
+      run: async (exec) => {
+        await widenIntColumnsToBigInt("oauth_tokens", ["updated_at"], exec);
+      },
+    },
+    ...fromMigrationEntries(
+      OAUTH_TOKEN_MIGRATIONS_TABLE,
+      OAUTH_TOKEN_MIGRATIONS,
+      { data: [4, 6] },
+    ),
+  ],
+});
+
+export function ensureTable(): Promise<void> {
+  return oauthTokensStore.ready();
 }
 
 export async function getOAuthTokens(
@@ -309,17 +332,6 @@ export async function saveOAuthTokens(
     ...(existingTokens ?? {}),
     ...cleanedIncomingTokens,
   };
-  const existingScope = existingTokens?.scope;
-  const incomingScope = cleanedIncomingTokens.scope;
-  if (typeof existingScope === "string" && typeof incomingScope === "string") {
-    tokensToStore.scope = Array.from(
-      new Set(
-        `${existingScope} ${incomingScope}`
-          .split(/[\s,]+/)
-          .filter((scope) => scope.length > 0),
-      ),
-    ).join(" ");
-  }
 
   const result = await client.execute({
     sql: `INSERT INTO ${table} (provider, account_id, owner, display_name, tokens, updated_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (provider, account_id) DO UPDATE SET owner=EXCLUDED.owner, display_name=COALESCE(EXCLUDED.display_name, ${table}.display_name), tokens=EXCLUDED.tokens, updated_at=EXCLUDED.updated_at, revision=GREATEST(COALESCE(${table}.revision, 0) + 1, EXCLUDED.revision) WHERE ${table}.owner = EXCLUDED.owner OR (LOWER(${table}.owner) = LOWER(EXCLUDED.owner) AND LOWER(${table}.owner) LIKE 'user:%' AND LOWER(EXCLUDED.owner) LIKE 'user:%')`,

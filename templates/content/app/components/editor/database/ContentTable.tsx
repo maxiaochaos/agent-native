@@ -42,7 +42,8 @@ function subscribeToNoHover(onChange: () => void) {
   return () => media.removeEventListener("change", onChange);
 }
 
-function deviceCannotHover() {
+/** Whether no pointer on this device can hover, as on a phone. */
+export function deviceCannotHover() {
   return (
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
@@ -622,7 +623,7 @@ export const ContentTableRowActionButton = forwardRef<
       type="button"
       aria-label={label}
       className={cn(
-        "flex size-7 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100",
+        "flex size-7 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100 data-[state=open]:opacity-100 [@media(any-hover:none)]:opacity-100",
         className,
       )}
     >

@@ -2,10 +2,17 @@ import { defineAction, embedApp } from "@agent-native/core";
 import { readAppState } from "@agent-native/core/application-state";
 import { buildDeepLink, signShortLivedToken } from "@agent-native/core/server";
 import { resolveAccess, ForbiddenError } from "@agent-native/core/sharing";
+import { getAgentClipReadiness } from "@shared/agent-context";
+import { transcriptContextAt } from "@shared/comment-transcript-context";
+import {
+  embedFramesUnavailableReason,
+  recordingEmbedProvider,
+} from "@shared/embed-provider";
 import { isImageRecording, resolveRecordingKind } from "@shared/recording-kind";
 import { asc, eq } from "drizzle-orm";
 import { z } from "zod";
 
+import { trimsRevisionOf } from "../app/lib/timestamp-mapping.js";
 import { getDb, schema } from "../server/db/index.js";
 const IMAGE_TOKEN_STEP_SECONDS = 5 * 60;
 
@@ -58,6 +65,8 @@ import { resolvePlayerVideoUrl } from "../server/lib/player-video-url.js";
 import {
   canOpenDirectRecordingPage,
   isRecordingExpiredForViewer,
+  isRecordingTrashedForViewer,
+  recordingUsesSharePassword,
 } from "../server/lib/recording-page-access.js";
 import { hasExplicitRecordingShare } from "../server/lib/recording-share-grant.js";
 import {
@@ -69,16 +78,21 @@ import {
   viewerScreenshotEditsJson,
 } from "../server/lib/screenshot-edits.js";
 import { isSeekableRepairPending } from "../server/lib/seekable-media-state.js";
+import { getRecordingAccessTokenResourceId } from "../server/lib/share-password.js";
+import { listTranscriptVersions } from "../server/lib/transcript-versions.js";
 import { hydrateCommentAuthorNames } from "../server/lib/user-identities.js";
+import { parseAppActivitySummary } from "../shared/app-activity.js";
 import { parseBrowserDiagnosticsRow } from "../shared/browser-diagnostics.js";
 import {
   CLIPS_BUILDER_CREDITS_STATE_KEY,
   normalizeBuilderCreditsStatus,
 } from "../shared/builder-credits.js";
 import { displayCommentMentions } from "../shared/comment-mentions.js";
+import { parseStoredChapters } from "../shared/stored-chapters.js";
 import {
   normalizeTranscriptSegments,
   parseTranscriptSegments,
+  storedSegmentsUnreadable,
 } from "../shared/transcript-segments.js";
 import { resolveTranscriptPresentation } from "../shared/transcript-status.js";
 import { boundTranscriptForAgent } from "./lib/transcript-preview.js";
@@ -127,7 +141,7 @@ function recordingDeepLink(recordingId: string): string {
 
 export default defineAction({
   description:
-    "Fetch everything the player page needs for a recording: metadata, transcript, comments, reactions, chapters, tags, CTAs, the counted-view total, and the caller's effective role. Agent calls receive a bounded transcript chunk; pass transcriptOffset from nextFullTextOffset until it is null to read the complete transcript. Browser player calls receive the full transcript.",
+    "Fetch everything the player page needs for a recording: metadata, transcript, comments, reactions, chapters, tags, CTAs, the counted-view total, and the caller's effective role. Agent calls receive a bounded transcript chunk; pass transcriptOffset from nextFullTextOffset until it is null to read the complete transcript. Agent calls also get media (whether frames exist; a YouTube clip has none) and, on each comment, transcriptContext: the transcript spoken around its videoTimestampMs. Browser player calls receive the full transcript.",
   schema: z.object({
     recordingId: z.string().describe("Recording ID"),
     transcriptOffset: z.coerce.number().int().min(0).optional(),
@@ -151,6 +165,15 @@ export default defineAction({
 
     const db = getDb();
     const rec: any = access.resource;
+
+    if (
+      isRecordingTrashedForViewer({
+        trashedAt: rec.trashedAt,
+        viewerIsOwner: access.role === "owner",
+      })
+    ) {
+      throw new ForbiddenError(`No access to recording ${args.recordingId}`);
+    }
 
     if (
       isRecordingExpiredForViewer({
@@ -182,11 +205,14 @@ export default defineAction({
       );
     }
 
-    const [transcript] = await db
+    const transcriptRows = await db
       .select()
       .from(schema.recordingTranscripts)
       .where(eq(schema.recordingTranscripts.recordingId, args.recordingId))
       .limit(1);
+    // A recording can have no transcript row, which indexing alone wouldn't type.
+    const transcript =
+      transcriptRows.length > 0 ? transcriptRows[0] : undefined;
     const canEditRecording =
       access.role === "owner" ||
       access.role === "admin" ||
@@ -199,6 +225,7 @@ export default defineAction({
       seekableRepairPending,
       viewCount,
       agentViewCount,
+      transcriptVersions,
     ] = await Promise.all([
       readAppState(`transcript-cleanup-${args.recordingId}`).catch(() => null),
       canEditRecording
@@ -217,6 +244,11 @@ export default defineAction({
       }),
       countRecordingViews(args.recordingId).catch(() => 0),
       countRecordingAgentViews(args.recordingId).catch(() => 0),
+      // Replaced transcripts follow the edit permission: a viewer sees neither
+      // them nor that they exist.
+      canEditRecording
+        ? listTranscriptVersions(db, args.recordingId)
+        : Promise.resolve(null),
     ]);
     const cleanupState =
       cleanupStateRaw && typeof cleanupStateRaw === "object"
@@ -226,14 +258,17 @@ export default defineAction({
       ? normalizeBuilderCreditsStatus(builderCreditsRaw)
       : null;
 
-    const comments = await db
-      .select()
-      .from(schema.recordingComments)
-      .where(eq(schema.recordingComments.recordingId, args.recordingId))
-      .orderBy(
-        asc(schema.recordingComments.videoTimestampMs),
-        asc(schema.recordingComments.createdAt),
-      );
+    const comments =
+      rec.enableComments || access.role === "owner"
+        ? await db
+            .select()
+            .from(schema.recordingComments)
+            .where(eq(schema.recordingComments.recordingId, args.recordingId))
+            .orderBy(
+              asc(schema.recordingComments.videoTimestampMs),
+              asc(schema.recordingComments.createdAt),
+            )
+        : [];
     const hydratedComments = await hydrateCommentAuthorNames(comments);
 
     const reactions = await db
@@ -295,35 +330,35 @@ export default defineAction({
       );
     }
 
-    let chapters: { startMs: number; title: string }[] = [];
-    try {
-      const parsed = JSON.parse(rec.chaptersJson ?? "[]");
-      if (Array.isArray(parsed)) {
-        chapters = parsed.filter(
-          (c: any) =>
-            typeof c?.startMs === "number" && typeof c?.title === "string",
-        );
-      }
-    } catch {}
+    const chapters = parseStoredChapters(rec.chaptersJson);
 
     const transcriptSegments = normalizeTranscriptSegments({
       segments: parseTranscriptSegments(transcript?.segmentsJson),
       fullText: transcript?.fullText,
       durationMs: rec.durationMs,
     });
+    const segmentsUnreadable = storedSegmentsUnreadable(
+      transcript?.segmentsJson,
+    );
+    // Saved lines that can't be read aren't "no speech": the panel says the
+    // transcript couldn't be read instead.
     const transcriptReadyButEmpty =
       transcript?.status === "ready" &&
+      !segmentsUnreadable &&
       !transcript.fullText?.trim() &&
       transcriptSegments.length === 0;
     const transcriptPresentation = resolveTranscriptPresentation(transcript);
-    const agentTranscript =
-      ctx?.caller === "tool" || ctx?.caller === "mcp" || ctx?.caller === "a2a"
-        ? boundTranscriptForAgent({
-            fullText: transcript?.fullText,
-            segments: transcriptSegments,
-            fullTextOffset: args.transcriptOffset,
-          })
-        : null;
+    const isAgentCall =
+      ctx?.caller === "tool" || ctx?.caller === "mcp" || ctx?.caller === "a2a";
+    const embedProvider = recordingEmbedProvider(rec);
+    const readiness = getAgentClipReadiness(rec.status);
+    const agentTranscript = isAgentCall
+      ? boundTranscriptForAgent({
+          fullText: transcript?.fullText,
+          segments: transcriptSegments,
+          fullTextOffset: args.transcriptOffset,
+        })
+      : null;
 
     const resolvedVideoUrl = resolvePlayerVideoUrl(rec, {
       addPasswordToken: access.role !== "owner",
@@ -336,9 +371,17 @@ export default defineAction({
     // it is part of the <img> URL, and a token minted fresh on every refetch
     // would make the browser download the whole picture again each time.
     const imageAccessToken =
-      isImageRecording(rec) && rec.password && access.role !== "owner"
+      isImageRecording(rec) &&
+      recordingUsesSharePassword(rec.visibility) &&
+      rec.password &&
+      access.role !== "owner"
         ? signShortLivedToken({
-            resourceId: rec.id,
+            resourceId: getRecordingAccessTokenResourceId(
+              rec.id,
+              rec.password,
+              rec.sharePasswordVersion,
+              "public",
+            ),
             ttlSeconds: steppedTokenTtlSeconds(),
           })
         : null;
@@ -346,6 +389,21 @@ export default defineAction({
     return {
       role: access.role,
       canComment: canCommentRecording,
+      ...(isAgentCall
+        ? {
+            media: {
+              embedProvider,
+              framesAvailable: !embedProvider && readiness.state === "ready",
+              ...(embedProvider
+                ? {
+                    note: `${embedFramesUnavailableReason(embedProvider)} Each comment carries transcriptContext, the transcript spoken around its videoTimestampMs.`,
+                  }
+                : readiness.instruction
+                  ? { note: readiness.instruction }
+                  : {}),
+            },
+          }
+        : {}),
       viewCount,
       agentViewCount,
       recording: {
@@ -400,6 +458,9 @@ export default defineAction({
           : canEditRecording
             ? editorScreenshotEditsJson(rec.editsJson)
             : viewerScreenshotEditsJson(rec.editsJson),
+        ...(canEditRecording
+          ? { trimsRevision: trimsRevisionOf(rec.editsJson) }
+          : {}),
         videoUrl: resolvedVideoUrl,
         videoFormat: rec.videoFormat,
         videoSizeBytes: rec.videoSizeBytes ?? null,
@@ -416,6 +477,7 @@ export default defineAction({
         seekableRepairPending,
         uploadProgress: rec.uploadProgress,
         failureReason: rec.failureReason,
+        failureCode: rec.failureCode,
         ...(canEditRecording
           ? {
               uploadAttemptId: rec.uploadAttemptId ?? null,
@@ -443,6 +505,8 @@ export default defineAction({
               ? "failed"
               : transcriptPresentation.status,
             language: transcript.language,
+            source: transcript.source ?? null,
+            importId: transcript.importId ?? null,
             fullText: agentTranscript?.fullText ?? transcript.fullText,
             ...(agentTranscript
               ? {
@@ -458,6 +522,10 @@ export default defineAction({
               ? "No speech was detected by transcription. Check microphone and speech permissions, then retry transcription."
               : transcriptPresentation.failureReason,
             segments: agentTranscript?.segments ?? transcriptSegments,
+            ...(segmentsUnreadable
+              ? { segmentsUnreadable: true as const }
+              : {}),
+            ...(transcriptVersions ? { versions: transcriptVersions } : {}),
             cleanup: cleanupState
               ? {
                   status:
@@ -491,6 +559,14 @@ export default defineAction({
         content: c.content,
         mentions: displayCommentMentions(c.mentionsJson),
         videoTimestampMs: c.videoTimestampMs,
+        ...(isAgentCall
+          ? {
+              transcriptContext: transcriptContextAt(
+                transcriptSegments,
+                c.videoTimestampMs,
+              ),
+            }
+          : {}),
         emojiReactionsJson: c.emojiReactionsJson,
         resolved: Boolean(c.resolved),
         createdAt: c.createdAt,
@@ -515,7 +591,12 @@ export default defineAction({
       })),
       browserDiagnostics: browserDiagnostics
         ? canInspectSensitiveContext
-          ? browserDiagnostics
+          ? {
+              ...browserDiagnostics,
+              appActivity: parseAppActivitySummary(
+                browserDiagnosticsRow?.appActivitySummaryJson,
+              ),
+            }
           : { summary: browserDiagnostics.summary }
         : null,
       bugReport:

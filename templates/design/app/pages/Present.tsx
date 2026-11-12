@@ -25,11 +25,17 @@ import {
 
 import { appendHitTestResponder } from "@/components/design/design-canvas/hit-test";
 import {
+  connectNativePreviewSurface,
+  nativePreviewSurfaceDocumentKey,
+  prepareNativePreviewSurface,
+} from "@/components/design/design-canvas/native-preview-surface";
+import {
   connectPrivateReplayScreenshotPreview,
   preparePrivateReplayScreenshotPreviewDocument,
 } from "@/components/design/design-canvas/private-replay-screenshot-preview";
 import { reviewThreadIdFromHash } from "@/components/design/review-link";
 import { ReviewCommentsPanel } from "@/components/design/ReviewCommentsPanel";
+import { useNativeShaderApprovals } from "@/components/design/use-native-shader-approvals";
 import { QueryErrorState } from "@/components/QueryErrorState";
 import { Button } from "@/components/ui/button";
 import {
@@ -44,6 +50,7 @@ import {
   ReviewCanvasPins,
   type ReviewFocusRequest,
 } from "@/components/visual-editor/ReviewCanvasPins";
+import { prettyScreenName } from "@/lib/screen-names";
 
 import { withLocalRuntimes } from "../components/design/design-canvas/local-runtime";
 import {
@@ -80,6 +87,7 @@ export default function Present() {
     useState<ReviewFocusRequest | null>(null);
   const reviewFocusNonceRef = useRef(0);
   const reviewLinkCommentIdRef = useRef<string | null>(null);
+  const previewFrameRef = useRef<HTMLIFrameElement>(null);
 
   const {
     data: design,
@@ -141,6 +149,31 @@ export default function Present() {
       ),
     [id, reviewableContent],
   );
+  const { syncFrame: syncNativeShaderApprovals, approvedDefinitionHashes } =
+    useNativeShaderApprovals({
+      designId: id,
+      fileId: activeFile?.id,
+      enabled: Boolean(
+        activeFile?.content.includes("application/x-agent-native-effects"),
+      ),
+    });
+  const nativePreview = useMemo(
+    () =>
+      prepareNativePreviewSurface({
+        html: previewDocument.html,
+        sandbox: "allow-scripts",
+        profile: "interactive",
+        approvedHashes: approvedDefinitionHashes,
+        baseHref:
+          typeof window === "undefined" ? undefined : window.location.href,
+      }),
+    [approvedDefinitionHashes, previewDocument.html],
+  );
+  useEffect(() => {
+    const frame = previewFrameRef.current;
+    if (!frame) return;
+    return connectNativePreviewSurface(frame, nativePreview);
+  }, [nativePreview]);
   const reviewCommentCount =
     readDesignReviewSummary(reviewQuery.data)?.openCount ??
     new Set(
@@ -173,6 +206,15 @@ export default function Present() {
         threadId: thread.root.threadId,
       });
     },
+    [files],
+  );
+  // The shared file shape here carries no URL, so no screen gets a route.
+  const reviewScreens = useMemo(
+    () =>
+      files.map((file) => ({
+        id: file.id,
+        name: prettyScreenName(file.filename),
+      })),
     [files],
   );
 
@@ -282,11 +324,14 @@ export default function Present() {
     <div className="relative h-screen w-screen overflow-hidden bg-black">
       <div className="present-review-canvas h-full w-full">
         <iframe
+          key={nativePreviewSurfaceDocumentKey(nativePreview)}
+          ref={previewFrameRef}
           {...{ [SESSION_REPLAY_IFRAME_ATTRIBUTE]: "" }}
-          srcDoc={previewDocument.html}
+          srcDoc={nativePreview.html}
           sandbox="allow-scripts"
           data-design-preview-iframe
           onLoad={(event) => {
+            syncNativeShaderApprovals(event.currentTarget);
             if (id)
               connectPrivateReplayScreenshotPreview(
                 event.currentTarget,
@@ -353,14 +398,9 @@ export default function Present() {
               <ReviewCommentsPanel
                 designId={id}
                 canComment={canPost}
-                canResolve={canResolve}
                 currentTargetId={activeFile?.id ?? null}
                 currentUserEmail={session?.email}
-                canDeleteComment={(comment) =>
-                  canResolve ||
-                  ("canDelete" in comment && comment.canDelete === true) ||
-                  comment.authorEmail === session?.email
-                }
+                screens={reviewScreens}
                 signInHref={signInHref}
                 onSelectThread={handleReviewThreadSelect}
                 className="min-h-0 flex-1"

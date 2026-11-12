@@ -12,6 +12,7 @@ import { z } from "zod";
 
 import { getDb, schema } from "../server/db/index.js";
 import { documentAttributionActor } from "../server/lib/document-attribution.js";
+import { syncPrivateMediaReferences } from "../server/lib/private-media-references.js";
 import type {
   ContentDatabaseView,
   DocumentPropertySystemRole,
@@ -35,6 +36,7 @@ import {
   touchContentDatabase,
 } from "./_content-database-mutation-lock.js";
 import { ensureDocumentFilesMembership } from "./_content-files.js";
+import { assertCollectionAcceptsNewRows } from "./_document-source.js";
 import { nextAppendPosition } from "./_position-utils.js";
 import { nanoid, parseDatabaseViewConfig } from "./_property-utils.js";
 
@@ -480,6 +482,7 @@ export default defineAction({
         "Database page and database belong to different Content spaces.",
       );
     }
+    await assertCollectionAcceptsNewRows(database.id, db);
     const definitions = await db
       .select()
       .from(schema.documentPropertyDefinitions)
@@ -699,6 +702,10 @@ export default defineAction({
         createdAt: now,
         updatedAt: now,
       });
+      await syncPrivateMediaReferences(
+        tx as unknown as ReturnType<typeof getDb>,
+        { documentId, after: documentContent, userEmail: actor },
+      );
       await tx.insert(schema.contentDatabaseItems).values({
         id: itemId,
         ownerEmail: database.ownerEmail,

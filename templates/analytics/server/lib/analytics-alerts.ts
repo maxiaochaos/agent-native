@@ -22,6 +22,7 @@ import {
 } from "drizzle-orm";
 
 import { getDb, schema } from "../db/index.js";
+import { withBigQueryUsageAttribution } from "./bigquery-usage";
 import { getFirstPartyAnalyticsBackend } from "./first-party-analytics-backend.js";
 import { queryFirstPartyAnalytics } from "./first-party-analytics.js";
 
@@ -141,6 +142,10 @@ function nowIso(): string {
 }
 
 const ALERT_RULE_RUNNING_STALE_MS = 15 * 60 * 1000;
+// Synthetic budget: 2 days x 1M events/day x 2 KiB selected/event (including JSON)
+// x 3 batch branches x 2 scope scans, with ~2x headroom. Pre-execution estimates
+// do not credit clustering savings.
+const ANALYTICS_ALERT_MAX_BYTES_BILLED = 50_000_000_000;
 const DEFAULT_HTTP_5XX_ALERT_ID_PREFIX = "default-http-5xx-spike";
 const DEFAULT_AGENT_CHAT_STUCK_ALERT_ID_PREFIX =
   "default-agent-chat-stuck-spike";
@@ -149,6 +154,13 @@ const DEFAULT_AGENT_CHAT_STUCK_ALERT_WINDOW_MINUTES = 10;
 const DEFAULT_AGENT_CHAT_STUCK_ALERT_COOLDOWN_MINUTES = 60;
 const DEFAULT_ALERT_SCOPE_PAGE_SIZE = 500;
 const BIGQUERY_ALERT_PAGE_SIZE = 5_000;
+
+// Alerts watch the last few minutes, which an hourly events model has not
+// built yet.
+const ALERT_QUERY_OPTIONS = {
+  eventsSource: "raw",
+  maxBytesBilled: ANALYTICS_ALERT_MAX_BYTES_BILLED,
+} as const;
 const ALERT_RULE_DEFAULTS_KEY = "analytics-alert-rule-defaults";
 
 function safeJsonParse<T>(raw: unknown, fallback: T): T {
@@ -1165,16 +1177,19 @@ export async function evaluateBigQueryAnalyticsAlertBatch(
 ): Promise<Map<string, AnalyticsAlertBatchResult>> {
   const query = buildBigQueryAnalyticsAlertBatchQuery(rules, now);
   const first = rules[0]!;
-  const result = await runWithRequestContext(
-    {
-      userEmail: first.ownerEmail,
-      ...(first.orgId !== null ? { orgId: first.orgId } : {}),
-    },
-    () =>
-      queryFirstPartyAnalytics(query, {
+  const result = await withBigQueryUsageAttribution({ workload: "alert" }, () =>
+    runWithRequestContext(
+      {
         userEmail: first.ownerEmail,
-        orgId: first.orgId,
-      }),
+        ...(first.orgId !== null ? { orgId: first.orgId } : {}),
+      },
+      () =>
+        queryFirstPartyAnalytics(
+          query,
+          { userEmail: first.ownerEmail, orgId: first.orgId },
+          ALERT_QUERY_OPTIONS,
+        ),
+    ),
   );
   if (result.truncated || result.rows.length !== 1) {
     throw new Error(
@@ -1526,36 +1541,41 @@ async function loadCandidateEvents(
     orgId: rule.orgId,
   });
   if (backend.sink === "bigquery") {
-    return runWithRequestContext(
-      {
-        userEmail: rule.ownerEmail,
-        ...(rule.orgId ? { orgId: rule.orgId } : {}),
-      },
-      async () => {
-        const rows: AnalyticsAlertEventRow[] = [];
-        let cursor: { timestamp: string; id: string } | undefined;
-        while (true) {
-          const result = await queryFirstPartyAnalytics(
-            buildBigQueryAlertQuery(rule, windowStart, windowEnd, cursor),
-            { userEmail: rule.ownerEmail, orgId: rule.orgId },
-          );
-          if (result.truncated) {
-            throw new Error(
-              `BigQuery alert evaluation for rule ${rule.id} returned a transport-truncated page; refusing to evaluate partial data`,
+    return withBigQueryUsageAttribution({ workload: "alert" }, () =>
+      runWithRequestContext(
+        {
+          userEmail: rule.ownerEmail,
+          ...(rule.orgId ? { orgId: rule.orgId } : {}),
+        },
+        async () => {
+          const rows: AnalyticsAlertEventRow[] = [];
+          let cursor: { timestamp: string; id: string } | undefined;
+          for (;;) {
+            const result = await queryFirstPartyAnalytics(
+              buildBigQueryAlertQuery(rule, windowStart, windowEnd, cursor),
+              { userEmail: rule.ownerEmail, orgId: rule.orgId },
+              ALERT_QUERY_OPTIONS,
             );
+            if (result.truncated === true) {
+              throw new Error(
+                `BigQuery alert evaluation for rule ${rule.id} returned a transport-truncated page; refusing to evaluate partial data`,
+              );
+            }
+            const page = result.rows.map(normalizeBigQueryAlertEventRow);
+            rows.push(...page);
+            if (!page.length) break;
+            if (page.length < BIGQUERY_ALERT_PAGE_SIZE) break;
+            const lastRaw = result.rows.slice(-1).pop();
+            if (lastRaw === undefined)
+              throw new Error("BigQuery alert page had no final row");
+            cursor = {
+              timestamp: requiredBigQueryAlertString(lastRaw, "timestamp"),
+              id: requiredBigQueryAlertString(lastRaw, "id"),
+            };
           }
-          const page = result.rows.map(normalizeBigQueryAlertEventRow);
-          rows.push(...page);
-          if (!page.length) break;
-          if (page.length < BIGQUERY_ALERT_PAGE_SIZE) break;
-          const lastRaw = result.rows[result.rows.length - 1]!;
-          cursor = {
-            timestamp: requiredBigQueryAlertString(lastRaw, "timestamp"),
-            id: requiredBigQueryAlertString(lastRaw, "id"),
-          };
-        }
-        return rows;
-      },
+          return rows;
+        },
+      ),
     );
   }
 

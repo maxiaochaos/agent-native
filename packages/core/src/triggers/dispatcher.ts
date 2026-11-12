@@ -15,6 +15,7 @@ import {
   classifyAutomationFailure,
   CLEAR_FAILURE_STATE,
   CONFIG_INVALID_ERROR_CODE,
+  isTransientAutomationFailureCode,
   OWNER_MISSING_ERROR_CODE,
   pauseNow,
   type AutomationFailure,
@@ -24,6 +25,7 @@ import {
   checkBackgroundAutomationCredentials,
   isBackgroundAutomationRunActive,
   runBackgroundAutomation,
+  validateAutomationRunIdentity,
   type BackgroundAutomationContext,
   type BackgroundAutomationDeps,
 } from "../jobs/background-automation-runner.js";
@@ -45,7 +47,11 @@ import {
   resourcePutIfCurrent,
   type Resource,
 } from "../resources/store.js";
-import { startIntervalJob } from "../server/interval-job.js";
+import { registerBackgroundJobStop } from "../server/background-jobs.js";
+import {
+  startIntervalJob,
+  type IntervalJobHandle,
+} from "../server/interval-job.js";
 import { runWithRequestContext } from "../server/request-context.js";
 import { evaluateCondition } from "./condition-evaluator.js";
 import {
@@ -154,6 +160,10 @@ let _inflightEventAutomationScan: {
   scan: Promise<Resource[]>;
 } | null = null;
 let _triggerQueueWorkerStarted = false;
+let _triggerQueueWorker: IntervalJobHandle | null = null;
+// When true, in-process drains finish their current claim then stop taking
+// more work so stopTriggerQueueWorker cannot hang on a large backlog.
+let _triggerQueueStopping = false;
 // ponytail: warm-process backoff resets on cold start; persist only if cold churn warrants it.
 let _triggerQueueIdleBackoffMs = 0;
 let _triggerQueueResumeAt = 0;
@@ -216,6 +226,15 @@ ${fencedPayload}
 Execute the following automation instructions, and only these:
 
 ${input.body}`;
+}
+
+function automationNameOf(resource: Resource): string {
+  return resource.path.replace(/^jobs\//, "").replace(/\.md$/, "");
+}
+
+/** One label for a run and its condition check, so both count as its spend. */
+function automationUsageLabel(resource: Resource): string {
+  return `automation:${automationNameOf(resource)}`;
 }
 
 async function recordTriggerSkip(
@@ -315,7 +334,7 @@ async function recordTriggerExecutionOutcome(
   if (failed) countAutomationCredentialState(failed.failure.code);
   if (failed && pausedAfter !== undefined) {
     trackAutomationPaused({
-      name: resource.path.replace(/^jobs\//, "").replace(/\.md$/, ""),
+      name: automationNameOf(resource),
       failure: failed.failure,
       consecutiveFailures: pausedAfter,
       surface: failed.pauseImmediately ? "preflight" : "trigger",
@@ -329,6 +348,7 @@ export async function initTriggerDispatcher(
 ): Promise<void> {
   _deps = deps;
   resetTriggerQueueWorkerBackoff();
+  _triggerQueueStopping = false;
   // Init runs in an un-awaited Nitro plugin, so on a serverless request
   // function any query here outlives the response and the frozen instance
   // thaws into a timeout. Automations load on the first emitted event instead.
@@ -350,7 +370,7 @@ function startTriggerQueueWorker(): void {
     return;
   }
   _triggerQueueWorkerStarted = true;
-  startIntervalJob(
+  _triggerQueueWorker = startIntervalJob(
     async (signal) => {
       const deps = _deps;
       if (!deps || signal.aborted) return;
@@ -364,11 +384,25 @@ function startTriggerQueueWorker(): void {
         console.error("[triggers] Event queue recovery scan failed:", error),
     },
   );
+  registerBackgroundJobStop(stopTriggerQueueWorker);
+}
+
+export async function stopTriggerQueueWorker(): Promise<void> {
+  // Stays set until initTriggerDispatcher runs again: other jobs may still be
+  // stopping, and an event that lands meanwhile must not start a new drain.
+  _triggerQueueStopping = true;
+  const worker = _triggerQueueWorker;
+  _triggerQueueWorker = null;
+  _triggerQueueWorkerStarted = false;
+  if (worker) await worker.stop();
+  const drains = [..._drainingTriggers.values()];
+  if (drains.length > 0) await Promise.allSettled(drains);
 }
 
 async function drainReadyTriggerQueue(
   context?: RecurringSweepContext,
 ): Promise<void> {
+  if (_triggerQueueStopping) return;
   if (_triggerQueueResumeAt > Date.now()) return;
   const deps = _deps;
   if (!deps) return;
@@ -974,6 +1008,7 @@ function startTriggerDrain(
   const existing = _drainingTriggers.get(triggerId);
   if (existing)
     return options?.skipExisting ? Promise.resolve(false) : existing;
+  if (_triggerQueueStopping) return Promise.resolve(false);
   let localStaleExpiredCount = 0;
   const onStaleEventExpired =
     options?.onStaleEventExpired ?? (() => (localStaleExpiredCount += 1));
@@ -1025,6 +1060,7 @@ async function drainTriggerQueue(
     (queueQueryTimeoutMs !== undefined &&
       Date.now() + queueQueryTimeoutMs < deadline);
   while (processedEvents < maxEvents) {
+    if (_triggerQueueStopping) return processedEvents > 0;
     if (
       deadline !== undefined &&
       Date.now() +
@@ -1181,12 +1217,73 @@ async function dispatchQueuedAutomationEvent(
 
   let identity: AutomationExecutionIdentity;
   if (resource.owner === "__shared__") {
-    const userEmail = meta.createdBy || resource.owner;
+    const userEmail = meta.createdBy?.trim().toLowerCase();
+    if (!userEmail) {
+      await recordTriggerExecutionOutcome(
+        resource,
+        { lastCheck: new Date().toISOString() },
+        {
+          failure: {
+            code: CONFIG_INVALID_ERROR_CODE,
+            message: "Shared automation has no creator identity.",
+            precondition: true,
+          },
+          pauseImmediately: true,
+          eventId: queued.eventId,
+        },
+      );
+      return "completed";
+    }
+    const orgId = meta.orgId?.trim() || undefined;
+    let validation;
+    try {
+      validation = await validateAutomationRunIdentity(userEmail, orgId);
+    } catch (error) {
+      await recordTriggerSkip(
+        resource,
+        "error",
+        "Could not verify the automation execution identity.",
+        "owner_unverifiable",
+      );
+      throw error;
+    }
+    if (!validation.ok) {
+      if (
+        validation.code === OWNER_MISSING_ERROR_CODE ||
+        validation.code === CONFIG_INVALID_ERROR_CODE
+      ) {
+        await recordTriggerExecutionOutcome(
+          resource,
+          { lastCheck: new Date().toISOString() },
+          {
+            failure: {
+              code: validation.code,
+              message: validation.reason,
+              precondition: true,
+            },
+            pauseImmediately: true,
+            eventId: queued.eventId,
+          },
+        );
+        return "completed";
+      }
+      await recordTriggerSkip(
+        resource,
+        "error",
+        validation.reason,
+        validation.code,
+      );
+      return "completed";
+    }
     identity = {
       userEmail,
-      orgId: meta.orgId,
+      orgId,
+      ...(!orgId ? { defaultAgentEngineScope: "deployment" as const } : {}),
       eventOwner: userEmail.toLowerCase(),
     };
+    if (!automationMatchesEventOwner(identity, queued.eventOwner)) {
+      return "completed";
+    }
   } else {
     let resolved;
     try {
@@ -1244,7 +1341,16 @@ async function dispatchQueuedAutomationEvent(
   let classifierModel: string | undefined;
   if (meta.condition?.trim()) {
     const credentialCheck = await checkBackgroundAutomationCredentials(
-      { ownerEmail: identity.userEmail, orgId: identity.orgId },
+      {
+        ownerEmail: identity.userEmail,
+        orgId: identity.orgId,
+        ...(identity.orgScope === "personal"
+          ? { orgScope: "personal" as const }
+          : {}),
+        ...(identity.defaultAgentEngineScope === "deployment"
+          ? { defaultAgentEngineScope: "deployment" as const }
+          : {}),
+      },
       deps,
       meta.model,
     );
@@ -1252,8 +1358,17 @@ async function dispatchQueuedAutomationEvent(
       await recordTriggerExecutionOutcome(
         resource,
         { lastCheck: new Date().toISOString() },
-        { failure: credentialCheck.failure },
+        { failure: credentialCheck.failure, eventId: queued.eventId },
       );
+      // An unreadable credential store or a provider outage clears by itself,
+      // so the event stays queued, as it does when an unconditional run fails.
+      // A missing or rejected key does not, so the event ends here.
+      if (isTransientAutomationFailureCode(credentialCheck.failure.code)) {
+        throw new BackgroundAutomationRunError(
+          credentialCheck.failure.message,
+          credentialCheck.failure.code,
+        );
+      }
       return "completed";
     }
     classifierEngine = credentialCheck.engine;
@@ -1263,7 +1378,16 @@ async function dispatchQueuedAutomationEvent(
   let matches: boolean;
   try {
     matches = await runWithRequestContext(
-      { userEmail: identity.userEmail, orgId: identity.orgId },
+      {
+        userEmail: identity.userEmail,
+        orgId: identity.orgId,
+        ...(identity.orgScope === "personal"
+          ? { orgScope: "personal" as const }
+          : {}),
+        ...(identity.defaultAgentEngineScope === "deployment"
+          ? { defaultAgentEngineScope: "deployment" as const }
+          : {}),
+      },
       () =>
         evaluateCondition(
           meta.condition,
@@ -1277,6 +1401,7 @@ async function dispatchQueuedAutomationEvent(
             deadlineAt: hardDeadlineAt,
             engine: classifierEngine,
             resolvedModel: classifierModel,
+            usageLabel: automationUsageLabel(resource),
           },
         ),
     );
@@ -1355,7 +1480,16 @@ export async function dispatchAutomationWebhookTask(
   let classifierModel: string | undefined;
   if (meta.condition?.trim()) {
     const credentialCheck = await checkBackgroundAutomationCredentials(
-      { ownerEmail: identity.userEmail, orgId: identity.orgId },
+      {
+        ownerEmail: identity.userEmail,
+        orgId: identity.orgId,
+        ...(identity.orgScope === "personal"
+          ? { orgScope: "personal" as const }
+          : {}),
+        ...(identity.defaultAgentEngineScope === "deployment"
+          ? { defaultAgentEngineScope: "deployment" as const }
+          : {}),
+      },
       deps,
       meta.model,
     );
@@ -1375,7 +1509,16 @@ export async function dispatchAutomationWebhookTask(
   let matches: boolean;
   try {
     matches = await runWithRequestContext(
-      { userEmail: identity.userEmail, orgId: identity.orgId },
+      {
+        userEmail: identity.userEmail,
+        orgId: identity.orgId,
+        ...(identity.orgScope === "personal"
+          ? { orgScope: "personal" as const }
+          : {}),
+        ...(identity.defaultAgentEngineScope === "deployment"
+          ? { defaultAgentEngineScope: "deployment" as const }
+          : {}),
+      },
       () =>
         evaluateCondition(
           meta.condition,
@@ -1385,7 +1528,11 @@ export async function dispatchAutomationWebhookTask(
             orgId: identity.orgId,
             appId: deps.appId,
           },
-          { engine: classifierEngine, resolvedModel: classifierModel },
+          {
+            engine: classifierEngine,
+            resolvedModel: classifierModel,
+            usageLabel: automationUsageLabel(resource),
+          },
         ),
     );
   } catch (err) {
@@ -1437,7 +1584,7 @@ async function dispatchAgentic(
 ): Promise<boolean> {
   if (!_deps) return false;
 
-  const triggerName = resource.path.replace(/^jobs\//, "").replace(/\.md$/, "");
+  const triggerName = automationNameOf(resource);
   const now = new Date();
 
   const jobUserEmail = identity.userEmail;
@@ -1454,6 +1601,23 @@ async function dispatchAgentic(
   if (!jobBelongsToApp(latestTrigger.meta, _deps.appId)) {
     console.log(
       `[triggers] "${resource.path}" belongs to a different app; dropping the event.`,
+    );
+    return true;
+  }
+  // Only schedule and manual ticks reach a runner; an event would hand its
+  // placeholder body to the agent loop as a prompt.
+  if (latestTrigger.meta.runner) {
+    await recordTriggerExecutionOutcome(
+      latest,
+      { lastCheck: now.toISOString() },
+      {
+        failure: {
+          code: CONFIG_INVALID_ERROR_CODE,
+          message: `Job runner "${latestTrigger.meta.runner}" runs on a schedule or manually, not from events or webhooks.`,
+          precondition: true,
+        },
+        pauseImmediately: true,
+      },
     );
     return true;
   }
@@ -1496,8 +1660,14 @@ async function dispatchAgentic(
     body: latestTrigger.body,
     resource: claimed,
   };
-  const requestContext =
-    runningMeta.originScopeId &&
+  const requestContext = {
+    ...(identity.orgScope === "personal"
+      ? { orgScope: "personal" as const }
+      : {}),
+    ...(identity.defaultAgentEngineScope === "deployment"
+      ? { defaultAgentEngineScope: "deployment" as const }
+      : {}),
+    ...(runningMeta.originScopeId &&
     runningMeta.deliveryPlatform &&
     runningMeta.deliveryDestination
       ? {
@@ -1522,7 +1692,8 @@ async function dispatchAgentic(
             },
           },
         }
-      : undefined;
+      : {}),
+  };
 
   try {
     const result = await runBackgroundAutomation(
@@ -1540,7 +1711,7 @@ async function dispatchAgentic(
         }),
         threadTitle: `Trigger: ${triggerName} — ${now.toLocaleDateString()}`,
         runIdPrefix: `automation-${triggerName}`,
-        usageLabel: `automation:${triggerName}`,
+        usageLabel: automationUsageLabel(resource),
         usageRefId: eventMeta.eventId,
         eventId: eventMeta.eventId,
         requestContext,

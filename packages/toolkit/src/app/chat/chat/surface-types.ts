@@ -26,6 +26,13 @@ import type {
 import type { ExportedMessageRepository } from "@assistant-ui/react";
 import type * as React from "react";
 
+import type { AgentKitWorkedForSummaryRenderProps } from "../../agentkit/react/context.js";
+import type { AgentChatDataChartLayout } from "../../agentkit/react/data-chart-layout.js";
+import type { AgentMessageContentOrderResolver } from "../../agentkit/react/message-content-order.js";
+import type {
+  AgentChatTranscriptLayout,
+  AgentChatWorkedForRowLayout,
+} from "../../agentkit/react/transcript-layout.js";
 import type { AssistantChatHistoryConfig } from "./history-types.js";
 import type { BuilderSetupCardLayout } from "./run-recovery.js";
 
@@ -44,8 +51,11 @@ export interface AssistantChatSendOptions {
   trackInRunsTray?: boolean;
   requestMode?: AgentRequestMode;
   attachments?: AgentChatAttachment[];
+  references?: AgentChatMessage["references"];
   /** Correlates with `AGENT_CHAT_SUBMIT_RESULT_EVENT` — see agent-chat.ts. */
   submitMessageId?: string;
+  /** Drop a queued submit instead of handing it to chat after this time. */
+  submissionExpiresAt?: number;
   /** See `AgentChatMessage.usageLabel`. */
   usageLabel?: string;
   actionScope?: AgentActionScope;
@@ -53,13 +63,18 @@ export interface AssistantChatSendOptions {
   approvedToolCalls?: string[];
   /** Send as a protocol continuation that stays out of visible history. */
   hideUserMessage?: boolean;
+  /** The app surface this send came from, reported with the turn's analytics. */
+  surface?: string;
 }
 
 export type AssistantChatSubmitResult =
   | { status: "submitted" }
   | {
       status: "rejected";
-      reason: "engine-not-configured" | "submission-unavailable";
+      reason:
+        | "engine-not-configured"
+        | "submission-unavailable"
+        | "submission-expired";
     };
 
 export interface AssistantChatHandle {
@@ -135,6 +150,11 @@ export interface AssistantChatComposerContext {
   onRemoveContextItem: (key: string) => void;
   onRetryContextItem?: (key: string) => void;
   onInspectContextItem?: (key: string) => void;
+  /**
+   * Claims a paste as app context before the composer handles it. Return true
+   * when the paste was taken, so nothing is inserted or attached.
+   */
+  onPasteContext?: (clipboard: DataTransfer) => boolean;
   dialogs?: React.ReactNode;
   /** Revalidate only the captured app-owned items before dispatch. */
   prepareSubmission: (
@@ -168,7 +188,6 @@ export interface AssistantChatAdapterContext {
   effortRef: { current: ReasoningEffort | undefined };
   harnessRef?: { current: string | undefined };
   hostedHarnessRef?: { current: boolean };
-  execModeRef: { current: "build" | "plan" | undefined };
   browserTabId?: string;
   scopeRef: { current: ChatThreadScope | null | undefined };
   surface: AgentChatSurfaceKind;
@@ -176,7 +195,7 @@ export interface AssistantChatAdapterContext {
 
 export interface AssistantChatProps {
   /** API endpoint URL. Default: "/_agent-native/agent-chat" */
-  apiUrl?: string;
+  apiUrl?: string | undefined;
   /** Optional Nitro response-streaming endpoint, usually supplied by VITE_AGENT_NATIVE_AGENT_CHAT_STREAM_URL. */
   streamingUrl?: string;
   /** Stable tab identifier passed to the adapter for event correlation */
@@ -199,19 +218,21 @@ export interface AssistantChatProps {
    * Identifies which surface hosts this chat. Defaults to "app", which keeps
    * dev filesystem/bash code-editing tools out of in-product sidebars.
    */
-  agentChatSurface?: AgentChatSurfaceKind;
+  agentChatSurface?: AgentChatSurfaceKind | undefined;
   /** Whether the desktop host is currently showing its unauthenticated identity gate. */
-  desktopIdentityUnauthenticated?: boolean;
+  desktopIdentityUnauthenticated?: boolean | undefined;
   /** Whether the desktop host has just established its authenticated identity session. */
-  desktopIdentityAuthenticated?: boolean;
+  desktopIdentityAuthenticated?: boolean | undefined;
   /** Route completed first-party open_app calls through the host app pane. */
-  suppressInlineOpenApp?: boolean;
+  suppressInlineOpenApp?: boolean | undefined;
   /** Placeholder text for empty state */
-  emptyStateText?: string;
+  emptyStateText?: string | undefined;
   /** Initial empty-thread starters. Completed turns use the runtime's model-authored suggestions. */
-  suggestions?: AgentSuggestionInput[];
+  suggestions?: AgentSuggestionInput[] | undefined;
   /** Initial empty-thread suggestion behavior; never disables or replaces runtime follow-ups. */
-  dynamicSuggestions?: AgentDynamicSuggestionsOption;
+  dynamicSuggestions?: AgentDynamicSuggestionsOption | undefined;
+  /** Exclude providers whose connection flow is handled by the host app. */
+  mcpSuggestionExcludedIntegrationIds?: readonly string[] | undefined;
   /** Where suggestions appear. Context chips use a next-action bar at the thread base. */
   suggestionPlacement?:
     | "empty-state"
@@ -226,9 +247,19 @@ export interface AssistantChatProps {
   threadFooterSlot?: AssistantChatThreadFooterSlot;
   /** Optional content rendered in the empty state, above the suggestion buttons. */
   emptyStateAddon?: React.ReactNode;
+  /** Visual size for initial suggestion buttons in the empty state. Defaults to compact. */
+  emptyStateSuggestionSize?: "compact" | "comfortable";
   /** Optional content rendered in the empty state, below the suggestion
    *  buttons. Unlike `threadFooterSlot` this never survives the first message. */
   emptyStateFooter?: React.ReactNode;
+  /** Optional transcript geometry. Omitted values keep the shared defaults. */
+  transcriptLayout?: AgentChatTranscriptLayout;
+  /** Optional sizing and typography for built-in chat data charts. */
+  dataChartLayout?: AgentChatDataChartLayout;
+  /** Optional elapsed-work row geometry. Omitted values keep the shared defaults. */
+  workedForRowLayout?: AgentChatWorkedForRowLayout;
+  /** Optional duration text for the shared completed-work row. */
+  formatWorkedForDuration?: (durationMs: number) => string;
   /** Whether to show the header bar. Default: true */
   showHeader?: boolean;
   /** CSS class for the outer container */
@@ -260,8 +291,16 @@ export interface AssistantChatProps {
   ) => void;
   /** Optional content rendered just above the composer input */
   composerSlot?: React.ReactNode;
+  /** Optional shared context banner rendered above the composer input. */
+  composerContextBannerSlot?: React.ReactNode;
+  /** Optional renderer for the shared work-summary disclosure row. */
+  workedForSummarySlot?: React.ComponentType<AgentKitWorkedForSummaryRenderProps>;
+  /** Optional ordering policy for assistant message text and attached widgets. */
+  resolveMessageContentOrder?: AgentMessageContentOrderResolver;
   /** App-owned context controller, mounted separately for each chat thread. */
-  composerContextProvider?: React.ComponentType<AssistantChatComposerContextProviderProps>;
+  composerContextProvider?:
+    | React.ComponentType<AssistantChatComposerContextProviderProps>
+    | undefined;
   /** Optional home content rendered above the composer on an empty chat. */
   homeIntroSlot?: React.ReactNode;
   /** Optional content rendered below the composer on an empty chat. */
@@ -272,17 +311,17 @@ export interface AssistantChatProps {
    * Host apps can use this to render contextual, non-destructive affordances
    * beside the shared composer without replacing the composer stack.
    */
-  onComposerTextChange?: (text: string) => void;
+  onComposerTextChange?: ((text: string) => void) | undefined;
   /** Class applied to the shared composer area for host-specific sizing/skin. */
   composerAreaClassName?: string;
   /** Placeholder for the shared composer in its normal idle state. */
-  composerPlaceholder?: string;
+  composerPlaceholder?: string | undefined;
   /** Controls the compactness of the provider setup panel attached above the composer. */
   missingApiKeySetupLayout?: BuilderSetupCardLayout;
   /** Hide the provider setup panel when another host surface owns that prompt. */
-  showMissingApiKeySetup?: boolean;
+  showMissingApiKeySetup?: boolean | undefined;
   /** Keep chat-owned recovery cards hidden when the host renders the setup card. */
-  setupCardOwner?: "chat" | "host";
+  setupCardOwner?: "chat" | "host" | undefined;
   /** Visual density for the shared composer shell. */
   composerLayoutVariant?: AgentComposerLayoutVariant;
   /** Center the composer on a fresh empty chat instead of pinning it low. */
@@ -294,7 +333,7 @@ export interface AssistantChatProps {
   /** Optional action rendered beside the voice/send controls. */
   composerExtraActionButton?: React.ReactNode;
   /** Show the framework model picker in the shared composer. Defaults to true. */
-  showModelSelector?: boolean;
+  showModelSelector?: boolean | undefined;
   /** Disable the composer for capability-gated surfaces while still showing history. */
   composerDisabled?: boolean;
   /** Block sending while keeping the composer editable. */
@@ -309,14 +348,8 @@ export interface AssistantChatProps {
   isThreadStateLoading?: boolean;
   /** Called when a slash command (e.g. /clear, /help) is executed */
   onSlashCommand?: (command: string) => void;
-  /** Current execution mode (build/plan) */
-  execMode?: "build" | "plan";
-  /** Callback to change execution mode */
-  onExecModeChange?: (mode: "build" | "plan") => void;
-  /** Disable Plan mode while leaving Act mode available. */
+  /** Hide `/plan`, so every message from this chat acts. */
   planModeDisabled?: boolean;
-  /** Explanation shown next to the disabled Plan option. */
-  planModeDisabledReason?: string;
   /** Selected model override for this conversation (undefined = use server default) */
   selectedModel?: string;
   /** Default model from server config (shown in picker when no override is set) */
@@ -326,14 +359,16 @@ export interface AssistantChatProps {
   /** Selected effort override for this conversation */
   selectedEffort?: ReasoningEffort;
   /** Available engine/model list for the model picker */
-  availableModels?: Array<{
-    engine: string;
-    label: string;
-    models: string[];
-    configured: boolean;
-  }>;
+  availableModels?:
+    | Array<{
+        engine: string;
+        label: string;
+        models: string[];
+        configured: boolean;
+      }>
+    | undefined;
   /** Whether the model list is still being resolved. */
-  modelListLoading?: boolean;
+  modelListLoading?: boolean | undefined;
   /** Whether the model list failed to load. */
   modelListError?: boolean;
   /** Retry loading a host-managed model list. */
@@ -343,24 +378,24 @@ export interface AssistantChatProps {
   /** Callback when user picks an effort from the picker */
   onEffortChange?: (effort: ReasoningEffort) => void;
   /** Local or hosted agent runtimes shown above the model list. */
-  availableAgents?: ComposerAgentOption[];
+  availableAgents?: ComposerAgentOption[] | undefined;
   /** Selected agent runtime identifier. */
-  selectedAgent?: string;
+  selectedAgent?: string | undefined;
   /** Mark the selected runtime as the hosted tools-only harness mode. */
   hostedHarness?: boolean;
   /** Callback when the user picks an agent runtime. */
-  onAgentChange?: (agent: string) => void;
+  onAgentChange?: ((agent: string) => void) | undefined;
   /**
    * Optional secondary model menu (e.g. an image-generation model) shown inside
    * the composer's model picker. Opt-in; chat-only apps omit it.
    */
-  imageModelMenu?: ComposerImageModelMenu;
+  imageModelMenu?: ComposerImageModelMenu | undefined;
   /** Callback when user clicks "Fork Chat" in the message actions menu */
   onForkChat?: () => void | boolean | Promise<void | boolean>;
   /** Override Builder/provider connect routing for embedded hosts. */
-  onConnectProvider?: () => void;
+  onConnectProvider?: (() => void) | undefined;
   /** Route local runtime setup through the host's native bridge. */
-  onConnectLocalRuntime?: (engine: string) => void;
+  onConnectLocalRuntime?: ((engine: string) => void) | undefined;
   /**
    * Controls the shared composer + menu. Sidebar keeps the full menu by default;
    * hosts without the sidebar provider stack can use upload-only.
@@ -369,13 +404,13 @@ export interface AssistantChatProps {
   /** Replace the built-in transport with an AgentKit-native BYO transport. */
   createTransport?: (context: AssistantChatAdapterContext) => AgentTransport;
   /** Hide the default guided-question card when another host owns its flow. */
-  showGuidedQuestions?: boolean;
+  showGuidedQuestions?: boolean | undefined;
   /**
    * Bring-your-own agent runtime. When supplied, AssistantChat keeps the
    * standard composer/transcript/tool rendering shell but sends turns through
    * this runtime instead of the built-in Agent-Native SSE endpoint.
    */
-  runtime?: AgentChatRuntime;
+  runtime?: AgentChatRuntime | undefined;
   /**
    * Explicitly recreate an injected adapter or runtime when its identity
    * changes. Omit for the production sidebar so parent rerenders do not reset
@@ -415,5 +450,5 @@ export interface AssistantChatProps {
    * let the reader's own preference apply, which is what surfaces the in-chat
    * control — a pinned mode hides it rather than leaving a dead menu item.
    */
-  thinkingDisplay?: ThinkingDisplay;
+  thinkingDisplay?: ThinkingDisplay | undefined;
 }

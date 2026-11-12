@@ -11,12 +11,10 @@ import { z } from "zod";
 import { getDb, schema } from "../server/db/index.js";
 import { importedStateFingerprint } from "../server/lib/content-import.js";
 import { requireDocumentRequestActor } from "../server/lib/document-attribution.js";
+import { assertAgentsMayEditPageText } from "./_document-agent-lock.js";
 import { flushOpenDocumentEditorToSql } from "./_document-flush.js";
 import { assertDocumentMutationAccess } from "./_document-mutation-access.js";
-import {
-  lockDatabasesForTrash,
-  trashDocumentSubtree,
-} from "./delete-document.js";
+import { lockLifecycleGroup, trashDocumentSubtree } from "./delete-document.js";
 
 export default defineAction({
   description:
@@ -90,6 +88,19 @@ export default defineAction({
         );
       }
       const importedIds = new Set(records.map((record) => record.documentId));
+      // Collections before pages: every imported page and its subtree, in
+      // the one row-lock order Trash and restore use.
+      const owners = await tx
+        .select({
+          id: schema.documents.id,
+          ownerEmail: schema.documents.ownerEmail,
+        })
+        .from(schema.documents)
+        .where(inArray(schema.documents.id, [...importedIds]));
+      const locks = await lockLifecycleGroup(tx, {
+        operation: "trash",
+        roots: owners,
+      });
       const current = await tx
         .select({
           id: schema.documents.id,
@@ -102,10 +113,10 @@ export default defineAction({
           spaceId: schema.documents.spaceId,
           createdBy: schema.documents.createdBy,
           trashedAt: schema.documents.trashedAt,
+          agentTextLocked: schema.documents.agentTextLocked,
         })
         .from(schema.documents)
-        .where(inArray(schema.documents.id, [...importedIds]))
-        .for("update");
+        .where(inArray(schema.documents.id, [...importedIds]));
       const collections = await tx
         .select({ documentId: schema.contentDatabases.documentId })
         .from(schema.contentDatabases)
@@ -131,20 +142,17 @@ export default defineAction({
       const trashed: string[] = [];
       for (const page of live) {
         if (changed.includes(page)) continue;
+        assertAgentsMayEditPageText(page, ctx);
         // The page's owner now, not at import: moving a page between
         // workspaces makes the mover its owner.
-        const lockedDatabaseIds = await lockDatabasesForTrash(
-          tx,
-          page.id,
-          page.ownerEmail,
-        );
         const subtree = await trashDocumentSubtree(
           tx,
           page.id,
           page.ownerEmail,
           undefined,
-          lockedDatabaseIds,
+          locks,
           ctx?.caller,
+          ctx,
         );
         if (!subtree.includes(page.id)) {
           fail(

@@ -2,12 +2,17 @@ import {
   DESIGN_HTML_INTEGRITY_SUMMARY,
   isDesignHtmlIntegrityError,
 } from "@shared/html-integrity";
+import {
+  SOURCE_VERSION_UNVERIFIABLE_ERROR_CODE,
+  saveErrorCode,
+} from "@shared/save-conflict";
 
 export type DesignSaveFailureKind =
   | "offline"
   | "intentional-abort"
   | "conflict"
   | "invalid-html"
+  | "unverified"
   | "other";
 
 function errorField(error: unknown, field: string): unknown {
@@ -47,6 +52,12 @@ export function classifyDesignSaveFailure(
   const name = errorField(error, "name");
   if (name === "AbortError") return "intentional-abort";
 
+  // The server could not read the file's version at all: nothing is known to
+  // have changed, so this is a retry, not a conflict.
+  if (saveErrorCode(error) === SOURCE_VERSION_UNVERIFIABLE_ERROR_CODE) {
+    return "unverified";
+  }
+
   const status = errorField(error, "status");
   const message = designSaveErrorMessage(error)?.toLowerCase() ?? "";
   if (
@@ -61,6 +72,11 @@ export function classifyDesignSaveFailure(
   if (!navigatorOnline) return "offline";
   // The action client times a stalled request out locally, as status 408.
   if (errorField(error, "timedOut") === true) return "offline";
+  // A 2xx that throws lost its body after the server accepted the write, so
+  // only the outbox replay can settle it; calling it failed rolls back a move.
+  if (typeof status === "number" && status >= 200 && status < 300) {
+    return "offline";
+  }
   // The action client rethrows a fetch rejection as a plain Error with no status.
   const reachedServer = typeof status === "number" && status !== 0;
   if (

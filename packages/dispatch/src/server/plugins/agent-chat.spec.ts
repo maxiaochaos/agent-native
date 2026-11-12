@@ -2,10 +2,18 @@ import { describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   createAgentChatPlugin: vi.fn((options: Record<string, unknown>) => options),
+  registerAgentContextAgentFilter: vi.fn(),
+  hideHostedAppsWhenOff: vi.fn(),
 }));
 
 vi.mock("@agent-native/core/server", () => ({
   createAgentChatPlugin: mocks.createAgentChatPlugin,
+  getBuilderWorkspaceUrl: () => null,
+  registerAgentContextAgentFilter: mocks.registerAgentContextAgentFilter,
+}));
+
+vi.mock("../lib/hosted-apps-settings.js", () => ({
+  hideHostedAppsWhenOff: mocks.hideHostedAppsWhenOff,
 }));
 
 vi.mock("@agent-native/core/org", () => ({
@@ -30,6 +38,7 @@ describe("Dispatch agent chat plugin", () => {
           "list-dispatch-usage-metrics",
         ]),
         mcp: {
+          appApprovalPage: true,
           connectorCatalog: expect.arrayContaining([
             "start-workspace-app-creation",
             "list-dispatch-usage-metrics",
@@ -43,6 +52,29 @@ describe("Dispatch agent chat plugin", () => {
           resolveCaller: expect.any(Function),
         }),
       }),
+    );
+  });
+
+  it("hides hosted apps from its own agent context through the setting", async () => {
+    await import("./agent-chat.js");
+
+    expect(mocks.registerAgentContextAgentFilter).toHaveBeenCalledWith(
+      "dispatch",
+      mocks.hideHostedAppsWhenOff,
+    );
+  });
+
+  it("routes customer credit questions to the owning workspace app", async () => {
+    await import("./agent-chat.js");
+
+    const options = mocks.createAgentChatPlugin.mock.calls[0]?.[0] as {
+      systemPrompt?: string;
+    };
+    expect(options.systemPrompt).toContain(
+      "External customer, account, or company usage, credits, activity, or product data belongs to the relevant app",
+    );
+    expect(options.systemPrompt).toContain(
+      "Do not use this action for external customer/account/company data.",
     );
   });
 });

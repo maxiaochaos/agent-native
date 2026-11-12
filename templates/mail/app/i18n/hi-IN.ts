@@ -34,8 +34,12 @@ const messages = {
       newest: "नवीनतम",
       priority: "प्राथमिकता",
       priorityFailed: "इनबॉक्स को क्रमित नहीं किया जा सका।",
+      priorityProviderRequired:
+        "प्राथमिकता के अनुसार क्रमित करने के लिए किसी AI प्रदाता को कनेक्ट करें।",
+      priorityPartialFailed:
+        "{{count}} संदेशों की प्राथमिकता तय नहीं हो सकी। वे स्कोर किए गए संदेशों के बाद दिखेंगे।",
       priorityScoreHelp:
-        "ज़्यादा स्कोर का मतलब है कि Jev इस संदेश को अधिक महत्वपूर्ण मानता है।",
+        "ज़्यादा स्कोर का मतलब है कि यह संदेश महत्वपूर्ण होने की अधिक संभावना है।",
       priorityFeedbackSuggestion:
         "इस पैटर्न को महत्व या अपने-आप संग्रह करने के नियम में बदलें।",
       priorityFeedbackAskAgent: "एजेंट से नियम सुझाने को कहें",
@@ -302,7 +306,11 @@ const messages = {
       openProviderSettings: "Open {{provider}} Settings",
       apolloDescription: "कॉन्टैक्ट समृद्धि और कंपनी डेटा",
       hubspotDescription: "CRM कॉन्टैक्ट, डील और टिकट",
-      gongDescription: "हाल की कॉल और बातचीत इंटेलिजेंस",
+      gongDescription: "Gong कॉल इतिहास",
+      gongAccessCheckFailed: "Gong से कनेक्ट करने की अनुमति की जाँच नहीं हो सकी।",
+      gongKeyPlaceholder: "Gong API कुंजी",
+      gongKeyFormatHint:
+        "एक्सेस कुंजी और सीक्रेट को access_key:secret प्रारूप में दर्ज करें।",
       pylonDescription: "सपोर्ट समस्याएं और अकाउंट डेटा",
       gongCalls: "Gong कॉल",
       deals: "डील",
@@ -425,6 +433,7 @@ const messages = {
       tryDifferentKeywords: "अलग कीवर्ड आज़माएँ",
       nothingHere: "अभी यहाँ कुछ नहीं",
       loadingMore: "और लोड हो रहा है...",
+      openAllMailForOlder: "पुराने संदेशों के लिए सभी मेल खोलें",
     },
     toasts: {
       noEmailSelected: "कोई ईमेल चयनित नहीं।",
@@ -452,9 +461,20 @@ const messages = {
       scheduledCancelFailed: "शेड्यूल ईमेल रद्द करने में विफल",
       failedToAttachFile: "No se pudo adjuntar el archivo",
       failedToUploadImage: "छवि अपलोड करने में विफल",
+      storageBuilderRefused:
+        "Builder.io ने Mail के फ़ाइल स्टोरेज कनेक्शन को अस्वीकार कर दिया, इसलिए फ़ाइल अटैच नहीं हुई। Builder.io फिर से कनेक्ट करें या अपना स्टोरेज इस्तेमाल करें, फिर दोबारा कोशिश करें।",
+      storageRefused:
+        "आपके स्टोरेज बकेट ने यह अपलोड अस्वीकार कर दिया, इसलिए फ़ाइल अटैच नहीं हुई। बकेट और उसकी कुंजियाँ जाँचें, फिर दोबारा कोशिश करें।",
+      storageNotConfigured:
+        "फ़ाइल स्टोरेज सेट अप नहीं है, इसलिए फ़ाइल अटैच नहीं हुई। Builder.io या अपना स्टोरेज बकेट कनेक्ट करें, फिर दोबारा कोशिश करें।",
+      openStorageSettings: "स्टोरेज सेटिंग्स खोलें",
+      reconnectBuilderStorage: "Builder.io फिर से कनेक्ट करें",
+      useOwnStorage: "अपना स्टोरेज इस्तेमाल करें",
       failedToSendEmail: "No se pudo enviar el email",
       messageSent: "संदेश भेज दिया गया।",
       failedToSaveDraft: "ड्राफ़्ट सहेजा नहीं जा सका।",
+      failedToRefreshInbox:
+        "इनबॉक्स रीफ़्रेश नहीं हो सका। कुछ देर बाद फिर से प्रयास करें।",
       failedToDeleteDraft: "ड्राफ़्ट हटाया नहीं जा सका।",
       failedToScheduleEmailDraftKeptOpen:
         "No se pudo programar el email - borrador abierto",
@@ -701,12 +721,14 @@ const messages = {
       tagTabsHelp: "हर टैग इनबॉक्स टैब बन जाता है",
       addTag: "टैग जोड़ें",
       triageTitle: "AI ट्रायेज",
-      connectJev: "Jev कनेक्ट करें",
-      connectJevToRunTriage: "ट्रायेज चलाने के लिए Jev कनेक्ट करें",
+      connectJev: "AI प्रदाता कनेक्ट करें",
+      connectJevToRunTriage: "ट्रायेज चलाने के लिए AI प्रदाता कनेक्ट करें",
       freeBuilderOrApiKey: "Builder.io के साथ मुफ़्त, या API कुंजी जोड़ें।",
-      jevAvailabilityFailed: "Jev उपलब्ध है या नहीं, इसकी जाँच नहीं हो सकी।",
+      jevAvailabilityFailed:
+        "AI निर्णय प्रदाता उपलब्ध है या नहीं, इसकी जाँच नहीं हो सकी।",
       connectBuilder: "Builder.io इस्तेमाल करें",
-      addJevApiKey: "API कुंजी जोड़ें",
+      addJevApiKey: "Jev API कुंजी जोड़ें",
+      addOpenAiApiKey: "OpenAI API कुंजी जोड़ें",
     },
     draftQueue: {
       title: "Cola de borradores",
@@ -748,6 +770,16 @@ const messages = {
       emailThread: "Conversación de email",
       unableToLoadThread: "No se pudo cargar la conversación",
       openInApp: "Abrir en la app",
+      draft: "ईमेल ड्राफ़्ट - Mail",
+    },
+    draftCard: {
+      loadFailed: "यह ड्राफ़्ट लोड नहीं हो सका।",
+      notFoundTitle: "ड्राफ़्ट नहीं मिला",
+      goneTitle: "यह ड्राफ़्ट भेजा या हटाया जा चुका है।",
+      threadUnavailable: "इस बातचीत के पिछले संदेश लोड नहीं हो सके।",
+      earlierMessages: "पिछले संदेश ({{count}})",
+      sendInMail: "Mail में भेजें",
+      openBlocked: "आपके ब्राउज़र ने नया टैब ब्लॉक कर दिया।",
     },
     agentEngine: {
       activeEngine: "Motor activo",
@@ -904,15 +936,19 @@ const messages = {
     shortcutsList: "ईमेल सूची",
     shortcutsThread: "बातचीत",
     shortcutsCompose: "लिखें",
+    askAi: "AI से पूछें",
     backToCommands: "कमांड पर वापस जाएं",
     backToMessageList: "ईमेल सूची पर लौटें",
     cycleTabs: "टैब बदलें",
     extendSelection: "चयन बढ़ाएँ",
+    goToUnread: "अपठित पर जाएं",
     moveSelection: "चयन पर जाएं",
     nextPreviousConversation: "अगली / पिछली बातचीत",
     nextPreviousMessage: "अगला / पिछला संदेश",
     openMessage: "ईमेल खोलें",
+    pageDownUp: "पेज नीचे / ऊपर",
     selectAllConversations: "सभी बातचीत चुनें",
+    selectConversation: "बातचीत चुनें",
     sendAndMarkDone: "भेजें और पूर्ण के रूप में चिह्नित करें",
     toggleMessageExpansion: "संदेश फैलाएँ / समेटें",
     toggleReadState: "पढ़ने की स्थिति बदलें",

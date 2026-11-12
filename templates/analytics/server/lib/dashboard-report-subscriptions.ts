@@ -4,10 +4,18 @@ import { recordChange } from "@agent-native/core/server";
 import { EMBED_TOKEN_QUERY_PARAM } from "@agent-native/core/shared";
 import { and, asc, eq, isNull, lte, or, sql } from "drizzle-orm";
 
+import { BUILTIN_DASHBOARD_HIDDEN_BY } from "../../shared/builtin-dashboard-ids.js";
+import {
+  isTrafficFilterValue,
+  TRAFFIC_FILTER_ID,
+  TRAFFIC_FILTER_PARAM,
+} from "../../shared/traffic-environment.js";
 import { getDb, schema } from "../db/index.js";
+import type { AnnotationScope } from "./annotation-scope";
 import { repairKnownFirstPartyDashboardQueries } from "./canonical-first-party-dashboard-repair";
-import { loadDashboardSeed } from "./dashboard-seeds";
-import { getDashboard } from "./dashboards-store";
+import { storedDashboardAnnotationScope } from "./dashboard-annotation-scope";
+import { DashboardConflictError } from "./dashboards-store";
+import { openDashboard, type OpenedDashboard } from "./open-dashboard";
 
 export interface ReportSubscriptionInput {
   id?: string;
@@ -63,13 +71,27 @@ export interface ReportDashboard {
   id: string;
   title: string;
   config: Record<string, unknown>;
+  /** Whose key dates the dashboard draws, as its page does. */
+  annotationScope: AnnotationScope;
 }
 
 export async function getReportDashboard(
   dashboardId: string,
   ctx: AccessCtx,
 ): Promise<ReportDashboard | null> {
-  const dashboard = await getDashboard(dashboardId, ctx);
+  return reportDashboardFromOpened(
+    await openDashboard(dashboardId, ctx),
+    dashboardId,
+    ctx,
+  );
+}
+
+function reportDashboardFromOpened(
+  opened: OpenedDashboard | null,
+  dashboardId: string,
+  ctx: AccessCtx,
+): ReportDashboard | null {
+  const dashboard = opened?.saved;
   if (dashboard?.kind === "sql") {
     const config = repairKnownFirstPartyDashboardQueries(
       dashboardId,
@@ -79,18 +101,16 @@ export async function getReportDashboard(
       id: dashboard.id,
       title: dashboard.title,
       config,
+      annotationScope: storedDashboardAnnotationScope(dashboard, ctx).scope,
     };
   }
 
-  const seed = loadDashboardSeed(dashboardId);
-  if (!seed) return null;
+  if (!opened?.builtin) return null;
   return {
-    id: dashboardId,
-    title:
-      typeof seed.name === "string" && seed.name.trim()
-        ? seed.name.trim()
-        : dashboardId,
-    config: seed,
+    id: opened.builtin.id,
+    title: opened.builtin.title,
+    config: opened.builtin.config,
+    annotationScope: ctx,
   };
 }
 
@@ -188,6 +208,33 @@ export function normalizeDashboardReportRecipients(
   return normalized;
 }
 
+/**
+ * A new report saved without a traffic choice starts on what its dashboard
+ * shows. A report that already exists is never given one: without it, it stays
+ * on all traffic until someone switches it.
+ */
+function withDashboardTraffic(
+  filters: Record<string, string> | undefined,
+  config: Record<string, unknown>,
+): Record<string, string> | undefined {
+  if (filters?.[TRAFFIC_FILTER_PARAM]) return filters;
+  const dashboardFilters: unknown[] = Array.isArray(config.filters)
+    ? config.filters
+    : [];
+  const traffic = dashboardFilters.find(
+    (filter): filter is { default: string } =>
+      typeof filter === "object" &&
+      filter !== null &&
+      "id" in filter &&
+      filter.id === TRAFFIC_FILTER_ID &&
+      "default" in filter &&
+      typeof filter.default === "string",
+  );
+  return traffic
+    ? { ...filters, [TRAFFIC_FILTER_PARAM]: traffic.default }
+    : filters;
+}
+
 function normalizeFilters(filters: Record<string, string> | undefined) {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(filters ?? {})) {
@@ -196,6 +243,23 @@ function normalizeFilters(filters: Record<string, string> | undefined) {
     if (k && v) out[k] = v;
   }
   return out;
+}
+
+function assertTrafficFilter(
+  filters: Record<string, string>,
+): Record<string, string> {
+  for (const [key, value] of Object.entries(filters)) {
+    // A report reads only f_ keys, so the bare id would be saved and ignored.
+    if (key === TRAFFIC_FILTER_ID) {
+      throw new Error(
+        `Set traffic as ${TRAFFIC_FILTER_PARAM}; a report doesn't read ${TRAFFIC_FILTER_ID}`,
+      );
+    }
+    if (key === TRAFFIC_FILTER_PARAM && !isTrafficFilterValue(value)) {
+      throw new Error(`${key} must be all, production or beta`);
+    }
+  }
+  return filters;
 }
 
 function assertTimeOfDay(value: string): string {
@@ -419,6 +483,36 @@ export async function listDashboardReportSubscriptions(
   return rows.map(rowToSubscription);
 }
 
+/**
+ * Enabled daily report schedules on a dashboard in the caller's tenant: every
+ * owner's in the caller's org, or only the caller's own without an org. Each
+ * one re-runs the dashboard's panels once a day on its owner's BigQuery
+ * connection, so other tenants' schedules bill other tenants and never count.
+ * Only the number is returned, never the subscriptions themselves.
+ */
+export async function countEnabledDashboardReportSubscriptions(
+  dashboardId: string,
+  ctx: AccessCtx,
+): Promise<number> {
+  const db = getDb() as any;
+  const [row] = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(schema.dashboardReportSubscriptions)
+    .where(
+      and(
+        eq(schema.dashboardReportSubscriptions.dashboardId, dashboardId),
+        eq(schema.dashboardReportSubscriptions.enabled, true),
+        ctx.orgId
+          ? eq(schema.dashboardReportSubscriptions.orgId, ctx.orgId)
+          : and(
+              isNull(schema.dashboardReportSubscriptions.orgId),
+              sql`lower(${schema.dashboardReportSubscriptions.ownerEmail}) = ${ctx.email.toLowerCase()}`,
+            ),
+      ),
+    );
+  return Number(row?.count ?? 0);
+}
+
 export async function getDashboardReportSubscription(
   id: string,
   ctx: AccessCtx,
@@ -435,7 +529,8 @@ export async function saveDashboardReportSubscription(
   input: ReportSubscriptionInput,
   ctx: AccessCtx,
 ): Promise<DashboardReportSubscription> {
-  const dashboard = await getReportDashboard(input.dashboardId, ctx);
+  const opened = await openDashboard(input.dashboardId, ctx);
+  const dashboard = reportDashboardFromOpened(opened, input.dashboardId, ctx);
   if (!dashboard) {
     throw Object.assign(new Error("Dashboard not found"), { statusCode: 404 });
   }
@@ -445,7 +540,13 @@ export async function saveDashboardReportSubscription(
 
   const timeOfDay = assertTimeOfDay(input.timeOfDay);
   const timezone = assertTimezone(input.timezone);
-  const filters = normalizeFilters(input.filters);
+  const filters = assertTrafficFilter(
+    normalizeFilters(
+      input.id
+        ? input.filters
+        : withDashboardTraffic(input.filters, dashboard.config),
+    ),
+  );
   const updatedAt = nowIso();
   const nextRunAt = input.enabled ? nextDailyRunAt(timeOfDay, timezone) : null;
   const name =
@@ -453,51 +554,75 @@ export async function saveDashboardReportSubscription(
   const db = getDb() as any;
   const id = input.id || randomUUID();
 
-  if (input.id) {
-    const existing = await getDashboardReportSubscription(input.id, ctx);
-    if (!existing) {
-      throw Object.assign(new Error("Report subscription not found"), {
-        statusCode: 404,
-      });
+  const saved = await db.transaction(async (tx: any) => {
+    // The deploy pass locks this parent before rechecking subscription references.
+    const [parent] = await tx
+      .select({
+        id: schema.dashboards.id,
+        hiddenBy: schema.dashboards.hiddenBy,
+      })
+      .from(schema.dashboards)
+      .where(eq(schema.dashboards.id, input.dashboardId))
+      .for("update");
+    if (
+      opened?.saved &&
+      (!parent || parent.hiddenBy === BUILTIN_DASHBOARD_HIDDEN_BY)
+    ) {
+      throw new DashboardConflictError(input.dashboardId);
     }
-    await db
-      .update(schema.dashboardReportSubscriptions)
-      .set({
+    if (input.id) {
+      const [existing] = await tx
+        .select()
+        .from(schema.dashboardReportSubscriptions)
+        .where(ownerWhere(ctx, undefined, input.id));
+      if (!existing) {
+        throw Object.assign(new Error("Report subscription not found"), {
+          statusCode: 404,
+        });
+      }
+      await tx
+        .update(schema.dashboardReportSubscriptions)
+        .set({
+          dashboardId: input.dashboardId,
+          name,
+          recipients: JSON.stringify(recipients),
+          slackWebhookUrl,
+          filters: JSON.stringify(filters),
+          timeOfDay,
+          timezone,
+          enabled: input.enabled,
+          nextRunAt,
+          updatedAt,
+          lastError: null,
+        })
+        .where(ownerWhere(ctx, undefined, id));
+    } else {
+      await tx.insert(schema.dashboardReportSubscriptions).values({
+        id,
         dashboardId: input.dashboardId,
         name,
         recipients: JSON.stringify(recipients),
         slackWebhookUrl,
         filters: JSON.stringify(filters),
+        frequency: "daily",
         timeOfDay,
         timezone,
         enabled: input.enabled,
         nextRunAt,
+        createdAt: updatedAt,
         updatedAt,
-        lastError: null,
-      })
-      .where(ownerWhere(ctx, undefined, id));
-  } else {
-    await db.insert(schema.dashboardReportSubscriptions).values({
-      id,
-      dashboardId: input.dashboardId,
-      name,
-      recipients: JSON.stringify(recipients),
-      slackWebhookUrl,
-      filters: JSON.stringify(filters),
-      frequency: "daily",
-      timeOfDay,
-      timezone,
-      enabled: input.enabled,
-      nextRunAt,
-      createdAt: updatedAt,
-      updatedAt,
-      ownerEmail: ctx.email,
-      orgId: ctx.orgId,
-    });
-  }
+        ownerEmail: ctx.email,
+        orgId: ctx.orgId,
+      });
+    }
 
-  const saved = await getDashboardReportSubscription(id, ctx);
-  if (!saved) throw new Error("Failed to save report subscription");
+    const [savedRow] = await tx
+      .select()
+      .from(schema.dashboardReportSubscriptions)
+      .where(ownerWhere(ctx, undefined, id));
+    if (!savedRow) throw new Error("Failed to save report subscription");
+    return rowToSubscription(savedRow);
+  });
   recordChange({
     source: "dashboard-report-subscriptions",
     type: "change",

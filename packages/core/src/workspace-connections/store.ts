@@ -18,7 +18,9 @@ import {
   ensureIndexExists,
   ensureTableExists,
 } from "../db/ddl-guard.js";
-import { retainRequestDbPoolScope } from "../db/request-pool-context.js";
+import { sql } from "../db/sql.js";
+import { defineStore } from "../db/store-registry.js";
+import { fromMigrationEntries } from "../db/versioned-store-migrations.js";
 import {
   getRequestOrgId,
   getRequestUserEmail,
@@ -30,6 +32,10 @@ import {
   workspaceUserGroupsIncludeUser,
 } from "./groups.js";
 import { notifyWorkspaceConnectionLifecycle } from "./lifecycle.js";
+import {
+  WORKSPACE_CONNECTIONS_MIGRATIONS,
+  WORKSPACE_CONNECTIONS_MIGRATIONS_TABLE,
+} from "./migrations.js";
 
 export type WorkspaceConnectionStatus =
   | "connected"
@@ -117,6 +123,8 @@ export interface ResolveWorkspaceConnectionForAppOptions extends ListWorkspaceCo
   accountId?: string;
   connectionOwnerEmail?: string;
   requireConnected?: boolean;
+  /** @internal Alternative OAuth scope sets used by the provider API runtime. */
+  requiredScopeSets?: readonly (readonly string[])[];
 }
 
 export interface UpsertWorkspaceConnectionInput {
@@ -327,8 +335,6 @@ export interface WorkspaceConnectionProviderCatalogForApp {
   };
 }
 
-let _initPromise: Promise<void> | undefined;
-
 function workspaceConnectionsTable(): string {
   return "public.workspace_connections";
 }
@@ -337,13 +343,16 @@ function workspaceConnectionGrantsTable(): string {
   return "public.workspace_connection_grants";
 }
 
-export async function ensureWorkspaceConnectionsTable(): Promise<void> {
-  if (!_initPromise) {
-    const _initPromiseWithRequestDbPoolScope = (async () => {
-      const table = workspaceConnectionsTable();
-      const grantsTable = workspaceConnectionGrantsTable();
+export const workspaceConnectionsStore = defineStore({
+  id: "workspace_connections",
+  migrations: [
+    {
+      name: "baseline",
+      run: async () => {
+        const table = workspaceConnectionsTable();
+        const grantsTable = workspaceConnectionGrantsTable();
 
-      const createConnectionsSql = `
+        const createConnectionsSql = `
           CREATE TABLE IF NOT EXISTS ${table} (
             id TEXT PRIMARY KEY,
             provider TEXT NOT NULL DEFAULT '',
@@ -366,7 +375,7 @@ export async function ensureWorkspaceConnectionsTable(): Promise<void> {
             last_error TEXT
           )
         `;
-      const createGrantsSql = `
+        const createGrantsSql = `
           CREATE TABLE IF NOT EXISTS ${grantsTable} (
             id TEXT PRIMARY KEY,
             connection_id TEXT NOT NULL DEFAULT '',
@@ -384,7 +393,6 @@ export async function ensureWorkspaceConnectionsTable(): Promise<void> {
           )
         `;
 
-      {
         await ensureTableExists("workspace_connections", createConnectionsSql);
         await ensureColumnExists(
           "workspace_connections",
@@ -558,15 +566,17 @@ export async function ensureWorkspaceConnectionsTable(): Promise<void> {
           "idx_workspace_connection_grants_updated_at",
           `CREATE INDEX IF NOT EXISTS idx_workspace_connection_grants_updated_at ON ${grantsTable} (updated_at)`,
         );
-        return;
-      }
-    })().catch((err) => {
-      _initPromise = undefined;
-      throw err;
-    });
-    _initPromise = retainRequestDbPoolScope(_initPromiseWithRequestDbPoolScope);
-  }
-  return _initPromise;
+      },
+    },
+    ...fromMigrationEntries(
+      WORKSPACE_CONNECTIONS_MIGRATIONS_TABLE,
+      WORKSPACE_CONNECTIONS_MIGRATIONS.filter((entry) => entry.version <= 7),
+    ),
+  ],
+});
+
+export function ensureWorkspaceConnectionsTable(): Promise<void> {
+  return workspaceConnectionsStore.ready();
 }
 
 function requireWorkspaceConnectionScope(): {
@@ -980,8 +990,14 @@ function connectionForApp(
   connection: SerializedWorkspaceConnection,
   appId: string,
   grants: SerializedWorkspaceConnectionGrant[],
+  requiredScopeSets?: readonly (readonly string[])[],
 ): WorkspaceConnectionForApp {
   const normalizedAppId = appId.trim();
+  const explicitGrant = explicitGrantForConnection(
+    connection.id,
+    grants,
+    normalizedAppId,
+  );
   const appAccess = getWorkspaceConnectionAppAccess(
     connection,
     normalizedAppId,
@@ -992,32 +1008,70 @@ function connectionForApp(
     status: connectionStatusForProvider(
       getWorkspaceConnectionProvider(connection.provider),
       connection,
+      requiredScopeSets,
+      explicitGrant?.scopes,
     ),
     appAccess,
-    explicitGrant:
-      explicitGrantForConnection(connection.id, grants, normalizedAppId) ??
-      null,
+    explicitGrant: explicitGrant ?? null,
   };
 }
 
 function connectionStatusForProvider(
   provider: WorkspaceConnectionProviderLike | null | undefined,
   connection: SerializedWorkspaceConnection,
+  requiredScopeSets?: readonly (readonly string[])[],
+  appGrantScopes?: readonly string[],
 ): WorkspaceConnectionStatus {
   const grantedScopes = new Set(connection.scopes.map(normalizeOAuthScope));
+  const missingAppGrantScopes =
+    appGrantScopes !== undefined &&
+    ((appGrantScopes.length === 0 &&
+      (provider?.oauth?.scopes.length ?? 0) > 0) ||
+      appGrantScopes.some(
+        (scope) => !grantedScopes.has(normalizeOAuthScope(scope)),
+      ));
+  const missingProviderScopes =
+    requiredScopeSets === undefined && appGrantScopes !== undefined
+      ? false
+      : requiredScopeSets === undefined
+        ? provider?.oauth?.scopes.some(
+            (scope) => !grantedScopes.has(normalizeOAuthScope(scope)),
+          )
+        : !requiredScopeSets.some(
+            (scopeSet) =>
+              scopeSet.length > 0 &&
+              scopeSet.every((scope) =>
+                grantedScopes.has(normalizeOAuthScope(scope)),
+              ),
+          );
   if (
     connection.status === "connected" &&
     connection.config.credentialMode === "oauth" &&
-    provider?.oauth?.scopes.some(
-      (scope) => !grantedScopes.has(normalizeOAuthScope(scope)),
-    )
+    (missingAppGrantScopes || missingProviderScopes)
   ) {
     return "needs_reauth";
   }
   return connection.status;
 }
 
-function normalizeOAuthScope(scope: string): string {
+function connectionStatusForApp(
+  provider: WorkspaceConnectionProviderLike | null | undefined,
+  connection: SerializedWorkspaceConnection,
+  grants: SerializedWorkspaceConnectionGrant[],
+  appId?: string,
+): WorkspaceConnectionStatus {
+  const appGrant = appId
+    ? explicitGrantForConnection(connection.id, grants, appId)
+    : undefined;
+  return connectionStatusForProvider(
+    provider,
+    connection,
+    undefined,
+    appGrant?.scopes,
+  );
+}
+
+export function normalizeOAuthScope(scope: string): string {
   if (scope === "https://www.googleapis.com/auth/userinfo.email") {
     return "email";
   }
@@ -1115,8 +1169,12 @@ export function summarizeWorkspaceConnectionProviderForApp({
   );
   const connectedConnections = grantedConnections.filter(
     (connection) =>
-      connectionStatusForProvider(providerDefinition, connection) ===
-      "connected",
+      connectionStatusForApp(
+        providerDefinition,
+        connection,
+        grants,
+        normalizedAppId,
+      ) === "connected",
   );
   const ungrantedConnectionCount =
     allConnections.length - grantedConnections.length;
@@ -1184,14 +1242,24 @@ export function summarizeWorkspaceConnectionProviderForApp({
     lastUsedAt,
     statuses: uniqueStrings(
       allConnections.map((connection) =>
-        connectionStatusForProvider(providerDefinition, connection),
+        connectionStatusForApp(
+          providerDefinition,
+          connection,
+          grants,
+          normalizedAppId,
+        ),
       ),
     ) as WorkspaceConnectionStatus[],
     connections: visibleConnections.map((connection) =>
       serializeConnectionForApp(
         {
           ...connection,
-          status: connectionStatusForProvider(providerDefinition, connection),
+          status: connectionStatusForApp(
+            providerDefinition,
+            connection,
+            grants,
+            normalizedAppId,
+          ),
         },
         normalizedAppId,
         grants,
@@ -1244,8 +1312,9 @@ export function summarizeWorkspaceConnectionProviderReadiness({
   );
   const attentionConnections = activeConnections.filter(
     (connection) =>
-      connectionStatusForProvider(provider, connection) === "error" ||
-      connectionStatusForProvider(provider, connection) === "needs_reauth" ||
+      connectionStatusForApp(provider, connection, grants, appId) === "error" ||
+      connectionStatusForApp(provider, connection, grants, appId) ===
+        "needs_reauth" ||
       Boolean(connection.lastError),
   );
   const missingKeys = uniqueStrings(
@@ -1259,7 +1328,8 @@ export function summarizeWorkspaceConnectionProviderReadiness({
   );
   const readyConnections = activeConnections.filter(
     (connection) =>
-      connectionStatusForProvider(provider, connection) === "connected" &&
+      connectionStatusForApp(provider, connection, grants, appId) ===
+        "connected" &&
       missingRequiredCredentialKeys(
         provider,
         connection,
@@ -1396,6 +1466,7 @@ export async function resolveWorkspaceConnectionForApp({
   accountId,
   connectionOwnerEmail,
   requireConnected = false,
+  requiredScopeSets,
 }: ResolveWorkspaceConnectionForAppOptions): Promise<ResolvedWorkspaceConnectionForApp> {
   const normalizedAppId = normalizeRequiredString(
     appId,
@@ -1453,6 +1524,7 @@ export async function resolveWorkspaceConnectionForApp({
       connection,
       normalizedAppId,
       grants,
+      requiredScopeSets,
     );
 
     if (!connectionWithAccess.appAccess.available) {
@@ -1507,6 +1579,48 @@ export async function resolveWorkspaceConnectionForApp({
       ? `No available ${provider} workspace connection was found for ${normalizedAppId}.`
       : `No available workspace connection was found for ${normalizedAppId}.`,
   };
+}
+
+export interface ResolveWorkspaceConnectionsForAppOptions {
+  appId: string;
+  provider: string;
+  includeDisabled?: boolean;
+}
+
+// Every connection the request user may use for an app, loaded once: one
+// connection list, one user-scope filter, one grant list. A row the user cannot
+// reach or the app is not granted is absent, the same rule that
+// resolveWorkspaceConnectionForApp applies to a single id.
+export async function resolveWorkspaceConnectionsForApp({
+  appId,
+  provider,
+  includeDisabled = false,
+}: ResolveWorkspaceConnectionsForAppOptions): Promise<
+  WorkspaceConnectionForApp[]
+> {
+  const normalizedAppId = normalizeRequiredString(
+    appId,
+    "resolveWorkspaceConnectionsForApp appId",
+  );
+  const scope = requireWorkspaceConnectionScope();
+  const requestedConnections = await listWorkspaceConnections({
+    provider,
+    includeDisabled,
+  });
+  const userConnections = await filterWorkspaceConnectionsForUser(
+    requestedConnections,
+    scope,
+  );
+  const grants = await listWorkspaceConnectionGrants({
+    provider,
+    appId: normalizedAppId,
+  });
+  return userConnections
+    .map((connection) => connectionForApp(connection, normalizedAppId, grants))
+    .filter((connection) => connection.appAccess.available)
+    .filter(
+      (connection) => includeDisabled || connection.status !== "disabled",
+    );
 }
 
 async function getGrantedConnectionIdsForApp(
@@ -1601,6 +1715,37 @@ export async function getWorkspaceConnection(
   });
   if (rows.length === 0) return null;
   return parseRow(rows[0] as Record<string, unknown>);
+}
+
+export async function setWorkspaceConnectionAgentDiscoveryPreference(
+  id: string,
+  includeInAgentDiscovery: boolean,
+): Promise<void> {
+  const normalizedId = id.trim();
+  if (!normalizedId) {
+    throw new Error(
+      "setWorkspaceConnectionAgentDiscoveryPreference requires a connection id.",
+    );
+  }
+  await ensureWorkspaceConnectionsTable();
+  const client = getDbExec();
+  const scope = requireWorkspaceConnectionScope();
+  const where = scope.orgId
+    ? sql`org_id = ${sql.value(scope.orgId)}`
+    : sql`owner_email = ${sql.value(scope.ownerEmail)} AND org_id IS NULL`;
+  const update = await client.execute(sql`UPDATE public.workspace_connections
+      SET config_json = jsonb_set(
+        COALESCE(config_json::jsonb, '{}'::jsonb),
+        '{includeInAgentDiscovery}',
+        to_jsonb(${sql.value(includeInAgentDiscovery)}::boolean),
+        true
+      )::text
+      WHERE id = ${sql.value(normalizedId)} AND ${where}`);
+  if (update.rowsAffected === 0) {
+    throw new Error(
+      `Workspace connection "${normalizedId}" was not found in the current request scope.`,
+    );
+  }
 }
 
 export async function upsertWorkspaceConnection(

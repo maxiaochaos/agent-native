@@ -169,6 +169,42 @@ const mockDb: any = {
       return { rows: [], rowsAffected: 0 };
     }
 
+    if (/UPDATE agent_runs\s+SET thread_projection_pending = TRUE/i.test(sql)) {
+      const [id] = args;
+      const row = rows.find(
+        (candidate) => candidate.id === id && candidate.status === "errored",
+      );
+      return row
+        ? { rows: [{ id }], rowsAffected: 1 }
+        : { rows: [], rowsAffected: 0 };
+    }
+
+    if (
+      /SELECT thread_id, COALESCE\(turn_id, id\) AS turn_id FROM agent_runs WHERE id = \?/i.test(
+        sql,
+      )
+    ) {
+      const row = rows.find((candidate) => candidate.id === args[0]);
+      return {
+        rows: row
+          ? [{ thread_id: row.thread_id, turn_id: row.turn_id ?? row.id }]
+          : [],
+        rowsAffected: 0,
+      };
+    }
+
+    if (
+      /SELECT status, worker_generation FROM agent_runs WHERE id = \?/i.test(
+        sql,
+      )
+    ) {
+      const row = rows.find((candidate) => candidate.id === args[0]);
+      return {
+        rows: row ? [{ status: row.status, worker_generation: null }] : [],
+        rowsAffected: 0,
+      };
+    }
+
     if (/SELECT status FROM agent_runs WHERE id = \?/i.test(sql)) {
       const row = rows.find((r) => r.id === args[0]);
       return {
@@ -203,7 +239,10 @@ const mockDb: any = {
       return { rows: [], rowsAffected: 0 };
     }
     if (/INSERT INTO agent_run_events/i.test(sql)) {
-      return { rows: [], rowsAffected: 1 };
+      return {
+        rows: /\bRETURNING\b/i.test(sql) ? [{ seq: args[1] }] : [],
+        rowsAffected: 1,
+      };
     }
 
     return { rows: [], rowsAffected: 0 };
@@ -213,11 +252,13 @@ const mockDb: any = {
 
 vi.mock("../db/client.js", () => ({
   getDbExec: () => mockDb,
+  getScopedDbExec: () => undefined,
 }));
 
 vi.mock("../db/ddl-guard.js", () => ({
   ensureColumnExists: vi.fn().mockResolvedValue(undefined),
   ensureTableExists: vi.fn().mockResolvedValue(undefined),
+  ensureIndexExists: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../server/capture-error.js", () => ({
@@ -372,6 +413,56 @@ describe("run-store durable background", () => {
       expect(parsed.stage).toBe(RUN_DIAG_STAGE.authFailed);
       expect(parsed.detail).toBe("status=401");
       expect(typeof parsed.at).toBe("number");
+    });
+
+    it("stores route failure evidence separately from raw diagnostic detail", async () => {
+      await insertRun("r-route-diag", "t1", "turn", {
+        dispatchMode: "background",
+      });
+      await recordRunDiagnostic(
+        "r-route-diag",
+        RUN_DIAG_STAGE.routeThrew,
+        "errorCode=customer_secret failure=raw detail",
+        {
+          format: "route_failure_v1",
+          errorName: "Error",
+          errorCode: "dispatch_timeout",
+        },
+      );
+      const stored = rows.find((r) => r.id === "r-route-diag")!.diag_stage!;
+      const parsed = JSON.parse(stored);
+      expect(parsed.detail).toBe(
+        "errorCode=customer_secret failure=raw detail",
+      );
+      expect(parsed.evidence).toEqual({
+        format: "route_failure_v1",
+        errorName: "Error",
+        errorCode: "dispatch_timeout",
+      });
+    });
+
+    it("keeps quote-heavy diagnostic details valid within the storage limit", async () => {
+      await insertRun("r-quoted-route-diag", "t1", "turn", {
+        dispatchMode: "background",
+      });
+      const evidence = {
+        format: "route_failure_v1" as const,
+        errorName: "Error",
+      };
+      await recordRunDiagnostic(
+        "r-quoted-route-diag",
+        RUN_DIAG_STAGE.routeThrew,
+        '"'.repeat(1500),
+        evidence,
+      );
+      const stored = rows.find(
+        (r) => r.id === "r-quoted-route-diag",
+      )!.diag_stage!;
+      const parsed = JSON.parse(stored);
+      expect(stored.length).toBeLessThanOrEqual(2000);
+      expect(parsed.stage).toBe(RUN_DIAG_STAGE.routeThrew);
+      expect(parsed.evidence).toEqual(evidence);
+      expect(parsed.detail.length).toBeLessThan(1500);
     });
 
     it("is a no-op for an empty runId and never throws", async () => {

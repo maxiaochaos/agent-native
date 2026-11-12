@@ -12,13 +12,32 @@ import { assertAccess, resolveAccess } from "@agent-native/core/sharing";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 
 import { isBoardFile } from "../shared/board-file.js";
-import { ensureCodeLayerNodeIdsInHtml } from "../shared/code-layer.js";
+import {
+  ensureCodeLayerNodeIdsInHtml,
+  reconcileIntroducedIdsInHtml,
+} from "../shared/code-layer.js";
+import { parseDesignDataBlob } from "../shared/full-app.js";
 import { isStandaloneHttpUrl } from "../shared/html-content.js";
 import {
   assertDesignHtmlEditIntegrity,
   isDesignHtmlIntegrityError,
 } from "../shared/html-integrity.js";
+import { assertHubSpotEmailFileType } from "../shared/hubspot-email-authoring.js";
+import { isHubSpotEmailHtml } from "../shared/hubspot-email.js";
 import { assertLockedLayersPreserved } from "../shared/locked-layers.js";
+import {
+  SOURCE_FILE_NOT_FOUND_ERROR_CODE,
+  SOURCE_VERSION_CONFLICT_ERROR_CODE,
+  SOURCE_VERSION_UNVERIFIABLE_ERROR_CODE,
+} from "../shared/save-conflict.js";
+import {
+  frameTypeFromStored,
+  sourceWriteFrameType,
+  resolveScreenFrameType,
+  storedScreenFrameType,
+  withScreenFrameTypeLayout,
+  type StoredScreenFrameType,
+} from "../shared/screen-frame-type.js";
 import { designSourceTypeFromData } from "../shared/source-mode.js";
 import type { DesignSourceType } from "../shared/source-mode.js";
 import {
@@ -27,7 +46,15 @@ import {
   sourceContentHash,
 } from "../shared/source-workspace.js";
 import { getDb, schema } from "./db/index.js";
+import { failOnSourceInputError } from "./lib/fail-on-source-input-error.js";
+import {
+  LegacyEmailFrameTypeNotStoredError,
+  writeWithLegacyEmailFrameTypes,
+} from "./lib/legacy-email-frame-type.js";
+import { readDesignDataForUpdate } from "./lib/screen-frame-type-store.js";
 import "./db/index.js";
+
+type LegacyEmailIds = ReadonlySet<string>;
 
 export interface SourceWorkspaceFile {
   id: string;
@@ -319,20 +346,41 @@ export async function resolveSourceWorkspace(
   };
 }
 
+export async function loadSelectedSourceWorkspaceFile(
+  file: SourceWorkspaceFile,
+): Promise<SourceWorkspaceFile | null> {
+  const [selected] = await getDb()
+    .select({ content: schema.designFiles.content })
+    .from(schema.designFiles)
+    .where(
+      and(
+        eq(schema.designFiles.id, file.id),
+        eq(schema.designFiles.designId, file.designId),
+      ),
+    )
+    .limit(1);
+  return selected ? { ...file, content: selected.content } : null;
+}
+
 export function findSourceWorkspaceFile(
   files: SourceWorkspaceFile[],
   target: { fileId?: string; path?: string },
 ): SourceWorkspaceFile {
   const normalizedPath =
-    target.path !== undefined ? normalizeInlineSourcePath(target.path) : null;
+    target.path !== undefined
+      ? failOnSourceInputError(() =>
+          normalizeInlineSourcePath(target.path as string),
+        )
+      : null;
   const file = target.fileId
     ? files.find((candidate) => candidate.id === target.fileId)
     : files.find((candidate) => candidate.filename === normalizedPath);
   if (!file) {
-    throw new Error(
+    fail(
       target.fileId
         ? `Source file id "${target.fileId}" not found.`
         : `Source file "${normalizedPath}" not found.`,
+      { statusCode: 404, errorCode: SOURCE_FILE_NOT_FOUND_ERROR_CODE },
     );
   }
   return file;
@@ -356,9 +404,7 @@ export async function readLiveSourceFile(file: SourceWorkspaceFile): Promise<{
       source = "collab";
     }
   } catch {
-    throw new SourceWorkspaceEditConflictError(
-      "Could not verify a source file's live version. Re-read the design and retry.",
-    );
+    throw sourceVersionUnverifiable();
   }
   return {
     content,
@@ -382,18 +428,27 @@ export async function readLiveSourceFile(file: SourceWorkspaceFile): Promise<{
  * and the live document is either the persisted base it was derived from or
  * the working copy itself (for callers that already published it to Yjs).
  * Any third live value is a genuine concurrent edit and fails closed. The
- * returned live hash must be passed to `writeInlineSourceFile`, whose
- * read-check-write lock closes the race after this preparation step.
+ * returned live hash must be passed to `writeInlineSourceFile`. A caller may
+ * also supply the working-copy hash, accepted only when live source now
+ * exactly matches that copy.
  */
 export class SourceWorkspaceEditConflictError extends Error {
   readonly statusCode = 409;
 
   constructor(
     message = "Source file changed since the editor snapshot was prepared.",
+    readonly errorCode: string = SOURCE_VERSION_CONFLICT_ERROR_CODE,
   ) {
     super(message);
     this.name = "SourceWorkspaceEditConflictError";
   }
+}
+
+function sourceVersionUnverifiable(): SourceWorkspaceEditConflictError {
+  return new SourceWorkspaceEditConflictError(
+    "Could not verify a source file's live version. Re-read the design and retry.",
+    SOURCE_VERSION_UNVERIFIABLE_ERROR_CODE,
+  );
 }
 
 export function readPreparedSourceText(
@@ -406,9 +461,7 @@ export function readPreparedSourceText(
     }
     return content;
   } catch {
-    throw new SourceWorkspaceEditConflictError(
-      "Could not verify a source file's live version. Re-read the design and retry.",
-    );
+    throw sourceVersionUnverifiable();
   }
 }
 
@@ -424,9 +477,7 @@ export async function lockPreparedSourceCollaboration(
       args: [fileId],
     })) as { rows: unknown[] };
   } catch {
-    throw new SourceWorkspaceEditConflictError(
-      "Could not verify a source file's live version. Re-read the design and retry.",
-    );
+    throw sourceVersionUnverifiable();
   }
 
   const row = result.rows[0] as
@@ -476,12 +527,17 @@ export async function prepareInlineSourceEdit(args: {
       "A source revision is required with current editor content.",
     );
   }
-  if (!args.file.updatedAt || args.revision !== args.file.updatedAt) {
+  if (!args.file.updatedAt) {
     throw new SourceWorkspaceEditConflictError();
   }
 
+  const revisionMatches = args.revision === args.file.updatedAt;
   const persistedVersionHash = sourceContentHash(args.file.content ?? "");
   const workingVersionHash = sourceContentHash(args.currentContent);
+  // A lagging editor timestamp is safe only when it already holds the live bytes.
+  if (!revisionMatches && workingVersionHash !== live.versionHash) {
+    throw new SourceWorkspaceEditConflictError();
+  }
   if (
     live.versionHash !== persistedVersionHash &&
     live.versionHash !== workingVersionHash
@@ -495,19 +551,45 @@ export async function prepareInlineSourceEdit(args: {
   };
 }
 
-export async function writeInlineSourceFile(args: {
-  designId: string;
-  file: SourceWorkspaceFile;
+export async function writeInlineSourceFile(
+  args: Parameters<typeof writeInlineSourceFileContent>[0],
+): ReturnType<typeof writeInlineSourceFileContent> {
+  return writeWithLegacyEmailFrameTypes({
+    designId: args.designId,
+    markedFileIds:
+      args.frameType === undefined &&
+      isHubSpotEmailHtml(args.file.content ?? "")
+        ? [args.file.id]
+        : [],
+    write: (storedLegacyEmailIds) =>
+      writeInlineSourceFileContent(args, storedLegacyEmailIds),
+  });
+}
+
+async function writeInlineSourceFileContent(
+  args: {
+    designId: string;
+    file: SourceWorkspaceFile;
+    content: string;
+    expectedVersionHash?: string;
+    expectedWorkingCopyHash?: string;
+    identityOnly?: boolean;
+    operationSource?: string;
+    operationRevision?: number;
+    allowUrlBackedTransition?: boolean;
+    /** Stored with the content, in the same transaction. */
+    frameType?: StoredScreenFrameType;
+  },
+  storedLegacyEmailIds: LegacyEmailIds,
+): Promise<{
   content: string;
-  expectedVersionHash?: string;
-  identityOnly?: boolean;
-  operationSource?: string;
-  operationRevision?: number;
-  allowUrlBackedTransition?: boolean;
-}): Promise<{ versionHash: string; changed: boolean; updatedAt: string }> {
+  versionHash: string;
+  changed: boolean;
+  updatedAt: string;
+}> {
   return withPreparedSourceFileMutation(args.file.id, "agent", async (lease) =>
     withDesignSourceMutationTransaction(args.designId, async (tx) => {
-      await assertAccess("design", args.designId, "editor");
+      const access = await assertAccess("design", args.designId, "editor");
       const [currentFile] = await tx
         .select({
           id: schema.designFiles.id,
@@ -532,9 +614,7 @@ export async function writeInlineSourceFile(args: {
       try {
         hasCollaborationState = await hasCollabState(args.file.id);
       } catch {
-        throw new SourceWorkspaceEditConflictError(
-          "Could not verify a source file's live version. Re-read the design and retry.",
-        );
+        throw sourceVersionUnverifiable();
       }
       const needsCollabSeed =
         !hasCollaborationState || lease.baseVersion === null;
@@ -547,6 +627,39 @@ export async function writeInlineSourceFile(args: {
         content: liveContent,
         versionHash: sourceContentHash(liveContent),
       };
+      let storedFrameType:
+        | { value: ReturnType<typeof storedScreenFrameType> }
+        | undefined;
+      const readStoredFrameType = () =>
+        (storedFrameType ??= {
+          value: storedScreenFrameType(
+            parseDesignDataBlob(access.resource.data),
+            args.file.id,
+          ),
+        }).value;
+      const requestedFrameType = args.frameType;
+      const frameTypeFor = (content: string) =>
+        requestedFrameType !== undefined
+          ? {
+              frameType: frameTypeFromStored(requestedFrameType),
+              unstoredLegacyMarker: false,
+            }
+          : sourceWriteFrameType({
+              readStored: readStoredFrameType,
+              previousContents: [current.content, currentFile.content],
+              nextContent: content,
+            });
+      if (
+        frameTypeFor(args.content).unstoredLegacyMarker &&
+        !storedLegacyEmailIds.has(args.file.id)
+      ) {
+        throw new LegacyEmailFrameTypeNotStoredError(args.file.id);
+      }
+      const assertEmailCandidate = (content: string) =>
+        assertHubSpotEmailFileType({
+          fileType: currentFile.fileType ?? args.file.fileType ?? "html",
+          frameType: frameTypeFor(content).frameType,
+        });
       const validatePreparedNoop = async () => {
         const preparedCollaboration = await lockPreparedSourceCollaboration(
           getDesignSourceMutationExec(tx),
@@ -572,11 +685,17 @@ export async function writeInlineSourceFile(args: {
       let identityOnlyOperationSource: string | undefined;
       let identityOnlyOperationRevision: number | undefined;
       const liveBaseHash = current.versionHash;
+      const liveMatchesPreparedWorkingCopy =
+        !identityOnly &&
+        args.expectedVersionHash !== undefined &&
+        args.expectedWorkingCopyHash !== undefined &&
+        args.expectedWorkingCopyHash === current.versionHash;
 
       if (
-        args.expectedVersionHash &&
+        args.expectedVersionHash !== undefined &&
         !identityOnly &&
-        args.expectedVersionHash !== current.versionHash
+        args.expectedVersionHash !== current.versionHash &&
+        !liveMatchesPreparedWorkingCopy
       ) {
         throw new SourceWorkspaceEditConflictError(
           "Source file changed since it was read. Re-read the file and retry.",
@@ -631,6 +750,7 @@ export async function writeInlineSourceFile(args: {
         if (exactPersistedOperation) {
           await validatePreparedNoop();
           return {
+            content: current.content,
             versionHash: candidateHash,
             changed: false,
             updatedAt: currentFile.updatedAt ?? new Date().toISOString(),
@@ -674,21 +794,28 @@ export async function writeInlineSourceFile(args: {
         }
       }
 
-      const changed = args.content !== current.content;
+      // An edit that copies an element repeats its ids. The editor re-stamps
+      // them only while a tab is mounted, so reconcile before persisting.
+      const content = identityOnly
+        ? args.content
+        : reconcileIntroducedIdsInHtml(current.content, args.content).content;
+
+      assertEmailCandidate(content);
+      const changed = content !== current.content;
       const updatedAt = new Date().toISOString();
       if (!changed && !identityOnly) {
         await validatePreparedNoop();
         return {
+          content: current.content,
           versionHash: current.versionHash,
           changed: false,
           updatedAt: currentFile.updatedAt ?? updatedAt,
         };
       }
 
-      if (!identityOnly)
-        assertLockedLayersPreserved(current.content, args.content);
+      if (!identityOnly) assertLockedLayersPreserved(current.content, content);
       const assertCandidateIntegrity = (candidate: string) => {
-        if (identityOnly && candidate !== args.content) {
+        if (identityOnly && candidate !== content) {
           throw new SourceWorkspaceEditConflictError(
             "A concurrent source edit prevented identity-only publication.",
           );
@@ -704,12 +831,13 @@ export async function writeInlineSourceFile(args: {
           filename: currentFile.filename ?? args.file.filename,
         });
       };
-      assertCandidateIntegrity(args.content);
+      assertCandidateIntegrity(content);
 
       const liveBeforeApply = readPreparedSourceText(lease);
-      const expectedLiveHash = identityOnly
-        ? liveBaseHash
-        : args.expectedVersionHash;
+      const expectedLiveHash =
+        identityOnly || liveMatchesPreparedWorkingCopy
+          ? liveBaseHash
+          : args.expectedVersionHash;
       if (
         expectedLiveHash &&
         expectedLiveHash !== sourceContentHash(liveBeforeApply)
@@ -718,13 +846,14 @@ export async function writeInlineSourceFile(args: {
           "Source file changed since it was read. Re-read the file and retry.",
         );
       }
-      if (liveBeforeApply !== args.content) {
-        applyTextToYDoc(lease.doc, "content", args.content, "agent");
+      if (liveBeforeApply !== content) {
+        applyTextToYDoc(lease.doc, "content", content, "agent");
       }
 
       const authoritativeContent = readPreparedSourceText(lease);
       try {
-        if (identityOnly && authoritativeContent !== args.content) {
+        assertEmailCandidate(authoritativeContent);
+        if (identityOnly && authoritativeContent !== content) {
           throw new SourceWorkspaceEditConflictError(
             "A concurrent source edit prevented identity-only publication.",
           );
@@ -843,12 +972,38 @@ export async function writeInlineSourceFile(args: {
         throw error;
       }
 
+      let frameTypeData: string | undefined;
+      if (requestedFrameType !== undefined) {
+        const designData = await readDesignDataForUpdate(tx, args.designId);
+        if (
+          storedScreenFrameType(designData, args.file.id) !== requestedFrameType
+        ) {
+          // The type's layout commits with it, so a stored email type never
+          // sits on web geometry if a later layout pass fails.
+          frameTypeData = JSON.stringify(
+            withScreenFrameTypeLayout(
+              designData,
+              args.file.id,
+              requestedFrameType,
+              resolveScreenFrameType({
+                designData,
+                fileId: args.file.id,
+                content: current.content,
+              }),
+            ),
+          );
+        }
+      }
       await tx
         .update(schema.designs)
-        .set({ updatedAt })
+        .set({
+          updatedAt,
+          ...(frameTypeData === undefined ? {} : { data: frameTypeData }),
+        })
         .where(eq(schema.designs.id, args.designId));
 
       return {
+        content: authoritativeContent,
         versionHash: sourceContentHash(authoritativeContent),
         changed: authoritativeContent !== current.content,
         updatedAt,
@@ -862,16 +1017,31 @@ export type InlineSourceBatchCollaborationFileStatus = {
   status: "synced";
 };
 
-export async function writeInlineSourceFilesBatch(args: {
-  designId: string;
-  files: Array<{
-    file: SourceWorkspaceFile;
-    content: string;
-    expectedVersionHash: string;
-  }>;
-  expectedHtmlFileIds?: readonly string[];
-  afterFilesPersist?: (tx: DbExec, updatedAt: string) => Promise<void>;
-}): Promise<{
+export async function writeInlineSourceFilesBatch(
+  args: Parameters<typeof writeInlineSourceFilesBatchContent>[0],
+): ReturnType<typeof writeInlineSourceFilesBatchContent> {
+  return writeWithLegacyEmailFrameTypes({
+    designId: args.designId,
+    markedFileIds: args.files.flatMap(({ file }) =>
+      isHubSpotEmailHtml(file.content ?? "") ? [file.id] : [],
+    ),
+    write: (stored) => writeInlineSourceFilesBatchContent(args, stored),
+  });
+}
+
+async function writeInlineSourceFilesBatchContent(
+  args: {
+    designId: string;
+    files: Array<{
+      file: SourceWorkspaceFile;
+      content: string;
+      expectedVersionHash: string;
+    }>;
+    expectedHtmlFileIds?: readonly string[];
+    afterFilesPersist?: (tx: DbExec, updatedAt: string) => Promise<void>;
+  },
+  stored: LegacyEmailIds,
+): Promise<{
   files: Array<{
     id: string;
     versionHash: string;
@@ -926,7 +1096,11 @@ export async function writeInlineSourceFilesBatch(args: {
   };
 
   return withLocks(0, async () => {
+    const previousContentsById = new Map<string, Array<string | null>>();
     const access = await assertAccess("design", args.designId, "editor");
+    let parsedDesignData: Record<string, unknown> | undefined;
+    const designData = () =>
+      (parsedDesignData ??= parseDesignDataBlob(access.resource.data));
     if (
       parseDesignDataSourceType(
         (access.resource as { data?: unknown }).data,
@@ -983,14 +1157,37 @@ export async function writeInlineSourceFilesBatch(args: {
             "A source file's stored or live version changed since the batch was prepared. Save or refresh the design and retry.",
           );
         }
-        assertLockedLayersPreserved(liveContent, content);
+        const reconciled = reconcileIntroducedIdsInHtml(
+          liveContent,
+          content,
+        ).content;
+        assertLockedLayersPreserved(liveContent, reconciled);
+        const previousContents = [liveContent, currentFile.content];
+        previousContentsById.set(file.id, previousContents);
+        const frameType = sourceWriteFrameType({
+          readStored: () => storedScreenFrameType(designData(), file.id),
+          previousContents,
+          nextContent: reconciled,
+        });
+        if (frameType.unstoredLegacyMarker && !stored.has(file.id)) {
+          throw new LegacyEmailFrameTypeNotStoredError(file.id);
+        }
+        assertHubSpotEmailFileType({
+          fileType: currentFile.fileType ?? file.fileType ?? "html",
+          frameType: frameType.frameType,
+        });
         assertDesignHtmlEditIntegrity({
           previousContent: liveContent,
-          nextContent: content,
+          nextContent: reconciled,
           fileType: currentFile.fileType ?? file.fileType ?? "html",
           filename: currentFile.filename ?? file.filename,
         });
-        return { fileId: file.id, currentFile, liveContent, content };
+        return {
+          fileId: file.id,
+          currentFile,
+          liveContent,
+          content: reconciled,
+        };
       }),
     );
 
@@ -1061,6 +1258,15 @@ export async function writeInlineSourceFilesBatch(args: {
             );
           }
           assertLockedLayersPreserved(liveContent, item.content);
+          assertHubSpotEmailFileType({
+            fileType: current.fileType ?? "html",
+            frameType: sourceWriteFrameType({
+              readStored: () =>
+                storedScreenFrameType(designData(), item.fileId),
+              previousContents: previousContentsById.get(item.fileId) ?? [],
+              nextContent: item.content,
+            }).frameType,
+          });
           assertDesignHtmlEditIntegrity({
             previousContent: liveContent,
             nextContent: item.content,
@@ -1158,10 +1364,10 @@ export async function writeInlineSourceFilesBatch(args: {
             : updatedAt,
       })),
       collaboration: {
-        status: "synced",
+        status: "synced" as const,
         files: planned.map((item) => ({
           fileId: item.fileId,
-          status: "synced",
+          status: "synced" as const,
         })),
       },
     };

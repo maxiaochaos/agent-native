@@ -3,6 +3,8 @@ import {
   useActionQuery,
 } from "@agent-native/core/client/hooks";
 import { useT } from "@agent-native/core/client/i18n";
+import { useOrgRole } from "@agent-native/core/client/org";
+import { parseAgentProfileMetadata } from "@agent-native/core/shared";
 import { APP_ACTION_MENU_CONTENT_CLASS } from "@agent-native/toolkit/app/chat/chat-first/app-open-actions";
 import { ShareButton } from "@agent-native/toolkit/app/sharing";
 import {
@@ -14,7 +16,6 @@ import {
   IconEyeOff,
   IconFileText,
   IconKey,
-  IconPin,
   IconShare3,
   IconSettings,
   IconTrash,
@@ -42,7 +43,8 @@ import { ActionQueryError } from "./action-query-error";
 import { AppIcon } from "./app-icon";
 import { AppKeysPanel } from "./app-keys-popover";
 import { AppListRow } from "./app-list-row";
-import { AppOpenActions } from "./app-open-actions";
+import { AppOpenActions, appOpenActionLabels } from "./app-open-actions";
+import { AppPinButton } from "./app-pin-button";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import {
@@ -69,6 +71,23 @@ import { AppResourceEffectiveStack } from "./workspace-resource-effective-stack"
 
 const APP_CARD_ACTION_CLASS =
   "size-7 rounded-md p-0 text-muted-foreground transition-[background-color,color] hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[state=open]:bg-accent data-[state=open]:text-foreground";
+
+function normalizeProfileDescription(value: string): string {
+  return value.replace(/[\r\n]+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "");
+}
+
+function normalizeWhenToUseText(value: string): string {
+  return value
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, "");
+}
+
+function parseWhenToUseText(value: string): string[] {
+  return value
+    .split("\n")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
 
 function deferWorkspaceAppOverlayOpen(
   event: { preventDefault: () => void },
@@ -108,6 +127,12 @@ export function WorkspaceAppCard({
   onTogglePinned?: () => void;
 }) {
   const t = useT();
+  const { org, role, isLoading: orgLoading, error: orgError } = useOrgRole();
+  const canEditMetadata =
+    !orgLoading &&
+    !orgError &&
+    !!org?.orgId &&
+    (role === "owner" || role === "admin");
   const href = workspaceAppHref(app);
   const directHref =
     app.status !== "pending" &&
@@ -130,48 +155,51 @@ export function WorkspaceAppCard({
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [draftName, setDraftName] = useState(app.name);
   const [draftDescription, setDraftDescription] = useState(
-    app.description || "",
+    normalizeProfileDescription(app.description || ""),
+  );
+  const [draftWhenToUse, setDraftWhenToUse] = useState(
+    app.whenToUse?.join("\n") ?? "",
+  );
+  const draftWhenToUseValues = parseWhenToUseText(draftWhenToUse);
+  const validProfile = Boolean(
+    parseAgentProfileMetadata({
+      ...(draftDescription.trim()
+        ? { description: draftDescription.trim() }
+        : {}),
+      whenToUse: draftWhenToUseValues,
+    }),
   );
 
   useEffect(() => {
     if (editOpen) return;
     setDraftName(app.name);
-    setDraftDescription(app.description || "");
-  }, [app.description, app.name, editOpen]);
+    setDraftDescription(normalizeProfileDescription(app.description || ""));
+    setDraftWhenToUse(app.whenToUse?.join("\n") ?? "");
+  }, [app.description, app.name, app.whenToUse, editOpen]);
 
   const archive = useActionMutation("archive-workspace-app", {
-    onError: (err) =>
-      toast.error(`Could not hide ${app.name}: ${stringifyError(err)}`),
+    onSuccess: () => toast.success(`Hid ${app.name} from the Apps list`),
+    errorLabel: `Could not hide ${app.name}`,
   });
   const unarchive = useActionMutation("unarchive-workspace-app", {
-    onError: (err) =>
-      toast.error(`Could not restore ${app.name}: ${stringifyError(err)}`),
+    onSuccess: () => toast.success(`Restored ${app.name} to the Apps list`),
+    errorLabel: `Could not restore ${app.name}`,
   });
   const removePending = useActionMutation("remove-pending-workspace-app", {
-    onError: (err) =>
-      toast.error(`Could not remove ${app.name}: ${stringifyError(err)}`),
+    onSuccess: () => toast.success(`Removed pending ${app.name}`),
+    errorLabel: `Could not remove ${app.name}`,
   });
   const updateMetadata = useActionMutation("update-workspace-app-metadata", {
     onSuccess: () => {
       toast.success(`Updated ${draftName.trim() || app.name}`);
       setEditOpen(false);
     },
-    onError: (err) =>
-      toast.error(`Could not update ${app.name}: ${stringifyError(err)}`),
+    errorLabel: `Could not update ${app.name}`,
   });
 
-  const handleArchive = () => {
-    archive.mutate({ appId: app.id });
-    toast.success(`Hid ${app.name} from the Apps list`);
-  };
-  const handleUnarchive = () => {
-    unarchive.mutate({ appId: app.id });
-    toast.success(`Restored ${app.name} to the Apps list`);
-  };
-  const handleRemovePending = () => {
-    removePending.mutate({ appId: app.id });
-    toast.success(`Removed pending ${app.name}`);
-  };
+  const handleArchive = () => archive.mutate({ appId: app.id });
+  const handleUnarchive = () => unarchive.mutate({ appId: app.id });
+  const handleRemovePending = () => removePending.mutate({ appId: app.id });
   const handleMetadataSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const name = draftName.trim();
@@ -179,19 +207,37 @@ export function WorkspaceAppCard({
       toast.error("App name is required.");
       return;
     }
+    const description = draftDescription.trim();
+    const currentDescription = normalizeProfileDescription(
+      app.description || "",
+    ).trim();
+    const currentWhenToUse = app.whenToUse ?? [];
+    const nameChanged = name !== app.name.trim();
+    const descriptionChanged = description !== currentDescription;
+    const whenToUseChanged =
+      draftWhenToUseValues.length !== currentWhenToUse.length ||
+      draftWhenToUseValues.some(
+        (example, index) => example !== currentWhenToUse[index],
+      );
+    if (
+      !parseAgentProfileMetadata({
+        ...(description ? { description } : {}),
+        whenToUse: draftWhenToUseValues,
+      })
+    ) {
+      return;
+    }
+    if (!nameChanged && !descriptionChanged && !whenToUseChanged) {
+      setEditOpen(false);
+      return;
+    }
     updateMetadata.mutate({
       appId: app.id,
-      name,
-      description: draftDescription.trim(),
+      ...(nameChanged ? { name } : {}),
+      ...(descriptionChanged ? { description } : {}),
+      ...(whenToUseChanged ? { whenToUse: draftWhenToUseValues } : {}),
     });
   };
-  const pinLabel = t(
-    isPinned ? "dispatch.pages.unpinApp" : "dispatch.pages.pinApp",
-    {
-      name: app.name,
-      defaultValue: isPinned ? "Unpin this app" : "Pin this app",
-    },
-  );
 
   return (
     <>
@@ -234,19 +280,25 @@ export function WorkspaceAppCard({
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {onTogglePinned ? (
+            <AppPinButton
+              appId={app.id}
+              name={app.name}
+              pinned={isPinned}
+              onToggle={onTogglePinned}
+            />
+          ) : null}
           <WorkspaceAppOpenActions
             app={app}
             href={directHref ?? href}
             openDirectly={Boolean(
               directHref && shouldOpenWorkspaceAppInTopWindow(),
             )}
-            isPinned={isPinned}
-            pinLabel={pinLabel}
             pendingOpenLabel={pendingOpenLabel}
-            onTogglePinned={onTogglePinned}
           />
           <WorkspaceAppSettings
             app={app}
+            canEditMetadata={canEditMetadata}
             isArchived={isArchived}
             isPending={isPending}
             onEdit={() => setEditOpen(true)}
@@ -284,10 +336,42 @@ export function WorkspaceAppCard({
               <Textarea
                 id={`app-description-${app.id}`}
                 value={draftDescription}
-                maxLength={500}
+                maxLength={1000}
                 rows={4}
-                onChange={(event) => setDraftDescription(event.target.value)}
+                onChange={(event) =>
+                  setDraftDescription(
+                    normalizeProfileDescription(event.target.value),
+                  )
+                }
               />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor={`app-when-to-use-${app.id}`}>
+                {t("dispatch.pages.appProfileWhenToUse", {
+                  defaultValue: "When to use",
+                })}
+              </Label>
+              <Textarea
+                id={`app-when-to-use-${app.id}`}
+                value={draftWhenToUse}
+                aria-invalid={!validProfile}
+                rows={3}
+                placeholder={t(
+                  "dispatch.pages.appProfileWhenToUsePlaceholder",
+                  {
+                    defaultValue: "One example request per line",
+                  },
+                )}
+                onChange={(event) =>
+                  setDraftWhenToUse(normalizeWhenToUseText(event.target.value))
+                }
+              />
+              <p className="text-xs text-muted-foreground">
+                {t("dispatch.pages.appProfileWhenToUseHint", {
+                  defaultValue:
+                    "Add up to 6 examples, with no more than 140 characters each.",
+                })}
+              </p>
             </div>
             <DialogFooter>
               <Button
@@ -297,7 +381,10 @@ export function WorkspaceAppCard({
               >
                 Cancel
               </Button>
-              <Button type="submit" disabled={updateMetadata.isPending}>
+              <Button
+                type="submit"
+                disabled={updateMetadata.isPending || !validProfile}
+              >
                 {updateMetadata.isPending ? "Saving..." : "Save"}
               </Button>
             </DialogFooter>
@@ -333,19 +420,14 @@ function WorkspaceAppOpenActions({
   app,
   href,
   openDirectly,
-  isPinned,
-  pinLabel,
   pendingOpenLabel,
-  onTogglePinned,
 }: {
   app: WorkspaceAppSummary;
   href: string | null;
   openDirectly: boolean;
-  isPinned: boolean;
-  pinLabel: string;
   pendingOpenLabel: string;
-  onTogglePinned?: () => void;
 }) {
+  const t = useT();
   const navigate = useNavigate();
   const appRoute = workspaceAppRoute(app.id);
   const isPending = app.status === "pending";
@@ -367,7 +449,7 @@ function WorkspaceAppOpenActions({
   if (!href) {
     return (
       <Button size="sm" variant="outline" disabled>
-        Open app
+        {t("dispatch.pages.openApp", { defaultValue: "Open" })}
       </Button>
     );
   }
@@ -377,22 +459,11 @@ function WorkspaceAppOpenActions({
       name={app.name}
       href={href}
       showNewTabOption
+      labels={appOpenActionLabels(t, app.name)}
       onOpen={() => {
         if (openDirectly && navigateToWorkspaceApp(href)) return;
         void navigate(appRoute);
       }}
-      menuItems={
-        onTogglePinned
-          ? [
-              {
-                id: "pin",
-                label: pinLabel,
-                icon: <IconPin size={14} strokeWidth={isPinned ? 2.2 : 1.7} />,
-                onSelect: onTogglePinned,
-              },
-            ]
-          : undefined
-      }
     />
   );
 }
@@ -406,6 +477,7 @@ type WorkspaceAppMetadataLabels = {
 
 function WorkspaceAppSettings({
   app,
+  canEditMetadata,
   isArchived,
   isPending,
   onEdit,
@@ -417,6 +489,7 @@ function WorkspaceAppSettings({
   labels,
 }: {
   app: WorkspaceAppSummary;
+  canEditMetadata: boolean;
   isArchived: boolean;
   isPending: boolean;
   onEdit: () => void;
@@ -477,10 +550,12 @@ function WorkspaceAppSettings({
             )
           }
         >
-          <DropdownMenuItem onSelect={onEdit}>
-            <IconEdit size={14} aria-hidden="true" />
-            Edit details
-          </DropdownMenuItem>
+          {canEditMetadata ? (
+            <DropdownMenuItem onSelect={onEdit}>
+              <IconEdit size={14} aria-hidden="true" />
+              Edit details
+            </DropdownMenuItem>
+          ) : null}
           {!isPending ? (
             <DropdownMenuItem
               onSelect={(event) =>
@@ -785,9 +860,4 @@ function AppResourcesDialog({
       </DialogContent>
     </Dialog>
   );
-}
-
-function stringifyError(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
 }

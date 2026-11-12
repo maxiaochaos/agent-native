@@ -5,12 +5,18 @@ import {
   isLoomEmbedBackedRecording,
   isLoomRecordingSource,
 } from "../../shared/loom.js";
+import {
+  youtubeEmbedUrl,
+  youtubeVideoIdForRecording,
+} from "../../shared/youtube.js";
+import { recordingUsesSharePassword } from "./recording-page-access.js";
 import { getRecordingAccessTokenResourceId } from "./share-password.js";
 
 type PlayerVideoRecording = {
   id: string;
   password?: string | null;
   sharePasswordVersion?: string | null;
+  visibility?: string | null;
   sourceAppName?: string | null;
   sourceWindowTitle?: string | null;
   videoUrl?: string | null;
@@ -35,6 +41,11 @@ export function resolvePlayerVideoUrl(
 ): string | null {
   let resolvedVideoUrl = recording.videoUrl ?? null;
   if (!resolvedVideoUrl) return null;
+
+  // YouTube's player loads the video itself, so the canonical embed URL goes
+  // to the browser as is: there is no Clips media behind it to proxy or gate.
+  const youtubeVideoId = youtubeVideoIdForRecording(recording);
+  if (youtubeVideoId) return youtubeEmbedUrl(youtubeVideoId);
 
   const isLoomSource = isLoomRecordingSource(recording);
   const isLoomNativeMedia =
@@ -65,6 +76,7 @@ export function resolvePlayerVideoUrl(
 
   if (
     options.addPasswordToken &&
+    recordingUsesSharePassword(recording.visibility) &&
     recording.password &&
     resolvedVideoUrl.startsWith("/api/video/")
   ) {
@@ -73,6 +85,7 @@ export function resolvePlayerVideoUrl(
         recording.id,
         recording.password,
         recording.sharePasswordVersion,
+        "public",
       ),
     });
     resolvedVideoUrl = appendQueryParam(resolvedVideoUrl, "t", token);

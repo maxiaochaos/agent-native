@@ -4,8 +4,8 @@ import { isEmbedMcpChatBridgeActive } from "@agent-native/core/client/host";
 import { useT } from "@agent-native/core/client/i18n";
 import { writeClipboardText } from "@agent-native/toolkit/clipboard";
 import type { Document } from "@shared/api";
-import { useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { isCancelledError, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
@@ -37,6 +37,7 @@ import { DocumentEditorSkeleton } from "./DocumentEditorSkeleton";
 import { LiveEditorSessionContext } from "./live-editor-session";
 import {
   clearPageDraftJournal,
+  liveDraftWriterIds,
   readPageDraftJournal,
   sweepLegacyRetainedPageDraftMarkers,
   writePageDraftJournal,
@@ -56,11 +57,51 @@ function pageHoldsDraft(
   return draft.title === page.title && draft.content === page.content;
 }
 
+// A draft goes back onto the page as an edit of the page's body, so only while
+// the page still holds the body the draft was written on. The timestamp alone
+// cannot show that: a tab can stamp it from a copy that paired its body with
+// the timestamp of a body another writer saved.
+function draftWrittenOnPage(
+  draft: {
+    baseDocumentUpdatedAt: string | null;
+    baseContentHash?: string | null;
+  },
+  page: { updatedAt: string; contentHash?: string },
+): boolean {
+  return (
+    draft.baseDocumentUpdatedAt === page.updatedAt &&
+    !!draft.baseContentHash &&
+    draft.baseContentHash === page.contentHash
+  );
+}
+
+// Only a journal known to be empty lets an editor show before its draft is
+// checked; an unreadable one waits for the check, which reports the failure.
+function journalHoldsNoEntry(
+  scope: Parameters<typeof readPageDraftJournal>[0],
+): boolean {
+  try {
+    return readPageDraftJournal(scope) === null;
+  } catch {
+    // coercion-ok: unreadable is not "empty"; the journal effect reports it.
+    return false;
+  }
+}
+
 export function PageDraftRecovery({
   document,
+  documentFresh = true,
+  loading,
   children,
 }: {
   document: Document;
+  /**
+   * Whether `document` comes from this open's read. A page drawn from its
+   * cached read decides nothing about drafts until that read returns.
+   */
+  documentFresh?: boolean;
+  /** Drawn instead of the page skeleton while the page's drafts are checked. */
+  loading?: ReactNode;
   children: ReactNode;
 }) {
   const t = useT();
@@ -68,6 +109,10 @@ export function PageDraftRecovery({
   const openAiWidget = isOpenAiMcpAppHost();
   const widgetBridgeActive = isEmbedMcpChatBridgeActive();
   const scopedWidgetReadOnly = document.mcpDirectoryWidgetReadOnly === true;
+  // A switched page's body is written through its live copy, and one body
+  // write from here would send it back to the legacy path. Its drafts go to
+  // History instead of being saved over the page.
+  const bodyWritesThroughLiveCopy = document.writePath === "live_copy";
   const skipDraftRecovery =
     openAiWidget ||
     scopedWidgetReadOnly ||
@@ -98,6 +143,22 @@ export function PageDraftRecovery({
   const update = useUpdateDocument({ saveOrigin: "recovery" });
   const updateDraft = useUpdatePreviewDocumentDraft();
   const resolveDraft = useResolvePreviewDocumentDraft();
+  const showDraftFiled = (
+    choice: "keep_mine" | "use_saved" | "save_separately" | undefined,
+    urlPath: string | undefined,
+  ) => {
+    if (choice === "use_saved")
+      toast.success(t("editor.previewDraftSavedToHistory"));
+    if (choice === "save_separately")
+      toast.success(t("editor.previewDraftSavedSeparately"), {
+        action: urlPath
+          ? {
+              label: t("editor.previewDraftOpenSavedPage"),
+              onClick: () => void navigate(urlPath),
+            }
+          : undefined,
+      });
+  };
   const [releasedScopeKey, setReleasedScopeKey] = useState<string | null>(null);
   const [verifiedScopeKey, setVerifiedScopeKey] = useState<string | null>(null);
   const [verificationRevision, setVerificationRevision] = useState(0);
@@ -110,6 +171,20 @@ export function PageDraftRecovery({
     "checking" | "promoting" | "waiting_sql" | "ready" | "failed"
   >("checking");
   const [journalRevision, setJournalRevision] = useState(0);
+  // Another tab's open editor settles its own journal entries; replaying one
+  // here races its save queue and sends a save for text nobody typed here.
+  // A query only knows the editors open when it ran, so it holds for the
+  // journal entry and SQL draft it was taken for; a tab opened since writes
+  // entries it misses.
+  const [liveWriters, setLiveWriters] = useState<{
+    scopeKey: string;
+    entryKey: string | null;
+    draftKey: string | null;
+    writerIds: ReadonlySet<string>;
+  } | null>(null);
+  const scopeLiveWriters =
+    liveWriters && liveWriters.scopeKey === scopeKey ? liveWriters : null;
+  const skippedWriterIds = scopeLiveWriters?.writerIds;
   const journalAttemptRef = useRef<string | null>(null);
   const automaticRecoveryRef = useRef<string | null>(null);
   const automaticLegacyRecoveryRef = useRef<string | null>(null);
@@ -124,11 +199,69 @@ export function PageDraftRecovery({
     drafts.data.draft.editorSessionId === liveEditorSessionId
       ? null
       : drafts.data?.draft;
+  // So does an editor open in another tab; settling its draft here would move
+  // text it is still saving to History. Its draft can outlive its journal
+  // entry, or have none when that write failed, so the draft is checked too.
+  const draftKey = draft?.editorSessionId
+    ? `${draft.editorSessionId}:${draft.editGeneration}:${draft.version}`
+    : null;
+  const draftLivenessKnown =
+    draftKey === null || scopeLiveWriters?.draftKey === draftKey;
+  // Journal entries this page leaves alone: those of editors known to be
+  // open, this page's own included before its writer lock is seen. Both the
+  // journal and the SQL draft checks skip the same entries, or each would
+  // leave an entry to the other.
+  const journalSkippedWriterIds = useMemo(
+    () =>
+      liveEditorSessionId
+        ? new Set([...(skippedWriterIds ?? []), liveEditorSessionId])
+        : skippedWriterIds,
+    [liveEditorSessionId, skippedWriterIds],
+  );
+  const draftOpenElsewhere = Boolean(
+    draft?.editorSessionId && skippedWriterIds?.has(draft.editorSessionId),
+  );
   // No scope until the session read returns; the session cache expires, so a
   // page opened later can mount before then. Unverified until it does.
   const scopeVerified = scopeKey !== null && verifiedScopeKey === scopeKey;
   const editorReleased =
     scopeVerified && releasedScopeKey === scopeKey && !draft;
+  // Drafts are settled against this open's reads of the page and its draft.
+  const decisionsReady = scopeVerified && documentFresh;
+  // A visited page shows its editor while those reads run when nothing here
+  // can need recovering: its last draft read found none, and this browser's
+  // journal holds no entry for it, not even an open editor's. Decided once
+  // per page and account. A draft the reads then find is handled as it is
+  // before any editor shows.
+  const openedBeforeDraftReadRef = useRef<{
+    scopeKey: string;
+    open: boolean;
+  } | null>(null);
+  if (
+    session &&
+    scopeKey &&
+    openedBeforeDraftReadRef.current?.scopeKey !== scopeKey
+  ) {
+    openedBeforeDraftReadRef.current = {
+      scopeKey,
+      open:
+        !skipDraftRecovery &&
+        !skipCreationDraftRecovery &&
+        !creationPending &&
+        !documentBodyHydrationIsPending(document) &&
+        drafts.data?.draft === null &&
+        drafts.data.editable !== false &&
+        journalHoldsNoEntry({
+          accountId: session.email.trim().toLowerCase(),
+          orgId: session.orgId ?? null,
+          documentId: document.id,
+        }),
+    };
+  }
+  const openedBeforeDraftRead =
+    scopeKey !== null &&
+    openedBeforeDraftReadRef.current?.scopeKey === scopeKey &&
+    openedBeforeDraftReadRef.current.open;
 
   useEffect(() => {
     setVerifiedScopeKey(null);
@@ -141,11 +274,19 @@ export function PageDraftRecovery({
     )
       return;
     let cancelled = false;
-    void ensurePreviewDocumentDraftRead(
-      queryClient,
-      document.id,
-      document.createdAt,
-    )
+    // A visited page mounts this with its editor, so this check can start
+    // before the page-open draft read, which replaces the read in flight. A
+    // read cancelled that way is read again, not reported as failed.
+    const readDraft = (retries: number): Promise<void> =>
+      ensurePreviewDocumentDraftRead(
+        queryClient,
+        document.id,
+        document.createdAt,
+      ).catch((error: unknown) => {
+        if (cancelled || retries === 0 || !isCancelledError(error)) throw error;
+        return readDraft(retries - 1);
+      });
+    void readDraft(2)
       .then(() => {
         if (!cancelled) setVerifiedScopeKey(scopeKey);
       })
@@ -176,7 +317,7 @@ export function PageDraftRecovery({
     if (journalState === "promoting" || editorReleased) return;
     if (
       !drafts.data ||
-      !scopeVerified ||
+      !decisionsReady ||
       creationPending ||
       documentBodyHydrationIsPending(document)
     )
@@ -190,10 +331,39 @@ export function PageDraftRecovery({
     };
     let entry;
     try {
-      entry = readPageDraftJournal(scope);
+      entry = readPageDraftJournal(scope, journalSkippedWriterIds);
     } catch {
       setJournalState("failed");
       return;
+    }
+    const entryKey = entry
+      ? `${entry.scope.writerId}:${entry.snapshot.editGeneration}:${entry.writtenAt}`
+      : null;
+    if (
+      scopeKey &&
+      ((entryKey !== null && scopeLiveWriters?.entryKey !== entryKey) ||
+        !draftLivenessKnown)
+    ) {
+      let cancelled = false;
+      void liveDraftWriterIds().then(
+        (writerIds) => {
+          // Without Web Locks no writer reads as live, so every entry
+          // replays, as it did before writer locks.
+          if (!cancelled)
+            setLiveWriters({
+              scopeKey,
+              entryKey,
+              draftKey,
+              writerIds: writerIds ?? new Set(),
+            });
+        },
+        () => {
+          if (!cancelled) setJournalState("failed");
+        },
+      );
+      return () => {
+        cancelled = true;
+      };
     }
     if (!entry) {
       sweepLegacyRetainedPageDraftMarkers();
@@ -271,6 +441,9 @@ export function PageDraftRecovery({
                     journalSnapshot.baseContent === document.content
                       ? document.updatedAt
                       : null),
+                  // Bound to be filed: only a choice in the chooser puts it
+                  // back on the page.
+                  baseContentHash: null,
                   loadedContentWasEmpty: journalSnapshot.baseContent === "",
                   deferredReason: "conflict",
                 },
@@ -282,7 +455,7 @@ export function PageDraftRecovery({
       )
         throw new Error("The journal was not retained for recovery.");
       const preserved = await resolveDraft.mutateAsync({
-        choice: "use_saved",
+        choice: "automatic",
         documentId: document.id,
         expectedDraftVersion: retainedDraft.version,
         expectedDraftTitle: retainedDraft.title,
@@ -290,10 +463,10 @@ export function PageDraftRecovery({
         expectedDocumentUpdatedAt: document.updatedAt,
       });
       if (preserved.status !== "resolved")
-        throw new Error("The journal could not be preserved in history.");
+        throw new Error("The journal could not be preserved.");
       if (!clearPageDraftJournal(entry.scope, journalStorageSnapshot))
-        throw new Error("The journal changed during History preservation.");
-      toast.success(t("editor.previewDraftSavedToHistory"));
+        throw new Error("The journal changed during preservation.");
+      showDraftFiled(preserved.choice, preserved.urlPath);
       await queryClient.refetchQueries(documentQueryFilter(document.id));
       await drafts.refetch();
       setJournalState("checking");
@@ -344,7 +517,7 @@ export function PageDraftRecovery({
         localChangedTitle &&
         document.title !== journalSnapshot.baseTitle &&
         document.title !== journalSnapshot.title;
-      if (!baseUpdatedAt || titleConflict) {
+      if (bodyWritesThroughLiveCopy || !baseUpdatedAt || titleConflict) {
         await promote();
         return;
       }
@@ -464,14 +637,18 @@ export function PageDraftRecovery({
       setJournalState("checking");
     })().catch(() => setJournalState("failed"));
   }, [
+    bodyWritesThroughLiveCopy,
     creationPending,
+    decisionsReady,
     document,
     draft,
     drafts.data,
     editorReleased,
     journalRevision,
+    journalSkippedWriterIds,
     journalState,
-    scopeVerified,
+    scopeKey,
+    scopeLiveWriters,
     session?.email,
     session?.orgId,
   ]);
@@ -479,11 +656,11 @@ export function PageDraftRecovery({
   useEffect(() => {
     if (
       drafts.data?.draft === null &&
-      scopeVerified &&
+      decisionsReady &&
       journalState === "ready"
     )
       setReleasedScopeKey(scopeKey);
-  }, [drafts.data, journalState, scopeKey, scopeVerified]);
+  }, [decisionsReady, drafts.data, journalState, scopeKey]);
 
   async function settleDraft(restore: boolean) {
     if (!draft || busy) return;
@@ -612,7 +789,7 @@ export function PageDraftRecovery({
   }
 
   async function resolveConflict(
-    choice: "keep_mine" | "use_saved" | "save_separately",
+    choice: "keep_mine" | "use_saved" | "save_separately" | "automatic",
   ) {
     if (!draft || busy) return;
     setBusy(true);
@@ -638,19 +815,20 @@ export function PageDraftRecovery({
       }
       if (result.status !== "resolved")
         throw new Error("The draft could not be resolved.");
-      if (choice === "use_saved")
-        toast.success(t("editor.previewDraftSavedToHistory"));
-      if (choice === "save_separately")
-        toast.success(t("editor.previewDraftSavedSeparately"), {
-          action: result.urlPath
-            ? {
-                label: t("editor.previewDraftOpenSavedPage"),
-                onClick: () => void navigate(result.urlPath!),
-              }
-            : undefined,
-        });
+      showDraftFiled(result.choice, result.urlPath);
       await queryClient.refetchQueries(documentQueryFilter(document.id));
-      await drafts.refetch();
+      const reread = await drafts.refetch();
+      // Another editor can write this exact draft again after it's resolved, as
+      // a second browser filing the same typing does. Resolving it only finds
+      // the claim that already keeps it, so nothing else frees the page's draft
+      // slot and the page would wait on it at every open.
+      const writtenAgain = reread.data?.draft;
+      if (
+        writtenAgain?.version === draft.version &&
+        writtenAgain.title === draft.title &&
+        writtenAgain.content === draft.content
+      )
+        await discardDraft(writtenAgain);
     } catch {
       setFailure("error");
       await drafts.refetch();
@@ -670,31 +848,33 @@ export function PageDraftRecovery({
       failure ||
       journalState === "checking" ||
       journalState === "promoting" ||
-      !scopeVerified
+      !decisionsReady
     )
       return;
     const attempt = `${draft.version}:${document.updatedAt}`;
     if (automaticLegacyRecoveryRef.current === attempt) return;
     automaticLegacyRecoveryRef.current = attempt;
-    void resolveConflict("use_saved");
+    void resolveConflict("automatic");
   }, [
     busy,
+    decisionsReady,
     document.updatedAt,
     draft,
     failure,
     hasEditIdentity,
     journalState,
-    scopeVerified,
   ]);
   useEffect(() => {
     if (
       !draft ||
       !hasEditIdentity ||
+      !draftLivenessKnown ||
+      draftOpenElsewhere ||
       busy ||
       failure ||
       journalState === "checking" ||
       journalState === "promoting" ||
-      !scopeVerified ||
+      !decisionsReady ||
       documentBodyHydrationIsPending(document)
     )
       return;
@@ -705,18 +885,21 @@ export function PageDraftRecovery({
       void discardHeldDraft(draft);
       return;
     }
-    if (draft.baseDocumentUpdatedAt === document.updatedAt) {
+    if (!bodyWritesThroughLiveCopy && draftWrittenOnPage(draft, document)) {
       automaticRecoveryRef.current = attempt;
       void settleDraft(true);
       return;
     }
     if (session?.email) {
       try {
-        const journal = readPageDraftJournal({
-          accountId: session.email.trim().toLowerCase(),
-          orgId: session.orgId ?? null,
-          documentId: document.id,
-        });
+        const journal = readPageDraftJournal(
+          {
+            accountId: session.email.trim().toLowerCase(),
+            orgId: session.orgId ?? null,
+            documentId: document.id,
+          },
+          journalSkippedWriterIds,
+        );
         if (
           journal?.snapshot.title === draft.title &&
           journal.snapshot.content === draft.content
@@ -728,15 +911,19 @@ export function PageDraftRecovery({
       }
     }
     automaticRecoveryRef.current = attempt;
-    void resolveConflict("use_saved");
+    void resolveConflict("automatic");
   }, [
+    bodyWritesThroughLiveCopy,
     busy,
+    decisionsReady,
     document,
     draft,
+    draftLivenessKnown,
+    draftOpenElsewhere,
     failure,
     hasEditIdentity,
+    journalSkippedWriterIds,
     journalState,
-    scopeVerified,
     session?.email,
     session?.orgId,
   ]);
@@ -774,6 +961,10 @@ export function PageDraftRecovery({
         retrying={drafts.isFetching}
       />
     );
+  // A closed editor's journal entry found since is filed like any other,
+  // with the editor out of the way.
+  if (openedBeforeDraftRead && !draft && journalState !== "promoting")
+    return withNotice(null);
   if (
     !drafts.data ||
     !scopeVerified ||
@@ -781,29 +972,46 @@ export function PageDraftRecovery({
     journalState === "promoting"
   )
     return (
-      <DocumentEditorSkeleton
-        title={document.title}
-        iconRow={readPageIconRowHint(document.id)}
-        shape={readDocumentShapeHint(document)}
-        stalledLoad={
-          widgetBridgeActive
-            ? {
-                stage: t("editor.widgetDraftCheckStage"),
-                action: "get-preview-document-draft",
-              }
-            : undefined
-        }
-      />
+      loading ?? (
+        <DocumentEditorSkeleton
+          title={document.title}
+          iconRow={readPageIconRowHint(document.id)}
+          shape={readDocumentShapeHint(document)}
+          stalledLoad={
+            widgetBridgeActive
+              ? {
+                  stage: t("editor.widgetDraftCheckStage"),
+                  action: "get-preview-document-draft",
+                }
+              : undefined
+          }
+        />
+      )
     );
-  if (!draft) return withNotice(null);
+  if (!draft || draftOpenElsewhere) return withNotice(null);
   // Legacy drafts are preserved automatically; that path toasts once.
   if (!hasEditIdentity && !failure) return withNotice(null);
   if (!failure)
     return (
-      <DocumentEditorSkeleton
-        title={document.title}
-        iconRow={readPageIconRowHint(document.id)}
-        shape={readDocumentShapeHint(document)}
+      loading ?? (
+        <DocumentEditorSkeleton
+          title={document.title}
+          iconRow={readPageIconRowHint(document.id)}
+          shape={readDocumentShapeHint(document)}
+        />
+      )
+    );
+  if (bodyWritesThroughLiveCopy)
+    return (
+      <QueryErrorState
+        onRetry={() => {
+          automaticRecoveryRef.current = null;
+          automaticLegacyRecoveryRef.current = null;
+          setFailure(null);
+          void queryClient.refetchQueries(documentQueryFilter(document.id));
+          void drafts.refetch();
+        }}
+        retrying={busy || drafts.isFetching}
       />
     );
   const savedVersion = conflictDocument ?? document;
@@ -820,10 +1028,7 @@ export function PageDraftRecovery({
       }
       onKeepMine={() => {
         if (documentBodyHydrationIsPending(document)) return;
-        if (
-          failure === "conflict" ||
-          draft.baseDocumentUpdatedAt !== document.updatedAt
-        )
+        if (failure === "conflict" || !draftWrittenOnPage(draft, document))
           void resolveConflict("keep_mine");
         else void settleDraft(true);
       }}

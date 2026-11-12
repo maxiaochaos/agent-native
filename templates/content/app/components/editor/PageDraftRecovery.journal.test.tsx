@@ -40,6 +40,7 @@ const state = vi.hoisted(() => ({
   sweep: vi.fn(),
   draft: null as null | Record<string, unknown>,
   read: vi.fn(),
+  live: vi.fn(),
   verify: vi.fn(),
   session: null as null | { email: string; orgId: string },
 }));
@@ -52,6 +53,7 @@ vi.mock("@agent-native/core/client/i18n", () => ({
 }));
 vi.mock("react-router", () => ({ useNavigate: () => vi.fn() }));
 vi.mock("@tanstack/react-query", () => ({
+  isCancelledError: () => false,
   useQueryClient: () => ({ refetchQueries: state.refetch }),
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -75,6 +77,8 @@ vi.mock("@/hooks/use-documents", () => ({
   useResolvePreviewDocumentDraft: () => ({ mutateAsync: state.resolve }),
 }));
 vi.mock("./page-draft-journal", () => ({
+  holdPageDraftWriter: () => () => {},
+  liveDraftWriterIds: state.live,
   readPageDraftJournal: state.read,
   sweepLegacyRetainedPageDraftMarkers: state.sweep,
   writePageDraftJournal: (input: {
@@ -115,6 +119,7 @@ vi.mock("./DocumentEditorSkeleton", () => ({
   DocumentEditorSkeleton: () => <div data-testid="editor-skeleton" />,
 }));
 
+import { journalDisplacedTyping } from "./displaced-typing";
 import { useRegisterLiveEditorSession } from "./live-editor-session";
 import { PageDraftRecovery } from "./PageDraftRecovery";
 
@@ -123,7 +128,9 @@ const page = {
   title: "Saved",
   content: "Saved body",
   canEdit: true,
+  accessRole: "owner",
   updatedAt: "v2",
+  contentHash: "sha256:saved-body",
 } as Document;
 
 function entry(writerId: string, content: string, baseUpdatedAt = "v2") {
@@ -164,17 +171,24 @@ describe("Page browser journal recovery", () => {
     state.draft = null;
     state.session = { email: "writer@example.test", orgId: "org" };
     state.read.mockImplementation(
-      () => state.entries.find((entry) => !entry.recoveryStatus) ?? null,
+      (_scope: unknown, skip: ReadonlySet<string> = new Set()) =>
+        state.entries.find(
+          (entry) => !entry.recoveryStatus && !skip.has(entry.scope.writerId),
+        ) ?? null,
     );
+    state.live.mockResolvedValue(new Set());
     state.receipt.mockResolvedValue({ found: false });
-    state.refetch.mockResolvedValue(undefined);
+    state.refetch.mockResolvedValue({ data: undefined });
     state.verify.mockResolvedValue(undefined);
     state.rebase.mockResolvedValue({ status: "saved", document: page });
     state.upsert.mockResolvedValue({
       status: "saved",
       draft: { title: "Saved", content: "Local", version: 1 },
     });
-    state.resolve.mockResolvedValue({ status: "resolved" });
+    state.resolve.mockResolvedValue({
+      status: "resolved",
+      choice: "use_saved",
+    });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -194,6 +208,162 @@ describe("Page browser journal recovery", () => {
     expect(state.entries).toEqual([]);
     expect(state.rebase).toHaveBeenCalledTimes(1);
     expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("leaves an entry whose editor is open in another tab to that tab", async () => {
+    state.entries = [entry("other-tab", "Typed in the other tab")];
+    state.live.mockResolvedValue(new Set(["other-tab"]));
+
+    await act(async () => render());
+
+    expect(state.rebase).not.toHaveBeenCalled();
+    expect(state.update).not.toHaveBeenCalled();
+    expect(state.upsert).not.toHaveBeenCalled();
+    expect(state.entries).toHaveLength(1);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("leaves a SQL draft whose editor is open in another tab to that tab", async () => {
+    state.entries = [entry("other-tab", "Typed in the other tab")];
+    state.live.mockResolvedValue(new Set(["other-tab"]));
+    state.draft = {
+      version: 1,
+      title: "Saved",
+      content: "Typed in the other tab",
+      baseDocumentUpdatedAt: "v1",
+      editorSessionId: "other-tab",
+      editGeneration: 1,
+    };
+
+    await act(async () => render());
+
+    expect(state.resolve).not.toHaveBeenCalled();
+    expect(state.rebase).not.toHaveBeenCalled();
+    expect(state.entries).toHaveLength(1);
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
+  // Its journal write can fail, or its entry be cleared, while the SQL draft
+  // stays.
+  it.each([
+    [
+      "leaves a SQL draft with no journal entry to its editor in another tab",
+      new Set(["other-tab"]),
+      false,
+    ],
+    [
+      "settles a SQL draft with no journal entry once its editor has closed",
+      new Set<string>(),
+      true,
+    ],
+  ])("%s", async (_, live, settled) => {
+    state.live.mockResolvedValue(live);
+    state.draft = {
+      version: 1,
+      title: "Saved",
+      content: "Typed in the other tab",
+      baseDocumentUpdatedAt: "v1",
+      editorSessionId: "other-tab",
+      editGeneration: 1,
+    };
+
+    await act(async () => render());
+
+    expect(state.live).toHaveBeenCalled();
+    if (settled)
+      expect(state.resolve).toHaveBeenCalledWith(
+        expect.objectContaining({ choice: "automatic" }),
+      );
+    else {
+      expect(state.resolve).not.toHaveBeenCalled();
+      expect(state.update).not.toHaveBeenCalled();
+      expect(container.querySelector("textarea")).not.toBeNull();
+    }
+  });
+
+  it("holds a closed tab's entry behind a SQL draft whose editor is open in another tab", async () => {
+    state.entries = [
+      entry("other-tab", "Typed in the other tab"),
+      entry("closed-tab", "Typed before closing"),
+    ];
+    state.live.mockResolvedValue(new Set(["other-tab"]));
+    state.draft = {
+      version: 1,
+      title: "Saved",
+      content: "Typed in the other tab",
+      baseDocumentUpdatedAt: "v1",
+      editorSessionId: "other-tab",
+      editGeneration: 1,
+    };
+
+    await act(async () => render());
+
+    expect(state.resolve).not.toHaveBeenCalled();
+    expect(state.rebase).not.toHaveBeenCalled();
+    expect(state.upsert).not.toHaveBeenCalled();
+    expect(state.entries).toHaveLength(2);
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("replays a closed tab's entry past one whose editor is still open", async () => {
+    state.entries = [
+      entry("other-tab", "Typed in the other tab"),
+      entry("closed-tab", "Typed before closing"),
+    ];
+    state.live.mockResolvedValue(new Set(["other-tab"]));
+    state.rebase.mockResolvedValue({
+      status: "saved",
+      document: { ...page, content: "Typed before closing" },
+    });
+
+    await act(async () => render());
+
+    expect(state.rebase).toHaveBeenCalledOnce();
+    expect(state.rebase).toHaveBeenCalledWith(
+      expect.objectContaining({ content: "Typed before closing" }),
+    );
+    expect(state.entries.map((item) => item.scope.writerId)).toEqual([
+      "other-tab",
+    ]);
+  });
+
+  it("asks again which tabs are open before acting on an entry written since", async () => {
+    state.entries = [entry("closed-tab", "Saved body")];
+    await act(async () => render());
+    expect(state.entries).toEqual([]);
+
+    state.entries = [
+      { ...entry("new-tab", "Typed in the new tab"), writtenAt: 2 },
+    ];
+    state.live.mockResolvedValue(new Set(["new-tab"]));
+    state.draft = {
+      version: 1,
+      title: "Saved",
+      content: "Typed in the new tab",
+      baseDocumentUpdatedAt: "v2",
+      editorSessionId: "new-tab",
+      editGeneration: 1,
+    };
+    await act(async () => render());
+
+    expect(state.cleared).not.toHaveBeenCalledWith("new-tab");
+    expect(state.entries.map((item) => item.scope.writerId)).toEqual([
+      "new-tab",
+    ]);
+  });
+
+  it("shows a failure, not the editor, when open tabs cannot be read", async () => {
+    state.entries = [entry("other-tab", "Typed in the other tab")];
+    state.live.mockRejectedValue(new Error("lock manager unavailable"));
+
+    await act(async () => render());
+
+    expect(state.rebase).not.toHaveBeenCalled();
+    expect(container.querySelector("textarea")).toBeNull();
+    expect(
+      container.querySelector('[data-testid="editor-skeleton"]'),
+    ).toBeNull();
   });
 
   it("clears a journal generation superseded by Use saved without retaining or replaying it", async () => {
@@ -226,6 +396,7 @@ describe("Page browser journal recovery", () => {
       title: "Newer SQL title",
       content: "Local",
       baseDocumentUpdatedAt: "v2",
+      baseContentHash: "sha256:saved-body",
       loadedContentWasEmpty: 0,
       deferredReason: "conflict",
       editorSessionId: "first",
@@ -315,6 +486,7 @@ describe("Page browser journal recovery", () => {
       title: "Peer rename",
       content: "Local",
       baseDocumentUpdatedAt: "v2",
+      baseContentHash: "sha256:saved-body",
       loadedContentWasEmpty: 0,
       deferredReason: "conflict",
       editorSessionId: "first",
@@ -343,7 +515,7 @@ describe("Page browser journal recovery", () => {
     );
     expect(state.resolve).toHaveBeenCalledWith(
       expect.objectContaining({
-        choice: "use_saved",
+        choice: "automatic",
         expectedDraftTitle: localRename,
         expectedDraftContent: "Local",
       }),
@@ -373,6 +545,7 @@ describe("Page browser journal recovery", () => {
         title: "Newer SQL title",
         content: "Local",
         baseDocumentUpdatedAt: "v2",
+        baseContentHash: "sha256:saved-body",
         loadedContentWasEmpty: 0,
         deferredReason: "conflict",
         editorSessionId: "first",
@@ -580,11 +753,13 @@ describe("Page browser journal recovery", () => {
     expect(state.entries).toEqual([]);
   });
 
-  it("does not inspect local drafts before the current session passes access", async () => {
+  it("does not replay local drafts before the current session passes access", async () => {
     state.entries = [entry("first", "Local")];
     state.verify.mockRejectedValue(new Error("access denied"));
     await act(async () => render());
-    expect(state.read).not.toHaveBeenCalled();
+    // Read only to learn whether the editor may show before the draft check
+    // (the scope alone, no live writers to skip): with an entry it may not.
+    expect(state.read.mock.calls.every((args) => args.length === 1)).toBe(true);
     expect(state.rebase).not.toHaveBeenCalled();
     expect(container.querySelector("textarea")).toBeNull();
   });
@@ -663,7 +838,7 @@ describe("Page browser journal recovery", () => {
     state.rebase.mockResolvedValue({ status: "conflict" });
     await act(async () => render());
     expect(state.resolve).toHaveBeenCalledWith(
-      expect.objectContaining({ choice: "use_saved", documentId: "page" }),
+      expect.objectContaining({ choice: "automatic", documentId: "page" }),
     );
     expect(state.cleared).toHaveBeenCalledWith("first");
     expect(state.entries).toEqual([]);
@@ -770,7 +945,119 @@ describe("Page browser journal recovery", () => {
     await act(async () => renderLive());
 
     expect(state.resolve).toHaveBeenCalledWith(
-      expect.objectContaining({ choice: "use_saved" }),
+      expect.objectContaining({ choice: "automatic" }),
+    );
+  });
+
+  it("files a switched page's unsent journal to History instead of replaying it", async () => {
+    state.entries = [entry("closed-tab", "Local")];
+    await act(async () => render({ ...page, writePath: "live_copy" }));
+
+    expect(state.rebase).not.toHaveBeenCalled();
+    expect(state.update).not.toHaveBeenCalled();
+    expect(state.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operation: "upsert",
+        draft: expect.objectContaining({ content: "Local" }),
+      }),
+    );
+    expect(state.resolve).toHaveBeenCalledWith(
+      expect.objectContaining({ choice: "automatic" }),
+    );
+    expect(state.entries).toEqual([]);
+    expect(toast.success).toHaveBeenCalledTimes(1);
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("files typing a saved copy displaced to History, never over the page", async () => {
+    // Left by an editor that closed before it could file it: the typing went
+    // into a block the server has deleted since.
+    const typed = "Typed into a deleted block\n\nSaved body";
+    const kept = journalDisplacedTyping({
+      scope: {
+        accountId: "writer@example.test",
+        orgId: "org",
+        documentId: "page",
+      },
+      editorSessionId: "closed-editor",
+      title: "Saved",
+      content: typed,
+    });
+    state.entries = [
+      {
+        scope: { ...kept.scope, orgId: "org" },
+        snapshot: kept.snapshot,
+        writtenAt: 1,
+      },
+    ];
+    state.upsert.mockResolvedValue({
+      status: "saved",
+      draft: { title: "Saved", content: typed, version: 1 },
+    });
+    await act(async () => render());
+
+    expect(state.rebase).not.toHaveBeenCalled();
+    expect(state.update).not.toHaveBeenCalled();
+    expect(state.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        draft: expect.objectContaining({
+          content: typed,
+          baseDocumentUpdatedAt: null,
+          baseContentHash: null,
+        }),
+      }),
+    );
+    expect(state.resolve).toHaveBeenCalledWith(
+      expect.objectContaining({ choice: "automatic" }),
+    );
+    expect(state.entries).toEqual([]);
+    expect(container.querySelector("textarea")).not.toBeNull();
+  });
+
+  it("files a collaborator's displaced typing as a private page of their own", async () => {
+    const typed = "Typed into a deleted block\n\nSaved body";
+    const kept = journalDisplacedTyping({
+      scope: {
+        accountId: "writer@example.test",
+        orgId: "org",
+        documentId: "page",
+      },
+      editorSessionId: "closed-editor",
+      title: "Saved",
+      content: typed,
+    });
+    state.entries = [
+      {
+        scope: { ...kept.scope, orgId: "org" },
+        snapshot: kept.snapshot,
+        writtenAt: 1,
+      },
+    ];
+    state.upsert.mockResolvedValue({
+      status: "saved",
+      draft: { title: "Saved", content: typed, version: 1 },
+    });
+    state.resolve.mockResolvedValue({
+      status: "resolved",
+      choice: "save_separately",
+      urlPath: "/page/recovery-copy",
+    });
+    // The server decides who owns the page; the role read with it can be old.
+    await act(async () => render({ ...page, accessRole: "owner" } as Document));
+
+    expect(state.update).not.toHaveBeenCalled();
+    expect(state.resolve).toHaveBeenCalledWith(
+      expect.objectContaining({ choice: "automatic" }),
+    );
+    expect(state.entries).toEqual([]);
+    expect(toast.success).toHaveBeenCalledOnce();
+    expect(toast.success).toHaveBeenCalledWith(
+      "editor.previewDraftSavedSeparately",
+      {
+        action: expect.objectContaining({
+          label: "editor.previewDraftOpenSavedPage",
+        }),
+      },
     );
   });
 });

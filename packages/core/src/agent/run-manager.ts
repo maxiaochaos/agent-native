@@ -4,6 +4,7 @@ import {
   BACKGROUND_SOFT_TIMEOUT_CEILING_MS,
   RUN_NO_PROGRESS_HARD_TIMEOUT_MS,
 } from "../app-config/run-lifecycle-invariants.js";
+import type { DbExec } from "../db/client.js";
 import {
   getCurrentRequestDbPoolScope,
   retainRequestDbPoolScope,
@@ -12,6 +13,11 @@ import { recordAgentRun } from "../observability/metrics.js";
 import { parseServiceIdentityEmail } from "../org/service-identity.js";
 import { ServicePrincipalRefusedError } from "../org/service-principal-guard.js";
 import { captureError } from "../server/capture-error.js";
+import { isNonProgressEventType } from "../shared/progress-events.js";
+import {
+  EXECUTION_LEASE_LOST_ABORT_REASON,
+  isRequestedStopAbortReason,
+} from "./abort-reasons.js";
 import {
   isLlmCredentialError,
   LLM_MISSING_CREDENTIALS_ERROR_CODE,
@@ -22,24 +28,40 @@ import {
   describeErrorWithCauses,
   isProviderConnectionError,
 } from "./engine/error-detail.js";
-import { runErrorTelemetryProperties } from "./engine/error-telemetry.js";
 import { getAgentEngineEntry } from "./engine/registry.js";
 import { EngineError } from "./engine/types.js";
 import type { EngineRequestShape } from "./engine/types.js";
 import {
+  currentExecutionFence,
+  MissingExecutionFenceError,
+  StaleExecutionFenceError,
+  withExecutionFence,
+  withExecutionLeaseRequested,
+  type ExecutionFence,
+} from "./execution-fence.js";
+import {
+  AGENT_RUN_NO_OUTPUT_ERROR_CODE,
+  RUN_BUDGET_EXHAUSTED_ERROR_CODE,
+} from "./run-errors.js";
+import {
   type AgentTurnInitiator,
+  AgentRunEventNotPersistedError,
   insertRun,
   insertRunEvent,
   insertRunEvents,
   updateRunStatusIfRunning,
   markRunAborted,
+  markRunAbortedAtSafeBoundary,
+  markRunThreadProjectionPending,
   getRunAbortState,
   getRunStatus,
   getRunEventsSince,
   getCurrentTurnRunEventsForThread,
+  persistedRunEventData,
   getRunById,
   getRunByThread,
   getRunTurnRef,
+  listRunsForThread,
   markTurnAborted,
   cleanupOldRuns,
   updateRunHeartbeat,
@@ -54,17 +76,28 @@ import {
   resolveErroredRunTerminalEvent,
   setRunError,
   setRunTerminalReason,
+  setRunTerminalReasonIfStatus,
   persistRunCheckpointEvent,
   recordRunDiagnostic,
   RUN_DIAG_STAGE,
+  claimTurnExecutionLease,
+  renewTurnExecutionLease,
+  releaseTurnExecutionLease,
+  TurnExecutionLeaseBusyError,
   terminalEventForAbortReason,
   RUN_RECORD_MISSING_ERROR_EVENT,
   RUN_RECORD_MISSING_GRACE_MS,
   RUN_TERMINAL_LOOKUP_FAILED_ERROR_EVENT,
   UNKNOWN_RUN_STATUS_ERROR_EVENT,
 } from "./run-store.js";
-import { isContinuationTerminalReason } from "./types.js";
-import type { AgentChatEvent, RunEvent, RunStatus } from "./types.js";
+import { trackRunTerminal } from "./run-terminal-tracking.js";
+import { CONTINUATION_REASONS, isContinuationTerminalReason } from "./types.js";
+import type {
+  AgentChatEvent,
+  RunEvent,
+  RunStatus,
+  UnknownWriteCause,
+} from "./types.js";
 
 export interface ActiveRun {
   runId: string;
@@ -76,7 +109,13 @@ export interface ActiveRun {
   status: RunStatus;
   subscribers: Set<(event: RunEvent) => void>;
   abort: AbortController;
+  nextEventSeq?: number;
+  pendingAbortEvent?: RunEvent;
+  flushEvents?: () => Promise<void>;
+  waitForPersistence?: () => Promise<void>;
   abortReason?: string;
+  abortPersistenceManaged?: boolean;
+  abortPersistencePromise?: Promise<boolean>;
   continuationTerminalEvent?: Extract<
     AgentChatEvent,
     { type: "auto_continue" } | { type: "error" }
@@ -86,12 +125,59 @@ export interface ActiveRun {
 
 export interface StartedRun extends ActiveRun {
   finalized: Promise<void>;
+  livenessReady: Promise<boolean>;
 }
 
 const activeRuns = new Map<string, ActiveRun>();
 const threadToRun = new Map<string, string>();
 
+function peekRunEventSeq(run: ActiveRun): number {
+  return run.nextEventSeq ?? run.events.length;
+}
+
+function allocateRunEventSeq(run: ActiveRun): number {
+  const seq = peekRunEventSeq(run);
+  run.nextEventSeq = seq + 1;
+  return seq;
+}
+
+function reportAbortFlushFailure(run: ActiveRun, error: unknown): void {
+  captureError(error, {
+    route: "/_agent-native/agent-chat/runs/:id/abort",
+    aiTraceId: run.runId,
+    tags: {
+      source: "agent-run-manager",
+      phase: "abort-event-flush",
+    },
+    extra: { runId: run.runId, threadId: run.threadId },
+  });
+  console.error(
+    "[run-manager] failed to flush run events before abort:",
+    error instanceof Error ? error.message : error,
+  );
+}
+
+async function flushRunEventsBeforeAbort(
+  run?: ActiveRun,
+): Promise<AgentRunEventNotPersistedError | null> {
+  try {
+    await run?.waitForPersistence?.();
+    await run?.flushEvents?.();
+    return null;
+  } catch (error) {
+    if (run) reportAbortFlushFailure(run, error);
+    if (error instanceof AgentRunEventNotPersistedError && error.terminalRun) {
+      return error;
+    }
+    throw error;
+  }
+}
+
 const CLEANUP_DELAY_MS = 5 * 60 * 1000;
+
+const HEARTBEAT_ATTEMPT_DEADLINE_MS = 5_000;
+
+const MAX_PENDING_HEARTBEATS = 2;
 
 export const DEFAULT_HOSTED_RUN_SOFT_TIMEOUT_MS = 40_000;
 
@@ -145,6 +231,8 @@ export function resolveRunNoProgressTimeoutMs(params: {
   return override === 0 ? 0 : Math.min(override, ceiling);
 }
 
+const MAX_CONSECUTIVE_EMPTY_MODEL_CALLS = 3;
+
 function inFlightWorkDelta(event: AgentChatEvent): -1 | 0 | 1 {
   switch (event.type) {
     case "tool_start":
@@ -164,6 +252,36 @@ export const DEFAULT_COMPLETED_RUN_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_ERRORED_RUN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const TERMINAL_RUN_RECONNECT_WINDOW_MS = 20 * 60 * 1000;
+const RECONNECTABLE_TERMINAL_RUN_STATUSES = new Set([
+  "completed",
+  "truncated",
+  "errored",
+  "aborted",
+]);
+
+function isKnownRunStatus(status: string): status is RunStatus {
+  return (
+    status === "running" ||
+    status === "completed" ||
+    status === "truncated" ||
+    status === "errored" ||
+    status === "aborted"
+  );
+}
+
+function isDuplicateSubmissionMarker(run: {
+  status: string;
+  terminalReason?: string | null;
+}): boolean {
+  return (
+    run.status === "aborted" &&
+    run.terminalReason === "aborted:duplicate_submission"
+  );
+}
+
+function isTurnAbortMarker(run: { dispatchMode?: string | null }): boolean {
+  return run.dispatchMode === "turn-abort";
+}
 
 export const SQL_SUBSCRIPTION_ACTIVE_POLL_MS = 125;
 
@@ -292,6 +410,8 @@ function shouldCaptureRunError(err: unknown): boolean {
   const normalizedCode = errorCode.toLowerCase();
   return (
     !normalizedCode.startsWith("credits-limit") &&
+    normalizedCode !== AGENT_RUN_NO_OUTPUT_ERROR_CODE &&
+    normalizedCode !== RUN_BUDGET_EXHAUSTED_ERROR_CODE &&
     normalizedCode !== "builder_gateway_network_error" &&
     normalizedCode !== "builder_gateway_stream_ended" &&
     normalizedCode !== PROVIDER_NETWORK_ERROR_CODE &&
@@ -303,6 +423,7 @@ function shouldCaptureRunError(err: unknown): boolean {
 export interface StartRunOptions {
   waitUntil?: (promise: Promise<unknown>) => void;
   softTimeoutMs?: number;
+  softTimeoutDeadlineAt?: number;
   useHostedSoftTimeoutDefault?: boolean;
   turnId?: string;
   agentKitApprovalContinuation?: boolean;
@@ -313,6 +434,9 @@ export interface StartRunOptions {
   dispatchMode?: "foreground" | "foreground-self-chain" | "background";
   turnInitiator?: AgentTurnInitiator;
   runRowAlreadyInserted?: boolean;
+  /** Serialized with the run insert before the run driver starts. */
+  afterRunInsert?: (tx: DbExec) => Promise<void>;
+  executionLease?: boolean;
   model?: string;
   engineName?: string;
   userId?: string;
@@ -437,9 +561,21 @@ function isTerminalRunEvent(event: AgentChatEvent): boolean {
   );
 }
 
+interface PendingRunEventPublication {
+  runEvent: RunEvent;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+  settled: boolean;
+}
+
+interface PendingRunEventWrite {
+  write: () => Promise<void>;
+  publications: PendingRunEventPublication[];
+}
+
 interface RunEventBatch {
   events: Array<{ seq: number; eventAt: number; eventData: string }>;
-  write: Promise<void>;
+  pendingWrite: PendingRunEventWrite;
 }
 
 function isBatchableRunEvent(event: AgentChatEvent): boolean {
@@ -468,9 +604,14 @@ function isBatchableRunEvent(event: AgentChatEvent): boolean {
  */
 export function endsAfterToolResultWithoutAssistantFinal(
   run: ActiveRun,
+  privateCompletedUiTools: ReadonlySet<number> = new Set(),
 ): boolean {
   let toolResultAfterLastAssistantText = false;
-  for (const { event } of run.events) {
+  for (const { event, seq } of run.events) {
+    if (event.type === "done" && event.reason === "action_settled") {
+      toolResultAfterLastAssistantText = false;
+      continue;
+    }
     if (event.type === "text" && event.text.trim().length > 0) {
       toolResultAfterLastAssistantText = false;
       continue;
@@ -479,7 +620,9 @@ export function endsAfterToolResultWithoutAssistantFinal(
       if (event.approvalPause === true) return false;
       toolResultAfterLastAssistantText =
         event.isError === true ||
-        (event.chatUI === undefined && event.mcpApp === undefined);
+        (event.chatUI === undefined &&
+          event.mcpApp === undefined &&
+          !privateCompletedUiTools.has(seq));
       continue;
     }
     if (
@@ -530,7 +673,7 @@ function terminalEventForcesErroredStatus(event: AgentChatEvent | null) {
 }
 
 function terminalReasonForRun(
-  finalStatus: "completed" | "errored" | "aborted",
+  finalStatus: "completed" | "truncated" | "errored" | "aborted",
   terminalEvent: AgentChatEvent | null,
   abortReason: string | undefined,
   completionError: unknown,
@@ -550,6 +693,7 @@ function terminalReasonForRun(
   if (terminalEvent?.type === "error") {
     return `error:${terminalEvent.errorCode || "unknown"}`;
   }
+  if (finalStatus === "truncated") return "stream_ended";
   if (finalStatus === "aborted") return `aborted:${abortReason ?? "user"}`;
   if (completionError) return "completion_error";
   if (finalStatus === "errored") return "error:unknown";
@@ -614,6 +758,8 @@ function emitRunTerminalTrackingEvent(args: {
   engineName?: string;
   userId?: string;
   attemptCount?: number;
+  blockedTool?: string;
+  blockedBy?: UnknownWriteCause;
 }): void {
   try {
     recordAgentRun({
@@ -629,42 +775,28 @@ function emitRunTerminalTrackingEvent(args: {
   } catch {
     // Metrics must never affect the agent run or its persisted status.
   }
-  const properties: Record<string, unknown> = {
-    source: "agent_run_manager",
-    run_id: args.runId,
-    thread_id: args.threadId,
-    turn_id: args.turnId,
-    status: args.status,
-    terminal_reason: args.terminalReason,
-    error_code: args.errorCode,
-    ...(args.errorCode ? runErrorTelemetryProperties(args.errorCode) : {}),
-    dispatch_mode: args.dispatchMode,
-    abort_reason: args.abortReason,
-    duration_ms: args.durationMs,
-    model: args.model,
-    engine: args.engineName,
-    attempt_count: args.attemptCount,
-  };
-  for (const key of Object.keys(properties)) {
-    if (properties[key] === undefined) delete properties[key];
-  }
-
-  try {
-    void Promise.all([
-      import("../tracking/registry.js"),
-      import("../observability/tracking-identity.js"),
-    ])
-      .then(([{ track }, { trackingIdentityProperties }]) => {
-        track(
-          "agent_run_terminal",
-          { ...properties, ...trackingIdentityProperties() },
-          { userId: args.userId },
-        );
-      })
-      .catch(() => {});
-  } catch {
-    // Tracking must never affect the agent run or its persisted status.
-  }
+  // An abort is reported by the SQL write that ended the row, which may be
+  // another process's stop; reporting it here too would double-count it.
+  if (args.status === "aborted") return;
+  void trackRunTerminal(
+    {
+      runId: args.runId,
+      threadId: args.threadId,
+      turnId: args.turnId,
+      status: args.status,
+      terminalReason: args.terminalReason,
+      errorCode: args.errorCode,
+      dispatchMode: args.dispatchMode,
+      abortReason: args.abortReason,
+      durationMs: args.durationMs,
+      model: args.model,
+      engineName: args.engineName,
+      attemptCount: args.attemptCount,
+      blockedTool: args.blockedTool,
+      blockedBy: args.blockedBy,
+    },
+    { userId: args.userId },
+  );
 }
 
 function abortInMemoryRun(run: ActiveRun, reason: string = "user") {
@@ -677,13 +809,37 @@ function abortInMemoryRun(run: ActiveRun, reason: string = "user") {
   const existingTerminalEvent = [...run.events]
     .reverse()
     .find((event) => isTerminalRunEvent(event.event));
-  const terminalRunEvent = existingTerminalEvent ?? {
-    seq: run.events.length,
-    event: terminalEventForAbortReason(reason),
-  };
-  if (!existingTerminalEvent) {
-    run.events.push(terminalRunEvent);
+  const terminalRunEvent = existingTerminalEvent ??
+    run.pendingAbortEvent ?? {
+      seq: allocateRunEventSeq(run),
+      event: terminalEventForAbortReason(reason),
+    };
+  if (!existingTerminalEvent && !run.pendingAbortEvent) {
+    run.pendingAbortEvent = terminalRunEvent;
+    const publishTerminal = () => {
+      run.pendingAbortEvent = undefined;
+      run.events.push(terminalRunEvent);
+      for (const subscriber of run.subscribers) {
+        try {
+          subscriber(terminalRunEvent);
+        } catch {
+          // coercion-ok: one disconnected subscriber must not block terminal delivery.
+          // ignore — subscriber is being removed below
+        }
+      }
+      run.subscribers.clear();
+    };
+    if (run.flushEvents) {
+      void run
+        .flushEvents()
+        .catch((error) => reportAbortFlushFailure(run, error))
+        .then(publishTerminal);
+    } else {
+      publishTerminal();
+    }
+    return;
   }
+  if (!existingTerminalEvent && run.pendingAbortEvent) return;
   for (const subscriber of run.subscribers) {
     try {
       subscriber(terminalRunEvent);
@@ -698,19 +854,36 @@ export function startRun(
   runId: string,
   threadId: string,
   runFn: (
-    send: (event: AgentChatEvent) => void,
+    send: (event: AgentChatEvent) => Promise<void>,
     signal: AbortSignal,
     control: RunChunkControl,
   ) => Promise<void>,
   onComplete?: (run: ActiveRun) => void | Promise<void>,
   options?: StartRunOptions,
 ): StartedRun {
+  if (options?.runRowAlreadyInserted && options.afterRunInsert) {
+    throw new Error("Run admission checks require a new run row.");
+  }
+  if (
+    options?.softTimeoutDeadlineAt !== undefined &&
+    !Number.isFinite(options.softTimeoutDeadlineAt)
+  ) {
+    throw new Error("Run soft-timeout deadline must be a finite timestamp.");
+  }
   const existingRunId = threadToRun.get(threadId);
   if (existingRunId) {
-    abortRun(existingRunId);
+    if (existingRunId === runId) {
+      const existingRun = activeRuns.get(existingRunId);
+      if (existingRun?.status === "running") {
+        abortInMemoryRun(existingRun, "superseded");
+      }
+    } else {
+      abortRun(existingRunId);
+    }
   }
 
   const abort = new AbortController();
+  const isRunAborted = (): boolean => abort.signal.aborted;
   const recoverChunkBoundaries = options?.recoverChunkBoundaries === true;
   let chunkAbort: AbortController | null = recoverChunkBoundaries
     ? new AbortController()
@@ -752,7 +925,7 @@ export function startRun(
     });
   }
   const runControl: RunChunkControl = {
-    flushEvents: () => persistenceChain,
+    flushEvents: () => flushEventWrites(true),
     get turnSignal() {
       return abort.signal;
     },
@@ -768,15 +941,21 @@ export function startRun(
       chunkAbort = new AbortController();
       armChunkSoftTimeout();
       lastRealProgressAt = Date.now();
+      consecutiveEmptyModelCalls = 0;
       return chunkAbort.signal;
     },
   };
   let softTimedOut = false;
+  let checkpointBoundaryStarted = false;
   let resolveFinalized: () => void = () => {};
   let rejectFinalized: (reason?: unknown) => void = () => {};
+  let resolveLivenessReady: (ready: boolean) => void = () => {};
   const finalized = new Promise<void>((resolve, reject) => {
     resolveFinalized = resolve;
     rejectFinalized = reject;
+  });
+  const livenessReady = new Promise<boolean>((resolve) => {
+    resolveLivenessReady = resolve;
   });
   void finalized.catch(() => {});
   const run: StartedRun = {
@@ -791,19 +970,27 @@ export function startRun(
     status: "running",
     subscribers: new Set(),
     abort,
+    nextEventSeq: 0,
     startedAt: Date.now(),
     finalized,
+    livenessReady,
   };
 
   activeRuns.set(runId, run);
   threadToRun.set(threadId, runId);
+
+  let privateTurn = false;
+  const privateAssistantTextSequences = new Set<number>();
+  const privateCompletedUiTools = new Set<number>();
+  const safeRunError = (error: unknown) =>
+    privateTurn ? new Error("Private content omitted") : error;
 
   const captureRunPersistenceError = (
     error: unknown,
     phase: "insert-run" | "insert-event",
     extra: Record<string, unknown> = {},
   ) => {
-    captureError(error, {
+    captureError(safeRunError(error), {
       route: "/_agent-native/agent-chat",
       aiTraceId: runId,
       tags: {
@@ -835,7 +1022,7 @@ export function startRun(
   // final status cannot race ahead of a slow initial INSERT and then get
   // overwritten by a late row stuck at status='running'.
   const insertOptions =
-    options?.dispatchMode || options?.turnInitiator
+    options?.dispatchMode || options?.turnInitiator || options?.afterRunInsert
       ? {
           ...(options?.dispatchMode
             ? { dispatchMode: options.dispatchMode }
@@ -843,12 +1030,16 @@ export function startRun(
           ...(options?.turnInitiator
             ? { turnInitiator: options.turnInitiator }
             : {}),
+          ...(options.afterRunInsert
+            ? { afterInsert: options.afterRunInsert }
+            : {}),
         }
       : undefined;
   const servicePrincipalRunStart = Boolean(
     options?.turnInitiator &&
     parseServiceIdentityEmail(options.turnInitiator.email),
   );
+  let servicePrincipalStartRefused = false;
   const insertRunPromise = (
     options?.runRowAlreadyInserted && !servicePrincipalRunStart
       ? Promise.resolve()
@@ -857,10 +1048,156 @@ export function startRun(
         : insertRun(runId, threadId, options?.turnId)
   ).catch((error) => {
     captureRunPersistenceError(error, "insert-run");
-    if (error instanceof ServicePrincipalRefusedError) throw error;
+    if (error instanceof ServicePrincipalRefusedError) {
+      servicePrincipalStartRefused = true;
+    }
+    if (
+      options?.executionLease ||
+      error instanceof ServicePrincipalRefusedError
+    )
+      throw error;
   });
+  const waitForRunInsert = async (): Promise<void> => {
+    try {
+      await insertRunPromise;
+    } catch (error) {
+      if (!servicePrincipalStartRefused) throw error;
+    }
+  };
+
+  let executionLeaseClaimFailed = false;
+  const executionFencePromise: Promise<ExecutionFence | undefined> =
+    options?.executionLease
+      ? insertRunPromise
+          .then(() => claimTurnExecutionLease(threadId, run.turnId, runId))
+          .catch((error: unknown) => {
+            executionLeaseClaimFailed = true;
+            abortInMemoryRun(
+              run,
+              error instanceof TurnExecutionLeaseBusyError
+                ? "execution-lease-busy"
+                : "execution-lease-claim-failed",
+            );
+            captureError(error, {
+              route: "/_agent-native/agent-chat",
+              aiTraceId: runId,
+              tags: {
+                source: "agent-run-manager",
+                phase: "execution-lease-claim",
+                errorCode:
+                  error instanceof TurnExecutionLeaseBusyError
+                    ? error.code
+                    : "execution_lease_claim_failed",
+              },
+              extra: { runId, threadId, turnId: run.turnId },
+            });
+            return undefined;
+          })
+      : Promise.resolve(undefined);
+  const withWorkerFence = async <T>(
+    work: () => Promise<T>,
+    fenceOptions?: { outlivesStop?: boolean },
+  ): Promise<T> => {
+    if (!options?.executionLease) return work();
+    return withExecutionLeaseRequested(async () => {
+      const fence = await executionFencePromise;
+      if (!fence) throw new MissingExecutionFenceError();
+      return withExecutionFence(
+        fenceOptions?.outlivesStop ? { ...fence, outlivesStop: true } : fence,
+        work,
+      );
+    });
+  };
 
   let persistenceChain: Promise<void> = Promise.resolve();
+  const pendingEventWrites: PendingRunEventWrite[] = [];
+  let persistenceDrain: Promise<void> | null = null;
+  let persistenceFailure: unknown;
+  let persistenceFailureBlocked = false;
+  const flushEventWrites = (retryAfterFailure: boolean): Promise<void> => {
+    if (
+      persistenceFailure instanceof AgentRunEventNotPersistedError &&
+      persistenceFailure.terminalRun
+    ) {
+      const failed = Promise.reject(persistenceFailure);
+      persistenceChain = failed;
+      return failed;
+    }
+    if (persistenceDrain) {
+      const activeDrain = persistenceDrain;
+      const settledDrain = retryAfterFailure
+        ? activeDrain.catch((error) => {
+            if (
+              error instanceof AgentRunEventNotPersistedError &&
+              error.terminalRun
+            ) {
+              throw error;
+            }
+          })
+        : activeDrain;
+      const flush = settledDrain.then(() =>
+        pendingEventWrites.length > 0
+          ? flushEventWrites(retryAfterFailure)
+          : undefined,
+      );
+      persistenceChain = flush;
+      return flush;
+    }
+    if (pendingEventWrites.length === 0) {
+      persistenceChain = Promise.resolve();
+      return persistenceChain;
+    }
+    if (persistenceFailureBlocked && !retryAfterFailure) {
+      const blocked = Promise.reject(persistenceFailure);
+      persistenceChain = blocked;
+      return blocked;
+    }
+    if (retryAfterFailure) {
+      persistenceFailure = undefined;
+      persistenceFailureBlocked = false;
+    }
+    const drain = Promise.resolve().then(async () => {
+      while (pendingEventWrites.length > 0) {
+        const pending = pendingEventWrites[0];
+        try {
+          await pending.write();
+        } catch (error) {
+          const terminalRun =
+            error instanceof AgentRunEventNotPersistedError &&
+            error.terminalRun;
+          persistenceFailure = error;
+          persistenceFailureBlocked = true;
+          for (const queued of pendingEventWrites) {
+            for (const publication of queued.publications) {
+              if (publication.settled) continue;
+              publication.settled = true;
+              publication.reject(error);
+            }
+          }
+          if (terminalRun) {
+            pendingEventWrites.length = 0;
+            openEventBatch = null;
+          }
+          throw error;
+        }
+        pendingEventWrites.shift();
+        for (const publication of pending.publications) {
+          publishRunEvent(publication.runEvent);
+          if (publication.settled) continue;
+          publication.settled = true;
+          publication.resolve();
+        }
+      }
+    });
+    const activeDrain = drain.finally(() => {
+      if (persistenceDrain === activeDrain) persistenceDrain = null;
+    });
+    persistenceDrain = activeDrain;
+    persistenceChain = activeDrain;
+    return activeDrain;
+  };
+  run.waitForPersistence = () => insertRunPromise;
+  run.flushEvents = () => flushEventWrites(true);
   // Streamed deltas arrive hundreds per tool call, and a write tool waits for
   // every queued event to persist first; one round trip per event put tens of
   // seconds between the model finishing and the tool starting.
@@ -948,7 +1285,7 @@ export function startRun(
     progressWritePending = false;
     lastProgressBumpAt = Date.now();
     progressWriteAttempts += 1;
-    const write = writeProgress()
+    const write = withWorkerFence(writeProgress)
       .catch((error: unknown) => {
         recordProgressWriteFailure(error, "error");
         progressWritePending = true;
@@ -986,7 +1323,6 @@ export function startRun(
     scheduleProgressWrite();
   };
   const shouldBumpProgressForEvent = (event: AgentChatEvent): boolean => {
-    if (event.type === "stream_keepalive") return false;
     if (event.type === "clear") {
       for (const [key, bytes] of preparingActivityBytes) {
         const toolKey = preparingActivityTools.get(key) ?? key;
@@ -997,8 +1333,8 @@ export function startRun(
       }
       preparingActivityBytes.clear();
       preparingActivityTools.clear();
-      return false;
     }
+    if (isNonProgressEventType(event.type)) return false;
     if (event.type === "activity" && isPreparingActionActivityEvent(event)) {
       const toolKey = event.tool?.trim() || event.label.trim();
       const activityKey = `${toolKey}:${event.id?.trim() || "no-id"}`;
@@ -1075,6 +1411,11 @@ export function startRun(
   };
 
   let lastRealProgressAt = Date.now();
+  // Every completed model call refreshes the silence clock (its result is still
+  // being processed), so a loop of calls that produce no text, tool call or
+  // result is caught by counting consecutive empty calls instead.
+  let consecutiveEmptyModelCalls = 0;
+  let modelCallHadProgress = false;
   let inFlightWorkCount = 0;
   let inFlightMarkerSince: number | null = null;
   let inFlightMarkerWrite = Promise.resolve();
@@ -1088,7 +1429,9 @@ export function startRun(
     inFlightMarkerWrite = inFlightMarkerWrite
       .catch(() => undefined)
       .then(() =>
-        setRunInFlightMarker(runId, inFlight, markerSince ?? undefined),
+        withWorkerFence(() =>
+          setRunInFlightMarker(runId, inFlight, markerSince ?? undefined),
+        ),
       )
       .catch((error: unknown) => {
         console.error(
@@ -1109,27 +1452,186 @@ export function startRun(
       mirrorInFlightMarker(false);
     }
   };
+  let checkpointRunBoundaryTask: Promise<void> = Promise.resolve();
   let checkpointAbortInFlight = false;
-  const checkpointRunBoundary = async (
+  let checkpointPersistenceFailed = false;
+  let checkpointStatusReadFailed = false;
+  let checkpointUnknownStatus: string | null = null;
+  let checkpointObservedTerminalStatus: Exclude<RunStatus, "running"> | null =
+    null;
+  const observeCheckpointRunStatus = (
+    persistedRun: Awaited<ReturnType<typeof getRunById>>,
+    context: "after checkpoint persistence" | "after checkpoint rejection",
+  ): "missing" | "unknown" | "running" | "terminal" => {
+    if (!persistedRun) {
+      checkpointStatusReadFailed = true;
+      console.error(`[run-manager] run row missing ${context}`, runId);
+      return "missing";
+    }
+    if (!isKnownRunStatus(persistedRun.status)) {
+      checkpointUnknownStatus = persistedRun.status;
+      return "unknown";
+    }
+    if (persistedRun.status === "running") return "running";
+
+    checkpointObservedTerminalStatus = persistedRun.status;
+    run.status = persistedRun.status;
+    if (persistedRun.status === "aborted") {
+      run.abortReason = persistedRun.terminalReason?.startsWith("aborted:")
+        ? persistedRun.terminalReason.slice("aborted:".length)
+        : undefined;
+    }
+    return "terminal";
+  };
+  let runDriverSettled = false;
+  let pendingTerminalEvent: RunEvent | null = null;
+  let persistedCheckpointTerminalEvent: RunEvent | null = null;
+  const rememberPersistedCheckpointTerminalEvent = (
+    persistedRun: Awaited<ReturnType<typeof getRunById>>,
+    checkpointEvent: AgentChatEvent,
+  ) => {
+    if (persistedRun?.status !== "truncated") return;
+    const persistedReason = persistedRun.terminalReason;
+    const persistedContinuationReason = CONTINUATION_REASONS.find(
+      (reason) => reason === persistedReason,
+    );
+    const reason =
+      persistedContinuationReason ??
+      (checkpointEvent.type === "auto_continue"
+        ? checkpointEvent.reason
+        : "stream_ended");
+    persistedCheckpointTerminalEvent = {
+      seq: peekRunEventSeq(run),
+      event: { type: "auto_continue", reason },
+    };
+  };
+  const checkpointRunBoundary = (
     event: AgentChatEvent,
-    terminalReason: string,
+    terminalReason: "no_progress" | "run_timeout",
+    diagnostic: { silentForMs?: number; lastEventType?: string },
   ): Promise<void> => {
     if (
       checkpointAbortInFlight ||
       run.status !== "running" ||
       abort.signal.aborted
     )
-      return;
+      return checkpointRunBoundaryTask;
     checkpointAbortInFlight = true;
-    try {
-      await persistRunCheckpointEvent(runId, event, terminalReason);
-    } catch {
-      // The abort still has to happen if the checkpoint write is rejected; the
-      // caller has already reached a server-owned chunk boundary.
-    } finally {
-      abort.abort(terminalReason);
-      checkpointAbortInFlight = false;
-    }
+    checkpointBoundaryStarted = true;
+    const task = (async () => {
+      let checkpointPersisted = false;
+      try {
+        await withWorkerFence(() =>
+          persistRunCheckpointEvent(
+            runId,
+            privateTurn ? { ...event, omitFromPersistedHistory: true } : event,
+            terminalReason,
+          ),
+        );
+        checkpointPersisted = true;
+        let persistedRun: Awaited<ReturnType<typeof getRunById>>;
+        try {
+          persistedRun = await getRunById(runId);
+        } catch (error) {
+          checkpointStatusReadFailed = true;
+          console.error(
+            "[run-manager] could not confirm run status after checkpoint persistence",
+            runId,
+            error instanceof Error ? error.message : error,
+          );
+          return;
+        }
+        const checkpointStatus = observeCheckpointRunStatus(
+          persistedRun,
+          "after checkpoint persistence",
+        );
+        if (checkpointStatus !== "running") {
+          rememberPersistedCheckpointTerminalEvent(persistedRun, event);
+          return;
+        }
+        softTimedOut = true;
+        recordRunBoundaryDiagnostic(terminalReason, diagnostic, "terminal");
+        emitRunBoundaryTrackingEvent({
+          runId,
+          threadId,
+          reason: terminalReason,
+          recovered: false,
+          boundaryIndex: recoveredChunkBoundaries + 1,
+          dispatchMode: options?.dispatchMode,
+          model: options?.model,
+          engineName: options?.engineName,
+          userId: options?.userId,
+        });
+        if (!pendingTerminalEvent && run.status === "running") {
+          send(event);
+          persistedCheckpointTerminalEvent = pendingTerminalEvent;
+        }
+      } catch (error) {
+        let persistedCheckpointStatus: ReturnType<
+          typeof observeCheckpointRunStatus
+        > = "running";
+        if (
+          error instanceof AgentRunEventNotPersistedError &&
+          error.terminalRun
+        ) {
+          try {
+            const persistedRun = await getRunById(runId);
+            persistedCheckpointStatus = observeCheckpointRunStatus(
+              persistedRun,
+              "after checkpoint rejection",
+            );
+            rememberPersistedCheckpointTerminalEvent(persistedRun, event);
+          } catch (statusError) {
+            checkpointStatusReadFailed = true;
+            console.error(
+              "[run-manager] could not confirm run status after checkpoint rejection",
+              runId,
+              statusError instanceof Error ? statusError.message : statusError,
+            );
+          }
+        }
+        if (
+          !checkpointStatusReadFailed &&
+          (persistedCheckpointStatus === "terminal" ||
+            (pendingTerminalEvent && !checkpointPersisted))
+        ) {
+          softTimedOut = true;
+        } else if (
+          !checkpointStatusReadFailed &&
+          persistedCheckpointStatus !== "unknown"
+        ) {
+          checkpointPersistenceFailed = true;
+        }
+        if (
+          persistedCheckpointStatus !== "terminal" &&
+          persistedCheckpointStatus !== "unknown" &&
+          !checkpointStatusReadFailed
+        ) {
+          console.error(
+            "[run-manager] could not persist run boundary checkpoint",
+            runId,
+            error instanceof Error ? error.message : error,
+          );
+        }
+        if (
+          !pendingTerminalEvent &&
+          persistedCheckpointStatus !== "terminal" &&
+          persistedCheckpointStatus !== "unknown" &&
+          !checkpointStatusReadFailed
+        ) {
+          send({
+            type: "error",
+            error: "The agent could not save its continuation checkpoint.",
+            errorCode: "run_checkpoint_persistence_failed",
+          });
+        }
+      } finally {
+        abort.abort(run.abortReason ?? terminalReason);
+        checkpointAbortInFlight = false;
+      }
+    })();
+    checkpointRunBoundaryTask = task;
+    return task;
   };
 
   const recordRunBoundaryDiagnostic = (
@@ -1139,21 +1641,22 @@ export function startRun(
   ) => {
     if (getCurrentRequestDbPoolScope()?.closing) return;
     void retainRequestDbPoolScope(
-      recordRunDiagnostic(
-        runId,
-        RUN_DIAG_STAGE.runBoundaryReached,
-        JSON.stringify({
-          reason,
-          disposition,
-          silentForMs: diagnostic.silentForMs,
-          lastEventType: diagnostic.lastEventType,
-          inFlightWorkCount,
-          eventCount: run.events.length,
-          elapsedMs: Date.now() - run.startedAt,
-        }),
-        // coercion-ok: recordRunDiagnostic already swallows its own failures;
-        // this guards only against an unhandled rejection.
-      ).catch(() => {}),
+      withWorkerFence(() =>
+        recordRunDiagnostic(
+          runId,
+          RUN_DIAG_STAGE.runBoundaryReached,
+          JSON.stringify({
+            reason,
+            disposition,
+            silentForMs: diagnostic.silentForMs,
+            lastEventType: diagnostic.lastEventType,
+            inFlightWorkCount,
+            eventCount: run.events.length,
+            elapsedMs: Date.now() - run.startedAt,
+          }),
+          // coercion-ok: diagnostic persistence must not create an unhandled rejection.
+        ).catch(() => {}),
+      ),
     ).catch(() => {});
   };
 
@@ -1161,7 +1664,8 @@ export function startRun(
     reason: "no_progress" | "run_timeout",
     diagnostic: { silentForMs?: number; lastEventType?: string } = {},
   ) => {
-    if (run.status !== "running" || abort.signal.aborted) return;
+    if (runDriverSettled || run.status !== "running" || abort.signal.aborted)
+      return;
     const activeChunkAbort = chunkAbort;
     const canRecoverChunk =
       activeChunkAbort !== null &&
@@ -1181,22 +1685,8 @@ export function startRun(
       return;
     }
     if (chunkAbort) chunkBoundaryReason = reason;
-    softTimedOut = true;
-    recordRunBoundaryDiagnostic(reason, diagnostic, "terminal");
-    emitRunBoundaryTrackingEvent({
-      runId,
-      threadId,
-      reason,
-      recovered: false,
-      boundaryIndex: recoveredChunkBoundaries + 1,
-      dispatchMode: options?.dispatchMode,
-      model: options?.model,
-      engineName: options?.engineName,
-      userId: options?.userId,
-    });
     const event: AgentChatEvent = { type: "auto_continue", reason };
-    send(event);
-    void checkpointRunBoundary(event, reason);
+    void checkpointRunBoundary(event, reason, diagnostic);
   };
 
   const checkNoProgressBackstop = () => {
@@ -1204,7 +1694,9 @@ export function startRun(
     if (run.status !== "running" || abort.signal.aborted) return;
     if (inFlightWorkCount > 0) return;
     const silentForMs = Date.now() - lastRealProgressAt;
-    if (silentForMs < noProgressTimeoutMs) return;
+    const emptyCallLoop =
+      consecutiveEmptyModelCalls > MAX_CONSECUTIVE_EMPTY_MODEL_CALLS;
+    if (!emptyCallLoop && silentForMs < noProgressTimeoutMs) return;
     const lastEventType = run.events.at(-1)?.event.type;
     if (!chunkAbort) {
       console.error(
@@ -1242,23 +1734,54 @@ export function startRun(
 
   let lastAbortCheck = Date.now() - 3000;
   let consecutiveAbortCheckFailures = 0;
-  const checkSqlAbort = () => {
-    const now = Date.now();
-    if (now - lastAbortCheck < 3000) return;
-    lastAbortCheck = now;
-    getRunAbortState(runId)
-      .then(async (state) => {
-        if (state.aborted && !abort.signal.aborted) {
-          abortInMemoryRun(run, state.reason ?? "user");
-          return;
-        }
-        if (!abort.signal.aborted) {
-          const status = await getRunStatus(runId);
-          if (status !== null && status !== "running") {
-            abortInMemoryRun(run, "displaced");
+  let completionInProgress = false;
+  let ownTerminalStatusEstablished = false;
+  let terminalStatusWrite: Promise<boolean> | null = null;
+  let terminalStatusWriteOutcomeUnknown = false;
+  const inspectSqlAbortState = async (
+    includeTerminalStatus: boolean,
+  ): Promise<void> => {
+    // raw-sql-ok: getRunAbortState binds runId through its query args.
+    const state = await getRunAbortState(runId);
+    if (state.aborted && !abort.signal.aborted) {
+      abortInMemoryRun(run, state.reason ?? "user");
+      return;
+    }
+    let status: string | null = null;
+    if (
+      includeTerminalStatus &&
+      !abort.signal.aborted &&
+      !ownTerminalStatusEstablished
+    ) {
+      status = await getRunStatus(runId);
+      if (status !== null && status !== "running") {
+        const pendingStatusWrite = terminalStatusWrite;
+        if (pendingStatusWrite) {
+          try {
+            await pendingStatusWrite;
+          } catch (error) {
+            if (!terminalStatusWriteOutcomeUnknown) throw error;
+            return;
           }
         }
-      })
+        if (terminalStatusWriteOutcomeUnknown) return;
+      }
+    }
+    if (
+      status !== null &&
+      status !== "running" &&
+      !abort.signal.aborted &&
+      !ownTerminalStatusEstablished
+    ) {
+      abortInMemoryRun(run, "displaced");
+    }
+  };
+
+  const checkSqlAbort = (): Promise<void> => {
+    const now = Date.now();
+    if (now - lastAbortCheck < 3000) return Promise.resolve();
+    lastAbortCheck = now;
+    return inspectSqlAbortState(true)
       .then(() => {
         consecutiveAbortCheckFailures = 0;
       })
@@ -1288,14 +1811,42 @@ export function startRun(
 
   let consecutiveHeartbeatFailures = 0;
   let heartbeatInFlight = false;
+  let livenessResolved = false;
+  let heartbeatAttempt = 0;
+  let pendingHeartbeats = 0;
   const heartbeatTimer: ReturnType<typeof setInterval> = setInterval(() => {
-    if (!heartbeatInFlight) {
+    if (!heartbeatInFlight && pendingHeartbeats < MAX_PENDING_HEARTBEATS) {
       heartbeatInFlight = true;
-      updateRunHeartbeat(runId)
-        .then(() => {
+      pendingHeartbeats += 1;
+      const attempt = ++heartbeatAttempt;
+      // One renewal stuck acquiring a connection must not hold the slot until
+      // the lease lapses, so a later tick retries while it settles. Only one
+      // retry may overlap it, or a stalled pool would fill with renewals.
+      const releaseStuckHeartbeat = setTimeout(() => {
+        if (heartbeatAttempt === attempt) heartbeatInFlight = false;
+      }, HEARTBEAT_ATTEMPT_DEADLINE_MS);
+      (options?.executionLease
+        ? executionFencePromise.then(async (fence) => {
+            if (!fence) return false;
+            await renewTurnExecutionLease(fence);
+            return true;
+          })
+        : updateRunHeartbeat(runId).then(() => true)
+      )
+        .then((livenessConfirmed) => {
           consecutiveHeartbeatFailures = 0;
+          if (livenessConfirmed && !livenessResolved) {
+            livenessResolved = true;
+            resolveLivenessReady(true);
+          }
         })
         .catch((error) => {
+          if (error instanceof StaleExecutionFenceError) {
+            if (!completionInProgress) {
+              abortInMemoryRun(run, EXECUTION_LEASE_LOST_ABORT_REASON);
+            }
+            return;
+          }
           consecutiveHeartbeatFailures += 1;
           if (consecutiveHeartbeatFailures >= 3) {
             captureError(error, {
@@ -1311,16 +1862,28 @@ export function startRun(
           }
         })
         .finally(() => {
-          heartbeatInFlight = false;
+          clearTimeout(releaseStuckHeartbeat);
+          pendingHeartbeats -= 1;
+          if (heartbeatAttempt === attempt) heartbeatInFlight = false;
         });
     }
-    checkSqlAbort();
+    void checkSqlAbort();
     checkNoProgressBackstop();
   }, 1500);
   const softTimeoutMs = resolveRunSoftTimeoutMs(options?.softTimeoutMs, {
     useHostedDefault: options?.useHostedSoftTimeoutDefault === true,
     backgroundFunction: options?.backgroundFunction === true,
   });
+  const hasSoftTimeout =
+    softTimeoutMs > 0 || options?.softTimeoutDeadlineAt !== undefined;
+  const runDeadlineAt = hasSoftTimeout
+    ? Math.min(
+        softTimeoutMs > 0
+          ? Date.now() + softTimeoutMs
+          : Number.POSITIVE_INFINITY,
+        options?.softTimeoutDeadlineAt ?? Number.POSITIVE_INFINITY,
+      )
+    : null;
   const noProgressTimeoutMs = resolveRunNoProgressTimeoutMs({
     softTimeoutMs,
     backgroundFunction: options?.backgroundFunction === true,
@@ -1328,15 +1891,18 @@ export function startRun(
     backgroundOverrideMs: options?.backgroundNoProgressTimeoutMs,
   });
   const softTimeoutTimer =
-    softTimeoutMs > 0 && !recoverChunkBoundaries
-      ? setTimeout(() => {
-          reachRunBoundary("run_timeout", {
-            lastEventType: run.events.at(-1)?.event.type,
-          });
-        }, softTimeoutMs)
+    hasSoftTimeout && !recoverChunkBoundaries
+      ? setTimeout(
+          () => {
+            const lastEventType = run.events.at(-1)?.event.type;
+            reachRunBoundary("run_timeout", {
+              ...(lastEventType === undefined ? {} : { lastEventType }),
+            });
+          },
+          Math.max(0, (runDeadlineAt ?? Date.now()) - Date.now()),
+        )
       : null;
-  if (recoverChunkBoundaries && softTimeoutMs > 0) {
-    const runDeadlineAt = Date.now() + softTimeoutMs;
+  if (recoverChunkBoundaries && hasSoftTimeout) {
     recoverableRunDeadlineAt = runDeadlineAt;
     armChunkSoftTimeout = () => {
       if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
@@ -1348,17 +1914,16 @@ export function startRun(
             lastEventType: run.events.at(-1)?.event.type,
           });
         },
-        Math.max(0, runDeadlineAt - Date.now()),
+        Math.max(0, (runDeadlineAt ?? Date.now()) - Date.now()),
       );
     };
     armChunkSoftTimeout();
   }
-  let pendingTerminalEvent: RunEvent | null = null;
-
   const captureRunError = (error: unknown, phase: "run" | "completion") => {
-    const errorCode = getRunErrorCode(error);
-    const engineError = error instanceof EngineError ? error : null;
-    captureError(error, {
+    const errorCode = privateTurn ? undefined : getRunErrorCode(error);
+    const engineError =
+      !privateTurn && error instanceof EngineError ? error : null;
+    captureError(safeRunError(error), {
       route: "/_agent-native/agent-chat",
       aiTraceId: runId,
       errorMessagePolicy: "omit",
@@ -1405,36 +1970,58 @@ export function startRun(
     eventData: string,
     eventAt: number,
   ): Promise<void> => {
-    if (runEvent.event.type === "tool_start") await insertRunPromise;
+    await waitForRunInsert();
+    const requireInserted = !servicePrincipalStartRefused;
     const write = () =>
-      runEvent.event.type === "tool_start" ||
-      runEvent.event.type === "tool_done"
-        ? insertRunEvent(runId, runEvent.seq, eventData, {
-            eventAt,
-            toolInputSource: "execution",
-            ...(runEvent.event.type === "tool_start"
-              ? { requireInserted: true }
-              : {}),
+      insertRunEvent(runId, runEvent.seq, eventData, {
+        eventAt,
+        ...(runEvent.event.type === "tool_start" ||
+        runEvent.event.type === "tool_done"
+          ? { toolInputSource: "execution" as const }
+          : {}),
+        ...(requireInserted ? { requireInserted: true } : {}),
+        ...(runEvent.event.type === "auto_continue"
+          ? { allowContinuationTerminal: true }
+          : {}),
+      });
+    return withWorkerFence(() =>
+      options?.persistEvent
+        ? options.persistEvent(write, {
+            terminal: isTerminalRunEvent(runEvent.event),
+            runId,
+            seq: runEvent.seq,
+            eventData,
           })
-        : insertRunEvent(runId, runEvent.seq, eventData, { eventAt });
-    return options?.persistEvent
-      ? options.persistEvent(write, {
-          terminal: isTerminalRunEvent(runEvent.event),
-          runId,
-          seq: runEvent.seq,
-          eventData,
-        })
-      : write();
+        : write(),
+    );
   };
 
-  const emitRunEvent = (
-    runEvent: RunEvent,
-    options?: { surfacePersistenceError?: boolean },
-  ): Promise<void> => {
-    const eventData = JSON.stringify(runEvent.event);
-    const eventAt = Date.now();
-    run.events.push(runEvent);
-
+  const publishRunEvent = (runEvent: RunEvent) => {
+    const retainedEvent =
+      runEvent.event.omitFromPersistedHistory === true
+        ? {
+            ...runEvent,
+            event: JSON.parse(
+              persistedRunEventData(JSON.stringify(runEvent.event)),
+            ) as AgentChatEvent,
+          }
+        : runEvent;
+    if (
+      runEvent.event.omitFromPersistedHistory === true &&
+      runEvent.event.type === "text" &&
+      runEvent.event.text.trim().length > 0
+    ) {
+      privateAssistantTextSequences.add(runEvent.seq);
+    }
+    if (
+      runEvent.event.omitFromPersistedHistory === true &&
+      runEvent.event.type === "tool_done" &&
+      (runEvent.event.chatUI !== undefined ||
+        runEvent.event.mcpApp !== undefined)
+    ) {
+      privateCompletedUiTools.add(runEvent.seq);
+    }
+    run.events.push(retainedEvent);
     for (const subscriber of run.subscribers) {
       try {
         subscriber(runEvent);
@@ -1442,13 +2029,72 @@ export function startRun(
         run.subscribers.delete(subscriber);
       }
     }
-
     trackInFlightWork(runEvent.event);
     if (shouldBumpProgressForEvent(runEvent.event)) {
       lastRealProgressAt = Date.now();
+      consecutiveEmptyModelCalls = 0;
+      modelCallHadProgress = true;
       bumpProgressIfDue();
+    } else if (runEvent.event.type === "model_stream") {
+      if (runEvent.event.status === "start") {
+        modelCallHadProgress = false;
+      } else {
+        lastRealProgressAt = Date.now();
+        if (!modelCallHadProgress) consecutiveEmptyModelCalls++;
+      }
     }
+  };
 
+  const queueRunEvent = (
+    pendingWrite: PendingRunEventWrite,
+    runEvent: RunEvent,
+  ): Promise<void> => {
+    let resolve!: () => void;
+    let reject!: (error: unknown) => void;
+    const publication = new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    const pendingPublication: PendingRunEventPublication = {
+      runEvent,
+      resolve,
+      reject,
+      settled: false,
+    };
+    pendingWrite.publications.push(pendingPublication);
+    void flushEventWrites(false).catch((error) => {
+      if (pendingPublication.settled) return;
+      pendingPublication.settled = true;
+      pendingPublication.reject(error);
+    });
+    return publication;
+  };
+
+  const emitRunEvent = (
+    runEvent: RunEvent,
+    options?: { surfacePersistenceError?: boolean },
+  ): Promise<void> => {
+    if (
+      persistenceFailure instanceof AgentRunEventNotPersistedError &&
+      persistenceFailure.terminalRun
+    ) {
+      const publication = Promise.reject(persistenceFailure);
+      if (!options?.surfacePersistenceError) publication.catch(() => {});
+      void checkSqlAbort();
+      return publication;
+    }
+    if (privateTurn && runEvent.event.omitFromPersistedHistory !== true) {
+      runEvent = {
+        ...runEvent,
+        event: { ...runEvent.event, omitFromPersistedHistory: true },
+      };
+    }
+    const eventData = JSON.stringify(runEvent.event);
+    const persistedEventData =
+      runEvent.event.omitFromPersistedHistory === true
+        ? persistedRunEventData(eventData)
+        : eventData;
+    const eventAt = Date.now();
     const retryOnce = async (write: () => Promise<void>) => {
       try {
         await write();
@@ -1460,85 +2106,152 @@ export function startRun(
             eventType: runEvent.event.type,
           });
         }
+        if (
+          error instanceof AgentRunEventNotPersistedError &&
+          error.terminalRun
+        ) {
+          throw error;
+        }
         await write();
       }
     };
-    let persistence: Promise<void>;
+    let publication: Promise<void>;
     if (isBatchableRunEvent(runEvent.event) && !persistEventHook) {
       if (!openEventBatch) {
         const batch: RunEventBatch = {
           events: [],
-          write: persistenceChain.then(() => {
-            if (openEventBatch === batch) openEventBatch = null;
-            return retryOnce(() => insertRunEvents(runId, batch.events));
-          }),
+          pendingWrite: {
+            publications: [],
+            write: () => {
+              if (openEventBatch === batch) openEventBatch = null;
+              return (async () => {
+                await waitForRunInsert();
+                if (servicePrincipalStartRefused) return;
+                await retryOnce(() =>
+                  withWorkerFence(() => insertRunEvents(runId, batch.events)),
+                );
+              })();
+            },
+          },
         };
         openEventBatch = batch;
-        persistenceChain = batch.write;
+        pendingEventWrites.push(batch.pendingWrite);
       }
       openEventBatch.events.push({
         seq: runEvent.seq,
         eventAt,
-        eventData,
+        eventData: persistedEventData,
       });
-      persistence = openEventBatch.write;
+      publication = queueRunEvent(openEventBatch.pendingWrite, runEvent);
     } else {
       // Anything emitted after this event must not persist before it.
       openEventBatch = null;
-      persistence = persistenceChain.then(() =>
-        retryOnce(() => persistRunEvent(runEvent, eventData, eventAt)),
-      );
-      persistenceChain = persistence;
-    }
-    if (!options?.surfacePersistenceError) {
-      persistence.catch(() => {});
+      const pendingWrite: PendingRunEventWrite = {
+        publications: [],
+        write: () =>
+          retryOnce(() =>
+            persistRunEvent(runEvent, persistedEventData, eventAt),
+          ),
+      };
+      pendingEventWrites.push(pendingWrite);
+      publication = queueRunEvent(pendingWrite, runEvent);
     }
 
-    checkSqlAbort();
-    return persistence;
+    if (!options?.surfacePersistenceError) publication.catch(() => {});
+
+    void checkSqlAbort();
+    return publication;
   };
 
   const send = (event: AgentChatEvent) => {
-    if (run.status === "aborted" && abort.signal.aborted) return;
+    if (run.status === "aborted" && abort.signal.aborted)
+      return Promise.resolve();
+    if (event.omitFromPersistedHistory === true) privateTurn = true;
+    const eventWithPrivacy = privateTurn
+      ? { ...event, omitFromPersistedHistory: true as const }
+      : event;
 
     // Explicit false distinguishes current completions from legacy pauses.
     const normalizedEvent =
-      event.type === "tool_done" && event.approvalPause === undefined
-        ? { ...event, approvalPause: false }
-        : event;
+      eventWithPrivacy.type === "tool_done" &&
+      eventWithPrivacy.approvalPause === undefined
+        ? { ...eventWithPrivacy, approvalPause: false }
+        : eventWithPrivacy;
     const runEvent: RunEvent = {
-      seq: run.events.length,
+      seq: peekRunEventSeq(run),
       event: normalizedEvent,
     };
     if (isTerminalRunEvent(event)) {
+      if (persistedCheckpointTerminalEvent) return Promise.resolve();
+      if (
+        checkpointPersistenceFailed &&
+        pendingTerminalEvent?.event.type === "error" &&
+        pendingTerminalEvent.event.errorCode ===
+          "run_checkpoint_persistence_failed"
+      ) {
+        return Promise.resolve();
+      }
       pendingTerminalEvent = runEvent;
-      return;
+      return Promise.resolve();
     }
 
-    void emitRunEvent(runEvent);
+    run.nextEventSeq = runEvent.seq + 1;
+    return emitRunEvent(runEvent);
   };
 
-  const runPromise = (
-    servicePrincipalRunStart
-      ? insertRunPromise.then(() => {
-          if (!abort.signal.aborted) {
-            return runFn(send, runControl.chunkSignal, runControl);
-          }
-        })
-      : runFn(send, runControl.chunkSignal, runControl)
-  )
-    .then(() => {
+  const startDriver = async (): Promise<void> => {
+    if (options?.executionLease) {
+      if (executionLeaseClaimFailed || abort.signal.aborted) return;
+      await withWorkerFence(async () => {
+        if (executionLeaseClaimFailed || abort.signal.aborted) return;
+        await inspectSqlAbortState(false);
+        consecutiveAbortCheckFailures = 0;
+        if (isRunAborted()) return;
+        await runFn(send, runControl.chunkSignal, runControl);
+      });
+      return;
+    }
+    if (servicePrincipalRunStart) await insertRunPromise;
+    if (abort.signal.aborted) return;
+    await inspectSqlAbortState(false);
+    consecutiveAbortCheckFailures = 0;
+    if (isRunAborted()) return;
+    await runFn(send, runControl.chunkSignal, runControl);
+  };
+
+  const runPromise = startDriver()
+    .then(async () => {
+      runDriverSettled = true;
+      if (checkpointAbortInFlight) await checkpointRunBoundaryTask;
       settleBoundary(false);
       if (abort.signal.aborted) {
-        run.status = softTimedOut ? "completed" : "aborted";
+        if (run.status !== "aborted") {
+          run.status =
+            checkpointObservedTerminalStatus ??
+            (checkpointPersistenceFailed
+              ? "errored"
+              : softTimedOut
+                ? "completed"
+                : "aborted");
+        }
         return;
       }
       run.status = "completed";
     })
-    .catch((err) => {
+    .catch(async (err) => {
+      runDriverSettled = true;
+      if (checkpointAbortInFlight) await checkpointRunBoundaryTask;
       settleBoundary(false);
       if (abort.signal.aborted) {
-        run.status = softTimedOut ? "completed" : "aborted";
+        if (run.status !== "aborted") {
+          run.status =
+            checkpointObservedTerminalStatus ??
+            (checkpointPersistenceFailed
+              ? "errored"
+              : softTimedOut
+                ? "completed"
+                : "aborted");
+        }
         return;
       }
       run.status = "errored";
@@ -1566,42 +2279,121 @@ export function startRun(
       });
     })
     .finally(async () => {
+      completionInProgress = true;
       let completionError: unknown = null;
       let terminalPersistenceError: unknown = null;
-      let eventPersistenceError: unknown = null;
+      let eventPersistenceFailure: { error: unknown } | null = null;
       let runTerminalErrorCode: string | undefined;
+      let runTerminalBlockedTool: string | undefined;
+      let runTerminalBlockedBy: UnknownWriteCause | undefined;
       let terminalPersistenceEstablished = false;
+      let continuationStatusPersistedBeforeEvent = false;
+      let suppressContinuationEvent = false;
       try {
         await persistenceChain;
       } catch (error) {
-        eventPersistenceError = error;
-        if (run.status !== "aborted") {
+        eventPersistenceFailure = { error };
+      }
+      try {
+        await run.abortPersistencePromise;
+      } catch (error) {
+        eventPersistenceFailure ??= { error };
+      }
+      if (eventPersistenceFailure && run.status !== "aborted") {
+        run.status = "errored";
+        pendingTerminalEvent = {
+          seq: allocateRunEventSeq(run),
+          event: {
+            type: "error",
+            error: "Agent run ended unexpectedly",
+            errorCode: "run_event_persistence_failed",
+          },
+        };
+      }
+      if (checkpointStatusReadFailed || checkpointUnknownStatus !== null) {
+        const event = checkpointStatusReadFailed
+          ? RUN_TERMINAL_LOOKUP_FAILED_ERROR_EVENT
+          : UNKNOWN_RUN_STATUS_ERROR_EVENT;
+        const abortAlreadyWon =
+          run.status === "aborted" && run.abortReason !== undefined;
+        if (!abortAlreadyWon) {
           run.status = "errored";
-          pendingTerminalEvent = {
-            seq: run.events.length,
-            event: {
-              type: "error",
-              error: "Agent run ended unexpectedly",
-              errorCode: "run_event_persistence_failed",
-            },
-          };
+          if (!eventPersistenceFailure) {
+            pendingTerminalEvent = {
+              seq: peekRunEventSeq(run),
+              event: { ...event },
+            };
+          }
+        }
+        if (checkpointUnknownStatus !== null) {
+          console.error(
+            "[run-manager] checkpoint observed an unknown persisted run status",
+            runId,
+            checkpointUnknownStatus,
+          );
         }
       }
       const resolveTerminalEventForCompletion = () => {
-        if (run.status === "aborted") return null;
-        if (eventPersistenceError) return pendingTerminalEvent;
+        if (run.status === "aborted" && run.abortReason !== undefined)
+          return null;
+        if (eventPersistenceFailure) {
+          return pendingTerminalEvent
+            ? { ...pendingTerminalEvent, seq: run.events.length }
+            : null;
+        }
+        if (checkpointStatusReadFailed || checkpointUnknownStatus !== null) {
+          return pendingTerminalEvent
+            ? { ...pendingTerminalEvent, seq: peekRunEventSeq(run) }
+            : null;
+        }
+        if (persistedCheckpointTerminalEvent) {
+          return {
+            ...persistedCheckpointTerminalEvent,
+            seq: peekRunEventSeq(run),
+          };
+        }
         const continuationTerminalEvent = run.continuationTerminalEvent
           ? {
-              seq: run.events.length,
+              seq: peekRunEventSeq(run),
               event: run.continuationTerminalEvent,
             }
           : null;
-        return continuationTerminalEvent ?? pendingTerminalEvent;
+        if (continuationTerminalEvent) return continuationTerminalEvent;
+        return pendingTerminalEvent
+          ? { ...pendingTerminalEvent, seq: peekRunEventSeq(run) }
+          : null;
       };
+      const stoppedByRequest = () =>
+        run.status === "aborted" &&
+        isRequestedStopAbortReason(run.abortReason ?? "");
       let terminalEventForCompletion = resolveTerminalEventForCompletion();
       let terminalEvent = terminalEventForCompletion?.event ?? null;
-      if (onComplete) {
+      if (
+        onComplete &&
+        !checkpointStatusReadFailed &&
+        checkpointUnknownStatus === null
+      ) {
         try {
+          const privateTurnForCompletion =
+            privateTurn ||
+            run.events.some(
+              ({ event }) => event.omitFromPersistedHistory === true,
+            );
+          const completionEvent = terminalEventForCompletion
+            ? privateTurnForCompletion
+              ? {
+                  ...terminalEventForCompletion,
+                  event: JSON.parse(
+                    persistedRunEventData(
+                      JSON.stringify({
+                        ...terminalEventForCompletion.event,
+                        omitFromPersistedHistory: true,
+                      }),
+                    ),
+                  ) as AgentChatEvent,
+                }
+              : terminalEventForCompletion
+            : null;
           const completionStatus =
             run.status !== "aborted" &&
             terminalEventForcesErroredStatus(terminalEvent)
@@ -1612,12 +2404,16 @@ export function startRun(
               ? {
                   ...run,
                   status: completionStatus,
-                  events: terminalEventForCompletion
-                    ? [...run.events, terminalEventForCompletion]
+                  events: completionEvent
+                    ? [...run.events, completionEvent]
                     : run.events,
                 }
               : run;
-          await onComplete(completionRun);
+          if (!executionLeaseClaimFailed) {
+            await withWorkerFence(async () => onComplete(completionRun), {
+              outlivesStop: stoppedByRequest(),
+            });
+          }
           run.continuationTerminalEvent ??=
             completionRun.continuationTerminalEvent;
         } catch (err) {
@@ -1625,7 +2421,11 @@ export function startRun(
           captureRunError(err, "completion");
           console.error(
             "[run-manager] onComplete callback error:",
-            err instanceof Error ? err.message : err,
+            privateTurn
+              ? "Private content omitted"
+              : err instanceof Error
+                ? err.message
+                : err,
           );
         }
       }
@@ -1640,12 +2440,34 @@ export function startRun(
               completionError ||
               terminalEventForcesErroredStatus(terminalEvent)
             ? "errored"
-            : "completed";
+            : run.status === "truncated"
+              ? "truncated"
+              : "completed";
       run.status = finalStatus;
+      const runForCompletionChecks: ActiveRun = privateTurn
+        ? {
+            ...run,
+            events: run.events.map((runEvent) =>
+              privateAssistantTextSequences.has(runEvent.seq) &&
+              runEvent.event.type === "text"
+                ? { ...runEvent, event: { ...runEvent.event, text: "..." } }
+                : runEvent,
+            ),
+          }
+        : run;
       const shouldAutoContinueAfterUnfinishedTurn =
         finalStatus === "completed" &&
-        (endsAfterToolResultWithoutAssistantFinal(run) ||
-          endsDuringActionPreparation(run)) &&
+        !checkpointStatusReadFailed &&
+        checkpointUnknownStatus === null &&
+        !(
+          terminalEventForCompletion?.event.type === "done" &&
+          terminalEventForCompletion.event.reason === "action_settled"
+        ) &&
+        (endsAfterToolResultWithoutAssistantFinal(
+          runForCompletionChecks,
+          privateCompletedUiTools,
+        ) ||
+          endsDuringActionPreparation(runForCompletionChecks)) &&
         (!terminalEventForCompletion ||
           (terminalEventForCompletion.event.type === "done" &&
             terminalEventForCompletion.event.reason !== "user"));
@@ -1660,22 +2482,132 @@ export function startRun(
         terminalEvent = unfinishedTurnContinuationEvent;
       }
       const terminalReason =
-        eventPersistenceError && finalStatus !== "aborted"
+        eventPersistenceFailure && finalStatus !== "aborted"
           ? "error:run_event_persistence_failed"
-          : terminalReasonForRun(
-              finalStatus,
-              terminalEvent,
-              run.abortReason,
-              completionError,
-            );
+          : privateTurn && terminalEvent?.type === "error"
+            ? "error:private_content_omitted"
+            : terminalReasonForRun(
+                finalStatus,
+                terminalEvent,
+                run.abortReason,
+                completionError,
+              );
       const persistedStatus =
         finalStatus === "completed" &&
         isContinuationTerminalReason(terminalReason)
           ? "truncated"
           : finalStatus;
+      let volatileTerminalEvent: RunEvent | null = null;
+      const threadProjectionPending = Boolean(
+        completionError ||
+        (onComplete &&
+          (checkpointStatusReadFailed || checkpointUnknownStatus !== null)),
+      );
+      const terminalStatusOptions = {
+        ...(threadProjectionPending ? { threadProjectionPending: true } : {}),
+        ...(checkpointBoundaryStarted || persistedStatus === "truncated"
+          ? { terminalReason }
+          : {}),
+      };
+      const persistTerminalStatus = () =>
+        Object.keys(terminalStatusOptions).length === 0
+          ? updateRunStatusIfRunning(runId, persistedStatus)
+          : updateRunStatusIfRunning(
+              runId,
+              persistedStatus,
+              terminalStatusOptions,
+            );
+      const persistOwnTerminalState = async (
+        persist: () => Promise<boolean>,
+      ) => {
+        let writeStarted = false;
+        const write = withWorkerFence(() => {
+          writeStarted = true;
+          return persist();
+        }).catch((error) => {
+          if (writeStarted) terminalStatusWriteOutcomeUnknown = true;
+          throw error;
+        });
+        terminalStatusWrite = write;
+        try {
+          const established = await write;
+          if (established && !terminalStatusWriteOutcomeUnknown) {
+            ownTerminalStatusEstablished = true;
+          }
+          return established;
+        } finally {
+          if (terminalStatusWrite === write) terminalStatusWrite = null;
+        }
+      };
+      const persistOwnTerminalStatus = () =>
+        persistOwnTerminalState(persistTerminalStatus);
+      const confirmAmbiguousTerminalStatus = async () => {
+        const persistedRun = await getRunById(runId);
+        if (persistedRun?.status !== persistedStatus) return false;
+
+        const expectedTerminalReason = terminalReason.slice(0, 200);
+        if (persistedRun.terminalReason === expectedTerminalReason) {
+          return true;
+        }
+        if (persistedRun.terminalReason) return false;
+
+        return withWorkerFence(() =>
+          setRunTerminalReasonIfStatus(
+            runId,
+            persistedStatus,
+            expectedTerminalReason,
+          ),
+        );
+      };
+      const reconcileTerminalRun = async () => {
+        let reconciled = false;
+        try {
+          reconciled = await persistOwnTerminalState(() =>
+            threadProjectionPending
+              ? reconcileTerminalRunFromEvents(runId, {
+                  threadProjectionPending: true,
+                })
+              : reconcileTerminalRunFromEvents(runId),
+          );
+        } catch (error) {
+          if (!terminalStatusWriteOutcomeUnknown) throw error;
+        }
+        if (reconciled) {
+          terminalStatusWriteOutcomeUnknown = false;
+          ownTerminalStatusEstablished = true;
+          return true;
+        }
+        if (!terminalStatusWriteOutcomeUnknown) {
+          return reconciled;
+        }
+        const confirmed = await confirmAmbiguousTerminalStatus();
+        terminalStatusWriteOutcomeUnknown = false;
+        if (confirmed) ownTerminalStatusEstablished = true;
+        return confirmed;
+      };
+      const reportTerminalStatusPersistenceError = (error: unknown) => {
+        captureError(safeRunError(error), {
+          route: "/_agent-native/agent-chat",
+          aiTraceId: runId,
+          tags: {
+            source: "agent-run-manager",
+            phase: "terminal-status-persistence",
+            errorCode: "run_terminal_status_persistence_failed",
+          },
+          extra: { runId, threadId, turnId: run.turnId },
+        });
+        console.error(
+          "[run-manager] terminal status persistence error:",
+          privateTurn
+            ? "Private content omitted"
+            : error instanceof Error
+              ? error.message
+              : error,
+        );
+      };
 
       if (finalStatus === "completed" || finalStatus === "errored") {
-        const terminalEventToEmit: AgentChatEvent = eventPersistenceError
+        const terminalEventToEmit: AgentChatEvent = eventPersistenceFailure
           ? {
               type: "error",
               error: "Agent run ended unexpectedly",
@@ -1696,26 +2628,63 @@ export function startRun(
                       ? "Agent response could not be saved."
                       : "Agent run ended unexpectedly",
                   };
+        if (terminalEventToEmit.type === "auto_continue") {
+          if (persistedStatus !== "truncated") {
+            suppressContinuationEvent = true;
+          } else {
+            try {
+              await insertRunPromise;
+              continuationStatusPersistedBeforeEvent =
+                await persistOwnTerminalStatus();
+              if (!continuationStatusPersistedBeforeEvent) {
+                await reconcileTerminalRun();
+                const persistedRun = await getRunById(runId);
+                continuationStatusPersistedBeforeEvent =
+                  persistedRun?.status === "truncated" &&
+                  persistedRun.terminalReason === terminalReason;
+              }
+              if (continuationStatusPersistedBeforeEvent) {
+                terminalPersistenceEstablished = true;
+              } else {
+                suppressContinuationEvent = true;
+              }
+            } catch (error) {
+              suppressContinuationEvent = true;
+              reportTerminalStatusPersistenceError(error);
+            }
+          }
+        }
         const last = run.events[run.events.length - 1];
-        if (!last || !isTerminalRunEvent(last.event)) {
+        if (
+          (!last || !isTerminalRunEvent(last.event)) &&
+          !suppressContinuationEvent
+        ) {
           const terminal: RunEvent = {
-            seq: run.events.length,
-            event: terminalEventToEmit,
+            seq: terminalEventForCompletion?.seq ?? allocateRunEventSeq(run),
+            event: privateTurn
+              ? { ...terminalEventToEmit, omitFromPersistedHistory: true }
+              : terminalEventToEmit,
           };
-          try {
-            await emitRunEvent(terminal, { surfacePersistenceError: true });
-          } catch (err) {
-            terminalPersistenceError = err;
-            captureRunError(err, "completion");
-            console.error(
-              "[run-manager] terminal event persistence error:",
-              err instanceof Error ? err.message : err,
-            );
-            if (!eventPersistenceError) {
+          if (eventPersistenceFailure) {
+            volatileTerminalEvent = terminal;
+          } else {
+            try {
+              await emitRunEvent(terminal, { surfacePersistenceError: true });
+            } catch (err) {
+              terminalPersistenceError = err;
+              captureRunError(err, "completion");
+              console.error(
+                "[run-manager] terminal event persistence error:",
+                privateTurn
+                  ? "Private content omitted"
+                  : err instanceof Error
+                    ? err.message
+                    : err,
+              );
               try {
                 await persistRunEvent(
                   terminal,
-                  JSON.stringify(terminal.event),
+                  persistedRunEventData(JSON.stringify(terminal.event)),
                   Date.now(),
                 );
                 terminalPersistenceError = null;
@@ -1724,59 +2693,137 @@ export function startRun(
                 captureRunError(retryError, "completion");
                 console.error(
                   "[run-manager] terminal event retry persistence error:",
-                  retryError instanceof Error ? retryError.message : retryError,
+                  privateTurn
+                    ? "Private content omitted"
+                    : retryError instanceof Error
+                      ? retryError.message
+                      : retryError,
                 );
               }
             }
           }
         }
       }
-      for (const subscriber of run.subscribers) {
-        run.subscribers.delete(subscriber);
+      if (!volatileTerminalEvent) {
+        for (const subscriber of run.subscribers) {
+          run.subscribers.delete(subscriber);
+        }
       }
 
       if (inFlightWorkCount > 0 || inFlightMarkerSince !== null) {
         inFlightWorkCount = 0;
-        mirrorInFlightMarker(false);
+        if (!executionLeaseClaimFailed) mirrorInFlightMarker(false);
       }
 
-      try {
-        await insertRunPromise;
-        if (!terminalPersistenceError || eventPersistenceError) {
-          let statusUpdated = false;
+      if (executionLeaseClaimFailed || finalStatus === "aborted") {
+        if (!executionLeaseClaimFailed && run.abortPersistenceManaged) {
+          terminalPersistenceEstablished = true;
+        } else if (
+          !executionLeaseClaimFailed &&
+          (run.abortReason === "superseded" ||
+            run.abortReason === EXECUTION_LEASE_LOST_ABORT_REASON)
+        ) {
+          terminalPersistenceEstablished = false;
+        } else {
+          let abortStatusAttempted = false;
           try {
-            statusUpdated = await updateRunStatusIfRunning(
-              runId,
-              persistedStatus,
-            );
-          } catch {
-            statusUpdated = false;
-          }
-          if (statusUpdated) {
-            terminalPersistenceEstablished = !terminalPersistenceError;
-            await setRunTerminalReason(runId, terminalReason);
-          } else {
-            terminalPersistenceEstablished =
-              await reconcileTerminalRunFromEvents(runId).catch(() => false);
+            await insertRunPromise;
+            abortStatusAttempted = true;
+            const persistAtomicAbort = () =>
+              markRunAborted(
+                runId,
+                run.abortReason ?? "execution-lease-claim-failed",
+              );
+            const aborted = executionLeaseClaimFailed
+              ? await persistAtomicAbort()
+              : await withWorkerFence(persistAtomicAbort);
+            terminalPersistenceEstablished = aborted
+              ? true
+              : await reconcileTerminalRun();
+          } catch (error) {
+            terminalPersistenceEstablished = false;
+            reportTerminalStatusPersistenceError(error);
+            if (
+              eventPersistenceFailure &&
+              (abortStatusAttempted || eventPersistenceFailure.error !== error)
+            ) {
+              throw new AggregateError(
+                [eventPersistenceFailure.error, error],
+                "Run event and abort status persistence both failed",
+              );
+            }
+            throw error;
           }
         }
-      } catch {
-        // Best-effort — reapIfStale will eventually clean this up via
-        // the heartbeat-stale path.
+        if (
+          completionError &&
+          !executionLeaseClaimFailed &&
+          stoppedByRequest()
+        ) {
+          // The abort already made the run terminal, so no later status write
+          // carries the projection retry, and the reply it wrote would never
+          // reach the thread.
+          try {
+            await markRunThreadProjectionPending(runId);
+          } catch (error) {
+            reportTerminalStatusPersistenceError(error);
+          }
+        }
+      } else {
+        try {
+          if (!continuationStatusPersistedBeforeEvent) {
+            await insertRunPromise;
+          }
+          if (
+            !continuationStatusPersistedBeforeEvent &&
+            (!terminalPersistenceError || eventPersistenceFailure)
+          ) {
+            let statusUpdated = false;
+            try {
+              statusUpdated = await persistOwnTerminalStatus();
+            } catch (error) {
+              reportTerminalStatusPersistenceError(error);
+            }
+            if (statusUpdated) {
+              if (!checkpointBoundaryStarted) {
+                await withWorkerFence(() =>
+                  setRunTerminalReason(runId, terminalReason),
+                );
+              }
+              terminalPersistenceEstablished = !terminalPersistenceError;
+            } else {
+              terminalPersistenceEstablished = await reconcileTerminalRun();
+            }
+          }
+        } catch (error) {
+          terminalPersistenceEstablished = false;
+          reportTerminalStatusPersistenceError(error);
+        }
       }
 
       if (finalStatus === "errored") {
         let errorCode: string | undefined;
         let errorDetail: string | undefined;
+        const privateRun =
+          privateTurn ||
+          run.events.some(
+            ({ event }) => event.omitFromPersistedHistory === true,
+          );
         const diagnosticEvents = pendingTerminalEvent
           ? [...run.events, pendingTerminalEvent]
           : run.events;
-        for (let i = diagnosticEvents.length - 1; i >= 0; i--) {
+        if (privateRun) {
+          errorCode = "private_content_omitted";
+          errorDetail = "Private content omitted";
+        }
+        for (let i = diagnosticEvents.length - 1; !privateRun && i >= 0; i--) {
           const ev = diagnosticEvents[i].event as {
             type: string;
             error?: string;
             errorCode?: string;
             details?: string;
+            blockedTool?: string;
+            blockedBy?: UnknownWriteCause;
           };
           if (ev.type === "missing_api_key") {
             errorCode = LLM_MISSING_CREDENTIALS_ERROR_CODE;
@@ -1785,10 +2832,12 @@ export function startRun(
           } else if (ev.type === "error") {
             errorCode = ev.errorCode;
             errorDetail = ev.error ?? ev.details;
+            runTerminalBlockedTool = ev.blockedTool;
+            runTerminalBlockedBy = ev.blockedBy;
             break;
           }
         }
-        if (completionError && !errorCode) {
+        if (completionError && !errorCode && !privateRun) {
           errorCode = "completion_error";
           errorDetail =
             errorDetail ??
@@ -1798,13 +2847,24 @@ export function startRun(
         }
         errorCode ??= classifyTerminalErrorCode(errorDetail);
         runTerminalErrorCode = errorCode ?? "unknown";
-        await setRunError(runId, errorCode ?? "unknown", errorDetail);
+        await withWorkerFence(() =>
+          setRunError(runId, errorCode ?? "unknown", errorDetail),
+        );
+      }
+
+      if (volatileTerminalEvent) {
+        // The errored run row can reproduce this terminal on replay. Do not
+        // publish later sequence numbers across the missing durable prefix.
+        publishRunEvent({ ...volatileTerminalEvent, seq: run.events.length });
+        for (const subscriber of run.subscribers) {
+          run.subscribers.delete(subscriber);
+        }
       }
 
       if (terminalPersistenceError) {
-        const reconciled = eventPersistenceError
+        const reconciled = eventPersistenceFailure
           ? false
-          : await reconcileTerminalRunFromEvents(runId);
+          : await reconcileTerminalRun();
         if (!reconciled) throw terminalPersistenceError;
         terminalPersistenceEstablished = true;
       }
@@ -1825,6 +2885,8 @@ export function startRun(
           status: persistedStatus,
           terminalReason,
           errorCode: runTerminalErrorCode,
+          blockedTool: runTerminalBlockedTool,
+          blockedBy: runTerminalBlockedBy,
           dispatchMode: options?.dispatchMode,
           abortReason: run.abortReason,
           durationMs: Date.now() - run.startedAt,
@@ -1834,18 +2896,47 @@ export function startRun(
           attemptCount: options?.attemptCount,
         });
       }
+      if (eventPersistenceFailure) {
+        throw eventPersistenceFailure.error;
+      }
     })
-    .finally(() => {
+    .finally(async () => {
       clearInterval(heartbeatTimer);
+      if (!livenessResolved) {
+        livenessResolved = true;
+        resolveLivenessReady(false);
+      }
       if (softTimeoutTimer) clearTimeout(softTimeoutTimer);
       if (chunkSoftTimeoutTimer) clearTimeout(chunkSoftTimeoutTimer);
       if (progressWriteTimer) clearTimeout(progressWriteTimer);
       progressWriteTimer = null;
       progressWritePending = false;
+      if (options?.executionLease && !executionLeaseClaimFailed) {
+        try {
+          const fence = await executionFencePromise;
+          if (fence) await releaseTurnExecutionLease(fence);
+        } catch (error) {
+          captureError(error, {
+            route: "/_agent-native/agent-chat",
+            aiTraceId: runId,
+            tags: {
+              source: "agent-run-manager",
+              phase: "execution-lease-release",
+              errorCode:
+                error instanceof Error && "code" in error
+                  ? String((error as Error & { code?: unknown }).code)
+                  : "execution_lease_release_failed",
+            },
+            extra: { runId, threadId, turnId: run.turnId },
+          });
+        }
+      }
       setTimeout(() => {
-        activeRuns.delete(runId);
-        if (threadToRun.get(threadId) === runId) {
-          threadToRun.delete(threadId);
+        if (activeRuns.get(runId) === run) {
+          activeRuns.delete(runId);
+          if (threadToRun.get(threadId) === runId) {
+            threadToRun.delete(threadId);
+          }
         }
       }, CLEANUP_DELAY_MS);
       cleanupOldRuns(
@@ -1935,6 +3026,45 @@ function streamEventWithIdentity(
     : { ...event, seq, eventId: runEventIdentity(runId, seq) };
 }
 
+class SqlRunEventIntegrityError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "SqlRunEventIntegrityError";
+  }
+}
+
+function parseSqlRunEvent(
+  runId: string,
+  expectedSeq: number,
+  persisted: { seq: number; eventData: string },
+): AgentChatEvent {
+  if (!Number.isSafeInteger(persisted.seq) || persisted.seq !== expectedSeq) {
+    throw new SqlRunEventIntegrityError(
+      `Run ${runId} event sequence gap: expected ${expectedSeq}, received ${persisted.seq}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(persisted.eventData);
+  } catch (cause) {
+    throw new SqlRunEventIntegrityError(
+      `Run ${runId} event ${persisted.seq} contains invalid JSON`,
+      { cause },
+    );
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    typeof (parsed as { type?: unknown }).type !== "string"
+  ) {
+    throw new SqlRunEventIntegrityError(
+      `Run ${runId} event ${persisted.seq} is not a typed event`,
+    );
+  }
+  return parsed as AgentChatEvent;
+}
+
 function subscribeInMemory(
   run: ActiveRun,
   fromSeq: number,
@@ -1970,7 +3100,7 @@ function subscribeInMemory(
         }
       }
 
-      if (run.status !== "running") {
+      if (run.status !== "running" && !run.pendingAbortEvent) {
         let bufferedTerminalIndex = -1;
         for (let index = run.events.length - 1; index >= 0; index -= 1) {
           const buffered = run.events[index];
@@ -2137,6 +3267,27 @@ function subscribeFromSQL(
         closeStream();
       };
 
+      const publishPersistedEvents = (
+        events: Array<{ seq: number; eventData: string }>,
+      ): boolean => {
+        for (const persisted of events) {
+          const parsed = parseSqlRunEvent(runId, lastSeq, persisted);
+          try {
+            controller.enqueue(
+              encoder.encode(
+                `data: ${JSON.stringify(streamEventWithIdentity(runId, parsed, persisted.seq))}\n\n`,
+              ),
+            );
+          } catch {
+            cancelled = true;
+            return false;
+          }
+          lastSeq = persisted.seq + 1;
+          if (isTerminalRunEvent(parsed)) return true;
+        }
+        return false;
+      };
+
       const poll = async () => {
         if (cancelled) return;
         try {
@@ -2150,31 +3301,11 @@ function subscribeFromSQL(
           if (events.length > 0) {
             activePollUntil = Date.now() + SQL_SUBSCRIPTION_ACTIVE_GRACE_MS;
           }
-          for (const { seq, eventData } of events) {
-            lastSeq = seq + 1;
-            let parsed: any;
-            try {
-              parsed = JSON.parse(eventData);
-            } catch {
-              continue;
-            }
-            try {
-              controller.enqueue(
-                encoder.encode(
-                  `data: ${JSON.stringify(streamEventWithIdentity(runId, parsed, seq))}\n\n`,
-                ),
-              );
-            } catch {
-              cancelled = true;
-              return;
-            }
-
-            if (isTerminalRunEvent(parsed)) {
-              if (pingTimer) clearInterval(pingTimer);
-              controller.close();
-              return;
-            }
+          if (publishPersistedEvents(events)) {
+            closeStream();
+            return;
           }
+          if (cancelled) return;
 
           if (events.length === 0) {
             const now = Date.now();
@@ -2215,39 +3346,22 @@ function subscribeFromSQL(
             }
             if (!run || run.status !== "running") {
               const finalEvents = await getRunEventsSince(runId, lastSeq);
-              for (const { seq, eventData } of finalEvents) {
-                lastSeq = seq + 1;
-                let parsed: any;
-                try {
-                  parsed = JSON.parse(eventData);
-                } catch {
-                  continue;
-                }
-                try {
-                  controller.enqueue(
-                    encoder.encode(
-                      `data: ${JSON.stringify(streamEventWithIdentity(runId, parsed, seq))}\n\n`,
-                    ),
-                  );
-                } catch {
-                  cancelled = true;
-                  return;
-                }
-                if (isTerminalRunEvent(parsed)) {
-                  if (pingTimer) clearInterval(pingTimer);
-                  controller.close();
-                  return;
-                }
+              if (publishPersistedEvents(finalEvents)) {
+                closeStream();
+                return;
               }
+              if (cancelled) return;
               if (run?.status === "aborted") {
                 const existing = await getLastTerminalRunEvent(runId).catch(
                   () => null,
                 );
+                const persistedTerminal =
+                  existing?.event.type === "auto_continue" ? null : existing;
                 const abortReason = run.terminalReason?.startsWith("aborted:")
                   ? run.terminalReason.slice("aborted:".length)
                   : undefined;
-                const terminalEvent = existing
-                  ? existing.event
+                const terminalEvent = persistedTerminal
+                  ? persistedTerminal.event
                   : terminalEventForAbortReason(abortReason);
                 try {
                   controller.enqueue(
@@ -2256,7 +3370,7 @@ function subscribeFromSQL(
                         streamEventWithIdentity(
                           runId,
                           terminalEvent,
-                          existing?.seq ?? lastSeq,
+                          persistedTerminal?.seq ?? lastSeq,
                         ),
                       )}\n\n`,
                     ),
@@ -2402,6 +3516,11 @@ function subscribeFromSQL(
             pollTimer = setTimeout(poll, pollMs);
           }
         } catch (error) {
+          if (error instanceof SqlRunEventIntegrityError) {
+            consecutivePollFailures += 1;
+            failSubscription(error);
+            return;
+          }
           consecutivePollFailures += 1;
           if (
             consecutivePollFailures >= SQL_SUBSCRIPTION_MAX_CONSECUTIVE_FAILURES
@@ -2455,6 +3574,8 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
   lastProgressAt: number | null;
   dispatchMode?: string | null;
   terminalReason?: string | null;
+  successorOfRunId?: string;
+  reapFailed?: boolean;
   diagStage?: string | null;
   /**
    * True exactly when this run is a `chainServerDrivenContinuation` deferral
@@ -2465,9 +3586,9 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
    * `agent-chat-adapter.ts`'s follow loop can tell "silently deferred,
    * server-side recovery in progress" apart from "dead" and stop counting the
    * quiet gap against its idle timeout — see the THREE-SITE INVARIANT comment
-   * below and in agent-chat-plugin.ts / production-agent.ts. Always false for
-   * an in-memory run (that isolate IS the live producer) and for any run that
-   * isn't an unclaimed background dispatch.
+   * below and in agent-chat-plugin.ts / production-agent.ts. False for a live
+   * in-memory run; the same-turn successor path can select an unclaimed SQL
+   * successor beside a stale in-memory predecessor, so it uses the same bound.
    */
   awaitingRedispatch: boolean;
   hasInFlightWork: boolean;
@@ -2480,23 +3601,26 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
       memRun.status !== "running" &&
       (!sqlSnapshot || sqlSnapshot.status === "running")
     ) {
-      const successor = await fetchNewerNonTerminalRunForSameTurn(
-        threadId,
-        memRun,
-      );
+      const successor = await fetchNewerRunForSameTurn(threadId, memRun);
       if (successor) {
         return {
           runId: successor.id,
           threadId: successor.threadId,
           turnId: successor.turnId ?? successor.id,
-          status: successor.status,
-          inFlight: true,
+          status: legacyWireRunStatus(successor.status),
+          inFlight: successor.status === "running",
           heartbeatAt: successor.heartbeatAt ?? successor.startedAt,
           lastProgressAt: successor.lastProgressAt,
           dispatchMode: successor.dispatchMode,
           terminalReason: successor.terminalReason,
+          successorOfRunId: memRun.runId,
           diagStage: successor.diagStage,
-          awaitingRedispatch: false,
+          awaitingRedispatch:
+            successor.status === "running" &&
+            successor.dispatchMode === "background" &&
+            shouldRedispatchUnclaimedBackgroundRun({
+              startedAt: successor.startedAt,
+            }),
           hasInFlightWork: successor.inFlightSince != null,
         };
       }
@@ -2526,134 +3650,219 @@ export async function getActiveRunForThreadAsync(threadId: string): Promise<{
       hasInFlightWork: sqlSnapshot?.inFlightSince != null,
     };
   }
-  try {
-    const sqlRun = await getRunByThread(threadId, { includeTerminal: true });
-    if (!sqlRun) return null;
-    if (sqlRun.status === "running") {
-      // FALLBACK HARDENING: a background-dispatched run that is still UNCLAIMED
-      // (dispatch_mode === 'background', never flipped to 'background-processing')
-      // past the tight grace means the bg-fn worker never started — a silent
-      // async-worker death that the 202-ack inline fallback can't catch. Reap it
-      // early and recoverably (background_worker_never_started) so the run no
-      // longer hangs for the full 90s window. Only fires when there is provably
-      // no live worker; a claimed/heartbeating run is left alone by the
-      // conditional SQL.
-      //
-      // REDISPATCH-BOUND GUARD (must be kept in lockstep with the "Unclaimed
-      // background-run sweep" in agent-chat-plugin.ts and with
-      // chainServerDrivenContinuation's deferral in production-agent.ts — do NOT
-      // remove this guard without reading those two sites):
-      // `chainServerDrivenContinuation` now DEFERS a dispatch-failed successor
-      // instead of erroring it — it leaves the row status='running',
-      // dispatch_mode='background' with its dispatch_payload intact so the sweep
-      // can silently redispatch it. This client poll runs every ~1s while a
-      // client is connected, so without this guard it would reap that deferred
-      // successor at the 25s unclaimed grace — long before the ~2-min sweep —
-      // converting the intended SILENT server-side recovery into a user-visible
-      // `background_worker_never_started` manual-retry error (that terminal
-      // reason does NOT auto-continue in the client follow loop; only `stale_run`
-      // does). While the successor is still inside its redispatch bound we skip
-      // this reap and leave it for the sweep. The outer backstops still bound it:
-      // `reapIfStale` below reaps a heartbeat-stale background row at 90s
-      // (BACKGROUND_RUN_STALE_MS) to the recoverable `stale_run` — which the
-      // follow loop AUTO-continues — and once the redispatch bound is exceeded
-      // this reap fires loudly as before. So recovery stays automatic in the
-      // common case and loud failure is only moved later, never removed.
-      //
-      // `isUnclaimedBackgroundDispatch` also becomes the `awaitingRedispatch`
-      // wire field below once the still-inside-the-bound check passes — see
-      // this function's doc comment and the THREE-SITE INVARIANT comment in
-      // agent-chat-plugin.ts / production-agent.ts.
-      const isUnclaimedBackgroundDispatch =
-        sqlRun.dispatchMode === "background";
-      const stillInsideRedispatchBound = shouldRedispatchUnclaimedBackgroundRun(
-        { startedAt: sqlRun.startedAt },
+  let sqlRun = await getRunByThread(threadId, { includeTerminal: true });
+  if (!sqlRun) return null;
+  if (isDuplicateSubmissionMarker(sqlRun)) {
+    // A foreground duplicate request has its own synthetic aborted row, but
+    // the accepted run remains the thread's actual work. Another isolate has
+    // no in-memory run map to disambiguate those rows, so prefer the live row.
+    const liveRun = await getRunByThread(threadId);
+    if (liveRun) {
+      sqlRun = liveRun;
+    } else {
+      const acceptedRun = (
+        await listRunsForThread(threadId, { limit: 50 })
+      ).find(
+        (run) => !isDuplicateSubmissionMarker(run) && !isTurnAbortMarker(run),
       );
-      if (isUnclaimedBackgroundDispatch && !stillInsideRedispatchBound) {
-        const recovered = await reapUnclaimedBackgroundRun(sqlRun.id).catch(
-          () => false,
-        );
-        if (recovered) return null;
+      if (
+        !acceptedRun ||
+        !RECONNECTABLE_TERMINAL_RUN_STATUSES.has(acceptedRun.status)
+      ) {
+        return null;
       }
-      const reaped = await reapIfStale(sqlRun.id).catch(() => false);
-      if (reaped) return null;
-      return {
-        runId: sqlRun.id,
-        threadId: sqlRun.threadId,
-        turnId: sqlRun.turnId ?? sqlRun.id,
-        status: sqlRun.status,
-        inFlight: true,
-        heartbeatAt: sqlRun.heartbeatAt ?? sqlRun.startedAt,
-        lastProgressAt: sqlRun.lastProgressAt,
-        dispatchMode: sqlRun.dispatchMode,
-        terminalReason: sqlRun.terminalReason,
-        diagStage: sqlRun.diagStage,
-        awaitingRedispatch:
-          isUnclaimedBackgroundDispatch && stillInsideRedispatchBound,
-        hasInFlightWork: sqlRun.inFlightSince != null,
-      };
-    }
-    if (
-      sqlRun.status === "completed" ||
-      sqlRun.status === "truncated" ||
-      sqlRun.status === "errored"
-    ) {
-      const referenceAt =
-        sqlRun.completedAt ?? sqlRun.heartbeatAt ?? sqlRun.startedAt;
-      const terminalAge = Date.now() - referenceAt;
+      const terminalAge =
+        Date.now() -
+        (acceptedRun.completedAt ??
+          acceptedRun.heartbeatAt ??
+          acceptedRun.startedAt);
       if (terminalAge > TERMINAL_RUN_RECONNECT_WINDOW_MS) return null;
       return {
-        runId: sqlRun.id,
-        threadId: sqlRun.threadId,
-        turnId: sqlRun.turnId ?? sqlRun.id,
-        status: legacyWireRunStatus(sqlRun.status),
+        runId: acceptedRun.id,
+        threadId: acceptedRun.threadId,
+        turnId: acceptedRun.turnId ?? acceptedRun.id,
+        status: legacyWireRunStatus(acceptedRun.status),
         inFlight: false,
-        heartbeatAt: sqlRun.heartbeatAt ?? sqlRun.startedAt,
-        lastProgressAt: sqlRun.lastProgressAt,
-        dispatchMode: sqlRun.dispatchMode,
-        terminalReason: sqlRun.terminalReason,
-        diagStage: sqlRun.diagStage,
+        heartbeatAt: acceptedRun.heartbeatAt ?? acceptedRun.startedAt,
+        lastProgressAt: acceptedRun.lastProgressAt,
+        dispatchMode: acceptedRun.dispatchMode,
+        terminalReason: acceptedRun.terminalReason,
+        diagStage: acceptedRun.diagStage,
         awaitingRedispatch: false,
         hasInFlightWork: false,
       };
     }
-  } catch {
-    // SQL error — fall through
+  }
+  if (sqlRun.status === "running") {
+    // FALLBACK HARDENING: a background-dispatched run that is still UNCLAIMED
+    // (dispatch_mode === 'background', never flipped to 'background-processing')
+    // past the tight grace means the bg-fn worker never started — a silent
+    // async-worker death that the 202-ack inline fallback can't catch. Reap it
+    // early and recoverably (background_worker_never_started) so the run no
+    // longer hangs for the full 90s window. Only fires when there is provably
+    // no live worker; a claimed/heartbeating run is left alone by the
+    // conditional SQL.
+    //
+    // REDISPATCH-BOUND GUARD (must be kept in lockstep with the "Unclaimed
+    // background-run sweep" in agent-chat-plugin.ts and with
+    // chainServerDrivenContinuation's deferral in production-agent.ts — do NOT
+    // remove this guard without reading those two sites):
+    // `chainServerDrivenContinuation` now DEFERS a dispatch-failed successor
+    // instead of erroring it — it leaves the row status='running',
+    // dispatch_mode='background' with its dispatch_payload intact so the sweep
+    // can silently redispatch it. This client poll runs every ~1s while a
+    // client is connected, so without this guard it would reap that deferred
+    // successor at the 25s unclaimed grace — long before the ~2-min sweep —
+    // converting the intended SILENT server-side recovery into a user-visible
+    // `background_worker_never_started` manual-retry error (that terminal
+    // reason does NOT auto-continue in the client follow loop; only `stale_run`
+    // does). While the successor is still inside its redispatch bound we skip
+    // this reap and leave it for the sweep. The outer backstops still bound it:
+    // `reapIfStale` below reaps a heartbeat-stale background row at 90s
+    // (BACKGROUND_RUN_STALE_MS) to the recoverable `stale_run` — which the
+    // follow loop AUTO-continues — and once the redispatch bound is exceeded
+    // this reap fires loudly as before. So recovery stays automatic in the
+    // common case and loud failure is only moved later, never removed.
+    //
+    // `isUnclaimedBackgroundDispatch` also becomes the `awaitingRedispatch`
+    // wire field below once the still-inside-the-bound check passes — see
+    // this function's doc comment and the THREE-SITE INVARIANT comment in
+    // agent-chat-plugin.ts / production-agent.ts.
+    const isUnclaimedBackgroundDispatch = sqlRun.dispatchMode === "background";
+    const stillInsideRedispatchBound = shouldRedispatchUnclaimedBackgroundRun({
+      startedAt: sqlRun.startedAt,
+    });
+    let reapFailed = false;
+    if (isUnclaimedBackgroundDispatch && !stillInsideRedispatchBound) {
+      const recovered = await reapUnclaimedBackgroundRun(sqlRun.id).then(
+        (value) => ({ ok: true as const, value }),
+        (error) => {
+          captureError(error, {
+            route: "/_agent-native/agent-chat/runs/active",
+            aiTraceId: sqlRun.id,
+            tags: {
+              source: "agent-run-manager",
+              phase: "unclaimed-background-reap",
+            },
+            extra: { runId: sqlRun.id, threadId },
+          });
+          return { ok: false as const };
+        },
+      );
+      if (!recovered.ok) reapFailed = true;
+      else if (recovered.value) return null;
+    }
+    const reaped = await reapIfStale(sqlRun.id).then(
+      (value) => ({ ok: true as const, value }),
+      (error) => {
+        captureError(error, {
+          route: "/_agent-native/agent-chat/runs/active",
+          aiTraceId: sqlRun.id,
+          tags: {
+            source: "agent-run-manager",
+            phase: "stale-run-reap",
+          },
+          extra: { runId: sqlRun.id, threadId },
+        });
+        return { ok: false as const };
+      },
+    );
+    if (!reaped.ok) reapFailed = true;
+    else if (reaped.value) return null;
+    return {
+      runId: sqlRun.id,
+      threadId: sqlRun.threadId,
+      turnId: sqlRun.turnId ?? sqlRun.id,
+      status: sqlRun.status,
+      inFlight: true,
+      heartbeatAt: sqlRun.heartbeatAt ?? sqlRun.startedAt,
+      lastProgressAt: sqlRun.lastProgressAt,
+      dispatchMode: sqlRun.dispatchMode,
+      terminalReason: sqlRun.terminalReason,
+      ...(reapFailed ? { reapFailed: true } : {}),
+      diagStage: sqlRun.diagStage,
+      awaitingRedispatch:
+        isUnclaimedBackgroundDispatch && stillInsideRedispatchBound,
+      hasInFlightWork: sqlRun.inFlightSince != null,
+    };
+  }
+  if (
+    sqlRun.status === "completed" ||
+    sqlRun.status === "truncated" ||
+    sqlRun.status === "errored" ||
+    sqlRun.status === "aborted"
+  ) {
+    const referenceAt =
+      sqlRun.completedAt ?? sqlRun.heartbeatAt ?? sqlRun.startedAt;
+    const terminalAge = Date.now() - referenceAt;
+    if (terminalAge > TERMINAL_RUN_RECONNECT_WINDOW_MS) return null;
+    return {
+      runId: sqlRun.id,
+      threadId: sqlRun.threadId,
+      turnId: sqlRun.turnId ?? sqlRun.id,
+      status: legacyWireRunStatus(sqlRun.status),
+      inFlight: false,
+      heartbeatAt: sqlRun.heartbeatAt ?? sqlRun.startedAt,
+      lastProgressAt: sqlRun.lastProgressAt,
+      dispatchMode: sqlRun.dispatchMode,
+      terminalReason: sqlRun.terminalReason,
+      diagStage: sqlRun.diagStage,
+      awaitingRedispatch: false,
+      hasInFlightWork: false,
+    };
   }
   return null;
 }
 
 async function fetchRunThreadSnapshot(runId: string, threadId: string) {
-  try {
-    const byThread = await getRunByThread(threadId, {
-      includeTerminal: true,
-    });
-    if (byThread && byThread.id === runId) return byThread;
-    return null;
-  } catch {
-    return null;
-  }
+  const byThread = await getRunByThread(threadId, {
+    includeTerminal: true,
+  });
+  if (byThread && byThread.id === runId) return byThread;
+  return null;
 }
 
-async function fetchNewerNonTerminalRunForSameTurn(
+async function fetchNewerRunForSameTurn(
   threadId: string,
   memRun: ActiveRun,
 ): Promise<Awaited<ReturnType<typeof getRunByThread>> | null> {
-  try {
-    const latest = await getRunByThread(threadId, { includeTerminal: true });
+  const latest = await getRunByThread(threadId, { includeTerminal: true });
+  if (!latest) return null;
+
+  const isNewerReconnectableSuccessor = (run: {
+    id: string;
+    turnId?: string | null;
+    status: string;
+    startedAt: number;
+    heartbeatAt: number | null;
+    completedAt: number | null;
+    dispatchMode?: string | null;
+    terminalReason?: string | null;
+  }) => {
     if (
-      latest &&
-      latest.id !== memRun.runId &&
-      latest.status === "running" &&
-      latest.startedAt > memRun.startedAt &&
-      (latest.turnId ?? latest.id) === memRun.turnId
+      isDuplicateSubmissionMarker(run) ||
+      isTurnAbortMarker(run) ||
+      run.id === memRun.runId ||
+      run.startedAt <= memRun.startedAt ||
+      (run.turnId ?? run.id) !== memRun.turnId
     ) {
-      return latest;
+      return false;
     }
-    return null;
-  } catch {
-    return null;
+    if (run.status === "running") return true;
+    if (!RECONNECTABLE_TERMINAL_RUN_STATUSES.has(run.status)) return false;
+    const terminalAge =
+      Date.now() - (run.completedAt ?? run.heartbeatAt ?? run.startedAt);
+    return terminalAge <= TERMINAL_RUN_RECONNECT_WINDOW_MS;
+  };
+
+  if (!isDuplicateSubmissionMarker(latest)) {
+    return isNewerReconnectableSuccessor(latest) ? latest : null;
   }
+
+  const acceptedSuccessor = (
+    await listRunsForThread(threadId, { limit: 50 })
+  ).find(isNewerReconnectableSuccessor);
+  return acceptedSuccessor ?? null;
 }
 
 export function getRun(runId: string): ActiveRun | null {
@@ -2669,8 +3878,32 @@ function abortRunInMemory(runId: string, reason: string): boolean {
 }
 
 export function abortRun(runId: string, reason: string = "user"): boolean {
+  const run = activeRuns.get(runId);
   const abortedInMemory = abortRunInMemory(runId, reason);
-  markRunAborted(runId, reason).catch(() => {});
+  const markAborted = () => markRunAborted(runId, reason);
+  const abortPersistence = flushRunEventsBeforeAbort(run)
+    .then(markAborted, markAborted)
+    .then(
+      (persisted) => {
+        if (run) run.abortPersistenceManaged = persisted;
+        return persisted;
+      },
+      (error) => {
+        if (run) run.abortPersistenceManaged = false;
+        captureError(error, {
+          route: "/_agent-native/agent-chat/runs/:id/abort",
+          aiTraceId: runId,
+          tags: { source: "agent-run-manager", phase: "abort-run-status" },
+          extra: { runId, threadId: run?.threadId, reason },
+        });
+        console.error(
+          "[run-manager] durable abort status write failed:",
+          error instanceof Error ? error.message : error,
+        );
+        return false;
+      },
+    );
+  if (run) run.abortPersistencePromise = abortPersistence;
   return abortedInMemory;
 }
 
@@ -2683,31 +3916,212 @@ export function abortRun(runId: string, reason: string = "user"): boolean {
 export async function abortRunDurably(
   runId: string,
   reason: string = "user",
+  options?: { allowNotStarted?: boolean },
 ): Promise<boolean> {
+  const run = activeRuns.get(runId);
   const abortedInMemory = abortRunInMemory(runId, reason);
-  try {
-    await markRunAborted(runId, reason);
-  } catch (error) {
-    captureError(error, {
-      route: "/_agent-native/agent-chat/runs/:id/abort",
-      aiTraceId: runId,
-      tags: {
-        source: "agent-run-manager",
-        phase: "abort-run",
-      },
-      extra: {
-        runId,
-        threadId: activeRuns.get(runId)?.threadId,
-        reason,
-        abortedInMemory,
-      },
-    });
-    console.error(
-      "[run-manager] durable abort persistence failed:",
-      error instanceof Error ? error.message : error,
+  const persistence = (async () => {
+    let eventFlushFailure: AgentRunEventNotPersistedError | null;
+    try {
+      eventFlushFailure = await flushRunEventsBeforeAbort(run);
+    } catch (error) {
+      if (run) run.abortPersistenceManaged = false;
+      throw error;
+    }
+    let abortPersistedDurably = false;
+    try {
+      const abortPersisted = await markRunAborted(runId, reason);
+      abortPersistedDurably = abortPersisted;
+      if (!abortPersisted || eventFlushFailure) {
+        const persistedStatus = await getRunStatus(runId);
+        abortPersistedDurably ||= persistedStatus === "aborted";
+        if (persistedStatus === null) {
+          // Agent Teams persists Stop intent before run registration.
+          // Workers recheck it before dispatch.
+          if (options?.allowNotStarted && !run && !eventFlushFailure)
+            return false;
+          throw new Error(
+            `Cannot confirm durable abort for missing run ${runId}`,
+          );
+        }
+        if (!abortPersisted && persistedStatus === "running") {
+          throw new Error(`Durable abort did not transition run ${runId}`);
+        }
+      }
+      if (run) run.abortPersistenceManaged = abortPersistedDurably;
+    } catch (error) {
+      if (run) run.abortPersistenceManaged = abortPersistedDurably;
+      captureError(error, {
+        route: "/_agent-native/agent-chat/runs/:id/abort",
+        aiTraceId: runId,
+        tags: {
+          source: "agent-run-manager",
+          phase: "abort-run",
+        },
+        extra: {
+          runId,
+          threadId: activeRuns.get(runId)?.threadId,
+          reason,
+          abortedInMemory,
+        },
+      });
+      console.error(
+        "[run-manager] durable abort persistence failed:",
+        error instanceof Error ? error.message : error,
+      );
+      if (eventFlushFailure) {
+        throw new AggregateError(
+          [eventFlushFailure, error],
+          "Run abort event flush and marker persistence failed",
+        );
+      }
+      throw error;
+    }
+    if (eventFlushFailure) throw eventFlushFailure;
+    return abortedInMemory;
+  })();
+  if (run) {
+    run.abortPersistencePromise = persistence.then(
+      () => run.abortPersistenceManaged ?? false,
+      () => run.abortPersistenceManaged ?? false,
     );
   }
-  return abortedInMemory;
+  return persistence;
+}
+
+interface SafeBoundaryAbortResult {
+  aborted: boolean;
+  eventFlushFailure: AgentRunEventNotPersistedError | null;
+}
+
+async function abortRunAtSafeBoundaryDurablyResult(
+  runId: string,
+  reason: string = "user",
+): Promise<SafeBoundaryAbortResult> {
+  const run = activeRuns.get(runId);
+  const eventFlushFailure = await flushRunEventsBeforeAbort(run);
+  let aborted: boolean;
+  try {
+    aborted = await markRunAbortedAtSafeBoundary(runId, reason);
+  } catch (error) {
+    try {
+      const state = await getRunAbortState(runId);
+      if (state.aborted && run) {
+        abortRunInMemory(runId, state.reason ?? reason);
+      }
+    } catch (stateError) {
+      captureError(stateError, {
+        route: "/_agent-native/agent-chat/runs/:id/abort",
+        aiTraceId: runId,
+        tags: {
+          source: "agent-run-manager",
+          phase: "safe-boundary-abort-state-read",
+        },
+        extra: {
+          runId,
+          reason,
+          abortError: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+    if (eventFlushFailure) {
+      throw new AggregateError(
+        [eventFlushFailure, error],
+        "Run abort event flush and marker persistence failed",
+      );
+    }
+    throw error;
+  }
+  if (!aborted) {
+    return { aborted: false, eventFlushFailure };
+  }
+  if (run) abortInMemoryRun(run, reason);
+  return { aborted: true, eventFlushFailure };
+}
+
+/** Abort after the durable run store confirms no model or tool work is in flight. */
+export async function abortRunAtSafeBoundaryDurably(
+  runId: string,
+  reason: string = "user",
+): Promise<boolean> {
+  const result = await abortRunAtSafeBoundaryDurablyResult(runId, reason);
+  if (result.eventFlushFailure) throw result.eventFlushFailure;
+  return result.aborted;
+}
+
+async function abortTurnByRefDurablyInternal(
+  threadId: string,
+  turnId: string,
+  reason: string,
+  reportedFlushFailure?: {
+    runId: string;
+    error: AgentRunEventNotPersistedError;
+  },
+): Promise<"aborted" | "already_terminal"> {
+  const fence = currentExecutionFence();
+  if (fence && (fence.threadId !== threadId || fence.turnId !== turnId)) {
+    throw new StaleExecutionFenceError(fence);
+  }
+  const runsToFlush: ActiveRun[] = [];
+  for (const run of activeRuns.values()) {
+    if (
+      run.threadId === threadId &&
+      run.turnId === turnId &&
+      (!fence || run.runId === fence.runId)
+    ) {
+      abortInMemoryRun(run, reason);
+      runsToFlush.push(run);
+    }
+  }
+  const flushResults = await Promise.allSettled(
+    runsToFlush.map((run) => flushRunEventsBeforeAbort(run)),
+  );
+  // Only the same run's repeated flush is already reported by the caller;
+  // a marker write can fail with the very same error object independently.
+  const unreportedFlushFailures: unknown[] = [];
+  let hasRejectedFlush = false;
+  for (const [index, result] of flushResults.entries()) {
+    if (result.status === "rejected") {
+      hasRejectedFlush = true;
+      unreportedFlushFailures.push(result.reason);
+    } else if (
+      result.value &&
+      !(
+        reportedFlushFailure &&
+        runsToFlush[index]?.runId === reportedFlushFailure.runId &&
+        result.value === reportedFlushFailure.error
+      )
+    ) {
+      unreportedFlushFailures.push(result.value);
+    }
+  }
+  if (hasRejectedFlush) {
+    if (unreportedFlushFailures.length === 1) throw unreportedFlushFailures[0];
+    throw new AggregateError(
+      unreportedFlushFailures,
+      "Turn abort event flushes failed",
+    );
+  }
+  let result: "aborted" | "already_terminal";
+  try {
+    result = await markTurnAborted(threadId, turnId, reason);
+  } catch (error) {
+    if (unreportedFlushFailures.length) {
+      throw new AggregateError(
+        [...unreportedFlushFailures, error],
+        "Turn abort event flush and marker persistence failed",
+      );
+    }
+    throw error;
+  }
+  if (unreportedFlushFailures.length === 1) throw unreportedFlushFailures[0];
+  if (unreportedFlushFailures.length > 1) {
+    throw new AggregateError(
+      unreportedFlushFailures,
+      "Turn abort event flushes failed",
+    );
+  }
+  return result;
 }
 
 export async function abortTurnByRefDurably(
@@ -2715,33 +4129,96 @@ export async function abortTurnByRefDurably(
   turnId: string,
   reason: string = "user",
 ): Promise<"aborted" | "already_terminal"> {
-  for (const run of activeRuns.values()) {
-    if (run.threadId === threadId && run.turnId === turnId) {
-      abortInMemoryRun(run, reason);
-    }
-  }
-  return markTurnAborted(threadId, turnId, reason);
+  return abortTurnByRefDurablyInternal(threadId, turnId, reason);
 }
 
-export async function abortTurnDurably(
+async function abortTurnDurablyInternal(
   runId: string,
-  reason: string = "user",
-): Promise<void> {
+  reason: string,
+  reportedFlushFailure?: {
+    runId: string;
+    error: AgentRunEventNotPersistedError;
+  },
+): Promise<"aborted" | "already_terminal"> {
   const memRun = activeRuns.get(runId);
-  const ref = memRun
-    ? { threadId: memRun.threadId, turnId: memRun.turnId }
-    : await getRunTurnRef(runId).catch(() => null);
-  if (!ref) return;
   try {
-    await abortTurnByRefDurably(ref.threadId, ref.turnId, reason);
+    const ref = memRun
+      ? { threadId: memRun.threadId, turnId: memRun.turnId }
+      : await getRunTurnRef(runId);
+    if (!ref) {
+      throw new Error(`Cannot durably abort turn for missing run ${runId}`);
+    }
+    return await abortTurnByRefDurablyInternal(
+      ref.threadId,
+      ref.turnId,
+      reason,
+      reportedFlushFailure,
+    );
   } catch (error) {
     captureError(error, {
       route: "/_agent-native/agent-chat/runs/:id/abort",
       aiTraceId: runId,
       tags: { source: "agent-run-manager", phase: "abort-turn" },
-      extra: { runId, reason, ...ref },
+      extra: { runId, reason },
     });
+    throw error;
   }
+}
+
+export async function abortTurnDurably(
+  runId: string,
+  reason: string = "user",
+): Promise<"aborted" | "already_terminal"> {
+  return abortTurnDurablyInternal(runId, reason);
+}
+
+/** Persist a Stop's turn marker even when a terminal event flush must be reported. */
+export async function abortRunAndTurnDurably(
+  runId: string,
+  reason: string = "user",
+  options?: { safeBoundary?: boolean },
+): Promise<boolean> {
+  let abortedInMemory = false;
+  let terminalFlushFailure: AgentRunEventNotPersistedError | undefined;
+  try {
+    if (options?.safeBoundary) {
+      const result = await abortRunAtSafeBoundaryDurablyResult(runId, reason);
+      abortedInMemory = result.aborted;
+      terminalFlushFailure = result.eventFlushFailure ?? undefined;
+    } else {
+      abortedInMemory = await abortRunDurably(runId, reason);
+    }
+  } catch (error) {
+    if (
+      !(error instanceof AgentRunEventNotPersistedError) ||
+      !error.terminalRun
+    ) {
+      throw error;
+    }
+    terminalFlushFailure = error;
+  }
+
+  if (!options?.safeBoundary || abortedInMemory) {
+    try {
+      await abortTurnDurablyInternal(
+        runId,
+        reason,
+        terminalFlushFailure
+          ? { runId, error: terminalFlushFailure }
+          : undefined,
+      );
+    } catch (error) {
+      if (terminalFlushFailure) {
+        throw new AggregateError(
+          [terminalFlushFailure, error],
+          "Run event flush and turn abort persistence failed",
+        );
+      }
+      throw error;
+    }
+  }
+  if (terminalFlushFailure) throw terminalFlushFailure;
+  return abortedInMemory;
 }
 
 export { getSlotHoldingRunId, tryClaimRunSlot } from "./run-store.js";

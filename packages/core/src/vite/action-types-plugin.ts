@@ -99,6 +99,10 @@ const CORE_SHARING_ACTIONS: Array<{ name: string; specifier: string }> = [
     specifier: "@agent-native/core/agent/actions/list-model-providers",
   },
   {
+    name: "describe-models",
+    specifier: "@agent-native/core/agent/actions/describe-models",
+  },
+  {
     name: "get-hosted-harness-config",
     specifier:
       "@agent-native/core/hosted-harness/actions/get-hosted-harness-config",
@@ -191,6 +195,11 @@ const CORE_SHARING_ACTIONS: Array<{ name: string; specifier: string }> = [
       "@agent-native/core/workspace-connections/actions/list-workspace-user-groups",
   },
   {
+    name: "list-workspace-connection-scopes",
+    specifier:
+      "@agent-native/core/workspace-connections/actions/list-workspace-connection-scopes",
+  },
+  {
     name: "upsert-workspace-user-group",
     specifier:
       "@agent-native/core/workspace-connections/actions/upsert-workspace-user-group",
@@ -225,6 +234,15 @@ const CORE_SHARING_ACTIONS: Array<{ name: string; specifier: string }> = [
   {
     name: "context-report",
     specifier: "@agent-native/core/agent/context-xray/actions/context-report",
+  },
+  {
+    name: "context-compact",
+    specifier: "@agent-native/core/agent/context-xray/actions/context-compact",
+  },
+  {
+    name: "context-compaction-get",
+    specifier:
+      "@agent-native/core/agent/context-xray/actions/context-compaction-get",
   },
   {
     name: "get-localization-preference",
@@ -368,6 +386,38 @@ const CORE_SHARING_ACTIONS: Array<{ name: string; specifier: string }> = [
     specifier: "@agent-native/core/review/actions/send-review-thread-to-agent",
   },
   {
+    name: "list-recurring-jobs",
+    specifier: "@agent-native/core/jobs/actions/list-recurring-jobs",
+  },
+  {
+    name: "manage-recurring-job",
+    specifier: "@agent-native/core/jobs/actions/manage-recurring-job",
+  },
+  {
+    name: "run-automation-now",
+    specifier: "@agent-native/core/jobs/actions/run-automation-now",
+  },
+  {
+    name: "list-automation-runs",
+    specifier: "@agent-native/core/jobs/actions/list-automation-runs",
+  },
+  {
+    name: "list-automations",
+    specifier: "@agent-native/core/triggers/actions/list-automations",
+  },
+  {
+    name: "list-automation-events",
+    specifier: "@agent-native/core/triggers/actions/list-automation-events",
+  },
+  {
+    name: "manage-automation",
+    specifier: "@agent-native/core/triggers/actions/manage-automation",
+  },
+  {
+    name: "search-automation-accounts",
+    specifier: "@agent-native/core/triggers/actions/search-automation-accounts",
+  },
+  {
     name: "react-to-review-comment",
     specifier: "@agent-native/core/review/actions/react-to-review-comment",
   },
@@ -449,7 +499,7 @@ function scanActionFiles(actionsDir: string): string[] {
       const reexportsDefaultAction =
         /export\s*\{\s*default\s*\}\s*from\s*["'][^"']+["']/.test(content);
       const exportsActionFactory =
-        /export\s+default\s+(?:create[A-Z][A-Za-z0-9]*Action|defineActionFactory)\s*\(/.test(
+        /export\s+default\s+(?:(?:create|define)[A-Z][A-Za-z0-9]*Action|defineActionFactory)\s*\(/.test(
           content,
         );
       if (

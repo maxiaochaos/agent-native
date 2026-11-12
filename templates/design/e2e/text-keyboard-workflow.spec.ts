@@ -8,8 +8,7 @@ const FIXTURE = `<!doctype html>
   </main>
 </body></html>`;
 
-// fixme: product bug: The duplicate's Layers row stays 'First title' after its text became 'Second title': both rows read 'First title' (duplication froze the
-test.fixme("Cmd+Enter commits a text edit so Cmd+D duplicates the layer, and each copy keeps its own text and name", async ({
+test("Cmd+Enter commits a text edit so Cmd+D duplicates the layer, and each copy keeps its own text and name", async ({
   app,
 }) => {
   const id = await app.seed(FIXTURE);
@@ -23,7 +22,10 @@ test.fixme("Cmd+Enter commits a text edit so Cmd+D duplicates the layer, and eac
     rect.x + rect.width / 2,
     rect.y + rect.height / 2,
   );
+  // Cmd+click reaches a nested layer; a plain click takes the top-level one.
+  await page.keyboard.down("ControlOrMeta");
   await page.mouse.click(center.x, center.y);
+  await page.keyboard.up("ControlOrMeta");
   await expect.poll(() => app.selectedLayers()).toEqual(["Draft title"]);
 
   const editable = app.page

@@ -8,12 +8,14 @@ import {
   formatComposerContext,
   hasComposerSystemContext,
 } from "@/lib/composer-context";
+import { figmaReferenceDirectives } from "@/lib/figma-attachment";
 import {
   clearPendingGeneration,
   failPendingGenerationForMissingImagePayload,
   isPendingGenerationStale,
   patchPendingGeneration,
   readPendingGeneration,
+  snapshotGenerationOutputBaseline,
   shouldSkipPendingGenerationResume,
 } from "@/lib/pending-generation";
 import { designPrecedentDirectives } from "@/pages/design-editor/creative-context-precedent";
@@ -49,6 +51,7 @@ export interface ResumePendingGenerationArgs {
     model?: string;
     engine?: string;
     effort?: PromptComposerSubmitOptions["effort"];
+    references?: PromptComposerSubmitOptions["references"];
   } | null>;
   imageAttachmentUnavailableMessage: string;
   invalidCanvasDimensionsMessage: string;
@@ -57,7 +60,6 @@ export interface ResumePendingGenerationArgs {
   setGenerationChatTabId: Dispatch<SetStateAction<string | null>>;
   setGenerationIssue: Dispatch<SetStateAction<string | null>>;
   setHasPendingGeneration: Dispatch<SetStateAction<boolean>>;
-  trackAgentGeneration: (tabId: string) => void;
 }
 
 export function runResumePendingGeneration({
@@ -76,7 +78,6 @@ export function runResumePendingGeneration({
   setGenerationChatTabId,
   setGenerationIssue,
   setHasPendingGeneration,
-  trackAgentGeneration,
 }: ResumePendingGenerationArgs) {
   if (!id || !design) return;
   if (creativeContextLabLoading) return;
@@ -97,7 +98,6 @@ export function runResumePendingGeneration({
     setGenerationIssue(null);
     setHasPendingGeneration(true);
     setGenerationChatTabId(pending.runTabId);
-    trackAgentGeneration(pending.runTabId);
     return;
   }
 
@@ -229,6 +229,7 @@ export function runResumePendingGeneration({
       fileContext,
       "",
       ...generationDirectives,
+      ...figmaReferenceDirectives(pending.contextItems),
     ].join("\n");
 
     clearGenerationCompleteTimer();
@@ -237,11 +238,13 @@ export function runResumePendingGeneration({
       model: pending.model,
       engine: pending.engine,
       effort: pending.effort,
+      references: pending.references,
     };
     const runTabId = agentSubmit(prompt, context, {
       model: pending.model,
       engine: pending.engine,
       effort: pending.effort,
+      references: pending.references,
       newTab: true,
       images,
     });
@@ -251,6 +254,13 @@ export function runResumePendingGeneration({
       attempt: pending.attempt ?? 1,
       designSystemId: pendingDesignSystemId,
       startedAt: Date.now(),
+      ...(!pending.templateId
+        ? {
+            outputBaselineFiles:
+              pending.outputBaselineFiles ??
+              snapshotGenerationOutputBaseline(files),
+          }
+        : {}),
     });
     setHasPendingGeneration(true);
   })();

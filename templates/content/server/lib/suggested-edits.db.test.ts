@@ -2,13 +2,18 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import {
+  privateMedia,
+  privateMediaStore,
+} from "@agent-native/core/private-media";
 import type { SuggestionOperation } from "@agent-native/core/review";
 import { runWithRequestContext } from "@agent-native/core/server";
 import { yDocToProsemirrorJSON } from "@tiptap/y-tiptap";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 
+import { mergeDocumentBodyIntents } from "../../shared/document-intent-merge.js";
 import { canonicalizeNfm } from "../../shared/nfm.js";
 import {
   markdownSuggestionOperations,
@@ -29,6 +34,7 @@ let getDb: DbModule["getDb"];
 let schema: DbModule["schema"];
 let getDbExec: typeof import("@agent-native/core/db").getDbExec;
 let adapter: Adapter;
+let lockSuggestionPage: typeof import("./suggested-edits.js").lockSuggestionPage;
 let getDocumentAction: typeof import("../../actions/get-document.js").default;
 let updateDocumentAction: typeof import("../../actions/update-document.js").default;
 let commentThreadDigest: typeof import("./comment-ai.js").commentThreadDigest;
@@ -42,8 +48,8 @@ beforeAll(async () => {
   getDb = dbModule.getDb;
   schema = dbModule.schema;
   getDbExec = (await import("@agent-native/core/db")).getDbExec;
-  adapter = (await import("./suggested-edits.js"))
-    .contentDocumentSuggestionAdapter;
+  ({ contentDocumentSuggestionAdapter: adapter, lockSuggestionPage } =
+    await import("./suggested-edits.js"));
   getDocumentAction = (await import("../../actions/get-document.js")).default;
   updateDocumentAction = (await import("../../actions/update-document.js"))
     .default;
@@ -251,6 +257,7 @@ function coordination() {
       isPersisted: () => true,
       publish: vi.fn(),
     },
+    heldMembershipIds: undefined as ReadonlySet<string> | undefined,
   };
 }
 
@@ -260,7 +267,10 @@ async function accept(
   baseRevision = "rev-1",
   acceptedOperation: SuggestionOperation = operation,
   prepared = coordination(),
+  ctx: Record<string, unknown> = {},
 ) {
+  // The decision locks the Page this way before it applies the suggestion.
+  prepared.heldMembershipIds ??= await lockSuggestionPage(tx, documentId);
   const result = await runWithRequestContext({ userEmail: ownerEmail }, () =>
     adapter.apply({
       resourceType: "document",
@@ -288,7 +298,7 @@ async function accept(
       },
       operations: [acceptedOperation],
       access: { role: "editor" },
-      ctx: {},
+      ctx,
       transaction: tx,
       coordination: prepared,
     }),
@@ -357,9 +367,494 @@ describe("Content suggested edits Blocks transaction", () => {
         );
         const updated = await getDocumentAction.run({ id: documentId }, ctx);
         expect(updated.content).toBe(after);
-        expect(updated.bodyRevision).toBe(2);
+        // The whole proposal lands as one Page revision.
+        expect(updated.bodyRevision).toBe(1);
       });
     await run();
+  });
+
+  it("accepts one unit of a proposal as one Page version and leaves the rest pending", async () => {
+    sequence += 1;
+    const documentId = `suggestion-unit-page-${sequence}`;
+    const before = canonicalizeNfm(
+      "Teh team will recieve the files.\n\nBring the draft on Thursday.",
+    );
+    const after = canonicalizeNfm(
+      "The team will receive the files.\n\nBring the draft on Friday.",
+    );
+    const now = new Date().toISOString();
+    await getDb().insert(schema.documents).values({
+      id: documentId,
+      title: "Unit page",
+      content: before,
+      ownerEmail,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const ctx = { caller: "cli" as const, userEmail: ownerEmail };
+    const create =
+      await import("@agent-native/core/review/suggestions/actions/create-resource-suggestion-proposal");
+    const decide =
+      await import("@agent-native/core/review/suggestions/actions/decide-resource-suggestion-proposal");
+    await runWithRequestContext({ userEmail: ownerEmail }, async () => {
+      const document = await getDocumentAction.run({ id: documentId }, ctx);
+      const operations = markdownSuggestionOperations(before, after);
+      expect(operations).toHaveLength(3);
+      const created = await create.default.run(
+        {
+          resourceType: "document",
+          resourceId: documentId,
+          adapterKind: adapter.kind,
+          baseRevision: document.revision,
+          summary: "Three pieces, two units",
+          idempotencyKey: `content-unit-${documentId}`,
+          suggestions: operations.map((part, index) => ({
+            summary: `Piece ${index + 1}`,
+            operations: [part],
+          })),
+        },
+        ctx,
+      );
+      const [teh = null, recieve = null, thursday = null] = created.suggestions;
+      if (!teh || !recieve || !thursday) throw new Error("Three pieces");
+      const accepted = await decide.default.run(
+        {
+          proposalId: created.proposal.id,
+          decision: "accepted",
+          idempotencyKey: `content-unit-decision-${documentId}`,
+          members: [teh, recieve].map((suggestion) => ({
+            id: suggestion.id,
+            observedRevision: suggestion.revision,
+            observedBase: suggestion.baseRevision,
+          })),
+        },
+        ctx,
+      );
+      expect(accepted.suggestions.map((member) => member.status)).toEqual([
+        "accepted",
+        "accepted",
+      ]);
+      const updated = await getDocumentAction.run({ id: documentId }, ctx);
+      expect(updated.content).toBe(
+        canonicalizeNfm(
+          "The team will receive the files.\n\nBring the draft on Thursday.",
+        ),
+      );
+      expect(updated.bodyRevision).toBe(1);
+      // One history entry: the Page before the unit, then the Page after it.
+      const versions = await getDb()
+        .select({ checkpointKind: schema.documentVersions.checkpointKind })
+        .from(schema.documentVersions)
+        .where(eq(schema.documentVersions.documentId, documentId));
+      expect(versions.map((version) => version.checkpointKind).sort()).toEqual([
+        "after",
+        "before",
+      ]);
+      const lookup =
+        await import("@agent-native/core/review/suggestions/actions/get-resource-suggestion");
+      const rest = await lookup.default.run({ id: thursday.id }, ctx);
+      expect(rest.status).toBe("pending");
+    });
+  });
+
+  it("won't accept what's left of a unit with a stale piece, only reject it", async () => {
+    sequence += 1;
+    const documentId = `suggestion-stale-unit-page-${sequence}`;
+    const before = canonicalizeNfm(
+      "Teh team will recieve the files.\n\nBring the draft on Thursday.",
+    );
+    const after = canonicalizeNfm(
+      "The team will receive the files.\n\nBring the draft on Friday.",
+    );
+    const now = new Date().toISOString();
+    await getDb().insert(schema.documents).values({
+      id: documentId,
+      title: "Stale unit page",
+      content: before,
+      ownerEmail,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const ctx = { caller: "cli" as const, userEmail: ownerEmail };
+    const create =
+      await import("@agent-native/core/review/suggestions/actions/create-resource-suggestion-proposal");
+    const decideGroup =
+      await import("@agent-native/core/review/suggestions/actions/decide-resource-suggestion-proposal");
+    const decideOne =
+      await import("@agent-native/core/review/suggestions/actions/decide-resource-suggestion");
+    await runWithRequestContext({ userEmail: ownerEmail }, async () => {
+      const document = await getDocumentAction.run({ id: documentId }, ctx);
+      const created = await create.default.run(
+        {
+          resourceType: "document",
+          resourceId: documentId,
+          adapterKind: adapter.kind,
+          baseRevision: document.revision,
+          summary: "Three pieces, two units",
+          idempotencyKey: `content-stale-unit-${documentId}`,
+          suggestions: markdownSuggestionOperations(before, after).map(
+            (part, index) => ({
+              summary: `Piece ${index + 1}`,
+              operations: [part],
+              metadata: { reviewUnit: index < 2 ? "key:0" : "key:1" },
+            }),
+          ),
+        },
+        ctx,
+      );
+      const [teh = null, recieve = null, thursday = null] = created.suggestions;
+      if (!teh || !recieve || !thursday) throw new Error("Three pieces");
+      await getDbExec().execute({
+        sql: "UPDATE agent_review_suggestions SET status = 'stale' WHERE id = ?",
+        args: [teh.id],
+      });
+      const onThePage = async () =>
+        (await getDocumentAction.run({ id: documentId }, ctx)).content;
+      const decideMembers = (
+        members: (typeof created.suggestions)[number][],
+        decision: "accepted" | "rejected",
+        key: string,
+      ) =>
+        decideGroup.default.run(
+          {
+            proposalId: created.proposal.id,
+            decision,
+            idempotencyKey: `${key}-${documentId}`,
+            members: members.map((suggestion) => ({
+              id: suggestion.id,
+              observedRevision: suggestion.revision,
+              observedBase: suggestion.baseRevision,
+            })),
+          },
+          ctx,
+        );
+
+      const refused = { statusCode: 409, errorCode: "suggestion_stale" };
+      await expect(
+        decideMembers([recieve, thursday], "accepted", "accept-group"),
+      ).rejects.toMatchObject(refused);
+      await expect(
+        decideOne.default.run(
+          {
+            id: recieve.id,
+            decision: "accepted",
+            idempotencyKey: `accept-piece-${documentId}`,
+            observedBase: recieve.baseRevision,
+            observedRevision: recieve.revision,
+          },
+          ctx,
+        ),
+      ).rejects.toMatchObject(refused);
+      expect(await onThePage()).toBe(before);
+
+      // The other unit isn't affected, and what's left of this one can go.
+      const other = await decideMembers([thursday], "accepted", "accept-other");
+      expect(other.suggestions.map(({ status }) => status)).toEqual([
+        "accepted",
+      ]);
+      const rest = await decideMembers([recieve], "rejected", "reject-rest");
+      expect(rest.suggestions.map(({ status }) => status)).toEqual([
+        "rejected",
+      ]);
+      expect(await onThePage()).toBe(
+        canonicalizeNfm(
+          "Teh team will recieve the files.\n\nBring the draft on Friday.",
+        ),
+      );
+    });
+  });
+
+  it("accepts a 50-edit proposal as one Page version with every edit placed", async () => {
+    sequence += 1;
+    const documentId = `suggestion-large-proposal-page-${sequence}`;
+    const before = canonicalizeNfm(
+      Array.from(
+        { length: 50 },
+        (_, index) =>
+          `Paragraph ${index + 1} says the quick brown fox jumps over the lazy dog number ${index + 1}.`,
+      ).join("\n\n"),
+    );
+    const now = new Date().toISOString();
+    await getDb().insert(schema.documents).values({
+      id: documentId,
+      title: "Large proposal page",
+      content: before,
+      ownerEmail,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const ctx = { caller: "cli" as const, userEmail: ownerEmail };
+    await runWithRequestContext({ userEmail: ownerEmail }, async () => {
+      const document = await getDocumentAction.run({ id: documentId }, ctx);
+      // Each edit is saved against the same Page, as an agent's batch is.
+      const suggestions = Array.from({ length: 50 }, (_, index) => {
+        const from = before.indexOf(`lazy dog number ${index + 1}.`);
+        const to = from + "lazy dog".length;
+        return {
+          summary: `Edit ${index + 1}`,
+          operations: [
+            {
+              ordinal: 0,
+              kind: "replace_text",
+              targetId: "body",
+              schemaVersion: 1,
+              before: { markdown: before, changedText: "lazy dog" },
+              after: {
+                markdown: `${before.slice(0, from)}sleepy cat${before.slice(to)}`,
+                changedText: "sleepy cat",
+              },
+              anchor: {
+                from,
+                to,
+                prefix: before.slice(Math.max(0, from - 32), from),
+                suffix: before.slice(to, to + 32),
+              },
+            },
+          ],
+        };
+      });
+      const created = await (
+        await import("@agent-native/core/review/suggestions/actions/create-resource-suggestion-proposal")
+      ).default.run(
+        {
+          resourceType: "document",
+          resourceId: documentId,
+          adapterKind: adapter.kind,
+          baseRevision: document.revision,
+          summary: "Fifty edits",
+          idempotencyKey: `content-large-proposal-${documentId}`,
+          suggestions,
+        },
+        ctx,
+      );
+      const accepted = await (
+        await import("@agent-native/core/review/suggestions/actions/decide-resource-suggestion-proposal")
+      ).default.run(
+        {
+          proposalId: created.proposal.id,
+          decision: "accepted",
+          idempotencyKey: `content-large-proposal-decision-${documentId}`,
+          members: created.suggestions.map((suggestion) => ({
+            id: suggestion.id,
+            observedRevision: suggestion.revision,
+            observedBase: suggestion.baseRevision,
+          })),
+        },
+        ctx,
+      );
+      expect(accepted.suggestions.map((suggestion) => suggestion.id)).toEqual(
+        created.suggestions.map((suggestion) => suggestion.id),
+      );
+      expect(
+        accepted.suggestions.every(
+          (suggestion) => suggestion.status === "accepted",
+        ),
+      ).toBe(true);
+      const updated = await getDocumentAction.run({ id: documentId }, ctx);
+      expect(updated.content).toBe(before.split("lazy dog").join("sleepy cat"));
+      expect(updated.bodyRevision).toBe(1);
+      // One history entry: the original Page, then the Page after all 50.
+      const versions = await getDb()
+        .select({
+          checkpointKind: schema.documentVersions.checkpointKind,
+          content: schema.documentVersions.content,
+        })
+        .from(schema.documentVersions)
+        .where(eq(schema.documentVersions.documentId, documentId));
+      expect(
+        versions
+          .map((version) => [version.checkpointKind, version.content])
+          .sort(([a], [b]) => String(a).localeCompare(String(b))),
+      ).toEqual([
+        ["after", updated.content],
+        ["before", before],
+      ]);
+    });
+  });
+
+  it("keeps each Blocks paragraph's ID when proposal edits reuse each other's text", async () => {
+    const { documentId, propertyId } = await seedSystemDatabasePage();
+    const original = "Apple\nBanana";
+    const db = getDb();
+    await db
+      .update(schema.documents)
+      .set({ content: original })
+      .where(eq(schema.documents.id, documentId));
+    const { persistBlocksFieldIdentity } =
+      await import("../../actions/_blocks-field-identity.js");
+    await persistBlocksFieldIdentity({
+      db,
+      ownerEmail,
+      documentId,
+      propertyId,
+      previousMarkdown: original,
+      markdown: original,
+      now: new Date().toISOString(),
+    });
+    const liveBlocks = async () => {
+      const [field] = await db
+        .select()
+        .from(schema.documentBlockFields)
+        .where(eq(schema.documentBlockFields.propertyId, propertyId));
+      const blocks = await db
+        .select({
+          id: schema.documentBlocks.id,
+          markdown: schema.documentBlocks.markdown,
+          state: schema.documentBlocks.state,
+        })
+        .from(schema.documentBlocks)
+        .where(eq(schema.documentBlocks.fieldId, field!.id))
+        .orderBy(schema.documentBlocks.sortIndex);
+      return blocks
+        .filter((block) => block.state !== "deleted")
+        .map(({ id, markdown }) => ({ id, markdown }));
+    };
+    const [apple, banana] = await liveBlocks();
+    expect([apple?.markdown, banana?.markdown]).toEqual(["Apple", "Banana"]);
+
+    const ctx = { caller: "cli" as const, userEmail: ownerEmail };
+    await runWithRequestContext({ userEmail: ownerEmail }, async () => {
+      const document = await getDocumentAction.run({ id: documentId }, ctx);
+      // Both edits are written against the original Page. The second turns
+      // Apple into the text that the first one replaces.
+      const suggestions = ["Apple\nCherry", "Banana\nBanana"].map((after) => {
+        const operations = markdownSuggestionOperations(original, after);
+        expect(operations).toHaveLength(1);
+        return { summary: after, operations };
+      });
+      const created = await (
+        await import("@agent-native/core/review/suggestions/actions/create-resource-suggestion-proposal")
+      ).default.run(
+        {
+          resourceType: "document",
+          resourceId: documentId,
+          adapterKind: adapter.kind,
+          baseRevision: document.revision,
+          summary: "Swap fruit",
+          idempotencyKey: `content-blocks-proposal-${documentId}`,
+          suggestions,
+        },
+        ctx,
+      );
+      await (
+        await import("@agent-native/core/review/suggestions/actions/decide-resource-suggestion-proposal")
+      ).default.run(
+        {
+          proposalId: created.proposal.id,
+          decision: "accepted",
+          idempotencyKey: `content-blocks-proposal-decision-${documentId}`,
+          members: created.suggestions.map((suggestion) => ({
+            id: suggestion.id,
+            observedRevision: suggestion.revision,
+            observedBase: suggestion.baseRevision,
+          })),
+        },
+        ctx,
+      );
+      const updated = await getDocumentAction.run({ id: documentId }, ctx);
+      expect(updated.content).toBe("Banana\nCherry");
+    });
+    // Saved one edit at a time, Apple's paragraph becomes Banana and Banana's
+    // becomes Cherry. Matching only the first and last Page would swap them.
+    expect(await liveBlocks()).toEqual([
+      { id: apple!.id, markdown: "Banana" },
+      { id: banana!.id, markdown: "Cherry" },
+    ]);
+  });
+
+  it("keeps a stale save for review when proposal edits move paragraphs", async () => {
+    sequence += 1;
+    const documentId = `suggestion-moving-proposal-page-${sequence}`;
+    const original = canonicalizeNfm("Alpha\n\nBravo\n\nCharlie\n\nDelta");
+    const now = new Date().toISOString();
+    await getDb().insert(schema.documents).values({
+      id: documentId,
+      title: "Moving proposal page",
+      content: original,
+      ownerEmail,
+      createdAt: now,
+      updatedAt: now,
+    });
+    const ctx = { caller: "cli" as const, userEmail: ownerEmail };
+    const updated = await runWithRequestContext(
+      { userEmail: ownerEmail },
+      async () => {
+        const document = await getDocumentAction.run({ id: documentId }, ctx);
+        // One edit adds a paragraph and another removes one, so the Page keeps
+        // its paragraph count while Bravo and Charlie move down.
+        const suggestions = [
+          "Alpha\n\nInserted\n\nBravo\n\nCharlie\n\nDelta",
+          "Alpha\n\nBravo\n\nCharlie",
+        ].map((after) => {
+          const operations = markdownSuggestionOperations(
+            original,
+            canonicalizeNfm(after),
+          );
+          expect(operations).toHaveLength(1);
+          return { summary: after, operations };
+        });
+        const created = await (
+          await import("@agent-native/core/review/suggestions/actions/create-resource-suggestion-proposal")
+        ).default.run(
+          {
+            resourceType: "document",
+            resourceId: documentId,
+            adapterKind: adapter.kind,
+            baseRevision: document.revision,
+            summary: "Move paragraphs",
+            idempotencyKey: `content-moving-proposal-${documentId}`,
+            suggestions,
+          },
+          ctx,
+        );
+        await (
+          await import("@agent-native/core/review/suggestions/actions/decide-resource-suggestion-proposal")
+        ).default.run(
+          {
+            proposalId: created.proposal.id,
+            decision: "accepted",
+            idempotencyKey: `content-moving-proposal-decision-${documentId}`,
+            members: created.suggestions.map((suggestion) => ({
+              id: suggestion.id,
+              observedRevision: suggestion.revision,
+              observedBase: suggestion.baseRevision,
+            })),
+          },
+          ctx,
+        );
+        return getDocumentAction.run({ id: documentId }, ctx);
+      },
+    );
+    expect(updated.content).toBe(
+      canonicalizeNfm("Alpha\n\nInserted\n\nBravo\n\nCharlie"),
+    );
+    const { readDocumentBodyIntents } =
+      await import("./document-body-intents.js");
+    // An editor still on the original Page saves a change to Bravo. Bravo now
+    // sits one paragraph lower, so merging by position would put the change
+    // into Inserted. Saved one edit at a time, this save was kept for review.
+    expect(
+      mergeDocumentBodyIntents({
+        authoredBaseContent: original,
+        authoredCandidateContent: canonicalizeNfm(
+          "Alpha\n\nBravo, edited\n\nCharlie\n\nDelta",
+        ),
+        currentContent: updated.content,
+        currentRevision: updated.bodyRevision,
+        incoming: {
+          writerId: "editor:stale-tab",
+          operationId: "stale-save",
+          authoredBaseRevision: 0,
+        },
+        priorIntents: await readDocumentBodyIntents({
+          db: getDb(),
+          ownerEmail,
+          documentId,
+          afterRevision: 0,
+          throughRevision: updated.bodyRevision,
+        }),
+      }),
+    ).toEqual({ status: "preservation-required", reason: "provenance" });
   });
 
   it("lets a commenter withdraw their own suggestion without touching the Page", async () => {
@@ -536,6 +1031,57 @@ describe("Content suggested edits Blocks transaction", () => {
       .from(schema.documents)
       .where(eq(schema.documents.id, documentId));
     expect(document?.content).toBe("After");
+  });
+
+  it("binds a private image that an accepted suggestion adds", async () => {
+    await privateMediaStore.ready();
+    sequence += 1;
+    const documentId = `suggestion-private-image-page-${sequence}`;
+    const mediaId = "3c9a1f5e-8b2d-4e7a-9f61-0d4c2b7e5a18";
+    await getDb().insert(schema.documents).values({
+      id: documentId,
+      title: "Page with an image",
+      content: "Before",
+      ownerEmail,
+      createdAt: new Date().toISOString(),
+      updatedAt: "rev-1",
+    });
+    await getDb().insert(privateMedia).values({
+      id: mediaId,
+      ownerEmail,
+      mimeType: "image/png",
+      size: 3,
+      sha256: "0",
+      blobHandleJson: "{}",
+      createdAt: 0,
+    });
+
+    await getDbExec().transaction?.(async (tx) => {
+      await accept(
+        documentId,
+        tx,
+        "rev-1",
+        {
+          ...operation,
+          after: {
+            markdown: `See the [photo](/api/private-media/${mediaId}).`,
+          },
+        },
+        coordination(),
+        { userEmail: ownerEmail },
+      );
+    });
+
+    const bound = await getDb()
+      .select()
+      .from(schema.privateMediaReferences)
+      .where(
+        and(
+          eq(schema.privateMediaReferences.documentId, documentId),
+          eq(schema.privateMediaReferences.mediaId, mediaId),
+        ),
+      );
+    expect(bound).toHaveLength(1);
   });
 
   it("honors collection access through a non-active organization", async () => {
@@ -775,6 +1321,8 @@ describe("Content suggested edits Blocks transaction", () => {
       );
     await expect(
       getDbExec().transaction!(async (tx) => {
+        const prepared = coordination();
+        prepared.heldMembershipIds = await lockSuggestionPage(tx, documentId);
         const execute = tx.execute.bind(tx);
         const wrapped = {
           ...tx,
@@ -791,7 +1339,7 @@ describe("Content suggested edits Blocks transaction", () => {
             return execute(query);
           },
         } as DbExec;
-        return accept(documentId, wrapped);
+        return accept(documentId, wrapped, "rev-1", operation, prepared);
       }),
     ).rejects.toThrow(/no primary Blocks field/);
     const [document] = await getDb()
@@ -801,26 +1349,51 @@ describe("Content suggested edits Blocks transaction", () => {
     expect(document?.content).toBe("Before");
   });
 
-  it("returns a retryable conflict when membership writes hold the table lock", async () => {
-    const { documentId } = await seedSystemDatabasePage();
+  it("returns a retryable conflict when the Page joins a collection after its memberships were locked", async () => {
+    const { documentId } = await seedSystemDatabasePage(1);
+    const joining = (
+      await getDb()
+        .delete(schema.contentDatabaseItems)
+        .where(
+          eq(
+            schema.contentDatabaseItems.id,
+            `suggestion-ordinary-item-${sequence}-0`,
+          ),
+        )
+        .returning()
+    ).pop();
+    if (!joining) throw new Error("The Page has no ordinary membership.");
     await expect(
       getDbExec().transaction!(async (tx) => {
+        const prepared = coordination();
+        prepared.heldMembershipIds = await lockSuggestionPage(tx, documentId);
         const execute = tx.execute.bind(tx);
+        let joined = false;
         const wrapped = {
           ...tx,
           execute: async (query: Parameters<DbExec["execute"]>[0]) => {
             if (
-              query ===
-              "LOCK TABLE content_database_items IN SHARE ROW EXCLUSIVE MODE NOWAIT"
+              !joined &&
+              typeof query !== "string" &&
+              query.sql === "SELECT id FROM documents WHERE id = ? FOR UPDATE"
             ) {
-              throw Object.assign(new Error("lock unavailable"), {
-                code: "55P03",
+              joined = true;
+              await execute({
+                sql: "INSERT INTO content_database_items (id, owner_email, database_id, document_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                args: [
+                  joining.id,
+                  joining.ownerEmail,
+                  joining.databaseId,
+                  joining.documentId,
+                  joining.createdAt,
+                  joining.updatedAt,
+                ],
               });
             }
             return execute(query);
           },
         } as DbExec;
-        return accept(documentId, wrapped);
+        return accept(documentId, wrapped, "rev-1", operation, prepared);
       }),
     ).rejects.toMatchObject({ errorCode: "suggestion_conflict" });
     const [document] = await getDb()
@@ -1215,6 +1788,55 @@ describe("Content single suggestion decisions", () => {
         "pending",
       ]);
       expect(after[1]!.revision).toBe(second!.revision);
+    });
+  });
+
+  it("accepts a whole-text suggestion after another was accepted from the same text", async () => {
+    const before = "Before the change.";
+    const documentId = await seedPage(before);
+    await runWithRequestContext({ userEmail: ownerEmail }, async () => {
+      const create = (
+        await import("@agent-native/core/review/suggestions/actions/create-resource-suggestion")
+      ).default;
+      // A whole before and after with no anchor, as an exact before-text allows.
+      const propose = async (after: string) => {
+        const document = await getDocumentAction.run({ id: documentId }, ctx);
+        return create.run(
+          {
+            resourceType: "document",
+            resourceId: documentId,
+            adapterKind: adapter.kind,
+            baseRevision: document.revision,
+            summary: "Whole text",
+            idempotencyKey: `whole-${documentId}-${after}`,
+            operations: [
+              {
+                ordinal: 0,
+                kind: "replace_text",
+                targetId: "body",
+                before: { markdown: before },
+                after: { markdown: after },
+                schemaVersion: 1,
+              },
+            ],
+          },
+          ctx,
+        );
+      };
+      const first = await propose("After the first change.");
+      expect((await decide(first, "accept-first")).suggestion.status).toBe(
+        "accepted",
+      );
+      await getDb()
+        .update(schema.documents)
+        .set({ content: before })
+        .where(eq(schema.documents.id, documentId));
+
+      const second = await propose("After the second change.");
+      const result = await decide(second, "accept-second");
+      expect(result.suggestion.status).toBe("accepted");
+      const page = await getDocumentAction.run({ id: documentId }, ctx);
+      expect(page.content).toBe("After the second change.");
     });
   });
 });

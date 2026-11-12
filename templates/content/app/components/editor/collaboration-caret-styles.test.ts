@@ -28,7 +28,7 @@ describe("collaboration caret styles", () => {
     document.head.append(style);
 
     const editor = document.createElement("div");
-    editor.className = "notion-editor";
+    editor.className = "content-editor";
     const paragraph = document.createElement("p");
     paragraph.append("Link", caret, selection, " sample.");
     editor.append(paragraph);
@@ -41,5 +41,23 @@ describe("collaboration caret styles", () => {
     expect(getComputedStyle(label).width).toBe("max-content");
     expect(getComputedStyle(selection).display).toBe("inline");
     expect(getComputedStyle(selection).borderRadius).toBe("2px");
+  });
+
+  it("tints a collaborator's selection in their colour without fading its text", () => {
+    const style = document.createElement("style");
+    style.textContent = readFileSync("app/global.css", "utf8");
+    document.head.append(style);
+
+    const selection = document.createElement("span");
+    selection.className = "ProseMirror-yjs-selection";
+    selection.setAttribute("style", "--collaboration-color: #db70ae");
+    selection.textContent = "selected words";
+    const editor = document.createElement("div");
+    editor.className = "content-editor";
+    editor.append(selection);
+    document.body.append(editor);
+
+    const computed = getComputedStyle(selection);
+    expect(computed.opacity).not.toBe("0.16");
   });
 });

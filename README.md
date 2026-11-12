@@ -97,6 +97,7 @@ https://github.com/user-attachments/assets/ef51644b-6506-46d8-8083-0af7b7e5b65c
 ## Open-source agents
 
 Start from one of these agents or use it as an example for your own.
+For a source-to-answer architecture example, see [Brain’s visual overview](templates/brain/README.md#brain-at-a-glance).
 
 <br />
 
@@ -280,7 +281,7 @@ Explore the [full app gallery](https://agent-native.com/apps?utm_source=github&u
 
 ## Contributing
 
-Working on this repository itself? See [DEVELOPMENT.md](./DEVELOPMENT.md) for local setup, workspace structure, and guard scripts.
+Want to send a change back? Start with [CONTRIBUTING.md](./CONTRIBUTING.md). [DEVELOPMENT.md](./DEVELOPMENT.md) covers local setup, workspace structure, and guard scripts.
 
 ## License
 

@@ -1,4 +1,3 @@
-
 use serde::Serialize;
 use tauri::AppHandle;
 
@@ -67,9 +66,10 @@ pub async fn audio_transcription_start(
     mic_device_id: Option<String>,
     mic_device_label: Option<String>,
     capture_system: Option<bool>,
-    voice_processing: Option<bool>,
     emit_partials: Option<bool>,
     owner: Option<String>,
+    run_id: Option<u64>,
+    engine: Option<String>,
 ) -> Result<(), String> {
     let _ = meeting_id;
     crate::logfile::diagnostic("[meeting-audio] transcription engine start requested");
@@ -79,9 +79,10 @@ pub async fn audio_transcription_start(
         mic_device_id,
         mic_device_label,
         capture_system.unwrap_or(true),
-        voice_processing.unwrap_or(false),
         emit_partials.unwrap_or(true),
         owner,
+        run_id,
+        engine,
     )
     .await;
     if let Err(error) = &result {
@@ -96,13 +97,28 @@ pub async fn audio_transcription_start(
 }
 
 #[tauri::command]
-pub async fn audio_transcription_stop(app: AppHandle) -> Result<(), String> {
-    crate::whisper_speech::whisper_transcription_stop(app).await
+pub async fn audio_transcription_stop(
+    app: AppHandle,
+    owner: Option<String>,
+    run_id: Option<u64>,
+    discard: Option<bool>,
+) -> Result<crate::whisper_speech::WhisperStopResult, String> {
+    crate::whisper_speech::whisper_transcription_stop(app, owner, run_id, discard.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
-pub async fn audio_transcription_reset_timeline(offset_ms: Option<u64>) -> Result<(), String> {
-    crate::whisper_speech::whisper_transcription_reset_timeline(offset_ms.unwrap_or(0)).await
+pub async fn audio_transcription_reset_timeline(
+    owner: Option<String>,
+    run_id: Option<u64>,
+    offset_ms: Option<u64>,
+) -> Result<(), String> {
+    crate::whisper_speech::whisper_transcription_reset_timeline(
+        owner,
+        run_id,
+        offset_ms.unwrap_or(0),
+    )
+    .await
 }
 
 #[cfg(target_os = "macos")]
@@ -182,6 +198,7 @@ pub(crate) mod macos {
         app: AppHandle,
         cancelled: Arc<AtomicBool>,
         level_tick: Arc<AtomicU32>,
+        run_id: Option<u64>,
         output_type: SCStreamOutputType,
         source: &'static str,
     }
@@ -225,6 +242,7 @@ pub(crate) mod macos {
                     AudioLevelPayload {
                         level,
                         source: self.source,
+                        run_id: self.run_id,
                     },
                 );
             }
@@ -262,8 +280,9 @@ pub(crate) mod macos {
     pub(crate) fn start_raw_system_capture(
         app: AppHandle,
         on_samples: Arc<dyn Fn(&[f32]) + Send + Sync>,
+        run_id: Option<u64>,
     ) -> Result<RawSckAudioCapture, String> {
-        start_raw_sck_audio_capture(app, true, None, None, Some(on_samples), None)
+        start_raw_sck_audio_capture(app, true, None, None, Some(on_samples), None, run_id)
     }
 
     pub(crate) fn supports_sck_microphone_capture() -> bool {
@@ -276,6 +295,7 @@ pub(crate) mod macos {
         mic_device_id: Option<String>,
         mic_device_label: Option<String>,
         capture_system: bool,
+        run_id: Option<u64>,
         on_mic_samples: Arc<dyn Fn(&[f32]) + Send + Sync>,
         on_system_samples: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
     ) -> Result<RawSckAudioCapture, String> {
@@ -289,6 +309,7 @@ pub(crate) mod macos {
             mic_device_label,
             on_system_samples,
             Some(on_mic_samples),
+            run_id,
         )
     }
 
@@ -299,6 +320,7 @@ pub(crate) mod macos {
         mic_device_label: Option<String>,
         on_system_samples: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
         on_mic_samples: Option<Arc<dyn Fn(&[f32]) + Send + Sync>>,
+        run_id: Option<u64>,
     ) -> Result<RawSckAudioCapture, String> {
         let granted = unsafe { CGPreflightScreenCaptureAccess() };
         if !granted {
@@ -355,6 +377,7 @@ pub(crate) mod macos {
                 app: app.clone(),
                 cancelled: cancelled.clone(),
                 level_tick: Arc::new(AtomicU32::new(0)),
+                run_id,
                 output_type: SCStreamOutputType::Audio,
                 source: "system",
             };
@@ -366,6 +389,7 @@ pub(crate) mod macos {
                 app: app.clone(),
                 cancelled: cancelled.clone(),
                 level_tick: Arc::new(AtomicU32::new(0)),
+                run_id,
                 output_type: SCStreamOutputType::Microphone,
                 source: "mic",
             };
@@ -381,8 +405,11 @@ pub(crate) mod macos {
     }
 
     #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase")]
     struct AudioLevelPayload {
         level: f32,
         source: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<u64>,
     }
 }

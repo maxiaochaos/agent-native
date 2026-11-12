@@ -9,22 +9,26 @@ import {
 
 import { getAppConfig } from "../app-config/store.js";
 import { getConfiguredAppBasePath } from "../server/app-base-path.js";
-import { isLoopbackRequest } from "../server/auth.js";
 import {
   describeBearerCredentialRefusal,
   type BearerCredentialRefusal,
 } from "../server/bearer-credential-refusal.js";
 import { CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE } from "../server/credential-membership-unavailable.js";
+import { resolveEmbedRequestOrigin } from "../server/embed-request-origin.js";
 import { getH3App } from "../server/framework-request-handler.js";
 import { getOrigin } from "../server/google-oauth.js";
 import { readBody } from "../server/h3-helpers.js";
-import { trackMcpInitialize } from "./analytics.js";
+import { isDirectLoopbackRequest } from "../server/loopback.js";
+import { registerMcpAppCardsLab } from "./app-cards-lab.js";
+import { mcpApprovalRoute, mountMcpApprovalRoute } from "./approval-route.js";
+import { mcpApprovalAppId } from "./approval-store.js";
 import {
-  createMCPServerForRequest,
   verifyAuth,
   McpIdentityVerificationUnavailableError,
+  McpIdentityVerificationRefusedError,
   getAccessTokens,
   resolveOrgIdFromDomain,
+  resolveMcpIdentityOrgId,
   buildLinkArtifacts,
   McpDirectoryProfileValidationError,
   validateMcpDirectoryProfile,
@@ -36,6 +40,7 @@ import {
   type MCPCallerIdentity,
   type MCPRequestMeta,
 } from "./build-server.js";
+import { handleMcpFetchRequest } from "./framework-fetch-handler.js";
 import {
   buildMcpOAuthChallenge,
   getMcpOAuthAudiences,
@@ -50,8 +55,8 @@ import {
   joinMcpRoute,
 } from "./route-paths.js";
 
+export { createMCPServerForRequest } from "./build-server.js";
 export {
-  createMCPServerForRequest,
   verifyAuth,
   getAccessTokens,
   resolveOrgIdFromDomain,
@@ -114,22 +119,6 @@ function deriveRequestMeta(event: H3Event): MCPRequestMeta {
     ...(fullCatalog ? { fullCatalog } : {}),
     ...(inlineAppsRequested ? { inlineMcpApps: true } : {}),
   };
-}
-
-function isLoopbackOrigin(origin: string | undefined): boolean {
-  if (!origin) return false;
-  try {
-    const hostname = new URL(origin).hostname;
-    return (
-      hostname === "localhost" ||
-      hostname === "127.0.0.1" ||
-      hostname === "::1" ||
-      hostname === "[::1]" ||
-      hostname.startsWith("127.")
-    );
-  } catch {
-    return false;
-  }
 }
 
 function buildWebRequest(
@@ -290,6 +279,38 @@ function directoryProfileUnavailable(
   };
 }
 
+function identityVerificationUnavailable(
+  event: H3Event,
+  error: McpIdentityVerificationUnavailableError,
+): {
+  error: string;
+  message?: string;
+} {
+  if (error.retryable === false) {
+    setResponseStatus(event, 500);
+    return { error: "Internal server error" };
+  }
+  setResponseStatus(event, 503);
+  setResponseHeader(event, "Retry-After", "5");
+  return {
+    error: "Service Unavailable",
+    message: CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE,
+  };
+}
+
+function identityVerificationRefused(
+  event: H3Event,
+  routePath: string,
+): ReturnType<typeof buildUnauthorizedBody> {
+  setResponseStatus(event, 401);
+  setResponseHeader(
+    event,
+    "WWW-Authenticate",
+    buildMcpOAuthChallenge(event, routePath, "invalid"),
+  );
+  return buildUnauthorizedBody(event, routePath, "invalid");
+}
+
 // ---------------------------------------------------------------------------
 // handleMcpRequest — runtime-agnostic MCP request handler
 // ---------------------------------------------------------------------------
@@ -315,7 +336,8 @@ function directoryProfileUnavailable(
 async function handleMcpRequestInternal(
   event: H3Event,
   config: MCPConfig,
-  routePath = MCP_PUBLIC_ROUTE_PREFIX,
+  routePath: string,
+  approvalRoute: string,
   onMcpMethod?: (method: string) => void,
 ): Promise<
   Response | string | { error: string } | Record<string, unknown> | undefined
@@ -334,9 +356,15 @@ async function handleMcpRequestInternal(
     "x-agent-native-owner-email",
   );
   const requestMeta = deriveRequestMeta(event);
-  const hasLocalOwnerHint = Boolean(ownerEmailHeader?.trim());
+  const requestOrigin = getRequestHeader(event, "origin");
+  const directLocalRequest =
+    isDirectLoopbackRequest(event) &&
+    (requestOrigin === undefined || requestOrigin === requestMeta.origin);
+  const localOwnerHint = directLocalRequest ? ownerEmailHeader : undefined;
+  const hasLocalOwnerHint = Boolean(localOwnerHint?.trim());
   const directoryProfile =
-    routePath === MCP_DIRECTORY_ROUTE_PREFIX
+    routePath === MCP_DIRECTORY_ROUTE_PREFIX &&
+    config.directoryProfile?.directoryRoute !== false
       ? config.directoryProfile
       : undefined;
   if (routePath === MCP_DIRECTORY_ROUTE_PREFIX && !directoryProfile) {
@@ -358,23 +386,23 @@ async function handleMcpRequestInternal(
     : config;
   let authResult: Awaited<ReturnType<typeof verifyAuth>>;
   try {
-    authResult = await verifyAuth(authHeader, ownerEmailHeader, {
+    authResult = await verifyAuth(authHeader, localOwnerHint, {
+      allowLocalOwnerHint: hasLocalOwnerHint,
       allowDevOpen:
-        isLoopbackRequest(event) &&
-        isLoopbackOrigin(requestMeta.origin) &&
+        directLocalRequest &&
         (hasLocalOwnerHint || getAppConfig().mcp.allowDevOpen),
       resourceUrl: getMcpOAuthAudiences(event, routePath),
       requestOrigin: getOrigin(event),
+      event,
     });
   } catch (error) {
-    if (!(error instanceof McpIdentityVerificationUnavailableError))
-      throw error;
-    setResponseStatus(event, 503);
-    setResponseHeader(event, "Retry-After", "5");
-    return {
-      error: "Service Unavailable",
-      message: CREDENTIAL_MEMBERSHIP_UNAVAILABLE_MESSAGE,
-    };
+    if (error instanceof McpIdentityVerificationUnavailableError) {
+      return identityVerificationUnavailable(event, error);
+    }
+    if (error instanceof McpIdentityVerificationRefusedError) {
+      return identityVerificationRefused(event, routePath);
+    }
+    throw error;
   }
   if (!authResult.authed && authResult.unavailable) {
     // The token is valid but its org membership could not be checked. No auth
@@ -397,37 +425,36 @@ async function handleMcpRequestInternal(
     return buildUnauthorizedBody(event, routePath, authResult.refusal);
   }
 
+  if (
+    authResult.identity &&
+    authResult.identity.orgId === undefined &&
+    (authResult.identity.orgDomain !== undefined ||
+      Boolean(authResult.identity.userEmail))
+  ) {
+    try {
+      const orgId = await resolveMcpIdentityOrgId(authResult.identity);
+      authResult = {
+        ...authResult,
+        identity: { ...authResult.identity, orgId: orgId ?? null },
+      };
+    } catch (error) {
+      if (error instanceof McpIdentityVerificationUnavailableError) {
+        return identityVerificationUnavailable(event, error);
+      }
+      if (error instanceof McpIdentityVerificationRefusedError) {
+        return identityVerificationRefused(event, routePath);
+      }
+      throw error;
+    }
+  }
+
   const body = method === "POST" ? await readBody(event) : undefined;
   onMcpMethod?.(directoryLogMethod(body) ?? method);
 
-  const initializeRequest = body
-    ? (Array.isArray(body) ? body : [body]).find(
-        (
-          m,
-        ): m is {
-          params?: {
-            capabilities?: unknown;
-            clientInfo?: { name?: unknown; version?: unknown };
-            protocolVersion?: unknown;
-          };
-        } =>
-          typeof m === "object" &&
-          m !== null &&
-          (m as { method?: unknown }).method === "initialize",
-      )
-    : undefined;
-
-  if (getAppConfig().observability.mcpDebugInitialize && initializeRequest) {
-    console.error(
-      "[MCP_DEBUG_INIT] clientInfo=",
-      JSON.stringify(initializeRequest.params?.clientInfo),
-      "capabilities=",
-      JSON.stringify(initializeRequest.params?.capabilities),
-    );
-  }
-
   const serverRequestMeta: MCPRequestMeta = {
     ...requestMeta,
+    resolveEmbedRequestOrigin: () => resolveEmbedRequestOrigin(event),
+    approvalRoute,
     ...(requestConfig.createLocalAgentTaskClient
       ? {
           localAgentTaskClient: requestConfig.createLocalAgentTaskClient(event),
@@ -453,54 +480,19 @@ async function handleMcpRequestInternal(
       return directoryProfileUnavailable(event, error);
     }
   }
-  if (initializeRequest) {
-    const clientInfo = initializeRequest.params?.clientInfo;
-    const protocolVersion = initializeRequest.params?.protocolVersion;
-    trackMcpInitialize({
-      source: "http",
-      serverName: requestConfig.name,
-      serverVersion: requestConfig.version ?? "1.0.0",
-      ...(requestConfig.appId ? { appId: requestConfig.appId } : {}),
-      ...(typeof clientInfo?.name === "string"
-        ? { clientName: clientInfo.name }
-        : {}),
-      ...(typeof clientInfo?.version === "string"
-        ? { clientVersion: clientInfo.version }
-        : {}),
-      ...(requestMeta.clientName
-        ? { clientUserAgent: requestMeta.clientName }
-        : {}),
-      ...(typeof protocolVersion === "string" ? { protocolVersion } : {}),
-      ...(authResult.identity?.userEmail
-        ? { userId: authResult.identity.userEmail }
-        : {}),
-    });
-  }
-
-  const { createMcpHandler } = await import("@modelcontextprotocol/server");
-  const handler = createMcpHandler(
-    () =>
-      createMCPServerForRequest(
-        requestConfig,
-        authResult.identity,
-        serverRequestMeta,
-      ),
-    {
-      legacy: "stateless",
-      responseMode: "auto",
-    },
-  );
   const webRequest = buildWebRequest(event, method, routePath);
-  return handler.fetch(
-    webRequest,
-    method === "POST" ? { parsedBody: body } : undefined,
-  );
+  return handleMcpFetchRequest(webRequest, requestConfig, {
+    identity: authResult.identity,
+    requestMeta: serverRequestMeta,
+    parsedBody: body,
+  });
 }
 
 export async function handleMcpRequest(
   event: H3Event,
   config: MCPConfig,
   routePath = MCP_PUBLIC_ROUTE_PREFIX,
+  approvalRoute = mcpApprovalRoute(),
 ): Promise<
   Response | string | { error: string } | Record<string, unknown> | undefined
 > {
@@ -517,6 +509,7 @@ export async function handleMcpRequest(
       event,
       config,
       routePath,
+      approvalRoute,
       (requestMethod) => {
         method = requestMethod;
       },
@@ -545,17 +538,43 @@ export function mountMCP(
   config: MCPConfig,
   routePrefix = "/_agent-native",
 ): void {
+  registerMcpAppCardsLab();
   const routePaths =
     routePrefix === "/_agent-native"
       ? [...MCP_ROUTE_PREFIXES]
       : [joinMcpRoute(routePrefix, "/mcp")];
-  if (config.directoryProfile) routePaths.unshift(MCP_DIRECTORY_ROUTE_PREFIX);
+  if (
+    config.directoryProfile &&
+    config.directoryProfile.directoryRoute !== false
+  )
+    routePaths.unshift(MCP_DIRECTORY_ROUTE_PREFIX);
+  if (config.appApprovalPage && routePrefix !== "/_agent-native") {
+    throw new Error(
+      `appApprovalPage needs MCP mounted under /_agent-native, where the app's review page reads approvals, not under ${routePrefix}.`,
+    );
+  }
 
+  mountMcpApprovalRoute(
+    nitroApp,
+    {
+      appId: mcpApprovalAppId(config),
+      // Only a signed-in caller makes a grant, and MCP runs its calls from
+      // `productionActions` when there is one (`selectMcpActionSurface`).
+      actions: config.productionActions ?? config.actions,
+      appPage: config.appApprovalPage === true,
+    },
+    routePrefix,
+  );
   for (const routePath of routePaths) {
     getH3App(nitroApp).use(
       routePath,
       defineEventHandler(async (event) => {
-        return handleMcpRequest(event as H3Event, config, routePath);
+        return handleMcpRequest(
+          event as H3Event,
+          config,
+          routePath,
+          mcpApprovalRoute(routePrefix),
+        );
       }),
     );
   }

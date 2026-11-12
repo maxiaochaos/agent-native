@@ -103,6 +103,7 @@ describe("resolvePlayerVideoUrl", () => {
       "rec-1",
       "encrypted",
       "initial",
+      "public",
     );
 
     expect(
@@ -139,6 +140,42 @@ describe("resolvePlayerVideoUrl", () => {
         { addPasswordToken: true },
       ),
     ).toBe("/api/video/rec-3?loomMedia=1&t=signed-token");
+  });
+
+  it.each(["private", "org"])(
+    "does not mint a password token for %s recordings with a stored password",
+    (visibility) => {
+      expect(
+        resolvePlayerVideoUrl(
+          {
+            id: "rec-1",
+            visibility,
+            password: "encrypted",
+            videoUrl: "/api/uploads/rec-1/blob",
+          },
+          { addPasswordToken: true },
+        ),
+      ).toBe("/api/video/rec-1");
+    },
+  );
+
+  it("hands YouTube's embed URL to the browser instead of proxying it", () => {
+    expect(
+      resolvePlayerVideoUrl(
+        {
+          id: "rec-1",
+          password: "hash",
+          sourceAppName: "YouTube",
+          sourceWindowTitle: "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+          videoUrl: "https://www.youtube.com/embed/jNQXAC9IVRw",
+        },
+        {
+          addPasswordToken: true,
+          appPath: (path) => `/clips${path}`,
+          proxyRemoteMedia: true,
+        },
+      ),
+    ).toBe("https://www.youtube.com/embed/jNQXAC9IVRw");
   });
 
   it("does not throw when the stored video URL is malformed", () => {

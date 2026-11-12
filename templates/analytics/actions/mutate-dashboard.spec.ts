@@ -211,6 +211,15 @@ describe("mutate-dashboard", () => {
     mocks.seedFromText.mockClear();
   });
 
+  it("advertises the returnTypes help-only call without a dashboard id", () => {
+    expect(
+      (mutateDashboard.tool.parameters as any).required ?? [],
+    ).not.toContain("dashboardId");
+    expect(
+      (mutateDashboard.tool.parameters as any).properties.returnTypes.type,
+    ).toBe("boolean");
+  });
+
   it.each([[], ""])(
     "ignores an empty auto-serialized operations sibling (%j) when code is present",
     async (emptyOperations) => {
@@ -506,6 +515,29 @@ describe("mutate-dashboard", () => {
     expect(mocks.dryRunQuery).not.toHaveBeenCalled();
   });
 
+  it("persists clearPanelHeight by removing the stored height field", async () => {
+    const existingConfig = dashboardConfig();
+    (existingConfig.panels[0] as Record<string, unknown>).height = 3;
+    mocks.getDashboard.mockResolvedValue({
+      kind: "sql",
+      config: existingConfig,
+    });
+
+    const args = mutateDashboard.schema.parse({
+      dashboardId: "traffic",
+      operations: [{ op: "clearPanelHeight", panelId: "a" }],
+    });
+    const result: any = await mutateDashboard.run(args);
+
+    expect(result.saved).toBe(true);
+    expect(result.changedPanelIds).toEqual(["a"]);
+    expect(mocks.upsertDashboard).toHaveBeenCalledOnce();
+    const saved = mocks.upsertDashboard.mock.calls[0][2] as {
+      panels: Array<Record<string, unknown>>;
+    };
+    expect(saved.panels[0]).not.toHaveProperty("height");
+  });
+
   it("returns the SQL save proof when collab sync hangs", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -555,8 +587,9 @@ describe("mutate-dashboard", () => {
       "dryRun",
       "allowEmptyResult",
       "returnConfig",
+      "returnTypes",
     ]);
-    expect(parameters.required).toEqual(["dashboardId"]);
+    expect(parameters.required ?? []).not.toContain("dashboardId");
     expect(parameters.properties.dashboardId.minLength).toBe(1);
     expect(parameters.properties.code.maxLength).toBe(12_000);
     expect(parameters.properties.operations).toBeDefined();
@@ -702,7 +735,7 @@ describe("mutate-dashboard", () => {
       operations: [
         {
           op: "insertPanel",
-          panel: panel("new-panel"),
+          panel: { ...panel("new-panel"), height: 3 },
         },
       ],
     };
@@ -721,6 +754,17 @@ describe("mutate-dashboard", () => {
         ],
       }),
     ).toThrow(/expected number, received string/i);
+    expect(() =>
+      mutateDashboard.schema.parse({
+        ...base,
+        operations: [
+          {
+            ...base.operations[0],
+            panel: { ...base.operations[0].panel, height: "3" },
+          },
+        ],
+      }),
+    ).toThrow(/expected number, received string/i);
   });
 
   it("validates SQL-affecting mutations before saving", async () => {
@@ -733,14 +777,122 @@ describe("mutate-dashboard", () => {
     });
     mocks.dryRunQuery.mockResolvedValue("bad column");
 
+    const run = mutateDashboard.run({
+      dashboardId: "traffic",
+      code: 'dashboard.panel("a").setSql("SELECT bad_column FROM `project.dataset.table`");',
+    });
+    await expect(run).rejects.toThrow(/SQL is invalid: bad column/);
+    // A caller error, so the route echoes the message instead of a bare 500.
+    await expect(run).rejects.toMatchObject({
+      errorCode: "action_failed",
+      statusCode: 400,
+    });
+
+    expect(mocks.upsertDashboard).not.toHaveBeenCalled();
+  });
+
+  it("reports invalid SQL on a dry run as a caller error", async () => {
+    mocks.getDashboard.mockResolvedValue({
+      kind: "sql",
+      config: {
+        ...dashboardConfig(),
+        panels: [panel("a", "bigquery")],
+      },
+    });
+    mocks.dryRunQuery.mockResolvedValue(
+      "Syntax error: concatenated string literals must be separated by whitespace or comments",
+    );
+
     await expect(
       mutateDashboard.run({
         dashboardId: "traffic",
-        code: 'dashboard.panel("a").setSql("SELECT bad_column FROM `project.dataset.table`");',
+        dryRun: true,
+        operations: [
+          {
+            op: "updatePanel",
+            panelId: "a",
+            patch: {
+              sql: "SELECT 'Alice''s' AS value FROM `project.dataset.table`",
+            },
+          },
+        ],
       }),
-    ).rejects.toThrow(/SQL is invalid: bad column/);
-
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/SQL is invalid: Syntax error/),
+      statusCode: 400,
+    });
     expect(mocks.upsertDashboard).not.toHaveBeenCalled();
+  });
+
+  it("reports a validator that could not run as unavailable, not as invalid SQL", async () => {
+    mocks.getDashboard.mockResolvedValue({
+      kind: "sql",
+      config: {
+        ...dashboardConfig(),
+        panels: [panel("a", "bigquery")],
+      },
+    });
+    mocks.dryRunQuery.mockRejectedValue(new Error("Token exchange failed"));
+
+    await expect(
+      mutateDashboard.run({
+        dashboardId: "traffic",
+        operations: [
+          {
+            op: "updatePanel",
+            panelId: "a",
+            patch: { sql: "SELECT 1" },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      message: "Dashboard SQL could not be validated: Token exchange failed",
+      errorCode: "sql_validation_unavailable",
+      statusCode: 503,
+    });
+    expect(mocks.upsertDashboard).not.toHaveBeenCalled();
+  });
+
+  it("reports a validation timeout as unavailable", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.getDashboard.mockResolvedValue({
+        kind: "sql",
+        config: {
+          ...dashboardConfig(),
+          panels: [panel("a", "bigquery")],
+        },
+      });
+      mocks.dryRunQuery.mockImplementation(
+        async (_sql: string, options: { signal: AbortSignal }) =>
+          await new Promise<null>((_resolve, reject) => {
+            options.signal.addEventListener("abort", () =>
+              reject(new Error("aborted")),
+            );
+          }),
+      );
+
+      const pending = mutateDashboard.run({
+        dashboardId: "traffic",
+        operations: [
+          {
+            op: "updatePanel",
+            panelId: "a",
+            patch: { sql: "SELECT 1" },
+          },
+        ],
+      });
+      const outcome = expect(pending).rejects.toMatchObject({
+        message: expect.stringMatching(/timed out after 10 seconds/),
+        errorCode: "sql_validation_unavailable",
+        statusCode: 503,
+      });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await outcome;
+      expect(mocks.upsertDashboard).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("validates multiple BigQuery panels in parallel within one batch", async () => {
@@ -1021,6 +1173,41 @@ describe("mutate-dashboard", () => {
       expect(mocks.upsertDashboard).not.toHaveBeenCalled();
     });
 
+    it("rejects a record template with a list variable, naming the pattern to use, and writes nothing", async () => {
+      mocks.getDashboard.mockResolvedValue({
+        kind: "sql",
+        config: lineConfig(),
+      });
+
+      const attempt = mutateDashboard.run(
+        {
+          dashboardId: "traffic",
+          operations: [
+            {
+              op: "updatePanel",
+              panelId: "a",
+              patch: {
+                config: {
+                  drilldown: {
+                    sql: "SELECT visitor FROM events WHERE app IN ({{appFilter:list}})",
+                  },
+                },
+              },
+            },
+          ],
+        },
+        agent,
+      );
+
+      await expect(attempt).rejects.toMatchObject({
+        errorCode: "invalid_panel_config",
+        message: expect.stringContaining(
+          "In first-party SQL: ('{{appFilter}}' IN ('', 'all') OR STRPOS(",
+        ),
+      });
+      expect(mocks.upsertDashboard).not.toHaveBeenCalled();
+    });
+
     it("rejects renderer options placed at the panel level", async () => {
       mocks.getDashboard.mockResolvedValue({
         kind: "sql",
@@ -1136,9 +1323,10 @@ describe("mutate-dashboard", () => {
             { value: "exclude_builder", label: "Exclude @builder.io" },
           ],
         };
-        const examplePanel = (id: string, title: string) => ({
+        const examplePanel = (id: string, title: string, height?: number) => ({
           ...panel(id),
           title,
+          ...(height === undefined ? {} : { height }),
         });
         mocks.getDashboard.mockResolvedValue({
           kind: "sql",
@@ -1147,7 +1335,7 @@ describe("mutate-dashboard", () => {
             columns: 2,
             filters: [timeRange, emailFilter],
             panels: [
-              examplePanel("retention", "Retention"),
+              examplePanel("retention", "Retention", 3),
               examplePanel("top-referrers", "Top Referrers"),
               examplePanel("recurring-users-by-template", "Recurring Users"),
               examplePanel("dau-over-time", "Signed-In Daily Active Visitors"),
@@ -1231,7 +1419,11 @@ describe("mutate-dashboard", () => {
           {
             dashboardId: "traffic",
             operations: [
-              { op: "updatePanel", panelId: "a", patch: { width: 0 } },
+              {
+                op: "updatePanel",
+                panelId: "a",
+                patch: { width: 0, height: 0 },
+              },
               { op: "updatePanel", panelId: "b", patch: { width: 9 } },
             ],
           },
@@ -1242,6 +1434,7 @@ describe("mutate-dashboard", () => {
           errorCode: "dashboard_invalid_panel",
           message:
             'panel "a" ("a") width is 0; set width to an integer 1-6 (updatePanel patch {"width":1}).\n' +
+            'panel "a" ("a") height is 0; set height to an integer 1-6 (each unit is 180px).\n' +
             'panel "b" ("b") width is 9; set width to an integer 1-6 (updatePanel patch {"width":1}).',
         });
         expect(mocks.upsertDashboard).not.toHaveBeenCalled();
@@ -1415,6 +1608,38 @@ describe("mutate-dashboard", () => {
         });
 
         expect(result.changed).toBe(false);
+        expect(mocks.dryRunQuery).not.toHaveBeenCalled();
+      });
+
+      it("rejects a title edit that removes an all-time panel's lifetime label", async () => {
+        const baseConfig = dashboardConfig();
+        const config = {
+          ...baseConfig,
+          panels: [
+            {
+              ...panel("a", "first-party"),
+              title: "Lifetime signups",
+              config: { timeScope: "all-time" },
+            },
+            ...baseConfig.panels.slice(1),
+          ],
+        };
+        mocks.getDashboard.mockResolvedValue({ kind: "sql", config });
+
+        await expect(
+          mutateDashboard.run({
+            dashboardId: "traffic",
+            operations: [
+              {
+                op: "updatePanel",
+                panelId: "a",
+                patch: { title: "Signups" },
+              },
+            ],
+          }),
+        ).rejects.toThrow(/description or title.*lifetime/);
+
+        expect(mocks.upsertDashboard).not.toHaveBeenCalled();
         expect(mocks.dryRunQuery).not.toHaveBeenCalled();
       });
 
@@ -1680,7 +1905,7 @@ describe("mutate-dashboard", () => {
       expect(saved.message).toMatch(/^SAVED BUT NOT VERIFIED:/);
     });
 
-    it("executes nothing for a title, width or layout edit", async () => {
+    it("executes nothing for a title, width, height or layout edit", async () => {
       const saved: any = await mutateDashboard.run(
         {
           dashboardId: "growth",
@@ -1688,7 +1913,7 @@ describe("mutate-dashboard", () => {
             {
               op: "updatePanel",
               panelId: "signups-by-app",
-              patch: { title: "Renamed", width: 3 },
+              patch: { title: "Renamed", width: 3, height: 2 },
             },
             { op: "movePanels", panelIds: ["kpi"], position: "top" },
           ],
@@ -1703,6 +1928,15 @@ describe("mutate-dashboard", () => {
       });
       expect(saved.message).toContain("No panel render was affected");
       expect(saved._receipt.summary).toContain("no panel render was affected");
+      const config = mocks.upsertDashboard.mock.calls[0][2] as {
+        panels: Array<{ id: string; width: number; height?: number }>;
+      };
+      expect(
+        config.panels.find((panel) => panel.id === "signups-by-app"),
+      ).toMatchObject({
+        width: 3,
+        height: 2,
+      });
       expect(mocks.resolvePanel).not.toHaveBeenCalled();
       expect(mocks.dryRunQuerySchema).not.toHaveBeenCalled();
     });

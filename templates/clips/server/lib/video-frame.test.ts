@@ -8,8 +8,12 @@ import { promisify } from "node:util";
 import ffmpegPath from "ffmpeg-static";
 import { describe, expect, it } from "vitest";
 
+import { RecordingMediaFetchError } from "./recording-media-fetch-error.js";
+import { clampFrameSheetRange, planFrameSheet } from "./video-frame-sheet.js";
 import {
   extractJpegFrameFromFile,
+  extractJpegFrameSheetFromFile,
+  probeFrameSheetFpsFromFile,
   probeMediaDurationMs,
 } from "./video-frame.js";
 
@@ -220,6 +224,207 @@ describe("probeMediaDurationMs", () => {
   );
 });
 
+describe("frame extraction timeout", () => {
+  it.each([false, true])(
+    "settles promptly with inherited stderr and remote failure=%s",
+    async (remoteFailed) => {
+      const root = await mkdtemp(join(tmpdir(), "clips-frame-timeout-"));
+      const command = join(root, "ffmpeg");
+      const childPidPath = join(root, "child.pid");
+      const previous = process.env.FFMPEG_PATH;
+      let operation: Promise<number> | undefined;
+      let childPid: number | undefined;
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      let healthChecks = 0;
+      const remoteError = new RecordingMediaFetchError(
+        "Recording range budget exceeded.",
+        413,
+      );
+      try {
+        await writeFile(
+          command,
+          `#!/bin/sh\nsleep 30 &\nprintf '%s\\n' "$!" > ${JSON.stringify(childPidPath)}\nwait\n`,
+        );
+        await chmod(command, 0o755);
+        process.env.FFMPEG_PATH = command;
+        operation = probeFrameSheetFpsFromFile("unused", {
+          format: "mov",
+          remainingMs: () => 1_000,
+          assertHealthy: async () => {
+            healthChecks++;
+            if (remoteFailed) throw remoteError;
+          },
+        });
+        const result = operation.then(
+          () => "resolved",
+          (error: unknown) => error,
+        );
+        const startedDeadline = Date.now() + 3_000;
+        while (!existsSync(childPidPath)) {
+          if (Date.now() >= startedDeadline)
+            throw new Error("child did not start");
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        childPid = Number(await readFile(childPidPath, "utf8"));
+        const bounded = new Promise<never>((_, reject) => {
+          deadlineTimer = setTimeout(
+            () => reject(new Error("extraction hung")),
+            3_000,
+          );
+        });
+        const error = await Promise.race([result, bounded]);
+        if (remoteFailed) {
+          expect(error).toBe(remoteError);
+        } else {
+          expect(error).toMatchObject({
+            code: "EXTRACTION_FAILED",
+            message: expect.stringContaining("ffmpeg timed out"),
+          });
+        }
+        expect(healthChecks).toBe(1);
+      } finally {
+        clearTimeout(deadlineTimer);
+        if (childPid !== undefined) {
+          try {
+            process.kill(childPid, "SIGKILL");
+          } catch (error) {
+            if (
+              !(
+                error instanceof Error &&
+                "code" in error &&
+                error.code === "ESRCH"
+              )
+            )
+              throw error;
+          }
+        }
+        await operation?.catch(() => {});
+        if (previous === undefined) delete process.env.FFMPEG_PATH;
+        else process.env.FFMPEG_PATH = previous;
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe("frame extraction capacity", () => {
+  async function withControlledFfmpeg(
+    run: (gate: {
+      start: (name: string) => Promise<void>;
+      release: (name: string) => Promise<void>;
+      didStart: (name: string) => boolean;
+    }) => Promise<void>,
+  ) {
+    const root = await mkdtemp(join(tmpdir(), "clips-frame-slots-"));
+    const previous = process.env.FFMPEG_PATH;
+    const command = join(root, "ffmpeg");
+    const path = (kind: string, name: string) => join(root, `${kind}-${name}`);
+    try {
+      await writeFile(
+        command,
+        `#!/usr/bin/env node\nconst fs=require('node:fs');\nconst p=require('node:path');\nconst a=process.argv.slice(2);\nconst name=a[a.indexOf('-i')+1];\nconst dir=${JSON.stringify(root)};\nfs.writeFileSync(p.join(dir,'start-'+name),'');\nconst t=setInterval(()=>{if(fs.existsSync(p.join(dir,'release-'+name))){clearInterval(t);process.exit(0);}},10);\n`,
+      );
+      await chmod(command, 0o755);
+      process.env.FFMPEG_PATH = command;
+      await run({
+        start: async (name) => {
+          const deadline = Date.now() + 3_000;
+          while (!existsSync(path("start", name))) {
+            if (Date.now() >= deadline)
+              throw new Error(`${name} did not start`);
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        },
+        release: async (name) => {
+          await writeFile(path("release", name), "");
+        },
+        didStart: (name) => existsSync(path("start", name)),
+      });
+    } finally {
+      if (previous === undefined) delete process.env.FFMPEG_PATH;
+      else process.env.FFMPEG_PATH = previous;
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  it("hands an expired resumed waiter's capacity to the next queued operation", async () => {
+    await withControlledFfmpeg(async (gate) => {
+      const operations: Promise<unknown>[] = [];
+      let checks = 0;
+      const remote = {
+        format: "mov" as const,
+        assertHealthy: async () => {},
+        remainingMs: () => {
+          if (++checks > 1) throw new Error("remote deadline expired");
+          return 10_000;
+        },
+      };
+      try {
+        operations.push(
+          probeFrameSheetFpsFromFile("a"),
+          probeFrameSheetFpsFromFile("b"),
+        );
+        await Promise.all([gate.start("a"), gate.start("b")]);
+        const expired = probeFrameSheetFpsFromFile("expired", remote);
+        operations.push(expired.catch(() => undefined));
+        const following = probeFrameSheetFpsFromFile("following");
+        operations.push(following);
+        expect(checks).toBe(1);
+        await gate.release("a");
+        await expect(expired).rejects.toThrow("remote deadline expired");
+        await gate.start("following");
+        expect(gate.didStart("expired")).toBe(false);
+        await gate.release("following");
+        await gate.release("b");
+        await Promise.all(operations);
+      } finally {
+        await Promise.all(["a", "b", "expired", "following"].map(gate.release));
+        await Promise.allSettled(operations);
+      }
+    });
+  });
+
+  it("reserves a handed-off slot against a fresh concurrent caller", async () => {
+    await withControlledFfmpeg(async (gate) => {
+      const operations: Promise<unknown>[] = [];
+      let checks = 0;
+      let fresh: Promise<number> | undefined;
+      const remote = {
+        format: "mov" as const,
+        assertHealthy: async () => {},
+        remainingMs: () => {
+          if (++checks === 2) {
+            fresh = probeFrameSheetFpsFromFile("fresh");
+            operations.push(fresh);
+          }
+          return 10_000;
+        },
+      };
+      try {
+        operations.push(
+          probeFrameSheetFpsFromFile("a"),
+          probeFrameSheetFpsFromFile("b"),
+        );
+        await Promise.all([gate.start("a"), gate.start("b")]);
+        operations.push(probeFrameSheetFpsFromFile("queued", remote));
+        expect(checks).toBe(1);
+        await gate.release("a");
+        await gate.start("queued");
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(gate.didStart("fresh")).toBe(false);
+        await gate.release("b");
+        await gate.start("fresh");
+        await gate.release("queued");
+        await gate.release("fresh");
+        await Promise.all(operations);
+      } finally {
+        await Promise.all(["a", "b", "queued", "fresh"].map(gate.release));
+        await Promise.allSettled(operations);
+      }
+    });
+  });
+});
+
 describe("extractJpegFrameFromFile", () => {
   it("classifies empty media separately from a missing timestamp frame", async () => {
     const root = await mkdtemp(join(tmpdir(), "clips-empty-frame-test-"));
@@ -281,6 +486,80 @@ describe("extractJpegFrameFromFile", () => {
   );
 
   it.skipIf(!availableFfmpegPath)(
+    "returns the frame that starts within the millisecond before atMs",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "clips-frame-start-test-"));
+      const videoPath = join(root, "video.mp4");
+      const framePath = join(root, "frame.jpg");
+      const previousFfmpegPath = process.env.FFMPEG_PATH;
+      process.env.FFMPEG_PATH = availableFfmpegPath!;
+
+      // Frame n is one of three grays (n mod 3), so a neighbouring frame
+      // reads differently. At 30 fps most frames start between milliseconds.
+      const shadeAt = async (atMs: number) => {
+        await writeFile(
+          framePath,
+          await extractJpegFrameFromFile({ mediaPath: videoPath, atMs }),
+        );
+        const { stdout } = await execFileAsync(
+          availableFfmpegPath!,
+          [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            framePath,
+            "-vf",
+            "scale=1:1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+            "-",
+          ],
+          { encoding: "buffer" },
+        );
+        const level = stdout[0];
+        return level < 75 ? 0 : level < 168 ? 1 : 2;
+      };
+
+      try {
+        await execFileAsync(availableFfmpegPath!, [
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-y",
+          "-f",
+          "lavfi",
+          "-i",
+          "color=c=black:s=32x32:r=30:d=1.2,geq=lum='40+mod(N,3)*80':cb=128:cr=128",
+          "-c:v",
+          "libx264",
+          "-pix_fmt",
+          "yuv420p",
+          videoPath,
+        ]);
+
+        // Frame starts rounded up to whole milliseconds, as comments store them.
+        for (const frame of [1, 2, 30, 31]) {
+          const atMs = Math.ceil((frame * 1000) / 30);
+          expect({ atMs, shade: await shadeAt(atMs) }).toEqual({
+            atMs,
+            shade: frame % 3,
+          });
+        }
+      } finally {
+        if (previousFfmpegPath === undefined) {
+          delete process.env.FFMPEG_PATH;
+        } else {
+          process.env.FFMPEG_PATH = previousFfmpegPath;
+        }
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!availableFfmpegPath)(
     "classifies a missing timestamp separately from recordings without video",
     async () => {
       const root = await mkdtemp(join(tmpdir(), "clips-timestamp-frame-test-"));
@@ -321,6 +600,230 @@ describe("extractJpegFrameFromFile", () => {
         }
         await rm(root, { recursive: true, force: true });
       }
+    },
+  );
+});
+
+describe("extractJpegFrameSheetFromFile", () => {
+  // Frame n of each test video is a flat gray with luma 20 + 4n, so a cell's
+  // brightness names the frame it shows. JPEG stores full-range luma, which
+  // maps back to the video's 16-235 range.
+  const frameIndexOf = (level: number) =>
+    Math.round(((level * 219) / 255 + 16 - 20) / 4);
+
+  async function grayLevels(
+    imagePath: string,
+    width: number,
+    points: Array<[number, number]>,
+  ) {
+    const { stdout } = await execFileAsync(
+      availableFfmpegPath!,
+      [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        imagePath,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
+      ],
+      { encoding: "buffer", maxBuffer: 64 * 1024 * 1024 },
+    );
+    return points.map(([x, y]) => stdout[y * width + x]);
+  }
+
+  async function withNumberedVideo(
+    run: (paths: { root: string; videoPath: string }) => Promise<void>,
+    {
+      dropFrames,
+      durationSeconds = 1.5,
+    }: { dropFrames?: [number, number]; durationSeconds?: number } = {},
+  ) {
+    const root = await mkdtemp(join(tmpdir(), "clips-frame-sheet-test-"));
+    const videoPath = join(root, "video.mp4");
+    const previousFfmpegPath = process.env.FFMPEG_PATH;
+    process.env.FFMPEG_PATH = availableFfmpegPath!;
+    try {
+      await execFileAsync(availableFfmpegPath!, [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        `color=c=black:s=64x48:r=30:d=${durationSeconds},geq=lum='20+4*N':cb=128:cr=128`,
+        // A screen recording drops frames while nothing moves.
+        ...(dropFrames
+          ? [
+              "-vf",
+              `select='not(between(n,${dropFrames[0]},${dropFrames[1]}))'`,
+              "-fps_mode",
+              "vfr",
+            ]
+          : []),
+        "-c:v",
+        "libx264",
+        "-qp",
+        "0",
+        "-g",
+        "15",
+        "-pix_fmt",
+        "yuv420p",
+        videoPath,
+      ]);
+      await run({ root, videoPath });
+    } finally {
+      if (previousFfmpegPath === undefined) {
+        delete process.env.FFMPEG_PATH;
+      } else {
+        process.env.FFMPEG_PATH = previousFfmpegPath;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+
+  async function sheetFrames(
+    root: string,
+    videoPath: string,
+    request: { startMs: number; endMs: number; fps: number },
+  ) {
+    const result = planFrameSheet({
+      request,
+      fps: request.fps,
+      width: 64,
+      height: 48,
+    });
+    if (!result.ok) throw new Error(result.error);
+    const plan = result.value;
+    const sheetPath = join(root, "sheet.jpg");
+    await writeFile(
+      sheetPath,
+      await extractJpegFrameSheetFromFile({ mediaPath: videoPath, plan }),
+    );
+    const centers = plan.frameTimesMs.map((_, index): [number, number] => [
+      (index % plan.columns) * plan.cellWidth + plan.cellWidth / 2,
+      Math.floor(index / plan.columns) * plan.cellHeight + plan.cellHeight / 2,
+    ]);
+    const levels = await grayLevels(
+      sheetPath,
+      plan.columns * plan.cellWidth,
+      centers,
+    );
+    return { plan, frames: levels.map(frameIndexOf), levels };
+  }
+
+  it.skipIf(!availableFfmpegPath)(
+    "shows every frame once at the video's own rate, matching single frames",
+    async () => {
+      await withNumberedVideo(async ({ root, videoPath }) => {
+        await expect(probeFrameSheetFpsFromFile(videoPath)).resolves.toBe(30);
+        const { plan, frames } = await sheetFrames(root, videoPath, {
+          startMs: 500,
+          endMs: 800,
+          fps: 30,
+        });
+        expect(frames).toEqual([15, 16, 17, 18, 19, 20, 21, 22, 23]);
+
+        const framePath = join(root, "frame.jpg");
+        const singles: number[] = [];
+        for (const atMs of plan.frameTimesMs) {
+          await writeFile(
+            framePath,
+            await extractJpegFrameFromFile({ mediaPath: videoPath, atMs }),
+          );
+          const [level] = await grayLevels(framePath, 64, [[32, 24]]);
+          singles.push(frameIndexOf(level));
+        }
+        expect(frames).toEqual(singles);
+      });
+    },
+  );
+
+  it.skipIf(!availableFfmpegPath)(
+    "samples a slower rate from the frames on screen",
+    async () => {
+      await withNumberedVideo(async ({ root, videoPath }) => {
+        const { frames } = await sheetFrames(root, videoPath, {
+          startMs: 0,
+          endMs: 600,
+          fps: 10,
+        });
+        expect(frames).toEqual([0, 3, 6, 9, 12, 15]);
+      });
+    },
+  );
+
+  it.skipIf(!availableFfmpegPath)(
+    "keeps the frame on screen through a stretch with no new frames",
+    async () => {
+      await withNumberedVideo(
+        async ({ root, videoPath }) => {
+          const { frames } = await sheetFrames(root, videoPath, {
+            startMs: 600,
+            endMs: 1300,
+            fps: 10,
+          });
+          expect(frames).toEqual([18, 19, 19, 19, 19, 19, 36]);
+        },
+        { dropFrames: [20, 35] },
+      );
+    },
+  );
+
+  it.skipIf(!availableFfmpegPath)(
+    "finds the frame on screen after a long still stretch",
+    async () => {
+      // Nothing changes from frame 4 (133 ms) until frame 81 (2.7 s), so the
+      // frame on screen at 2 s is frame 4, well before the seek point.
+      await withNumberedVideo(
+        async ({ root, videoPath }) => {
+          const { frames } = await sheetFrames(root, videoPath, {
+            startMs: 2000,
+            endMs: 2300,
+            fps: 10,
+          });
+          expect(frames).toEqual([4, 4, 4]);
+        },
+        { dropFrames: [5, 80], durationSeconds: 3 },
+      );
+    },
+  );
+
+  it.skipIf(!availableFfmpegPath)(
+    "shows the last frame for a range in the video's final milliseconds",
+    async () => {
+      await withNumberedVideo(async ({ root, videoPath }) => {
+        const range = clampFrameSheetRange(
+          { startMs: 1499, endMs: 1500, fps: 30 },
+          1500,
+        );
+        if (!range.ok) throw new Error(range.error);
+        const { frames } = await sheetFrames(root, videoPath, {
+          startMs: range.value.startMs,
+          endMs: range.value.endMs!,
+          fps: 30,
+        });
+        expect(frames).toEqual([44]);
+      });
+    },
+  );
+
+  it.skipIf(!availableFfmpegPath)(
+    "leaves cells past the end of the video black",
+    async () => {
+      await withNumberedVideo(async ({ root, videoPath }) => {
+        const { frames, levels } = await sheetFrames(root, videoPath, {
+          startMs: 1400,
+          endMs: 1600,
+          fps: 30,
+        });
+        expect(frames.slice(0, 3)).toEqual([42, 43, 44]);
+        expect(levels.slice(3).every((level) => level < 5)).toBe(true);
+      });
     },
   );
 });

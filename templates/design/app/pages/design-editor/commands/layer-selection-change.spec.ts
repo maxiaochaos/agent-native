@@ -128,6 +128,7 @@ function selectLayer(args: {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
   };
+  const setViewMode = vi.fn();
 
   runLayerSelectionChange(
     {
@@ -167,7 +168,7 @@ function selectLayer(args: {
       setSelectedLayerIdsState: (value) => {
         selectedLayerIds = typeof value === "function" ? value([]) : value;
       },
-      setViewMode: vi.fn(),
+      setViewMode,
       viewModeRef: { current: "single" },
     },
     selectionIds,
@@ -184,6 +185,7 @@ function selectLayer(args: {
     selectedLayerIds,
     node,
     projections: [projection, secondProjection],
+    setViewMode,
     update,
   };
 }
@@ -212,6 +214,7 @@ function readOnlyWriterArgs(
     files: [activeFile],
     getScreenContent: () => activeFile.content ?? "",
     id: "design",
+    primeAcceptedSource: () => {},
     markPendingLocalFileContent: vi.fn(),
     overviewIsSynced: false,
     overviewPresenceFileId: null,
@@ -225,6 +228,13 @@ function readOnlyWriterArgs(
 }
 
 describe("Layers selection source identity", () => {
+  it("keeps the current screen in single view when selecting its source layer", () => {
+    const result = selectLayer({ sourceHTML: RICH_HTML });
+    expect(result.selectedElement?.sourceId).toBe("button-a");
+    expect(result.setViewMode).toHaveBeenCalledWith("single");
+    expect(result.setViewMode).not.toHaveBeenCalledWith("overview");
+  });
+
   it("persists a selected source node id without adding an undo step", () => {
     const result = selectLayer({});
     expect(result.update).toHaveBeenCalledWith("screen-a", expect.any(String), {
@@ -474,3 +484,50 @@ describe("Layers selection source identity", () => {
     );
   });
 });
+
+it.each(["overview", "single"] as const)(
+  "selects an unloaded screen by metadata in %s mode without an active body",
+  (viewMode) => {
+    const target: DesignFile = {
+      id: "unloaded",
+      filename: "other.html",
+      fileType: "html",
+      content: "",
+      createdAt: null,
+      updatedAt: "1",
+      sourceState: "unloaded",
+    };
+    const setActiveFileId = vi.fn();
+    const setOverviewSelectedScreenIds = vi.fn();
+    const setSelectedLayerIdsState = vi.fn();
+    runLayerSelectionChange(
+      {
+        activeFile: undefined,
+        applyFileContentUpdate: vi.fn(),
+        clearPendingOverviewLayerSelectionTimer: vi.fn(),
+        codeLayerOwnerByNodeId: new Map(),
+        effectiveCodeLayerState: { hiddenIds: new Set(), lockedIds: new Set() },
+        files: [target],
+        getScreenContent: vi.fn(),
+        overviewSelectedScreenIds: [],
+        pendingOverviewLayerSelectionRef: { current: null },
+        pendingOverviewScreenSelectionRef: { current: null },
+        selectedElement: null,
+        setActiveFileId,
+        setActiveTool: vi.fn(),
+        setCreatedOverviewLayerSelection: vi.fn(),
+        setMode: vi.fn(),
+        setOverviewSelectedScreenIds,
+        setSelectedElement: vi.fn(),
+        setSelectedLayerIdsState,
+        setViewMode: vi.fn(),
+        viewModeRef: { current: viewMode },
+      },
+      ["unloaded"],
+      { additive: false, id: "unloaded", range: false },
+    );
+    expect(setActiveFileId).toHaveBeenCalledWith("unloaded");
+    expect(setOverviewSelectedScreenIds).toHaveBeenCalledWith(["unloaded"]);
+    expect(setSelectedLayerIdsState).toHaveBeenCalledWith(["unloaded"]);
+  },
+);

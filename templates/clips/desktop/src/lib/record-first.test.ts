@@ -1,9 +1,14 @@
 import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const fs = vi.hoisted(() => ({ open: vi.fn(), stat: vi.fn() }));
+const fs = vi.hoisted(() => ({
+  open: vi.fn(),
+  stat: vi.fn(),
+  SeekMode: { Start: 0, Current: 1, End: 2 },
+}));
 vi.mock("@tauri-apps/plugin-fs", () => fs);
 
+import { sourceHeadSha256 } from "../../../shared/source-fingerprint";
 import {
   changeRecordFirstFiles,
   effectiveLocalRecordingMode,
@@ -12,9 +17,9 @@ import {
   RecordFirstFileUnreadableError,
   recordFirstFilesKey,
   RecordFirstHandoffResetError,
-  recordFirstFilesToQueue,
-  recordFirstMediaFlags,
+  recordFirstSourceHeadSha256,
   saveRecordFirstFiles,
+  shouldPollVideoStorageStatus,
   stageRecordFirstFile,
   stagedIdAfterFailure,
   transferRecordFirstFiles,
@@ -52,19 +57,25 @@ function memoryStorage() {
 }
 
 describe("effectiveLocalRecordingMode", () => {
-  it.each(["checking", "missing"] as const)(
-    "records to disk instead of waiting when storage is %s",
+  it.each(["off", "composed", "separate"] as const)(
+    "preserves the configured %s mode",
+    (mode) => {
+      expect(effectiveLocalRecordingMode(mode)).toBe(mode);
+    },
+  );
+});
+
+describe("shouldPollVideoStorageStatus", () => {
+  it.each(["checking", "missing", "unavailable"] as const)(
+    "keeps probing while storage is %s for a signed-in account",
     (status) => {
-      expect(effectiveLocalRecordingMode("off", status)).toBe("composed");
+      expect(shouldPollVideoStorageStatus(true, status)).toBe(true);
     },
   );
 
-  it("streams to the server once storage reads as connected", () => {
-    expect(effectiveLocalRecordingMode("off", "configured")).toBe("off");
-  });
-
-  it("keeps an explicit local mode", () => {
-    expect(effectiveLocalRecordingMode("separate", "missing")).toBe("separate");
+  it("stops probing when storage is configured or the user is signed out", () => {
+    expect(shouldPollVideoStorageStatus(true, "configured")).toBe(false);
+    expect(shouldPollVideoStorageStatus(false, "missing")).toBe(false);
   });
 });
 
@@ -227,32 +238,6 @@ describe("record-first file list", () => {
     });
   });
 
-  it("describes each separate file by what it holds", () => {
-    const take = { hasAudio: true, hasCamera: true };
-
-    expect(recordFirstMediaFlags("composed", take)).toEqual(take);
-    expect(recordFirstMediaFlags("desktop", take)).toEqual({
-      hasAudio: true,
-      hasCamera: false,
-    });
-    expect(recordFirstMediaFlags("camera", take)).toEqual({
-      hasAudio: false,
-      hasCamera: true,
-    });
-  });
-
-  it("queues the composed file, or every file when a capture wrote none", () => {
-    const composed = { role: "composed", path: "/c.webm" };
-    const desktop = { role: "desktop", path: "/d.webm" };
-    const camera = { role: "camera", path: "/cam.webm" };
-
-    expect(recordFirstFilesToQueue([desktop, composed])).toEqual([composed]);
-    expect(recordFirstFilesToQueue([desktop, camera])).toEqual([
-      desktop,
-      camera,
-    ]);
-  });
-
   it("sets an unreadable list aside instead of overwriting it", () => {
     const storage = memoryStorage();
     storage.setItem("k", "{not json");
@@ -267,14 +252,38 @@ describe("record-first file list", () => {
 /** A file read the way the fs plugin reads: up to `max` bytes per call. */
 function fileReader(bytes: Uint8Array, max = Infinity) {
   let offset = 0;
-  return vi.fn(async (buffer: Uint8Array) => {
-    const n = Math.min(buffer.byteLength, max, bytes.byteLength - offset);
-    if (n <= 0) return null;
-    buffer.set(bytes.subarray(offset, offset + n));
-    offset += n;
-    return n;
-  });
+  return Object.assign(
+    vi.fn(async (buffer: Uint8Array) => {
+      const n = Math.min(buffer.byteLength, max, bytes.byteLength - offset);
+      if (n <= 0) return null;
+      buffer.set(bytes.subarray(offset, offset + n));
+      offset += n;
+      return n;
+    }),
+    { seekTo: (position: number) => void (offset = position) },
+  );
 }
+
+describe("recordFirstSourceHeadSha256", () => {
+  it("hashes the first megabyte across short reads, like the server's first chunk", async () => {
+    const bytes = new Uint8Array(1024 * 1024 + 300).map((_, i) => i % 251);
+
+    await expect(
+      recordFirstSourceHeadSha256({
+        size: bytes.byteLength,
+        read: fileReader(bytes, 4096),
+      }),
+    ).resolves.toBe(await sourceHeadSha256(bytes));
+  });
+
+  it("hashes all of a file shorter than a megabyte", async () => {
+    const bytes = new Uint8Array(10).fill(7);
+
+    await expect(
+      recordFirstSourceHeadSha256({ size: 10, read: fileReader(bytes) }),
+    ).resolves.toBe(await sourceHeadSha256(bytes));
+  });
+});
 
 describe("stageRecordFirstFile", () => {
   async function stage(size: number, chunkBytes: number, max?: number) {
@@ -355,10 +364,18 @@ describe("queueRecordFirstUpload", () => {
     fetchMock.mockReset();
   });
 
-  function openFile(bytes: Uint8Array, read = fileReader(bytes)) {
+  function openFile(
+    bytes: Uint8Array,
+    wrapRead = (read: ReturnType<typeof fileReader>) => read,
+  ) {
+    const source = fileReader(bytes);
     const handle = {
       stat: vi.fn(async () => ({ size: bytes.byteLength })),
-      read,
+      read: wrapRead(source),
+      seek: vi.fn(async (offset: number) => {
+        source.seekTo(offset);
+        return offset;
+      }),
       close: vi.fn(async () => {}),
     };
     fs.open.mockResolvedValue(handle);
@@ -409,6 +426,59 @@ describe("queueRecordFirstUpload", () => {
     expect(await listBrowserRecordingBackups()).toEqual([
       expect.objectContaining({ recordingId: "rec-9", bytes: 10 }),
     ]);
+  });
+
+  it("sends the file's fingerprint, then stages the whole file from its start", async () => {
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(
+      "rec-9" as ReturnType<typeof crypto.randomUUID>,
+    );
+    const bytes = new Uint8Array(STREAM_CHUNK_BYTES + 10).map((_, i) => i % 7);
+    openFile(bytes);
+    serverWith({});
+
+    const upload = await queueRecordFirstUpload({
+      serverUrl: "https://clips.example",
+      ownerEmail: "me@example.com",
+      file,
+    });
+
+    const [, init] = fetchMock.mock.calls[0] ?? [];
+    const body = JSON.parse(String(init?.body));
+    expect(body.sourceHeadSha256).toBe(await sourceHeadSha256(bytes));
+    expect(upload).toMatchObject({
+      recordingId: "rec-9",
+      bytes: bytes.byteLength,
+    });
+  });
+
+  it("hands off nothing when this account already has the file as a clip", async () => {
+    vi.spyOn(crypto, "randomUUID").mockReturnValue(
+      "rec-9" as ReturnType<typeof crypto.randomUUID>,
+    );
+    const handle = openFile(new Uint8Array(10).fill(7));
+    fetchMock.mockImplementation(async (url: string) =>
+      String(url).endsWith("/create-recording")
+        ? Response.json({
+            result: {
+              id: "oe0Ehax9rUTS",
+              organizationId: "org-1",
+              status: "ready",
+              existingRecording: true,
+            },
+          })
+        : new Response("{}", { status: 200 }),
+    );
+
+    const upload = await queueRecordFirstUpload({
+      serverUrl: "https://clips.example",
+      ownerEmail: "me@example.com",
+      file,
+    });
+
+    expect(upload).toBeNull();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(await listBrowserRecordingBackups()).toEqual([]);
+    expect(handle.close).toHaveBeenCalledOnce();
   });
 
   const notFound = new Error(
@@ -635,14 +705,12 @@ describe("queueRecordFirstUpload", () => {
       "rec-9" as ReturnType<typeof crypto.randomUUID>,
     );
     const bytes = new Uint8Array(STREAM_CHUNK_BYTES + 10).fill(7);
-    const reader = fileReader(bytes);
     let reads = 0;
-    const handle = openFile(
-      bytes,
+    const handle = openFile(bytes, (reader) =>
       vi.fn(async (buffer: Uint8Array) => {
         reads += 1;
-        // The disk fails after the first slice was staged.
-        if (reads > 1) throw new Error("disk read failed");
+        // The disk fails after the fingerprint read and the first staged slice.
+        if (reads > 2) throw new Error("disk read failed");
         return reader(buffer);
       }),
     );
