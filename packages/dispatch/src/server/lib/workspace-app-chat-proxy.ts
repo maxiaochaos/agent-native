@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import { getOrgContext } from "@agent-native/core/org";
 import {
   getAppProductionUrl,
+  getBrowserCookieSession,
   getForwardedRequestOrigin,
   getSession,
   getRequestIdentityAuthenticatedAtMs,
+  isSessionResolutionUnavailable,
   resolveAppRuntimeUrl,
   runWithRequestContext,
 } from "@agent-native/core/server";
@@ -15,9 +17,11 @@ import {
 } from "@agent-native/core/shared";
 
 import { parseWorkspaceAppChatProxyPath } from "../../shared/workspace-app-chat.js";
+import { listWorkspaceApps } from "./app-creation-store.js";
 import {
   createGrantedDispatchMcpEmbedSessionForWorkspaceAppChat,
   createWorkspaceSsoEmbedSessionForWorkspaceAppChat,
+  mountedWorkspaceAppHomeUrl,
 } from "./mcp-gateway.js";
 
 const TARGET_CHAT_PATH = "/_agent-native/agent-chat";
@@ -72,6 +76,12 @@ interface CachedChatSession {
   expiresAt: number;
 }
 const sessionCache = new Map<string, CachedChatSession>();
+/**
+ * Concurrent polls of mode/runs/list can share one registry read. The
+ * promise is dropped as soon as it settles, so a later request always
+ * re-checks access instead of reusing a grant.
+ */
+const browserAppUrlInFlight = new Map<string, Promise<string | null>>();
 
 function sweepChatSessionCache(now: number): void {
   for (const [key, entry] of sessionCache) {
@@ -122,9 +132,9 @@ function httpOrigin(value: string | undefined): HttpOriginResult {
   }
 }
 
-function trustedWorkspaceRequestOrigin(
+function resolveTrustedWorkspaceRequestOrigin(
   event: WorkspaceAppChatProxyEvent,
-): string {
+): { origin: string; requestHostTrusted: boolean } {
   const configured = httpOrigin(getAppProductionUrl());
   const runtime = httpOrigin(resolveAppRuntimeUrl());
   const request = httpOrigin(
@@ -142,10 +152,14 @@ function trustedWorkspaceRequestOrigin(
   );
 
   if (request.kind === "valid" && allowedOrigins.has(request.origin)) {
-    return request.origin;
+    return { origin: request.origin, requestHostTrusted: true };
   }
-  if (configured.kind === "valid") return configured.origin;
-  if (runtime.kind === "valid") return runtime.origin;
+  if (configured.kind === "valid") {
+    return { origin: configured.origin, requestHostTrusted: false };
+  }
+  if (runtime.kind === "valid") {
+    return { origin: runtime.origin, requestHostTrusted: false };
+  }
   if (configured.kind === "invalid" || runtime.kind === "invalid") {
     throw new Error("Configured application origin is invalid.");
   }
@@ -344,22 +358,94 @@ async function resolveWorkspaceAppChatSession(input: {
 
 export function clearWorkspaceAppChatSessions(): void {
   sessionCache.clear();
+  browserAppUrlInFlight.clear();
+}
+
+function browserAppUrlKey(input: {
+  appId: string;
+  userEmail: string;
+  orgId: string | undefined;
+  requestOrigin: string;
+}): string {
+  return [
+    input.userEmail,
+    input.orgId ?? "",
+    input.requestOrigin,
+    input.appId,
+  ].join("\u0000");
+}
+
+function resolveBrowserAppUrl(input: {
+  appId: string;
+  userEmail: string;
+  orgId: string | undefined;
+  requestOrigin: string;
+}): Promise<string | null> {
+  const key = browserAppUrlKey(input);
+  const inFlight = browserAppUrlInFlight.get(key);
+  if (inFlight) return inFlight;
+  const url = Promise.resolve(
+    runWithRequestContext(
+      {
+        userEmail: input.userEmail,
+        ...(input.orgId ? { orgId: input.orgId } : {}),
+        requestOrigin: input.requestOrigin,
+      },
+      () => listWorkspaceApps({ includeAgentCards: false }),
+    ),
+  ).then((apps) => {
+    const app = apps.find(
+      (candidate) =>
+        candidate.id === input.appId &&
+        !candidate.isDispatch &&
+        candidate.status !== "pending",
+    );
+    return app ? mountedWorkspaceAppHomeUrl(app) : null;
+  });
+  browserAppUrlInFlight.set(key, url);
+  const forget = () => {
+    if (browserAppUrlInFlight.get(key) === url) {
+      browserAppUrlInFlight.delete(key);
+    }
+  };
+  url.then(forget, forget);
+  return url;
+}
+
+function isWorkspaceAppChatTarget(appBaseUrl: string, target: URL): boolean {
+  // URL parsing resolves encoded dot segments such as "%2e%2e", so check where
+  // the request lands before it carries the caller's session.
+  const chatPath = `${new URL(appBaseUrl).pathname.replace(/\/+$/, "")}${TARGET_CHAT_PATH}`;
+  const chatSubPath = target.pathname.slice(chatPath.length);
+  return (
+    target.pathname.startsWith(chatPath) &&
+    (chatSubPath === "" || chatSubPath.startsWith("/")) &&
+    !/%(?:2f|5c)/i.test(chatSubPath)
+  );
 }
 
 function upstreamRequestHeaders(
   request: Request,
-  session: WorkspaceAppChatSession,
+  session?: WorkspaceAppChatSession,
 ): Headers {
   const headers = new Headers();
   for (const [name, value] of request.headers) {
     const lower = name.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower) || DROPPED_REQUEST_HEADERS.has(lower)) {
+    const browserHeader =
+      !session &&
+      (lower === "cookie" || lower === "origin" || lower === "referer");
+    if (
+      HOP_BY_HOP_HEADERS.has(lower) ||
+      (DROPPED_REQUEST_HEADERS.has(lower) && !browserHeader)
+    ) {
       continue;
     }
     headers.set(name, value);
   }
-  headers.set("authorization", `Bearer ${session.token}`);
-  headers.set(CSRF_MARKER_HEADER, "1");
+  if (session) {
+    headers.set("authorization", `Bearer ${session.token}`);
+    headers.set(CSRF_MARKER_HEADER, "1");
+  }
   return headers;
 }
 
@@ -426,18 +512,47 @@ export function createWorkspaceAppChatProxyHandler(
         : undefined;
 
     let requestOrigin: string;
-    let appSession: WorkspaceAppChatSession;
+    let appBaseUrl: string;
+    let appSession: WorkspaceAppChatSession | undefined;
     try {
-      requestOrigin = trustedWorkspaceRequestOrigin(event);
-      appSession = await resolveWorkspaceAppChatSession({
-        appId: parsed.appId,
-        userEmail: session.email,
-        identityAuthenticatedAtMs,
-        identitySessionKey,
-        orgId,
-        requestOrigin,
-        fetchImpl,
-      });
+      const originDecision = resolveTrustedWorkspaceRequestOrigin(event);
+      requestOrigin = originDecision.origin;
+      const browserSession = await getBrowserCookieSession(event as never);
+      if (
+        browserSession === null &&
+        isSessionResolutionUnavailable(event as never)
+      ) {
+        throw new Error("Dispatch could not read your browser session.");
+      }
+      let browserAppUrl: string | null = null;
+      if (
+        originDecision.requestHostTrusted &&
+        browserSession?.email === session.email &&
+        (browserSession.orgId ?? null) === (orgId ?? null)
+      ) {
+        browserAppUrl = await resolveBrowserAppUrl({
+          appId: parsed.appId,
+          userEmail: session.email,
+          orgId,
+          requestOrigin,
+        });
+      }
+      // Page-only embed tokens do not authorize chat; same-origin apps
+      // recheck the browser session themselves.
+      if (browserAppUrl && new URL(browserAppUrl).origin === requestOrigin) {
+        appBaseUrl = browserAppUrl;
+      } else {
+        appSession = await resolveWorkspaceAppChatSession({
+          appId: parsed.appId,
+          userEmail: session.email,
+          identityAuthenticatedAtMs,
+          identitySessionKey,
+          orgId,
+          requestOrigin,
+          fetchImpl,
+        });
+        appBaseUrl = appSession.appBaseUrl;
+      }
     } catch (error) {
       console.warn("[dispatch] workspace app chat proxy could not connect", {
         app: parsed.appId,
@@ -451,9 +566,12 @@ export function createWorkspaceAppChatProxyHandler(
 
     const request = event.req;
     const target = new URL(
-      `${appSession.appBaseUrl}${TARGET_CHAT_PATH}${parsed.targetSubPath}`,
+      `${appBaseUrl}${TARGET_CHAT_PATH}${parsed.targetSubPath}`,
     );
     target.search = url.search;
+    if (!isWorkspaceAppChatTarget(appBaseUrl, target)) {
+      return proxyErrorResponse(404, "Workspace app chat route not found.");
+    }
 
     const method = request.method.toUpperCase();
     const body =
